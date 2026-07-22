@@ -186,6 +186,86 @@ async fn serve_page(
     }
 }
 
+const INDEX_STYLE: &str = r#"
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --fg: #1a1a1a;
+  --muted: #6b7280;
+  --card-bg: #ffffff;
+  --border: #e5e7eb;
+  --accent: #4f46e5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111114;
+    --fg: #e8e8ea;
+    --muted: #9198a1;
+    --card-bg: #1a1a1f;
+    --border: #2a2a30;
+    --accent: #818cf8;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 3rem 1.5rem;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+.container { max-width: 640px; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+.count { color: var(--muted); font-size: .9rem; margin: 0 0 1.5rem; }
+input[type="search"] {
+  width: 100%;
+  padding: .6rem .8rem;
+  border-radius: .5rem;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--fg);
+  font-size: .95rem;
+  margin-bottom: 1.25rem;
+}
+input[type="search"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+ul.pages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
+ul.pages li a {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: .75rem 1rem;
+  border-radius: .5rem;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--fg);
+  text-decoration: none;
+  font-size: .95rem;
+  transition: border-color .15s ease;
+}
+ul.pages li a:hover { border-color: var(--accent); }
+ul.pages li a::after { content: "\2192"; color: var(--muted); margin-left: .5rem; }
+.empty, .no-match { color: var(--muted); text-align: center; padding: 2rem 0; }
+.no-match { display: none; }
+"#;
+
+const INDEX_SEARCH_SCRIPT: &str = r#"
+<script>
+  const input = document.getElementById('q');
+  const items = Array.from(document.getElementById('list').children);
+  const noMatch = document.getElementById('no-match');
+  input.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    let visible = 0;
+    items.forEach((li) => {
+      const match = li.dataset.slug.includes(q);
+      li.style.display = match ? '' : 'none';
+      if (match) visible++;
+    });
+    noMatch.style.display = (items.length > 0 && visible === 0 && q !== '') ? 'block' : 'none';
+  });
+</script>
+"#;
+
 async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
     let mut slugs = Vec::new();
     if let Ok(mut entries) = fs::read_dir(&config.data_dir).await {
@@ -200,25 +280,55 @@ async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
     }
     slugs.sort();
 
-    let items: String = if slugs.is_empty() {
-        "<p>No pages yet.</p>".to_string()
-    } else {
-        slugs
-            .iter()
-            .map(|s| format!(r#"<li><a href="/p/{s}">{s}</a></li>"#))
-            .collect::<Vec<_>>()
-            .join("\n")
+    let count_label = match slugs.len() {
+        0 => "No pages yet".to_string(),
+        1 => "1 page".to_string(),
+        n => format!("{n} pages"),
     };
 
+    let (body, script) = if slugs.is_empty() {
+        (
+            r#"<p class="empty">No pages yet. Push one to see it here.</p>"#.to_string(),
+            "",
+        )
+    } else {
+        let items: String = slugs
+            .iter()
+            .map(|s| {
+                format!(
+                    r#"<li data-slug="{lower}"><a href="/p/{s}">{s}</a></li>"#,
+                    lower = s.to_lowercase()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            r#"<input type="search" id="q" placeholder="Filter pages&hellip;" autocomplete="off">
+<ul class="pages" id="list">
+{items}
+</ul>
+<p class="no-match" id="no-match">No pages match that.</p>"#
+        );
+        (body, INDEX_SEARCH_SCRIPT)
+    };
+
+    let style = INDEX_STYLE;
     Html(format!(
         r#"<!doctype html>
 <html>
-<head><meta charset="utf-8"><title>Pages</title></head>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pages</title>
+<style>{style}</style>
+</head>
 <body>
+<div class="container">
 <h1>Pages</h1>
-<ul>
-{items}
-</ul>
+<p class="count">{count_label}</p>
+{body}
+</div>
+{script}
 </body>
 </html>"#
     ))
