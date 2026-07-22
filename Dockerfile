@@ -15,7 +15,6 @@ WORKDIR /app
 COPY --from=builder /app/target/release/page-host /usr/local/bin/page-host
 
 ENV DATA_DIR=/data
-VOLUME ["/data"]
 EXPOSE 8080
 
 CMD ["page-host"]
