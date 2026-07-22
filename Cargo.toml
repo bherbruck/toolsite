@@ -1,0 +1,19 @@
+[package]
+name = "page-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+base64 = "0.22.1"
+rand = "0.10.2"
+rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+schemars = "1.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+urlencoding = "2.1.3"
