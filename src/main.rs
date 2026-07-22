@@ -20,7 +20,7 @@ use rmcp::{
     },
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpService,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
     ErrorData as McpError, ServerHandler,
 };
@@ -445,11 +445,30 @@ async fn main() -> anyhow::Result<()> {
         oauth,
     });
 
+    // rmcp's Streamable HTTP transport validates the inbound `Host` header
+    // (DNS-rebinding protection) against an allowlist that defaults to
+    // localhost only. Deployed behind a real domain, that must include the
+    // public host or every request 403s before auth even runs.
+    let host_config = match config
+        .base_url
+        .as_deref()
+        .and_then(|b| b.parse::<Uri>().ok())
+        .and_then(|u| u.authority().map(|a| a.as_str().to_string()))
+    {
+        Some(authority) => StreamableHttpServerConfig::default().with_allowed_hosts([
+            authority,
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ]),
+        None => StreamableHttpServerConfig::default().disable_allowed_hosts(),
+    };
+
     let mcp_config = config.clone();
     let mcp_service = StreamableHttpService::new(
         move || Ok(PageHost::new(mcp_config.clone())),
         LocalSessionManager::default().into(),
-        Default::default(),
+        host_config,
     );
 
     let mcp_router = Router::new()
