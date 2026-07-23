@@ -8,8 +8,14 @@ public URL.
 
 - `push_page(html, slug?)` — publish an HTML page. Omit `slug` for a random
   one. Reusing a slug overwrites that page in place. Returns the page URL.
+  `slug` may contain `/` to namespace it under an app, e.g. `myapp/about`.
 - `pull_page(slug)` — fetch the current HTML for a previously pushed page
   (so it can be edited and pushed back).
+- `push_app(app, pages)` — publish multiple pages under one app namespace in
+  a single call (`pages` maps page name to HTML). A page named `index` is
+  also served at the app's own root URL. Returns each page's URL.
+- `pull_app(app)` — fetch every page in an app namespace, keyed by page name,
+  so the app can be edited and pushed back with `push_app`.
 
 ## Endpoints
 

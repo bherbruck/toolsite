@@ -61,7 +61,7 @@ struct PushPageRequest {
     #[schemars(description = "Full self-contained HTML document (inline any CSS/JS).")]
     html: String,
     #[schemars(
-        description = "Optional URL slug. Random one is generated if omitted. Reusing a slug overwrites that page."
+        description = "Optional URL slug. Random one is generated if omitted. Reusing a slug overwrites that page. May contain '/' to namespace it under an app, e.g. 'myapp/about'."
     )]
     slug: Option<String>,
 }
@@ -70,6 +70,24 @@ struct PushPageRequest {
 struct PullPageRequest {
     #[schemars(description = "Slug of the page to fetch the current HTML for.")]
     slug: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PushAppRequest {
+    #[schemars(
+        description = "App namespace all pages are published under, e.g. 'myapp'. Letters, numbers, '-' and '_' only."
+    )]
+    app: String,
+    #[schemars(
+        description = "Map of page name to full HTML document, e.g. {\"index\": \"<html>...\", \"about\": \"<html>...\"}. A page named 'index' is also served at the app's own root URL."
+    )]
+    pages: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PullAppRequest {
+    #[schemars(description = "App namespace to fetch all pages for.")]
+    app: String,
 }
 
 #[derive(Clone)]
@@ -89,32 +107,30 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Publish a single self-contained HTML page and get back a public URL. Call again with the same slug to update it in place."
+        description = "Publish a single self-contained HTML page and get back a public URL. Call again with the same slug to update it in place. Use a slug like 'myapp/about' to group multiple pages under one app."
     )]
     async fn push_page(
         &self,
         Parameters(PushPageRequest { html, slug }): Parameters<PushPageRequest>,
     ) -> Result<CallToolResult, McpError> {
         let slug = slug.unwrap_or_else(random_slug);
-        if slug.is_empty()
-            || !slug
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !valid_slug(&slug) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "slug must be non-empty and contain only letters, numbers, '-' or '_'",
+                "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
             )]));
         }
 
         let path = self.config.data_dir.join(format!("{slug}.html"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
         fs::write(&path, html)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let url = match &self.config.base_url {
-            Some(base) => format!("{base}/p/{slug}"),
-            None => format!("/p/{slug}"),
-        };
+        let url = page_url(&self.config, &slug);
         Ok(CallToolResult::success(vec![ContentBlock::text(url)]))
     }
 
@@ -123,6 +139,11 @@ impl PageHost {
         &self,
         Parameters(PullPageRequest { slug }): Parameters<PullPageRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&slug) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
         let path = self.config.data_dir.join(format!("{slug}.html"));
         match fs::read_to_string(&path).await {
             Ok(html) => Ok(CallToolResult::success(vec![ContentBlock::text(html)])),
@@ -130,6 +151,87 @@ impl PageHost {
                 "no page found for slug '{slug}'"
             ))])),
         }
+    }
+
+    #[tool(
+        description = "Publish multiple HTML pages under one app namespace in a single call. A page named 'index' is also served at the app's own root URL. Returns each page's URL."
+    )]
+    async fn push_app(
+        &self,
+        Parameters(PushAppRequest { app, pages }): Parameters<PushAppRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_segment(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty and contain only letters, numbers, '-' or '_'",
+            )]));
+        }
+        if pages.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "pages must not be empty",
+            )]));
+        }
+        for name in pages.keys() {
+            if !valid_segment(name) {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "page name '{name}' must be non-empty and contain only letters, numbers, '-' or '_'"
+                ))]));
+            }
+        }
+
+        let app_dir = self.config.data_dir.join(&app);
+        fs::create_dir_all(&app_dir)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let mut urls = Vec::new();
+        for (name, html) in &pages {
+            let path = app_dir.join(format!("{name}.html"));
+            fs::write(&path, html)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let slug = format!("{app}/{name}");
+            urls.push(format!("{name}: {}", page_url(&self.config, &slug)));
+        }
+        urls.sort();
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            urls.join("\n"),
+        )]))
+    }
+
+    #[tool(
+        description = "Fetch the current HTML for every page in an app namespace, keyed by page name, so the app can be edited and pushed back with push_app."
+    )]
+    async fn pull_app(
+        &self,
+        Parameters(PullAppRequest { app }): Parameters<PullAppRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_segment(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty and contain only letters, numbers, '-' or '_'",
+            )]));
+        }
+        let app_dir = self.config.data_dir.join(&app);
+        let mut pages = HashMap::new();
+        if let Ok(mut entries) = fs::read_dir(&app_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("html") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        if let Ok(html) = fs::read_to_string(&path).await {
+                            pages.insert(stem.to_string(), html);
+                        }
+                    }
+                }
+            }
+        }
+        if pages.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "no pages found for app '{app}'"
+            ))]));
+        }
+        let json = serde_json::to_string(&pages)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
@@ -140,7 +242,8 @@ impl ServerHandler for PageHost {
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
             .with_server_info(Implementation::new("page-host", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Push single-file HTML artifacts and get back a public URL to view them.",
+                "Push single-file HTML artifacts and get back a public URL to view them. \
+                 Use push_app/pull_app for multi-page apps published under one namespace.",
             )
     }
 }
@@ -155,6 +258,21 @@ fn random_token(len: usize) -> String {
 
 fn random_slug() -> String {
     random_token(8)
+}
+
+fn valid_segment(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn valid_slug(s: &str) -> bool {
+    !s.is_empty() && s.split('/').all(valid_segment)
+}
+
+fn page_url(config: &Config, slug: &str) -> String {
+    match &config.base_url {
+        Some(base) => format!("{base}/p/{slug}"),
+        None => format!("/p/{slug}"),
+    }
 }
 
 async fn require_bearer(
@@ -179,11 +297,19 @@ async fn serve_page(
     State(config): State<Arc<Config>>,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
-    let path = config.data_dir.join(format!("{slug}.html"));
-    match fs::read_to_string(&path).await {
-        Ok(html) => Html(html).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    if !valid_slug(&slug) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
     }
+    let direct = config.data_dir.join(format!("{slug}.html"));
+    if let Ok(html) = fs::read_to_string(&direct).await {
+        return Html(html).into_response();
+    }
+    // App root without a filename: fall back to that app's 'index' page.
+    let index = config.data_dir.join(format!("{slug}/index.html"));
+    if let Ok(html) = fs::read_to_string(&index).await {
+        return Html(html).into_response();
+    }
+    (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
 const INDEX_STYLE: &str = r#"
@@ -266,18 +392,42 @@ const INDEX_SEARCH_SCRIPT: &str = r#"
 </script>
 "#;
 
-async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
-    let mut slugs = Vec::new();
-    if let Ok(mut entries) = fs::read_dir(&config.data_dir).await {
+fn collect_slugs<'a>(
+    dir: &'a std::path::Path,
+    prefix: String,
+    out: &'a mut Vec<String>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let Ok(mut entries) = fs::read_dir(dir).await else {
+            return;
+        };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("html") {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                let child_prefix = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                collect_slugs(&path, child_prefix, out).await;
+            } else if path.extension().and_then(|e| e.to_str()) == Some("html") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    slugs.push(stem.to_string());
+                    let slug = if prefix.is_empty() {
+                        stem.to_string()
+                    } else {
+                        format!("{prefix}/{stem}")
+                    };
+                    out.push(slug);
                 }
             }
         }
-    }
+    })
+}
+
+async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
+    let mut slugs = Vec::new();
+    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
     slugs.sort();
 
     let count_label = match slugs.len() {
@@ -587,7 +737,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut public_router = Router::new()
         .route("/", get(index))
-        .route("/p/{slug}", get(serve_page));
+        .route("/p/{*slug}", get(serve_page));
 
     if oauth_enabled {
         public_router = public_router
