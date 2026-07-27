@@ -819,6 +819,8 @@ fn success_token(oauth: &OAuth) -> axum::response::Response {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Local dev convenience; in a container the env is set directly.
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));

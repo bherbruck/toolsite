@@ -70,6 +70,9 @@ At least one of the two must be configured.
 
 ## Run
 
+Locally, `cp .env.example .env`, fill in a `BEARER_TOKEN`, then
+`cargo run --release` — `.env` is loaded at startup and is gitignored.
+
 ```
 docker build -t page-host .
 
