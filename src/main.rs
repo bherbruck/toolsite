@@ -1,10 +1,10 @@
 use axum::{
-    body::Body,
-    extract::{Form, Path, Query, State},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Form, Path, Query, State},
     http::{header, HeaderMap, Request, StatusCode, Uri},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Redirect},
-    routing::{get, post},
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{
@@ -49,11 +49,25 @@ struct OAuth {
     auth_codes: Mutex<HashMap<String, AuthCode>>,
 }
 
+/// A short-lived, single-slug write capability handed to an agent so it can
+/// `curl -T file.html <url>` instead of pasting page HTML through a tool call.
+struct UploadTicket {
+    slug: String,
+    expires_at: Instant,
+}
+
+const UPLOAD_TTL: Duration = Duration::from_secs(900);
+const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 struct Config {
     data_dir: PathBuf,
     base_url: Option<String>,
+    /// Stand-in for `base_url` when it isn't configured, so upload URLs handed
+    /// to an agent are still something it can actually curl.
+    local_base: String,
     valid_tokens: Vec<String>,
     oauth: Option<OAuth>,
+    uploads: Mutex<HashMap<String, UploadTicket>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -82,6 +96,14 @@ struct PushAppRequest {
         description = "Map of page name to full HTML document, e.g. {\"index\": \"<html>...\", \"about\": \"<html>...\"}. A page named 'index' is also served at the app's own root URL."
     )]
     pages: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CreateUploadRequest {
+    #[schemars(
+        description = "Slug the upload writes to. Random one is generated if omitted. For a multi-page app pass the app name, then upload one file per page."
+    )]
+    slug: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -189,13 +211,58 @@ impl PageHost {
             fs::write(&path, html)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            let slug = format!("{app}/{name}");
+            // 'index' is what the app root serves, so report that URL for it.
+            let slug = if name == "index" {
+                app.clone()
+            } else {
+                format!("{app}/{name}")
+            };
             urls.push(format!("{name}: {}", page_url(&self.config, &slug)));
         }
         urls.sort();
         Ok(CallToolResult::success(vec![ContentBlock::text(
             urls.join("\n"),
         )]))
+    }
+
+    #[tool(
+        description = "Preferred way to publish when you have a shell and the HTML already exists as a file: returns a short-lived upload URL you PUT the file to with curl, so the page contents never pass through the conversation. Handles single pages and multi-page apps."
+    )]
+    async fn create_upload(
+        &self,
+        Parameters(CreateUploadRequest { slug }): Parameters<CreateUploadRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let slug = slug.unwrap_or_else(random_slug);
+        if !valid_slug(&slug) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+
+        let ticket = random_token(32);
+        {
+            let now = Instant::now();
+            let mut tickets = self.config.uploads.lock().unwrap();
+            tickets.retain(|_, t| t.expires_at > now);
+            tickets.insert(
+                ticket.clone(),
+                UploadTicket {
+                    slug: slug.clone(),
+                    expires_at: now + UPLOAD_TTL,
+                },
+            );
+        }
+
+        let upload = upload_url(&self.config, &ticket);
+        let minutes = UPLOAD_TTL.as_secs() / 60;
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Upload with (expires in {minutes} min, reusable until then):\n\
+             \n  curl -fT <file.html> {upload}\n\
+             \nMulti-page app — append the page name, one PUT per page:\n\
+             \n  curl -fT index.html {upload}/index\n  curl -fT about.html {upload}/about\n\
+             \nEach upload replies with the page's public URL. Single-file page lands at {page}",
+            page = page_url(&self.config, &slug),
+        ))]))
     }
 
     #[tool(
@@ -242,8 +309,12 @@ impl ServerHandler for PageHost {
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
             .with_server_info(Implementation::new("page-host", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Push single-file HTML artifacts and get back a public URL to view them. \
-                 Use push_app/pull_app for multi-page apps published under one namespace.",
+                "Publishes self-contained HTML pages at public URLs. \
+                 If you have a shell and the HTML is (or can be) a file on disk, call \
+                 create_upload and curl the file to the URL it returns — that keeps the page \
+                 contents out of the conversation entirely. Use push_page/push_app only when \
+                 there is no shell available; pull_page/pull_app read a page back for editing \
+                 (or just curl its public URL).",
             )
     }
 }
@@ -275,6 +346,87 @@ fn page_url(config: &Config, slug: &str) -> String {
     }
 }
 
+fn upload_url(config: &Config, ticket: &str) -> String {
+    let base = config.base_url.as_deref().unwrap_or(&config.local_base);
+    format!("{base}/upload/{ticket}")
+}
+
+/// Ticket-authenticated write. The ticket itself is the credential, so this
+/// route sits outside the bearer middleware — an agent can upload a file
+/// without ever being handed the server's real token.
+async fn store_upload(
+    config: &Config,
+    ticket: &str,
+    sub: Option<String>,
+    body: Bytes,
+) -> Response {
+    let slug = {
+        let now = Instant::now();
+        let mut tickets = config.uploads.lock().unwrap();
+        tickets.retain(|_, t| t.expires_at > now);
+        match tickets.get(ticket) {
+            Some(t) => t.slug.clone(),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "upload ticket unknown or expired; call create_upload again\n",
+                )
+                    .into_response()
+            }
+        }
+    };
+
+    let slug = match sub {
+        Some(sub) => format!("{slug}/{}", sub.trim_end_matches(".html")),
+        None => slug,
+    };
+    if !valid_slug(&slug) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "page name must be path segments of letters, numbers, '-' or '_'\n",
+        )
+            .into_response();
+    }
+
+    let Ok(html) = String::from_utf8(body.to_vec()) else {
+        return (StatusCode::BAD_REQUEST, "body must be UTF-8 HTML\n").into_response();
+    };
+    if html.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
+    }
+
+    let path = config.data_dir.join(format!("{slug}.html"));
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).await.is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
+        }
+    }
+    if fs::write(&path, html).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
+    }
+
+    // An app's index page is reachable at the app root, which is the URL worth
+    // handing back.
+    let public = slug.strip_suffix("/index").unwrap_or(&slug);
+    (StatusCode::OK, format!("{}\n", page_url(config, public))).into_response()
+}
+
+async fn upload_root(
+    State(config): State<Arc<Config>>,
+    Path(ticket): Path<String>,
+    body: Bytes,
+) -> Response {
+    store_upload(&config, &ticket, None, body).await
+}
+
+async fn upload_sub(
+    State(config): State<Arc<Config>>,
+    Path((ticket, sub)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    store_upload(&config, &ticket, Some(sub), body).await
+}
+
 async fn require_bearer(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
@@ -296,17 +448,24 @@ async fn require_bearer(
 async fn serve_page(
     State(config): State<Arc<Config>>,
     Path(slug): Path<String>,
+    uri: Uri,
 ) -> impl IntoResponse {
-    if !valid_slug(&slug) {
+    let slug = slug.trim_end_matches('/');
+    if !valid_slug(slug) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     let direct = config.data_dir.join(format!("{slug}.html"));
     if let Ok(html) = fs::read_to_string(&direct).await {
         return Html(html).into_response();
     }
-    // App root without a filename: fall back to that app's 'index' page.
+    // App root without a filename: serve that app's 'index' page. Redirect to
+    // the trailing-slash form first so relative links inside the app resolve
+    // against the app directory rather than one level above it.
     let index = config.data_dir.join(format!("{slug}/index.html"));
     if let Ok(html) = fs::read_to_string(&index).await {
+        if !uri.path().ends_with('/') {
+            return Redirect::permanent(&format!("/p/{slug}/")).into_response();
+        }
         return Html(html).into_response();
     }
     (StatusCode::NOT_FOUND, "not found").into_response()
@@ -398,6 +557,12 @@ fn collect_slugs<'a>(
     out: &'a mut Vec<String>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
+        // A directory with an index page is an app: list its root only. Its
+        // inner pages belong to the app's own navigation, not this index.
+        if !prefix.is_empty() && fs::metadata(dir.join("index.html")).await.is_ok() {
+            out.push(prefix);
+            return;
+        }
         let Ok(mut entries) = fs::read_dir(dir).await else {
             return;
         };
@@ -697,12 +862,17 @@ async fn main() -> anyhow::Result<()> {
         valid_tokens.push(o.client_secret.clone());
     }
 
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
+    let addr = format!("0.0.0.0:{port}");
+
     let oauth_enabled = oauth.is_some();
     let config = Arc::new(Config {
         data_dir,
         base_url,
+        local_base: format!("http://localhost:{port}"),
         valid_tokens,
         oauth,
+        uploads: Mutex::new(HashMap::new()),
     });
 
     // rmcp's Streamable HTTP transport validates the inbound `Host` header
@@ -737,7 +907,10 @@ async fn main() -> anyhow::Result<()> {
 
     let mut public_router = Router::new()
         .route("/", get(index))
-        .route("/p/{*slug}", get(serve_page));
+        .route("/p/{*slug}", get(serve_page))
+        .route("/upload/{ticket}", put(upload_root).post(upload_root))
+        .route("/upload/{ticket}/{*sub}", put(upload_sub).post(upload_sub))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));
 
     if oauth_enabled {
         public_router = public_router
@@ -761,8 +934,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new().merge(mcp_router).merge(public_router);
 
-    let addr = "0.0.0.0:8080";
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())

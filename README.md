@@ -6,9 +6,22 @@ public URL.
 
 ## Tools
 
-- `push_page(html, slug?)` — publish an HTML page. Omit `slug` for a random
-  one. Reusing a slug overwrites that page in place. Returns the page URL.
-  `slug` may contain `/` to namespace it under an app, e.g. `myapp/about`.
+- `create_upload(slug?)` — **preferred when the agent has a shell.** Returns a
+  short-lived (15 min) upload URL. The agent `curl`s the file to it, so the
+  page HTML never passes through the model:
+
+  ```
+  curl -fT page.html https://host/upload/<ticket>       # single page
+  curl -fT index.html https://host/upload/<ticket>/index   # multi-page app
+  curl -fT about.html https://host/upload/<ticket>/about
+  ```
+
+  Each upload replies with the page's public URL. The ticket is the only
+  credential needed, so the server's real token is never handed to the agent.
+- `push_page(html, slug?)` — publish an HTML page by passing its source
+  inline. Only for clients with no shell (e.g. claude.ai web). Omit `slug` for
+  a random one. Reusing a slug overwrites that page in place. Returns the page
+  URL. `slug` may contain `/` to namespace it under an app, e.g. `myapp/about`.
 - `pull_page(slug)` — fetch the current HTML for a previously pushed page
   (so it can be edited and pushed back).
 - `push_app(app, pages)` — publish multiple pages under one app namespace in
@@ -20,8 +33,14 @@ public URL.
 ## Endpoints
 
 - `POST /mcp` — the MCP server (Streamable HTTP transport). Requires auth.
-- `GET /p/<slug>` — the published page. Public, no auth.
-- `GET /` — index of all published pages.
+- `PUT /upload/<ticket>[/<page>]` — write a page from a raw request body.
+  Authenticated by the ticket from `create_upload`, not the server token.
+  16 MB max.
+- `GET /p/<slug>` — the published page. Public, no auth. An app root
+  (`/p/myapp`) redirects to `/p/myapp/` and serves that app's `index` page, so
+  relative links inside the app resolve correctly.
+- `GET /` — index of published pages. Multi-page apps appear once, as their
+  root; their inner pages are the app's own business.
 
 ## Auth
 
@@ -47,6 +66,7 @@ At least one of the two must be configured.
 | `OAUTH_CLIENT_SECRET` | if using OAuth              | Paste into claude.ai's "OAuth Client Secret" field.                   |
 | `PUBLIC_BASE_URL`     | if using OAuth              | Absolute base URL of the deployed server (e.g. `https://host.com`). Needed for OAuth discovery metadata; if omitted (bearer-only mode), `push_page` returns a relative `/p/<slug>` URL instead. |
 | `DATA_DIR`            | no (default `/data`)       | Where pushed pages are stored.                                        |
+| `PORT`                | no (default `8080`)        | Port to listen on.                                                    |
 
 ## Run
 
