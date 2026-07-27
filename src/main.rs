@@ -1221,9 +1221,20 @@ async fn main() -> anyhow::Result<()> {
         panic!("set BEARER_TOKEN, or OAUTH_CLIENT_ID + OAUTH_CLIENT_SECRET (or both)");
     }
 
+    // A bare host is the natural thing to paste in, but every URL built from
+    // this needs a scheme to be usable, so supply one rather than emitting
+    // href-less strings like "example.com/p/slug".
     let base_url = std::env::var("PUBLIC_BASE_URL")
         .ok()
-        .map(|s| s.trim_end_matches('/').to_string());
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.contains("://") {
+                s
+            } else {
+                format!("https://{s}")
+            }
+        });
     if oauth.is_some() && base_url.is_none() {
         panic!(
             "PUBLIC_BASE_URL is required when OAUTH_CLIENT_ID/OAUTH_CLIENT_SECRET are set \
@@ -1241,6 +1252,15 @@ async fn main() -> anyhow::Result<()> {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
+
+    // Printed at boot so a misconfigured deploy is obvious from the logs
+    // rather than only from a client's opaque "can't connect".
+    tracing::info!(
+        bearer_auth = bearer_token.is_some(),
+        oauth_auth = oauth.is_some(),
+        base_url = base_url.as_deref().unwrap_or("<unset>"),
+        "auth configuration"
+    );
 
     let oauth_enabled = oauth.is_some();
     let config = Arc::new(Config {
