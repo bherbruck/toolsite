@@ -58,6 +58,9 @@ struct UploadTicket {
 
 const UPLOAD_TTL: Duration = Duration::from_secs(900);
 const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ICON_BYTES: usize = 1024 * 1024;
+/// Enough of a page to find its <title> without reading whole artifacts.
+const TITLE_SCAN_BYTES: u64 = 8 * 1024;
 
 struct Config {
     data_dir: PathBuf,
@@ -104,6 +107,16 @@ struct CreateUploadRequest {
         description = "Slug the upload writes to. Random one is generated if omitted. For a multi-page app pass the app name, then upload one file per page."
     )]
     slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetIconRequest {
+    #[schemars(description = "Slug of the page to set the icon for.")]
+    slug: String,
+    #[schemars(
+        description = "An emoji, a full inline <svg>...</svg>, or a data: URI. For a raster image file, use create_upload and PUT it to <upload-url>?icon instead."
+    )]
+    icon: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -266,6 +279,51 @@ impl PageHost {
     }
 
     #[tool(
+        description = "Set the icon shown next to a page on the site index: an emoji, inline SVG, or data: URI. Pages without one get a generated icon, so this is optional."
+    )]
+    async fn set_icon(
+        &self,
+        Parameters(SetIconRequest { slug, icon }): Parameters<SetIconRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&slug) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+        let icon = icon.trim();
+        if icon.is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "icon must not be empty",
+            )]));
+        }
+        if icon.len() > MAX_ICON_BYTES {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "icon must be under {} KB",
+                MAX_ICON_BYTES / 1024
+            ))]));
+        }
+        if page_path(&self.config, &slug).await.is_none() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "no page found for slug '{slug}'; publish the page first"
+            ))]));
+        }
+
+        // Sits beside the page file, matching however that page was resolved.
+        let path = match self.config.data_dir.join(format!("{slug}.html")) {
+            p if p.exists() => self.config.data_dir.join(format!("{slug}.icon")),
+            _ => self.config.data_dir.join(format!("{slug}/index.icon")),
+        };
+        fs::write(&path, icon)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "icon set for {}",
+            page_url(&self.config, &slug)
+        ))]))
+    }
+
+    #[tool(
         description = "Fetch the current HTML for every page in an app namespace, keyed by page name, so the app can be edited and pushed back with push_app."
     )]
     async fn pull_app(
@@ -346,6 +404,161 @@ fn page_url(config: &Config, slug: &str) -> String {
     }
 }
 
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The file backing a slug: either the page itself or, for an app root, that
+/// app's index page.
+async fn page_path(config: &Config, slug: &str) -> Option<PathBuf> {
+    let direct = config.data_dir.join(format!("{slug}.html"));
+    if fs::metadata(&direct).await.is_ok() {
+        return Some(direct);
+    }
+    let index = config.data_dir.join(format!("{slug}/index.html"));
+    fs::metadata(&index).await.ok().map(|_| index)
+}
+
+/// Icons live next to their page as `<slug>.icon`. An app root accepts either
+/// spelling, since a ticket upload writes the sibling form before the app
+/// directory necessarily exists.
+async fn icon_path(config: &Config, slug: &str) -> Option<PathBuf> {
+    let direct = config.data_dir.join(format!("{slug}.icon"));
+    if fs::metadata(&direct).await.is_ok() {
+        return Some(direct);
+    }
+    let index = config.data_dir.join(format!("{slug}/index.icon"));
+    fs::metadata(&index).await.ok().map(|_| index)
+}
+
+async fn page_title(path: &std::path::Path) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let file = fs::File::open(path).await.ok()?;
+    let mut head = Vec::new();
+    file.take(TITLE_SCAN_BYTES).read_to_end(&mut head).await.ok()?;
+    let html = String::from_utf8_lossy(&head);
+
+    let lower = html.to_lowercase();
+    let open = lower.find("<title")?;
+    let text_start = lower[open..].find('>')? + open + 1;
+    let text_end = lower[text_start..].find("</title>")? + text_start;
+    let title = html[text_start..text_end].trim();
+    (!title.is_empty()).then(|| escape_html(title))
+}
+
+enum Icon {
+    /// An emoji or other short scrap of text, drawn inline.
+    Text(String),
+    /// Anything with an image URL: an uploaded file, or a data: URI.
+    Src(String),
+    /// Fallback: initials on a slug-derived colour.
+    Generated(String, u16),
+}
+
+/// Stable per-slug hue so a page keeps the same generated colour forever.
+fn slug_hue(slug: &str) -> u16 {
+    let mut hash: u32 = 2_166_136_261;
+    for b in slug.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    (hash % 360) as u16
+}
+
+async fn page_icon(config: &Config, slug: &str) -> Icon {
+    if let Some(path) = icon_path(config, slug).await {
+        if let Ok(bytes) = fs::read(&path).await {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                let text = text.trim();
+                if text.starts_with("data:") {
+                    return Icon::Src(escape_html(text));
+                }
+                // Short, non-markup text is an emoji or a letter or two.
+                if !text.is_empty() && !text.starts_with('<') && text.chars().count() <= 4 {
+                    return Icon::Text(escape_html(text));
+                }
+            }
+            if !bytes.is_empty() {
+                return Icon::Src(format!("/icon/{slug}"));
+            }
+        }
+    }
+
+    let initials: String = slug
+        .rsplit('/')
+        .next()
+        .unwrap_or(slug)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(2)
+        .collect();
+    let initials = if initials.is_empty() {
+        "?".to_string()
+    } else {
+        initials.to_uppercase()
+    };
+    Icon::Generated(initials, slug_hue(slug))
+}
+
+fn icon_html(icon: &Icon) -> String {
+    match icon {
+        Icon::Text(text) => format!(r#"<span class="icon icon-text">{text}</span>"#),
+        Icon::Src(src) => format!(r#"<span class="icon"><img src="{src}" alt=""></span>"#),
+        Icon::Generated(initials, hue) => {
+            format!(r#"<span class="icon icon-gen" style="--h:{hue}">{initials}</span>"#)
+        }
+    }
+}
+
+fn sniff_image_type(bytes: &[u8]) -> &'static str {
+    let head = &bytes[..bytes.len().min(16)];
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("<svg") || trimmed.starts_with("<?xml") {
+        "image/svg+xml"
+    } else if head.starts_with(b"\x89PNG") {
+        "image/png"
+    } else if head.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if head.starts_with(b"GIF8") {
+        "image/gif"
+    } else if head.starts_with(b"RIFF") && bytes.len() > 12 && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if head.starts_with(b"\x00\x00\x01\x00") {
+        "image/x-icon"
+    } else if std::str::from_utf8(bytes).is_ok() {
+        // Emoji icons are stored as plain text.
+        "text/plain; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+async fn serve_icon(State(config): State<Arc<Config>>, Path(slug): Path<String>) -> Response {
+    let slug = slug.trim_end_matches('/');
+    if !valid_slug(slug) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let Some(path) = icon_path(&config, slug).await else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let Ok(bytes) = fs::read(&path).await else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let content_type = sniff_image_type(&bytes);
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 fn upload_url(config: &Config, ticket: &str) -> String {
     let base = config.base_url.as_deref().unwrap_or(&config.local_base);
     format!("{base}/upload/{ticket}")
@@ -354,10 +567,18 @@ fn upload_url(config: &Config, ticket: &str) -> String {
 /// Ticket-authenticated write. The ticket itself is the credential, so this
 /// route sits outside the bearer middleware — an agent can upload a file
 /// without ever being handed the server's real token.
+/// `?icon` on an upload URL stores the body as that page's icon instead of as
+/// the page. Presence is what counts; any value works.
+#[derive(Deserialize)]
+struct UploadQuery {
+    icon: Option<String>,
+}
+
 async fn store_upload(
     config: &Config,
     ticket: &str,
     sub: Option<String>,
+    as_icon: bool,
     body: Bytes,
 ) -> Response {
     let slug = {
@@ -388,21 +609,47 @@ async fn store_upload(
             .into_response();
     }
 
-    let Ok(html) = String::from_utf8(body.to_vec()) else {
-        return (StatusCode::BAD_REQUEST, "body must be UTF-8 HTML\n").into_response();
-    };
-    if html.trim().is_empty() {
+    if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
     }
+    if as_icon && body.len() > MAX_ICON_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("icon must be under {} KB\n", MAX_ICON_BYTES / 1024),
+        )
+            .into_response();
+    }
 
-    let path = config.data_dir.join(format!("{slug}.html"));
+    let bytes: Bytes = if as_icon {
+        body
+    } else {
+        match String::from_utf8(body.to_vec()) {
+            Ok(html) if !html.trim().is_empty() => Bytes::from(html),
+            Ok(_) => return (StatusCode::BAD_REQUEST, "body is empty\n").into_response(),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "body must be UTF-8 HTML\n").into_response()
+            }
+        }
+    };
+
+    let extension = if as_icon { "icon" } else { "html" };
+    let path = config.data_dir.join(format!("{slug}.{extension}"));
     if let Some(parent) = path.parent() {
         if fs::create_dir_all(parent).await.is_err() {
             return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
         }
     }
-    if fs::write(&path, html).await.is_err() {
+    if fs::write(&path, &bytes).await.is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
+    }
+
+    if as_icon {
+        let public = slug.strip_suffix("/index").unwrap_or(&slug);
+        return (
+            StatusCode::OK,
+            format!("icon set for {}\n", page_url(config, public)),
+        )
+            .into_response();
     }
 
     // An app's index page is reachable at the app root, which is the URL worth
@@ -414,17 +661,19 @@ async fn store_upload(
 async fn upload_root(
     State(config): State<Arc<Config>>,
     Path(ticket): Path<String>,
+    Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    store_upload(&config, &ticket, None, body).await
+    store_upload(&config, &ticket, None, query.icon.is_some(), body).await
 }
 
 async fn upload_sub(
     State(config): State<Arc<Config>>,
     Path((ticket, sub)): Path<(String, String)>,
+    Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    store_upload(&config, &ticket, Some(sub), body).await
+    store_upload(&config, &ticket, Some(sub), query.icon.is_some(), body).await
 }
 
 async fn require_bearer(
@@ -516,9 +765,9 @@ input[type="search"]:focus { outline: 2px solid var(--accent); outline-offset: 1
 ul.pages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
 ul.pages li a {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: .75rem 1rem;
+  gap: .75rem;
+  padding: .7rem .9rem;
   border-radius: .5rem;
   border: 1px solid var(--border);
   background: var(--card-bg);
@@ -528,7 +777,31 @@ ul.pages li a {
   transition: border-color .15s ease;
 }
 ul.pages li a:hover { border-color: var(--accent); }
-ul.pages li a::after { content: "\2192"; color: var(--muted); margin-left: .5rem; }
+ul.pages li a::after { content: "\2192"; color: var(--muted); margin-left: auto; }
+.icon {
+  flex: 0 0 2.25rem;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: .45rem;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+.icon img { width: 100%; height: 100%; object-fit: contain; }
+.icon-text { font-size: 1.25rem; line-height: 1; border: none; background: none; }
+.icon-gen {
+  background: hsl(var(--h) 55% 45%);
+  border-color: transparent;
+  color: #fff;
+  font-size: .8rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.meta { display: flex; flex-direction: column; min-width: 0; }
+.meta .title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta .slug { color: var(--muted); font-size: .8rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .empty, .no-match { color: var(--muted); text-align: center; padding: 2rem 0; }
 .no-match { display: none; }
 "#;
@@ -542,7 +815,7 @@ const INDEX_SEARCH_SCRIPT: &str = r#"
     const q = input.value.trim().toLowerCase();
     let visible = 0;
     items.forEach((li) => {
-      const match = li.dataset.slug.includes(q);
+      const match = (li.dataset.slug + ' ' + (li.dataset.title || '')).includes(q);
       li.style.display = match ? '' : 'none';
       if (match) visible++;
     });
@@ -590,10 +863,29 @@ fn collect_slugs<'a>(
     })
 }
 
+struct PageCard {
+    slug: String,
+    title: Option<String>,
+    icon: Icon,
+}
+
 async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
     let mut slugs = Vec::new();
     collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
     slugs.sort();
+
+    let mut cards = Vec::with_capacity(slugs.len());
+    for slug in &slugs {
+        let title = match page_path(&config, slug).await {
+            Some(path) => page_title(&path).await,
+            None => None,
+        };
+        cards.push(PageCard {
+            slug: slug.clone(),
+            title,
+            icon: page_icon(&config, slug).await,
+        });
+    }
 
     let count_label = match slugs.len() {
         0 => "No pages yet".to_string(),
@@ -607,12 +899,23 @@ async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
             "",
         )
     } else {
-        let items: String = slugs
+        let items: String = cards
             .iter()
-            .map(|s| {
+            .map(|card| {
+                let slug = &card.slug;
+                let icon = icon_html(&card.icon);
+                // With a title, the slug becomes the subtitle; without one the
+                // slug is all there is to show.
+                let meta = match &card.title {
+                    Some(title) => format!(
+                        r#"<span class="meta"><span class="title">{title}</span><span class="slug">{slug}</span></span>"#
+                    ),
+                    None => format!(r#"<span class="meta"><span class="title">{slug}</span></span>"#),
+                };
                 format!(
-                    r#"<li data-slug="{lower}"><a href="/p/{s}">{s}</a></li>"#,
-                    lower = s.to_lowercase()
+                    r#"<li data-slug="{slug_lower}" data-title="{title_lower}"><a href="/p/{slug}">{icon}{meta}</a></li>"#,
+                    slug_lower = slug.to_lowercase(),
+                    title_lower = card.title.as_deref().unwrap_or_default().to_lowercase(),
                 )
             })
             .collect::<Vec<_>>()
@@ -910,6 +1213,7 @@ async fn main() -> anyhow::Result<()> {
     let mut public_router = Router::new()
         .route("/", get(index))
         .route("/p/{*slug}", get(serve_page))
+        .route("/icon/{*slug}", get(serve_icon))
         .route("/upload/{ticket}", put(upload_root).post(upload_root))
         .route("/upload/{ticket}/{*sub}", put(upload_sub).post(upload_sub))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));

@@ -29,6 +29,29 @@ public URL.
   also served at the app's own root URL. Returns each page's URL.
 - `pull_app(app)` — fetch every page in an app namespace, keyed by page name,
   so the app can be edited and pushed back with `push_app`.
+- `set_icon(slug, icon)` — set the icon shown beside a page on the index.
+  Takes an emoji, inline `<svg>…</svg>`, or a `data:` URI. Optional.
+
+## Titles and icons on the index
+
+Each listed page shows an icon and a title, neither of which needs to be
+supplied:
+
+- **Title** — read from the page's own `<title>` tag (first 8 KB scanned).
+  Pages without one are listed by slug.
+- **Icon** — in priority order: an uploaded image (`PUT <upload-url>?icon`),
+  an emoji / inline SVG / `data:` URI set via `set_icon`, or a generated
+  badge showing the slug's initials on a colour derived from the slug (stable
+  forever, since it's a hash).
+
+Icons are stored beside the page as `<slug>.icon` and served from
+`/icon/<slug>`; content type is sniffed (PNG, JPEG, GIF, WebP, ICO, SVG).
+1 MB cap.
+
+```
+curl -fT logo.png "<upload-url>?icon"          # icon for the ticket's page
+curl -fT logo.svg "<upload-url>/about?icon"    # icon for one page of an app
+```
 
 ## Endpoints
 
@@ -39,8 +62,10 @@ public URL.
 - `GET /p/<slug>` — the published page. Public, no auth. An app root
   (`/p/myapp`) redirects to `/p/myapp/` and serves that app's `index` page, so
   relative links inside the app resolve correctly.
-- `GET /` — index of published pages. Multi-page apps appear once, as their
-  root; their inner pages are the app's own business.
+- `GET /icon/<slug>` — a page's icon, if one was set. Public, no auth.
+- `GET /` — index of published pages, each with an icon and title. Multi-page
+  apps appear once, as their root; their inner pages are the app's own
+  business.
 
 ## Auth
 
