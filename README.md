@@ -80,6 +80,8 @@ Two independent auth modes, use either or both at once:
 
 - **Bearer token** — set `BEARER_TOKEN`. Any MCP client that supports a
   plain `Authorization: Bearer <token>` header can connect directly.
+  `x-api-key: <token>` is accepted too, since clients differ on which one
+  they send.
 - **OAuth 2.1** — set `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET`. Needed for
   clients (like claude.ai custom connectors) that require a full OAuth
   flow. This is a minimal single-user shim: `/authorize` auto-approves (no
@@ -99,6 +101,7 @@ At least one of the two must be configured.
 | `PUBLIC_BASE_URL`     | if using OAuth              | Absolute base URL of the deployed server (e.g. `https://host.com`). Needed for OAuth discovery metadata; if omitted (bearer-only mode), `push_page` returns a relative `/p/<slug>` URL instead. |
 | `DATA_DIR`            | no (default `/data`)       | Where pushed pages are stored.                                        |
 | `PORT`                | no (default `8080`)        | Port to listen on.                                                    |
+| `RUST_LOG`            | no (default `info`)        | Log filter. Rejected requests are logged at `warn` with the headers that arrived (never the token). |
 
 ## Run
 
