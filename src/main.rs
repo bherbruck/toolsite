@@ -142,7 +142,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Publish a single self-contained HTML page and get back a public URL. Call again with the same slug to update it in place. Use a slug like 'myapp/about' to group multiple pages under one app."
+        description = "Fallback publisher for when you cannot reach this host from a shell: pastes the page's HTML through this call. If you can run shell commands with network access, use create_upload instead. Call again with the same slug to update in place. Use a slug like 'myapp/about' to group pages under one app."
     )]
     async fn push_page(
         &self,
@@ -189,7 +189,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Publish multiple HTML pages under one app namespace in a single call. A page named 'index' is also served at the app's own root URL. Returns each page's URL."
+        description = "Fallback publisher for a whole multi-page app when you cannot reach this host from a shell: pastes every page's HTML through this call. If you can run shell commands with network access, use create_upload instead. A page named 'index' is also served at the app's own root URL. Returns each page's URL."
     )]
     async fn push_app(
         &self,
@@ -239,7 +239,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Preferred way to publish when you have a shell and the HTML already exists as a file: returns a short-lived upload URL you PUT the file to with curl, so the page contents never pass through the conversation. Handles single pages and multi-page apps."
+        description = "The default way to publish. Returns a short-lived upload URL; write the HTML to a local file, then PUT the file to that URL with curl. Do not paste HTML into this call — the point is that the page never passes through the conversation. Works for a single page or a whole multi-page app. If the upload URL turns out to be unreachable from your sandbox, fall back to push_page/push_app."
     )]
     async fn create_upload(
         &self,
@@ -367,12 +367,23 @@ impl ServerHandler for PageHost {
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
             .with_server_info(Implementation::new("page-host", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Publishes self-contained HTML pages at public URLs. \
-                 If you have a shell and the HTML is (or can be) a file on disk, call \
-                 create_upload and curl the file to the URL it returns — that keeps the page \
-                 contents out of the conversation entirely. Use push_page/push_app only when \
-                 there is no shell available; pull_page/pull_app read a page back for editing \
-                 (or just curl its public URL).",
+                "Publishes self-contained HTML pages at public URLs.\n\
+                 \n\
+                 How to publish, in order of preference:\n\
+                 1. If you can run shell commands: write the HTML to a file, call \
+                 create_upload, then `curl -fT <file> <upload-url>`. Never read the file back \
+                 into the conversation — that is the whole point. Emitting a page's HTML as \
+                 tool-call arguments when you could have written a file is wasteful, so treat \
+                 this as the default path.\n\
+                 2. If curl fails because the sandbox has no network access to this host, fall \
+                 back to push_page / push_app, which take the HTML inline.\n\
+                 3. If there is no shell at all, use push_page / push_app directly.\n\
+                 \n\
+                 To edit an existing page, fetch it with `curl <page-url>` into a file (or \
+                 pull_page / pull_app when you have no shell), edit the file, then re-upload it \
+                 to the same slug. Icons are optional: set_icon takes an emoji or SVG, an image \
+                 file goes to `<upload-url>?icon`, and anything without one gets a generated \
+                 badge.",
             )
     }
 }

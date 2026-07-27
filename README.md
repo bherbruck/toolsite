@@ -18,10 +18,17 @@ public URL.
 
   Each upload replies with the page's public URL. The ticket is the only
   credential needed, so the server's real token is never handed to the agent.
-- `push_page(html, slug?)` — publish an HTML page by passing its source
-  inline. Only for clients with no shell (e.g. claude.ai web). Omit `slug` for
-  a random one. Reusing a slug overwrites that page in place. Returns the page
-  URL. `slug` may contain `/` to namespace it under an app, e.g. `myapp/about`.
+
+  The server's MCP `instructions` tell clients to take this path by default
+  and to fall back to `push_page` only if the upload URL is unreachable —
+  hosted sandboxes often have a filesystem but no outbound network. That's a
+  hint, not an enforcement; a client that ignores `instructions` will still
+  see "use create_upload instead" in the `push_page` description.
+- `push_page(html, slug?)` — fallback: publish an HTML page by passing its
+  source inline. For clients that can't reach this host from a shell. Omit
+  `slug` for a random one. Reusing a slug overwrites that page in place.
+  Returns the page URL. `slug` may contain `/` to namespace it under an app,
+  e.g. `myapp/about`.
 - `pull_page(slug)` — fetch the current HTML for a previously pushed page
   (so it can be edited and pushed back).
 - `push_app(app, pages)` — publish multiple pages under one app namespace in
