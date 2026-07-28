@@ -30,7 +30,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::fs;
 
@@ -57,8 +57,11 @@ struct UploadTicket {
 }
 
 const UPLOAD_TTL: Duration = Duration::from_secs(900);
-const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ICON_BYTES: usize = 1024 * 1024;
+/// Zip-bomb guards: a bundle is a built front-end, not an archive dump.
+const MAX_BUNDLE_UNPACKED: u64 = 128 * 1024 * 1024;
+const MAX_BUNDLE_ENTRIES: usize = 2_000;
 /// Enough of a page to find its <title> without reading whole artifacts.
 const TITLE_SCAN_BYTES: u64 = 8 * 1024;
 
@@ -117,6 +120,28 @@ struct SetIconRequest {
         description = "An emoji, a full inline <svg>...</svg>, or a data: URI. For a raster image file, use create_upload and PUT it to <upload-url>?icon instead."
     )]
     icon: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetVisibilityRequest {
+    #[schemars(description = "Slug of the page to change.")]
+    slug: String,
+    #[schemars(
+        description = "true takes the page down: its URL 404s and it leaves the index. Nothing is deleted — set false to bring it straight back."
+    )]
+    hidden: Option<bool>,
+    #[schemars(
+        description = "false keeps the page working at its URL but removes it from the site index. Use for scratch or link-only pages."
+    )]
+    listed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListPagesRequest {
+    #[schemars(
+        description = "Include pages that are hidden or unlisted. Defaults to false, which lists only what a visitor would see."
+    )]
+    include_all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -273,8 +298,111 @@ impl PageHost {
              \n  curl -fT <file.html> {upload}\n\
              \nMulti-page app — append the page name, one PUT per page:\n\
              \n  curl -fT index.html {upload}/index\n  curl -fT about.html {upload}/about\n\
+             \nWhole built site (React/Vite/etc), gzipped tar of the dist folder:\n\
+             \n  tar -czf - -C dist . | curl -f -T - '{upload}?bundle'\n\
+             \nAdd &spa for a client-side router, so unknown paths serve index.html:\n\
+             \n  tar -czf - -C dist . | curl -f -T - '{upload}?bundle&spa'\n\
              \nEach upload replies with the page's public URL. Single-file page lands at {page}",
             page = page_url(&self.config, &slug),
+        ))]))
+    }
+
+    #[tool(
+        description = "List published pages: slug, title, URL, when each was last changed, and its visibility. Call this to find out what already exists before editing or reusing a slug."
+    )]
+    async fn list_pages(
+        &self,
+        Parameters(ListPagesRequest { include_all }): Parameters<ListPagesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let include_all = include_all.unwrap_or(false);
+        let mut slugs = Vec::new();
+        collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
+
+        let mut rows = Vec::new();
+        for slug in slugs {
+            let meta = read_meta(&self.config, &slug).await;
+            if !include_all && (meta.hidden || !meta.listed) {
+                continue;
+            }
+            let path = page_path(&self.config, &slug).await;
+            let modified = match &path {
+                Some(p) => fs::metadata(p).await.ok().and_then(|m| m.modified().ok()),
+                None => None,
+            };
+            let title = match &path {
+                Some(p) => page_title(p).await,
+                None => None,
+            };
+            rows.push(serde_json::json!({
+                "slug": slug,
+                "title": title,
+                "url": page_url(&self.config, &slug),
+                "modified": modified.map(relative_time),
+                "modified_epoch": modified
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()),
+                "listed": meta.listed,
+                "hidden": meta.hidden,
+            }));
+        }
+        // Most recently touched first: that's what a follow-up edit is after.
+        rows.sort_by_key(|r| std::cmp::Reverse(r["modified_epoch"].as_u64().unwrap_or(0)));
+
+        if rows.is_empty() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "no pages published yet",
+            )]));
+        }
+        let json = serde_json::to_string(&rows)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    }
+
+    #[tool(
+        description = "Take a page down or restore it, and control whether it appears on the site index. Nothing is ever deleted, so this is the safe way to retract a page published by mistake."
+    )]
+    async fn set_visibility(
+        &self,
+        Parameters(SetVisibilityRequest {
+            slug,
+            hidden,
+            listed,
+        }): Parameters<SetVisibilityRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&slug) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+        if hidden.is_none() && listed.is_none() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "pass hidden, listed, or both",
+            )]));
+        }
+        if page_path(&self.config, &slug).await.is_none() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "no page found for slug '{slug}'"
+            ))]));
+        }
+
+        let mut meta = read_meta(&self.config, &slug).await;
+        if let Some(hidden) = hidden {
+            meta.hidden = hidden;
+        }
+        if let Some(listed) = listed {
+            meta.listed = listed;
+        }
+        write_meta(&self.config, &slug, &meta)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let state = match (meta.hidden, meta.listed) {
+            (true, _) => "hidden (URL returns 404; set hidden=false to restore)".to_string(),
+            (false, false) => format!("live but unlisted at {}", page_url(&self.config, &slug)),
+            (false, true) => format!("live and listed at {}", page_url(&self.config, &slug)),
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "{slug}: {state}"
         ))]))
     }
 
@@ -379,9 +507,15 @@ impl ServerHandler for PageHost {
                  back to push_page / push_app, which take the HTML inline.\n\
                  3. If there is no shell at all, use push_page / push_app directly.\n\
                  \n\
-                 To edit an existing page, fetch it with `curl <page-url>` into a file (or \
-                 pull_page / pull_app when you have no shell), edit the file, then re-upload it \
-                 to the same slug. Icons are optional: set_icon takes an emoji or SVG, an image \
+                 A built front-end (React, Vite, Svelte — anything with a dist folder) goes up \
+                 whole: `tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle'`, adding \
+                 &spa if it uses a client-side router.\n\
+                 \n\
+                 Call list_pages to see what already exists before picking a slug or editing \
+                 something. To edit, fetch the page with `curl <page-url>` into a file (or \
+                 pull_page / pull_app when you have no shell), edit it, then re-upload to the \
+                 same slug. set_visibility retracts a page without deleting it — nothing here \
+                 destroys data. Icons are optional: set_icon takes an emoji or SVG, an image \
                  file goes to `<upload-url>?icon`, and anything without one gets a generated \
                  badge.",
             )
@@ -406,6 +540,50 @@ fn valid_segment(s: &str) -> bool {
 
 fn valid_slug(s: &str) -> bool {
     !s.is_empty() && s.split('/').all(valid_segment)
+}
+
+/// Looser than `valid_slug` because built bundles ship names like
+/// `main.4f2a1c.js`. Dots are allowed inside a segment but a segment may not
+/// start with one, which rules out `..` and dotfiles in a single stroke.
+fn valid_asset_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('/').all(|seg| {
+            !seg.is_empty()
+                && !seg.starts_with('.')
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+}
+
+fn content_type_for(path: &str) -> &'static str {
+    let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "webmanifest" => "application/manifest+json",
+        _ => "application/octet-stream",
+    }
 }
 
 fn page_url(config: &Config, slug: &str) -> String {
@@ -443,6 +621,92 @@ async fn icon_path(config: &Config, slug: &str) -> Option<PathBuf> {
     }
     let index = config.data_dir.join(format!("{slug}/index.icon"));
     fs::metadata(&index).await.ok().map(|_| index)
+}
+
+/// Per-page state kept in a `<slug>.meta` sidecar. Absent means "a normal,
+/// visible page", so nothing has to be written on the common path.
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct PageMeta {
+    /// Shown on the site index.
+    #[serde(default = "yes")]
+    listed: bool,
+    /// Soft delete: the URL 404s, but the file is untouched and unhiding
+    /// brings it straight back.
+    #[serde(default)]
+    hidden: bool,
+    /// Client-routed bundle: unknown paths under the app fall back to its
+    /// index.html instead of 404ing.
+    #[serde(default)]
+    spa: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for PageMeta {
+    fn default() -> Self {
+        Self {
+            listed: true,
+            hidden: false,
+            spa: false,
+        }
+    }
+}
+
+/// Mirrors `icon_path`: a sidecar beside the page, or inside the app dir for
+/// an app root.
+async fn meta_path(config: &Config, slug: &str) -> PathBuf {
+    let direct = config.data_dir.join(format!("{slug}.meta"));
+    if fs::metadata(&direct).await.is_ok() {
+        return direct;
+    }
+    let inner = config.data_dir.join(format!("{slug}/index.meta"));
+    if fs::metadata(&inner).await.is_ok() {
+        return inner;
+    }
+    // Nothing written yet: put it wherever the page itself lives.
+    if fs::metadata(config.data_dir.join(format!("{slug}.html")))
+        .await
+        .is_ok()
+    {
+        direct
+    } else {
+        inner
+    }
+}
+
+async fn read_meta(config: &Config, slug: &str) -> PageMeta {
+    let path = meta_path(config, slug).await;
+    match fs::read_to_string(&path).await {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => PageMeta::default(),
+    }
+}
+
+async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io::Result<()> {
+    let path = meta_path(config, slug).await;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let json = serde_json::to_string(meta).map_err(std::io::Error::other)?;
+    fs::write(&path, json).await
+}
+
+/// Coarse "when did this change" for the index; exact timestamps aren't worth
+/// a date-formatting dependency here.
+fn relative_time(then: SystemTime) -> String {
+    let secs = SystemTime::now()
+        .duration_since(then)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", secs / 60),
+        3_600..=86_399 => format!("{}h ago", secs / 3_600),
+        86_400..=2_591_999 => format!("{}d ago", secs / 86_400),
+        _ => format!("{}mo ago", secs / 2_592_000),
+    }
 }
 
 async fn page_title(path: &std::path::Path) -> Option<String> {
@@ -575,21 +839,177 @@ fn upload_url(config: &Config, ticket: &str) -> String {
     format!("{base}/upload/{ticket}")
 }
 
-/// Ticket-authenticated write. The ticket itself is the credential, so this
-/// route sits outside the bearer middleware — an agent can upload a file
-/// without ever being handed the server's real token.
-/// `?icon` on an upload URL stores the body as that page's icon instead of as
-/// the page. Presence is what counts; any value works.
+/// Flags on an upload URL. Presence is what counts; any value works.
+/// `?icon` stores the body as the page's icon, `?bundle` unpacks it as a
+/// gzipped tar of a built site, and `?spa` marks that bundle client-routed.
 #[derive(Deserialize)]
 struct UploadQuery {
     icon: Option<String>,
+    bundle: Option<String>,
+    spa: Option<String>,
 }
 
+enum UploadKind {
+    Page,
+    Icon,
+    Bundle { spa: bool },
+}
+
+/// What to do with one archive entry.
+enum EntryVerdict {
+    Take(String),
+    /// Directories and archive metadata: every tarball has them and nothing is
+    /// lost by not writing them.
+    Ignore,
+    /// Dotfiles and symlinks: harmless to leave out, but reported so an upload
+    /// never silently ships less than it claims.
+    Skip(&'static str),
+    /// Traversal and absolute paths are attacks, not build-output quirks.
+    Reject(String),
+}
+
+fn classify_entry(entry: &tar::Entry<'_, impl std::io::Read>) -> EntryVerdict {
+    let entry_type = entry.header().entry_type();
+    if entry_type.is_dir() || entry_type.is_pax_global_extensions() || entry_type.is_gnu_longname()
+    {
+        return EntryVerdict::Ignore;
+    }
+    // Links can point anywhere on the host filesystem.
+    if !entry_type.is_file() {
+        return EntryVerdict::Skip("symlinks and special files");
+    }
+    let raw = match entry.path() {
+        Ok(path) => path.to_string_lossy().replace('\\', "/"),
+        Err(e) => return EntryVerdict::Reject(format!("unreadable path in bundle: {e}")),
+    };
+    let rel = raw.trim_start_matches("./").to_string();
+    if rel.is_empty() {
+        return EntryVerdict::Ignore;
+    }
+    if rel.starts_with('/') || rel.split('/').any(|seg| seg == ".." || seg == ".") {
+        return EntryVerdict::Reject(format!("unsafe path in bundle: {rel}"));
+    }
+    if rel.split('/').any(|seg| seg.starts_with('.')) {
+        return EntryVerdict::Skip("dotfiles");
+    }
+    if !valid_asset_path(&rel) {
+        return EntryVerdict::Reject(format!(
+            "unsupported filename in bundle: {rel} (use letters, numbers, '.', '-', '_')"
+        ));
+    }
+    EntryVerdict::Take(rel)
+}
+
+/// Entry paths as they should land on disk, or an error naming the offender.
+/// Rejects anything that could escape the destination directory.
+fn bundle_entry_paths(body: &[u8]) -> Result<Vec<String>, String> {
+    let decoder = flate2::read::GzDecoder::new(body);
+    let mut archive = tar::Archive::new(decoder);
+    let mut paths = Vec::new();
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        match classify_entry(&entry) {
+            EntryVerdict::Take(rel) => paths.push(rel),
+            EntryVerdict::Ignore | EntryVerdict::Skip(_) => continue,
+            EntryVerdict::Reject(message) => return Err(message),
+        }
+    }
+    if paths.is_empty() {
+        return Err("bundle contains no files".to_string());
+    }
+    if paths.len() > MAX_BUNDLE_ENTRIES {
+        return Err(format!("bundle has more than {MAX_BUNDLE_ENTRIES} files"));
+    }
+    Ok(paths)
+}
+
+/// `tar -czf - dist` wraps everything in `dist/`, while `tar -czf - -C dist .`
+/// does not. Strip a single shared top-level directory so both work.
+fn bundle_strip_prefix(paths: &[String]) -> Option<String> {
+    let first = paths.first()?.split('/').next()?.to_string();
+    let all_share = paths
+        .iter()
+        .all(|p| p.starts_with(&format!("{first}/")));
+    let root_has_index = paths.iter().any(|p| p == "index.html");
+    (all_share && !root_has_index).then_some(first)
+}
+
+struct Unpacked {
+    files: Vec<String>,
+    skipped: Vec<&'static str>,
+}
+
+fn unpack_bundle(body: &[u8], dest: &std::path::Path) -> Result<Unpacked, String> {
+    let paths = bundle_entry_paths(body)?;
+    let strip = bundle_strip_prefix(&paths);
+
+    let decoder = flate2::read::GzDecoder::new(body);
+    let mut archive = tar::Archive::new(decoder);
+    let mut written = Vec::new();
+    let mut skipped: Vec<&'static str> = Vec::new();
+    let mut total: u64 = 0;
+
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let rel = match classify_entry(&entry) {
+            EntryVerdict::Take(rel) => rel,
+            EntryVerdict::Ignore => continue,
+            EntryVerdict::Skip(reason) => {
+                if !skipped.contains(&reason) {
+                    skipped.push(reason);
+                }
+                continue;
+            }
+            EntryVerdict::Reject(message) => return Err(message),
+        };
+        let rel = match &strip {
+            Some(prefix) => rel
+                .strip_prefix(&format!("{prefix}/"))
+                .unwrap_or(&rel)
+                .to_string(),
+            None => rel,
+        };
+        if rel.is_empty() {
+            continue;
+        }
+
+        total += entry.header().size().unwrap_or(0);
+        if total > MAX_BUNDLE_UNPACKED {
+            return Err(format!(
+                "bundle exceeds {} MB unpacked",
+                MAX_BUNDLE_UNPACKED / 1024 / 1024
+            ));
+        }
+
+        let out = dest.join(&rel);
+        // Belt and braces: the path checks above should make this impossible,
+        // but never write outside the destination.
+        if !out.starts_with(dest) {
+            return Err(format!("path escapes the app directory: {rel}"));
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut file).map_err(|e| e.to_string())?;
+        written.push(rel);
+    }
+
+    written.sort();
+    Ok(Unpacked {
+        files: written,
+        skipped,
+    })
+}
+
+/// Ticket-authenticated write. The ticket itself is the credential, so this
+/// route sits outside the bearer middleware — an agent can upload a file
+/// without ever being handed the server's real token.
 async fn store_upload(
     config: &Config,
     ticket: &str,
     sub: Option<String>,
-    as_icon: bool,
+    kind: UploadKind,
     body: Bytes,
 ) -> Response {
     let slug = {
@@ -623,6 +1043,59 @@ async fn store_upload(
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
     }
+
+    if let UploadKind::Bundle { spa } = kind {
+        let dest = config.data_dir.join(&slug);
+        if fs::create_dir_all(&dest).await.is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
+        }
+        // Decompression is CPU-bound and blocking; keep it off the runtime.
+        let unpack_dest = dest.clone();
+        let result =
+            tokio::task::spawn_blocking(move || unpack_bundle(&body, &unpack_dest)).await;
+        let unpacked = match result {
+            Ok(Ok(unpacked)) => unpacked,
+            Ok(Err(message)) => {
+                tracing::warn!(slug = %slug, error = %message, "bundle rejected");
+                return (StatusCode::BAD_REQUEST, format!("{message}\n")).into_response();
+            }
+            Err(e) => {
+                tracing::error!(slug = %slug, error = %e, "bundle unpack panicked");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "unpack failed\n").into_response();
+            }
+        };
+
+        if spa {
+            let mut meta = read_meta(config, &slug).await;
+            meta.spa = true;
+            let _ = write_meta(config, &slug, &meta).await;
+        }
+
+        let has_index = unpacked.files.iter().any(|f| f == "index.html");
+        let mut body = format!(
+            "unpacked {} files to {}\n",
+            unpacked.files.len(),
+            page_url(config, &slug)
+        );
+        if !unpacked.skipped.is_empty() {
+            body.push_str(&format!("skipped {}\n", unpacked.skipped.join(", ")));
+        }
+        if !has_index {
+            body.push_str(
+                "warning: no index.html at the bundle root, so the app root will 404\n",
+            );
+        }
+        tracing::info!(
+            slug = %slug,
+            files = unpacked.files.len(),
+            skipped = ?unpacked.skipped,
+            spa,
+            "bundle published"
+        );
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let as_icon = matches!(kind, UploadKind::Icon);
     if as_icon && body.len() > MAX_ICON_BYTES {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -675,7 +1148,7 @@ async fn upload_root(
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    store_upload(&config, &ticket, None, query.icon.is_some(), body).await
+    store_upload(&config, &ticket, None, upload_kind(&query), body).await
 }
 
 async fn upload_sub(
@@ -684,7 +1157,19 @@ async fn upload_sub(
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    store_upload(&config, &ticket, Some(sub), query.icon.is_some(), body).await
+    store_upload(&config, &ticket, Some(sub), upload_kind(&query), body).await
+}
+
+fn upload_kind(query: &UploadQuery) -> UploadKind {
+    if query.bundle.is_some() {
+        UploadKind::Bundle {
+            spa: query.spa.is_some(),
+        }
+    } else if query.icon.is_some() {
+        UploadKind::Icon
+    } else {
+        UploadKind::Page
+    }
 }
 
 /// Clients disagree about how to present a static token: most send
@@ -764,9 +1249,23 @@ async fn serve_page(
     uri: Uri,
 ) -> impl IntoResponse {
     let slug = slug.trim_end_matches('/');
-    if !valid_slug(slug) {
+    if !valid_asset_path(slug) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
+    // A hidden page is indistinguishable from one that never existed. Hiding
+    // an app takes its assets down with it.
+    if is_hidden(&config, slug).await {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    // A file inside a bundle: styles, scripts, images, fonts.
+    let asset = config.data_dir.join(slug);
+    if asset.is_file() {
+        if let Ok(bytes) = fs::read(&asset).await {
+            return ([(header::CONTENT_TYPE, content_type_for(slug))], bytes).into_response();
+        }
+    }
+
     let direct = config.data_dir.join(format!("{slug}.html"));
     if let Ok(html) = fs::read_to_string(&direct).await {
         return Html(html).into_response();
@@ -781,7 +1280,45 @@ async fn serve_page(
         }
         return Html(html).into_response();
     }
+
+    // Client-routed bundle: /p/app/some/route is the app's own concern, so
+    // hand back its index and let the router sort it out.
+    if let Some(html) = spa_fallback(&config, slug).await {
+        return Html(html).into_response();
+    }
+
     (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+/// True if the page or any app above it has been hidden.
+async fn is_hidden(config: &Config, slug: &str) -> bool {
+    let mut prefix = String::new();
+    for segment in slug.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        if read_meta(config, &prefix).await.hidden {
+            return true;
+        }
+    }
+    false
+}
+
+async fn spa_fallback(config: &Config, slug: &str) -> Option<String> {
+    let segments: Vec<&str> = slug.split('/').collect();
+    // Nearest enclosing app wins, so nested bundles behave sensibly.
+    for depth in (1..segments.len()).rev() {
+        let app = segments[..depth].join("/");
+        if !read_meta(config, &app).await.spa {
+            continue;
+        }
+        let index = config.data_dir.join(format!("{app}/index.html"));
+        if let Ok(html) = fs::read_to_string(&index).await {
+            return Some(html);
+        }
+    }
+    None
 }
 
 const INDEX_STYLE: &str = r#"
@@ -866,6 +1403,8 @@ ul.pages li a::after { content: "\2192"; color: var(--muted); margin-left: auto;
 .meta { display: flex; flex-direction: column; min-width: 0; }
 .meta .title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .meta .slug { color: var(--muted); font-size: .8rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.meta .when { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.meta .when::before { content: "\00b7"; margin-right: .35rem; }
 .empty, .no-match { color: var(--muted); text-align: center; padding: 2rem 0; }
 .no-match { display: none; }
 "#;
@@ -931,33 +1470,49 @@ struct PageCard {
     slug: String,
     title: Option<String>,
     icon: Icon,
+    modified: Option<SystemTime>,
 }
 
 async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
     let mut slugs = Vec::new();
     collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
-    slugs.sort();
 
     let mut cards = Vec::with_capacity(slugs.len());
     for slug in &slugs {
-        let title = match page_path(&config, slug).await {
-            Some(path) => page_title(&path).await,
+        let meta = read_meta(&config, slug).await;
+        if meta.hidden || !meta.listed {
+            continue;
+        }
+        let path = page_path(&config, slug).await;
+        let title = match &path {
+            Some(path) => page_title(path).await,
+            None => None,
+        };
+        let modified = match &path {
+            Some(path) => fs::metadata(path).await.ok().and_then(|m| m.modified().ok()),
             None => None,
         };
         cards.push(PageCard {
             slug: slug.clone(),
             title,
             icon: page_icon(&config, slug).await,
+            modified,
         });
     }
+    // Newest first — the page you just pushed should be at the top.
+    cards.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
 
-    let count_label = match slugs.len() {
+    let count_label = match cards.len() {
         0 => "No pages yet".to_string(),
         1 => "1 page".to_string(),
         n => format!("{n} pages"),
     };
 
-    let (body, script) = if slugs.is_empty() {
+    let (body, script) = if cards.is_empty() {
         (
             r#"<p class="empty">No pages yet. Push one to see it here.</p>"#.to_string(),
             "",
@@ -970,11 +1525,17 @@ async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
                 let icon = icon_html(&card.icon);
                 // With a title, the slug becomes the subtitle; without one the
                 // slug is all there is to show.
+                let when = card
+                    .modified
+                    .map(|t| format!(r#" <span class="when">{}</span>"#, relative_time(t)))
+                    .unwrap_or_default();
                 let meta = match &card.title {
                     Some(title) => format!(
-                        r#"<span class="meta"><span class="title">{title}</span><span class="slug">{slug}</span></span>"#
+                        r#"<span class="meta"><span class="title">{title}</span><span class="slug">{slug}{when}</span></span>"#
                     ),
-                    None => format!(r#"<span class="meta"><span class="title">{slug}</span></span>"#),
+                    None => format!(
+                        r#"<span class="meta"><span class="title">{slug}</span><span class="slug">{when}</span></span>"#
+                    ),
                 };
                 format!(
                     r#"<li data-slug="{slug_lower}" data-title="{title_lower}"><a href="/p/{slug}">{icon}{meta}</a></li>"#,

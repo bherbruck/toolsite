@@ -38,6 +38,31 @@ public URL.
   so the app can be edited and pushed back with `push_app`.
 - `set_icon(slug, icon)` — set the icon shown beside a page on the index.
   Takes an emoji, inline `<svg>…</svg>`, or a `data:` URI. Optional.
+- `list_pages(include_all?)` — what's published: slug, title, URL, when it
+  last changed, visibility. Newest first. Pass `include_all` to see hidden and
+  unlisted pages too.
+- `set_visibility(slug, hidden?, listed?)` — `hidden` takes a page down (its
+  URL 404s) and `listed` controls whether it appears on the index. Nothing is
+  deleted, so both are reversible. There is deliberately no delete tool.
+
+## Bundles
+
+A built front-end goes up in one shot as a gzipped tar:
+
+```
+tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle'        # static site
+tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle&spa'    # client-side router
+```
+
+Both `tar -czf - -C dist .` and `tar -czf - dist` work — a single shared top
+level directory is stripped. Files are served from `/p/<app>/…` with a content
+type derived from the extension (JS, CSS, JSON, wasm, fonts, images). With
+`&spa`, a path that matches no file falls back to the app's `index.html` so
+client-side routes resolve; without it, unknown paths 404.
+
+Limits and rules: 64 MB compressed, 128 MB unpacked, 2000 files. Paths
+containing `..` or a leading `/` are rejected outright. Symlinks and dotfiles
+are skipped, and the response says so rather than silently shipping less.
 
 ## Titles and icons on the index
 
@@ -70,9 +95,10 @@ curl -fT logo.svg "<upload-url>/about?icon"    # icon for one page of an app
   (`/p/myapp`) redirects to `/p/myapp/` and serves that app's `index` page, so
   relative links inside the app resolve correctly.
 - `GET /icon/<slug>` — a page's icon, if one was set. Public, no auth.
-- `GET /` — index of published pages, each with an icon and title. Multi-page
-  apps appear once, as their root; their inner pages are the app's own
-  business.
+- `GET /` — index of published pages, newest first, each with an icon, title
+  and when it last changed. Multi-page apps and bundles appear once, as their
+  root; their inner pages are the app's own business. Hidden and unlisted
+  pages don't appear.
 
 ## Auth
 
