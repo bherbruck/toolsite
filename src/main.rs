@@ -264,7 +264,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "The default way to publish. Returns a short-lived upload URL; write the HTML to a local file, then PUT the file to that URL with curl. Do not paste HTML into this call — the point is that the page never passes through the conversation. Works for a single page or a whole multi-page app. If the upload URL turns out to be unreachable from your sandbox, fall back to push_page/push_app."
+        description = "The default way to publish. Returns a short-lived upload URL; write the HTML to a local file, then PUT the file to that URL with curl. Do not paste HTML into this call — the point is that the page never passes through the conversation. Works for a single page, a multi-page app, or a whole built front-end (TypeScript/React/Vite — tar the dist folder to ?bundle). The response includes the base path the build must be configured with. If the upload URL turns out to be unreachable from your sandbox, fall back to push_page/push_app."
     )]
     async fn create_upload(
         &self,
@@ -298,12 +298,22 @@ impl PageHost {
              \n  curl -fT <file.html> {upload}\n\
              \nMulti-page app — append the page name, one PUT per page:\n\
              \n  curl -fT index.html {upload}/index\n  curl -fT about.html {upload}/about\n\
-             \nWhole built site (React/Vite/etc), gzipped tar of the dist folder:\n\
+             \nWhole built site (TypeScript/React/Vite/Svelte/etc), gzipped tar of dist:\n\
              \n  tar -czf - -C dist . | curl -f -T - '{upload}?bundle'\n\
              \nAdd &spa for a client-side router, so unknown paths serve index.html:\n\
              \n  tar -czf - -C dist . | curl -f -T - '{upload}?bundle&spa'\n\
+             \nIMPORTANT — this app is served from {base}, not from the domain root, so a \
+             default build config will emit /assets/... URLs that 404 and render a blank \
+             page. Before building, set the base path:\n\
+             \n  vite.config: base: '{base}'\n  next.config: basePath: '{trimmed}', assetPrefix: '{base}'\n  \
+             create-react-app package.json: \"homepage\": \"{base}\"\n\
+             \nWith a router, set its basename to '{trimmed}' too (e.g. \
+             createBrowserRouter(routes, {{ basename: '{trimmed}' }})).\n\
+             \nAfter uploading, verify with: curl -I {page}/assets/<one-built-file>\n\
              \nEach upload replies with the page's public URL. Single-file page lands at {page}",
             page = page_url(&self.config, &slug),
+            base = format!("/p/{slug}/"),
+            trimmed = format!("/p/{slug}"),
         ))]))
     }
 
@@ -507,9 +517,15 @@ impl ServerHandler for PageHost {
                  back to push_page / push_app, which take the HTML inline.\n\
                  3. If there is no shell at all, use push_page / push_app directly.\n\
                  \n\
-                 A built front-end (React, Vite, Svelte — anything with a dist folder) goes up \
-                 whole: `tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle'`, adding \
-                 &spa if it uses a client-side router.\n\
+                 You are not limited to hand-written HTML. If you can run a shell with network \
+                 access, scaffolding a real TypeScript/React/Vite project, building it, and \
+                 uploading the dist folder is fully supported and often the better answer for \
+                 anything interactive: `tar -czf - -C dist . | curl -f -T - \
+                 '<upload-url>?bundle'`, adding &spa if it uses a client-side router. Every \
+                 app is served from a subpath (/p/<slug>/), never the domain root, so set the \
+                 build's base path accordingly — create_upload prints the exact value. \
+                 Skipping that step produces a page that loads but renders blank, because its \
+                 assets 404.\n\
                  \n\
                  Call list_pages to see what already exists before picking a slug or editing \
                  something. To edit, fetch the page with `curl <page-url>` into a file (or \

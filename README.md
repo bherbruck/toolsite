@@ -54,6 +54,23 @@ tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle'        # static site
 tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle&spa'    # client-side router
 ```
 
+### Set the base path before building
+
+Apps are served from `/p/<slug>/`, never the domain root. A default Vite /
+Next / CRA config emits absolute `/assets/…` URLs, which 404 here — the page
+loads and renders blank. `create_upload` prints the exact values for the slug
+you asked for:
+
+```
+vite.config:  base: '/p/<slug>/'
+next.config:  basePath: '/p/<slug>', assetPrefix: '/p/<slug>/'
+CRA:          "homepage": "/p/<slug>/"
+router:       basename: '/p/<slug>'
+```
+
+Relative (`base: './'`) also works for a static multi-page bundle, but breaks
+on deep client-side routes — prefer the absolute form for SPAs.
+
 Both `tar -czf - -C dist .` and `tar -czf - dist` work — a single shared top
 level directory is stripped. Files are served from `/p/<app>/…` with a content
 type derived from the extension (JS, CSS, JSON, wasm, fonts, images). With
