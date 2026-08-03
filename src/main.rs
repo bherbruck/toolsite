@@ -37,7 +37,22 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     fs::create_dir_all(&data_dir).await?;
 
-    let bearer_token = std::env::var("BEARER_TOKEN").ok().filter(|s| !s.is_empty());
+    // MCP_TOKEN was this variable's first name. A deployment still carrying
+    // it would otherwise start with no bearer auth at all and 401 everything,
+    // with nothing in the logs pointing at the cause.
+    let bearer_token = std::env::var("BEARER_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let legacy = std::env::var("MCP_TOKEN").ok().filter(|s| !s.is_empty());
+            if legacy.is_some() {
+                tracing::warn!(
+                    "MCP_TOKEN is the old name for BEARER_TOKEN and still works; \
+                     rename it to stop this warning"
+                );
+            }
+            legacy
+        });
     let oauth_client_id = std::env::var("OAUTH_CLIENT_ID").ok().filter(|s| !s.is_empty());
     let oauth_client_secret = std::env::var("OAUTH_CLIENT_SECRET")
         .ok()

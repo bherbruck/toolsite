@@ -266,7 +266,7 @@ Two independent modes — use either, or both at once. At least one is required.
 
 | Variable | Required | Description |
 |---|---|---|
-| `BEARER_TOKEN` | if not using OAuth | Static token for `/mcp`. |
+| `BEARER_TOKEN` | if not using OAuth | Static token for `/mcp`. Also read from `MCP_TOKEN`, its former name, with a warning at boot. |
 | `OAUTH_CLIENT_ID` | if using OAuth | Paste into the client's "OAuth Client ID" field. |
 | `OAUTH_CLIENT_SECRET` | if using OAuth | Paste into the client's "OAuth Client Secret" field. |
 | `PUBLIC_BASE_URL` | if using OAuth | Base URL of the deployment, e.g. `https://host.com`. A bare host gets `https://` prepended. Without it, published URLs come back relative. |
