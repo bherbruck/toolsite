@@ -24,6 +24,24 @@ docker run -d -p 8080:8080 -v ./data:/data \
 On Railway: attach a Volume at `/data` (the Dockerfile deliberately has no
 `VOLUME` line — Railway's builder rejects it) and set the variables below.
 
+## The CLI
+
+```
+cargo install --path cli
+export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
+```
+
+| Command | What it does |
+|---|---|
+| `toolsite init <name> [--spa] [--handler]` | Scaffolds an app with its base path already right, optionally with a wasm handler. |
+| `toolsite deploy [dir] [--slug s] [--spa]` | Builds the handler if there is one, tars `dist/`, uploads both, then fetches the page to check it. |
+| `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
+| `toolsite list [--all]` | What is published, newest first. |
+| `toolsite hide <slug>` / `unhide` | Reversible takedown. |
+
+`deploy` warns when `index.html` references `/assets/…` from the domain root,
+which is the mistake that ships a blank page while looking like a success.
+
 ## Connecting a client
 
 The MCP endpoint is `POST /mcp` — Streamable HTTP transport, so **no `/sse`
