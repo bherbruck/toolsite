@@ -26,6 +26,27 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), String> {
     MIGRATIONS.to_latest(conn).map_err(|e| e.to_string())
 }
 
+/// Every object SQLite reports for a database, in a stable order. Used to
+/// compare a migrated database against the declared shape.
+#[cfg(test)]
+fn describe(conn: &Connection) -> String {
+    let mut statement = conn
+        .prepare(
+            "select sql from sqlite_master
+              where sql is not null and name not like 'sqlite_%'
+              order by name",
+        )
+        .unwrap();
+    // Already ordered by name; sorting the SQL text instead would group every
+    // CREATE INDEX before every CREATE TABLE.
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,6 +73,36 @@ mod tests {
             .query_row("pragma user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, again);
+    }
+
+    /// The declared shape is documentation only until something checks it.
+    #[test]
+    fn the_ladder_produces_exactly_the_declared_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        // SQLite keeps comments inside the DDL it stores, so both sides are
+        // stripped of them and of incidental whitespace before comparing.
+        let normalise = |text: &str| {
+            text.lines()
+                .map(|line| match line.find("--") {
+                    Some(at) => &line[..at],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let actual = describe(&conn);
+        let declared = include_str!("../../migrations/schema.sql");
+        assert_eq!(
+            normalise(&actual),
+            normalise(&declared),
+            "\nmigrations/schema.sql no longer matches what the migrations build.\n\
+             Add a numbered migration for the change, then update schema.sql to match.\n"
+        );
     }
 
     #[test]
