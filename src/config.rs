@@ -9,5 +9,7 @@ pub(crate) struct Config {
     pub(crate) local_base: String,
     pub(crate) valid_tokens: Vec<String>,
     pub(crate) oauth: Option<OAuth>,
+    /// Per-app SQLite, opt-in until the surrounding wasm layer exists.
+    pub(crate) databases: bool,
     pub(crate) uploads: Mutex<HashMap<String, UploadTicket>>,
 }

@@ -1,4 +1,5 @@
 use crate::{
+    db,
     config::Config,
     slug::{random_slug, random_token, valid_segment, valid_slug},
     store::{collect_slugs, page_path, page_title, page_url, read_meta, relative_time, write_meta},
@@ -93,6 +94,22 @@ pub(crate) struct ListPagesRequest {
 pub(crate) struct PullAppRequest {
     #[schemars(description = "App namespace to fetch all pages for.")]
     pub(crate) app: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RunSqlRequest {
+    #[schemars(
+        description = "App whose database to run against. Every app has its own file; there is no shared database."
+    )]
+    pub(crate) app: String,
+    #[schemars(
+        description = "SQL to run. Pass one statement when using params; a parameterless script may hold several statements, which is how a schema migration is applied."
+    )]
+    pub(crate) sql: String,
+    #[schemars(
+        description = "Values bound to '?' placeholders, in order. Always bind values rather than building SQL by concatenation."
+    )]
+    pub(crate) params: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Clone)]
@@ -260,6 +277,48 @@ impl PageHost {
             base = format!("/p/{slug}/"),
             trimmed = format!("/p/{slug}"),
         ))]))
+    }
+
+    #[tool(
+        description = "Run SQL against one app's own SQLite database — create tables, seed or inspect data. Only reachable over MCP, never from a published page, so it is safe for schema work but is not how an app reads its own data at runtime."
+    )]
+    pub(crate) async fn run_sql(
+        &self,
+        Parameters(RunSqlRequest { app, sql, params }): Parameters<RunSqlRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !self.config.databases {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "databases are off; set DATABASES=on to enable them",
+            )]));
+        }
+        if !valid_slug(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+
+        let config = self.config.clone();
+        let params = params.unwrap_or_default();
+        let outcome =
+            tokio::task::spawn_blocking(move || db::run(&config, &app, &sql, &params))
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match outcome {
+            Ok(outcome) => {
+                let body = serde_json::json!({
+                    "columns": outcome.columns,
+                    "rows": outcome.rows,
+                    "rows_affected": outcome.rows_affected,
+                    "truncated": outcome.truncated,
+                });
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    serde_json::to_string(&body)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                )]))
+            }
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
     }
 
     #[tool(
