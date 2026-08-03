@@ -19,9 +19,9 @@ use tokio::fs;
 
 /// A short-lived, single-slug write capability handed to an agent so it can
 /// `curl -T file.html <url>` instead of pasting page HTML through a tool call.
-pub(crate) struct UploadTicket {
-    pub(crate) slug: String,
-    pub(crate) expires_at: Instant,
+pub struct UploadTicket {
+    pub slug: String,
+    pub expires_at: Instant,
 }
 
 pub(crate) const UPLOAD_TTL: Duration = Duration::from_secs(900);

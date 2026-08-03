@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) struct AuthCode {
+pub struct AuthCode {
     pub(crate) redirect_uri: String,
     pub(crate) code_challenge: Option<String>,
     pub(crate) expires_at: Instant,
@@ -26,10 +26,10 @@ pub(crate) struct AuthCode {
 /// Present only when OAUTH_CLIENT_ID + OAUTH_CLIENT_SECRET are configured.
 /// Mounts the OAuth discovery/authorize/token routes; absent means the server
 /// only does plain bearer-token auth (for clients that support that directly).
-pub(crate) struct OAuth {
-    pub(crate) client_id: String,
-    pub(crate) client_secret: String,
-    pub(crate) auth_codes: Mutex<HashMap<String, AuthCode>>,
+pub struct OAuth {
+    pub client_id: String,
+    pub client_secret: String,
+    pub auth_codes: Mutex<HashMap<String, AuthCode>>,
 }
 
 pub(crate) async fn oauth_protected_resource_metadata(State(config): State<Arc<Config>>) -> impl IntoResponse {

@@ -84,6 +84,7 @@ pub(crate) fn bundle_strip_prefix(paths: &[String]) -> Option<String> {
     (all_share && !root_has_index).then_some(first)
 }
 
+#[derive(Debug)]
 pub(crate) struct Unpacked {
     pub(crate) files: Vec<String>,
     pub(crate) skipped: Vec<&'static str>,
@@ -150,4 +151,129 @@ pub(crate) fn unpack_bundle(body: &[u8], dest: &std::path::Path) -> Result<Unpac
         files: written,
         skipped,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Writes tar headers by hand. The `tar` crate's builder refuses to
+    /// emit `..` or absolute paths, which is exactly what these tests need to
+    /// forge — a real attacker is not constrained by our tar library either.
+    fn raw_entry(path: &str, body: &[u8], type_flag: u8, link: &str) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let put = |header: &mut [u8; 512], offset: usize, bytes: &[u8]| {
+            header[offset..offset + bytes.len()].copy_from_slice(bytes);
+        };
+        put(&mut header, 0, path.as_bytes());
+        put(&mut header, 100, b"0000644\0");
+        put(&mut header, 108, b"0000000\0");
+        put(&mut header, 116, b"0000000\0");
+        put(&mut header, 124, format!("{:011o}\0", body.len()).as_bytes());
+        put(&mut header, 136, b"00000000000\0");
+        header[156] = type_flag;
+        put(&mut header, 157, link.as_bytes());
+        put(&mut header, 257, b"ustar\0");
+        put(&mut header, 263, b"00");
+
+        // Checksum is computed with the checksum field itself read as spaces.
+        put(&mut header, 148, b"        ");
+        let sum: u32 = header.iter().map(|b| *b as u32).sum();
+        put(&mut header, 148, format!("{sum:06o}\0 ").as_bytes());
+
+        let mut out = header.to_vec();
+        out.extend_from_slice(body);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out
+    }
+
+    /// `entries` are (path, contents); a path ending in '@' is a symlink to
+    /// /etc/passwd.
+    fn tarball(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        for (path, body) in entries {
+            match path.strip_suffix('@') {
+                Some(link) => tar.extend(raw_entry(link, b"", b'2', "/etc/passwd")),
+                None => tar.extend(raw_entry(path, body.as_bytes(), b'0', "")),
+            }
+        }
+        tar.extend(std::iter::repeat_n(0u8, 1024)); // end-of-archive marker
+
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn a_normal_build_output_unpacks_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tarball(&[
+            ("index.html", "<h1>hi</h1>"),
+            ("assets/main-4f2a.js", "console.log(1)"),
+            ("assets/main-4f2a.css", "body{}"),
+        ]);
+        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        assert_eq!(
+            unpacked.files,
+            ["assets/main-4f2a.css", "assets/main-4f2a.js", "index.html"]
+        );
+        assert!(unpacked.skipped.is_empty(), "{:?}", unpacked.skipped);
+        assert!(dir.path().join("assets/main-4f2a.js").exists());
+    }
+
+    #[test]
+    fn a_single_wrapping_directory_is_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tarball(&[("dist/index.html", "<h1>hi</h1>"), ("dist/app.js", "x")]);
+        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        assert_eq!(unpacked.files, ["app.js", "index.html"]);
+        assert!(dir.path().join("index.html").exists());
+    }
+
+    #[test]
+    fn traversal_aborts_the_whole_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../escape.html", "a/../../escape.html", "/etc/escape.html"] {
+            let body = tarball(&[("index.html", "ok"), (path, "pwned")]);
+            let error = unpack_bundle(&body, dir.path()).unwrap_err();
+            assert!(error.contains("unsafe path"), "{path:?} gave {error:?}");
+        }
+        // Nothing from a rejected archive may be left behind outside the dest.
+        assert!(!dir.path().parent().unwrap().join("escape.html").exists());
+    }
+
+    #[test]
+    fn symlinks_are_skipped_and_reported_rather_than_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tarball(&[("index.html", "ok"), ("passwd.html@", "")]);
+        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        assert_eq!(unpacked.files, ["index.html"]);
+        assert!(unpacked.skipped.contains(&"symlinks and special files"));
+        assert!(!dir.path().join("passwd.html").exists());
+    }
+
+    #[test]
+    fn dotfiles_are_skipped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tarball(&[("index.html", "ok"), (".env", "SECRET=1")]);
+        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        assert_eq!(unpacked.files, ["index.html"]);
+        assert!(unpacked.skipped.contains(&"dotfiles"));
+        assert!(!dir.path().join(".env").exists());
+    }
+
+    #[test]
+    fn an_empty_archive_is_an_error_not_a_silent_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = unpack_bundle(&tarball(&[]), dir.path()).unwrap_err();
+        assert!(error.contains("no files"), "got {error:?}");
+    }
+
+    #[test]
+    fn garbage_is_rejected_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(unpack_bundle(b"not a gzip stream at all", dir.path()).is_err());
+    }
 }

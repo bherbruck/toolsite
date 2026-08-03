@@ -51,13 +51,26 @@ types.
 
 ## Testing
 
-No test suite yet; changes are verified by driving a local instance:
+`cargo test`. The crate is split so this is possible: `lib.rs` owns
+`build_router`, `main.rs` only reads the environment and serves. Tests drive
+the real router in-process with `tower`'s `oneshot`, so every layer runs
+without binding a socket.
 
-```
-cargo build --release && ./target/release/toolsite      # reads .env, port 8099
-```
+- **Unit tests** live beside the code they cover (`#[cfg(test)] mod tests`),
+  since they need `pub(crate)` items: slug rules, bundle unpacking, database
+  isolation.
+- **Integration tests** live in `tests/http.rs` and go through the router.
 
-Then exercise `/mcp` over JSON-RPC (initialize, then `tools/call`) and the
-public routes with curl. Cover the security cases when touching upload or
-serving code: path traversal, absolute paths, symlinks in bundles, expired
-tickets, and unauthenticated `/mcp`.
+Two conventions worth keeping:
+
+- **Forge attacks, don't trust libraries to forge them for you.** The `tar`
+  crate refuses to *write* `..` paths, so the traversal fixtures build tar
+  headers by hand — an attacker is not constrained by our tar library either.
+- **Name the property, not the mechanism.** `attach_is_refused_so_sql_cannot_
+  reach_another_app` says why it exists; `test_authorizer` doesn't.
+
+Requests to `/mcp` in tests must carry a `Host` header — rmcp's transport
+enforces one as DNS-rebinding protection, and `oneshot` doesn't add it.
+
+Anything touching upload, serving, or SQL needs a test for the security
+property it rests on, not just the happy path.

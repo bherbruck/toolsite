@@ -93,6 +93,7 @@ fn from_sql(value: ValueRef<'_>) -> Value {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct SqlOutcome {
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<Value>>,
@@ -174,4 +175,136 @@ pub(crate) fn run(
         truncated,
         rows_affected: (conn.total_changes() - before) as usize,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn config() -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::local(dir.path().to_path_buf(), "test-token", true);
+        (dir, config)
+    }
+
+    #[test]
+    fn migrations_run_as_scripts_and_are_idempotent() {
+        let (_dir, config) = config();
+        let migration = "create table if not exists todos (id integer primary key, body text);\
+                         create index if not exists todos_body on todos(body);";
+        run(&config, "app", migration, &[]).unwrap();
+        // The second run must not error, which is what makes redeploys safe.
+        run(&config, "app", migration, &[]).unwrap();
+
+        let out = run(&config, "app", "select name from sqlite_master order by name", &[]).unwrap();
+        let names: Vec<_> = out.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(names, ["todos", "todos_body"]);
+    }
+
+    #[test]
+    fn parameters_are_bound_not_interpolated() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table t (body text)", &[]).unwrap();
+        // A classic injection payload must land as literal text.
+        let payload = "'); drop table t; --";
+        run(
+            &config,
+            "app",
+            "insert into t (body) values (?)",
+            &[json!(payload)],
+        )
+        .unwrap();
+
+        let out = run(&config, "app", "select body from t", &[]).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0].as_str().unwrap(), payload);
+    }
+
+    #[test]
+    fn each_app_gets_its_own_file() {
+        let (_dir, config) = config();
+        run(&config, "one", "create table only_in_one (a)", &[]).unwrap();
+        run(&config, "two", "create table only_in_two (a)", &[]).unwrap();
+
+        let out = run(&config, "two", "select name from sqlite_master", &[]).unwrap();
+        let names: Vec<_> = out.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(names, ["only_in_two"]);
+    }
+
+    #[test]
+    fn attach_is_refused_so_sql_cannot_reach_another_app() {
+        let (_dir, config) = config();
+        run(&config, "victim", "create table secrets (a)", &[]).unwrap();
+        run(&config, "attacker", "create table t (a)", &[]).unwrap();
+
+        for attempt in [
+            "attach database '../victim/data.db' as v",
+            "attach database '/etc/passwd' as p",
+            "ATTACH DATABASE '../victim/data.db' AS v",
+        ] {
+            let error = run(&config, "attacker", attempt, &[]).unwrap_err();
+            assert!(
+                error.contains("not authorized"),
+                "{attempt:?} gave {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pragmas_are_refused() {
+        let (_dir, config) = config();
+        let error = run(&config, "app", "pragma journal_mode=delete", &[]).unwrap_err();
+        assert!(error.contains("not authorized"), "got {error:?}");
+    }
+
+    #[test]
+    fn an_invalid_app_name_never_reaches_the_filesystem() {
+        let (_dir, config) = config();
+        assert!(db_path(&config, "../etc").is_none());
+        assert!(db_path(&config, "ok/name").is_some());
+        assert!(run(&config, "../etc", "select 1", &[]).is_err());
+    }
+
+    #[test]
+    fn reads_are_capped_and_say_so() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table n (i integer)", &[]).unwrap();
+        run(
+            &config,
+            "app",
+            "insert into n with recursive c(i) as (select 1 union all select i+1 from c where i<1500) select i from c",
+            &[],
+        )
+        .unwrap();
+
+        let out = run(&config, "app", "select i from n", &[]).unwrap();
+        assert_eq!(out.rows.len(), MAX_ROWS);
+        assert!(out.truncated);
+    }
+
+    #[test]
+    fn writes_stop_at_the_size_cap_instead_of_filling_the_volume() {
+        let (dir, config) = config();
+        run(&config, "app", "create table big (x blob)", &[]).unwrap();
+        let error = run(
+            &config,
+            "app",
+            "insert into big with recursive c(i) as (select 1 union all select i+1 from c where i<80) select randomblob(1000000) from c",
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("full"), "got {error:?}");
+
+        let size = std::fs::metadata(dir.path().join("app/data.db")).unwrap().len();
+        assert!(size < MAX_DB_BYTES, "database grew to {size}");
+    }
+
+    #[test]
+    fn rows_affected_is_reported_for_writes() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table t (a)", &[]).unwrap();
+        let out = run(&config, "app", "insert into t values (1)", &[]).unwrap();
+        assert_eq!(out.rows_affected, 1);
+    }
 }
