@@ -19,6 +19,8 @@ use crate::{config::Config, content::slug::valid_slug};
 const WIT: &str = include_str!("../../wit/toolsite.wit");
 const HANDLER_CARGO: &str = include_str!("../../templates/handler/Cargo.toml");
 const HANDLER_LIB: &str = include_str!("../../templates/handler/src/lib.rs");
+const HANDLER_MIGRATION: &str =
+    include_str!("../../templates/handler/migrations/001_initial.sql");
 
 /// The contract a handler compiles against, so `curl` is enough to start.
 pub async fn wit() -> Response {
@@ -68,9 +70,15 @@ Build:
     rustup target add wasm32-wasip2
     cargo build --release --target wasm32-wasip2
 
-Upload, using an upload URL from create_upload:
+Upload, using an upload URL from create_upload. Schema first, so the handler
+is never live without its tables:
 
+    tar -czf - -C migrations . | curl -f -T - '<upload-url>?migrations'
     curl -f -T target/wasm32-wasip2/release/{crate_name}.wasm '<upload-url>?handler'
+
+Add migrations/002_*.sql for the next schema change rather than editing 001:
+each file runs once, so an edited one never reaches a database that already
+ran it.
 
 It then answers every request under {base}/p/{app}/api/, and any route with no
 file behind it.
@@ -84,6 +92,7 @@ whoever is signed in. No filesystem, no network, no environment.
     let files = [
         ("Cargo.toml", HANDLER_CARGO.replace("NAME", &app)),
         ("src/lib.rs", HANDLER_LIB.to_string()),
+        ("migrations/001_initial.sql", HANDLER_MIGRATION.to_string()),
         ("wit/toolsite.wit", WIT.to_string()),
         ("README.md", readme),
     ];

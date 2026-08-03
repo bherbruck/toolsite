@@ -387,6 +387,12 @@ impl PageHost {
              \n  cargo build --release --target wasm32-wasip2\n\
              \n  curl -f -T target/wasm32-wasip2/release/*.wasm '{upload}?handler'\n\
              \nThe contract alone is at {site}/wit/toolsite.wit.\n\
+             \nThe app's tables come from numbered .sql files, applied once each, in \
+             order, before the handler goes live. The scaffold ships the first one; add \
+             002_*.sql for the next change rather than editing it, and never write \
+             'create table if not exists' in a handler — once the table exists it does \
+             nothing, so a later column never arrives:\n\
+             \n  tar -czf - -C migrations . | curl -f -T - '{upload}?migrations'\n\
              \nKeep the project with the app, since a bundle cannot be turned back into the \
              sources that built it. Visitors only ever see what the bundle contained:\n\
              \n  tar -czf - --exclude node_modules --exclude target . | curl -f -T - '{upload}?source'\n\

@@ -1460,6 +1460,7 @@ async fn an_agent_can_fetch_the_contract_and_a_crate_that_builds_against_it() {
         [
             "notes-handler/Cargo.toml",
             "notes-handler/README.md",
+            "notes-handler/migrations/001_initial.sql",
             "notes-handler/src/lib.rs",
             "notes-handler/wit/toolsite.wit",
         ]
@@ -1798,5 +1799,39 @@ async fn a_rule_covers_the_api_as_well_as_the_pages() {
     assert_eq!(
         send(&config, get("/p/board/api/all")).await.0,
         StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn the_scaffold_carries_the_schema_its_handler_expects() {
+    let (_dir, config) = server();
+    let (status, body) = send_bytes(&config, get("/scaffold/notes")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let decoder = flate2::read::GzDecoder::new(&body[..]);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().to_string_lossy().to_string();
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut contents).unwrap();
+        files.insert(name, contents);
+    }
+
+    // The handler it ships writes to a table, so a migration creating that
+    // table has to travel with it — otherwise the first request 500s.
+    let handler = &files["notes-handler/src/lib.rs"];
+    let migration = files
+        .get("notes-handler/migrations/001_initial.sql")
+        .expect("the scaffold has no migration");
+    assert!(handler.contains("visits"), "the template stopped using the table");
+    assert!(
+        migration.contains("create table visits"),
+        "the migration does not create the table the handler uses"
+    );
+    assert!(
+        !handler.contains("create table"),
+        "the handler is doing its own DDL again"
     );
 }
