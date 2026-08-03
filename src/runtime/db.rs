@@ -46,6 +46,16 @@ pub(crate) fn open(config: &Config, app: &str) -> Result<Connection, String> {
 /// Opens one SQLite file with the same guards everywhere: an authorizer that
 /// refuses anything reaching outside this file, a size ceiling, and WAL.
 pub(crate) fn open_at(path: &std::path::Path) -> Result<Connection, String> {
+    let conn = open_unguarded(path)?;
+    lock_down(&conn)?;
+    Ok(conn)
+}
+
+/// Everything `open_at` does except installing the authorizer. Only the
+/// account database uses this, and only long enough to run migrations, which
+/// need `pragma user_version` — a pragma the authorizer refuses once it is
+/// in place. Never hand a connection from here to a guest.
+pub(crate) fn open_unguarded(path: &std::path::Path) -> Result<Connection, String> {
     {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -69,10 +79,14 @@ pub(crate) fn open_at(path: &std::path::Path) -> Result<Connection, String> {
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
         .map_err(|e| e.to_string())?;
 
-    conn.authorizer(Some(deny_escapes))
-        .map_err(|e| e.to_string())?;
     Ok(conn)
     }
+}
+
+/// Closes the door: from here on the connection refuses ATTACH, DETACH and
+/// any pragma.
+pub(crate) fn lock_down(conn: &Connection) -> Result<(), String> {
+    conn.authorizer(Some(deny_escapes)).map_err(|e| e.to_string())
 }
 
 fn to_sql(value: &Value) -> Result<ToSqlOutput<'static>, String> {
@@ -306,6 +320,23 @@ mod tests {
 
         let size = std::fs::metadata(dir.path().join("app/data.db")).unwrap().len();
         assert!(size < MAX_DB_BYTES, "database grew to {size}");
+    }
+
+    #[test]
+    fn an_app_database_is_never_migrated_by_the_platform() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table t (a)", &[]).unwrap();
+
+        // The account database has a schema the platform owns and versions.
+        // An app's database does not: its shape is the app's business, and
+        // run_sql and the guest's db.query are the only things that shape it.
+        let conn = open(&config, "app").unwrap();
+        let version: i64 = conn
+            .query_row("select 1 from sqlite_master where name = 'users'", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        assert_eq!(version, 0, "platform tables appeared in an app database");
     }
 
     #[test]

@@ -33,35 +33,11 @@ fn site_db_path(config: &Config) -> PathBuf {
 }
 
 fn open(config: &Config) -> Result<Connection, String> {
-    let conn = db::open_at(&site_db_path(config))?;
-    conn.execute_batch(
-        "create table if not exists users (
-            id            text primary key,
-            email         text not null unique,
-            password_hash text,
-            created_at    integer not null
-         );
-         -- One account, several ways to sign in. Empty until a provider is
-         -- wired up, but adding it later would mean migrating live accounts.
-         create table if not exists identities (
-            provider    text not null,
-            provider_id text not null,
-            user_id     text not null,
-            primary key (provider, provider_id)
-         );
-         create table if not exists sessions (
-            token_hash text primary key,
-            user_id    text not null,
-            expires_at integer not null
-         );
-         create table if not exists grants (
-            user_id text not null,
-            app     text not null,
-            role    text not null,
-            primary key (user_id, app)
-         );",
-    )
-    .map_err(|e| e.to_string())?;
+    // Migrations read `pragma user_version`, which the authorizer refuses, so
+    // the schema is brought up to date before the door is closed.
+    let mut conn = db::open_unguarded(&site_db_path(config))?;
+    crate::accounts::schema::migrate(&mut conn)?;
+    db::lock_down(&conn)?;
     Ok(conn)
 }
 
