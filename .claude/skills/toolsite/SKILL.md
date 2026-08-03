@@ -251,6 +251,31 @@ curl -f -T target/wasm32-wasip2/release/<crate_name>.wasm '<upload-url>?handler'
 Create the schema with `run_sql` (or `toolsite sql <app> "..."`) before first
 use, or have the handler run `create table if not exists ...` itself.
 
+## Configure in the file, not in commands
+
+Put an app's gate, route rules, jobs and icon in `toolsite.toml` beside its
+source rather than issuing commands. It travels with the project, so the next
+session sees what was intended, and a redeploy reproduces it.
+
+```toml
+slug = "board"
+gate = "public"
+icon = "📋"
+
+[[route]]
+path = "/triage"
+gate = "authenticated"
+
+[[job]]
+name = "rollup"
+schedule = "0 0 3 * * *"
+path = "/api/rollup"
+```
+
+`toolsite deploy` applies it; otherwise `curl -f -T toolsite.toml
+'<upload-url>?manifest'`. Routes and jobs are replaced wholesale, so removing
+a line removes the thing.
+
 ## Keep the project, and start from it
 
 A bundle cannot be turned back into the sources that built it, so publish the

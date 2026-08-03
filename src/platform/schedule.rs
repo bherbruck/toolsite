@@ -172,13 +172,19 @@ pub async fn run_job(state: &AppState, app: &str, name: &str) -> Result<String, 
         Err(error) => format!("failed: {error}"),
     };
 
-    let mut jobs = read_jobs(&state.config, app);
-    if let Some(entry) = jobs.get_mut(name) {
-        entry.last_run = Some(now());
-        entry.last_status = Some(status.clone());
-        let _ = write_jobs(&state.config, app, &jobs);
-    }
+    record_run(&state.config, app, name, &status);
     Ok(status)
+}
+
+/// Records an outcome against a job. Used by the scheduler, and by tests
+/// that need a job to look as though it has run.
+pub fn record_run(config: &Config, app: &str, name: &str, status: &str) {
+    let mut jobs = read_jobs(config, app);
+    if let Some(job) = jobs.get_mut(name) {
+        job.last_run = Some(now());
+        job.last_status = Some(status.to_string());
+        let _ = write_jobs(config, app, &jobs);
+    }
 }
 
 /// Every app that has jobs, found the same way the index finds pages.

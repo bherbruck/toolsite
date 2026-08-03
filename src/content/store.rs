@@ -39,26 +39,26 @@ pub(crate) async fn icon_path(config: &Config, slug: &str) -> Option<PathBuf> {
 /// Per-page state kept in a `<slug>.meta` sidecar. Absent means "a normal,
 /// visible page", so nothing has to be written on the common path.
 #[derive(Debug, serde::Serialize, Deserialize)]
-pub(crate) struct PageMeta {
+pub struct PageMeta {
     /// Shown on the site index.
     #[serde(default = "yes")]
-    pub(crate) listed: bool,
+    pub listed: bool,
     /// Soft delete: the URL 404s, but the file is untouched and unhiding
     /// brings it straight back.
     #[serde(default)]
-    pub(crate) hidden: bool,
+    pub hidden: bool,
     /// Client-routed bundle: unknown paths under the app fall back to its
     /// index.html instead of 404ing.
     #[serde(default)]
-    pub(crate) spa: bool,
+    pub spa: bool,
     /// Who may reach this app: "public", "authenticated", or "granted".
     #[serde(default = "public")]
-    pub(crate) gate: String,
+    pub gate: String,
     /// Exceptions, by path prefix. A public app with a private corner and a
     /// private app with a public front page are the same feature, so both are
     /// this. Longest matching prefix wins.
     #[serde(default)]
-    pub(crate) rules: Vec<PathRule>,
+    pub rules: Vec<PathRule>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -70,7 +70,7 @@ pub struct PathRule {
 
 impl PageMeta {
     /// The gate that applies to one path within this app.
-    pub(crate) fn gate_for(&self, path: &str) -> &str {
+    pub fn gate_for(&self, path: &str) -> &str {
         self.rules
             .iter()
             .filter(|rule| path.starts_with(&rule.prefix))
@@ -124,7 +124,7 @@ pub(crate) async fn meta_path(config: &Config, slug: &str) -> PathBuf {
     }
 }
 
-pub(crate) async fn read_meta(config: &Config, slug: &str) -> PageMeta {
+pub async fn read_meta(config: &Config, slug: &str) -> PageMeta {
     let path = meta_path(config, slug).await;
     match fs::read_to_string(&path).await {
         Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
@@ -132,7 +132,7 @@ pub(crate) async fn read_meta(config: &Config, slug: &str) -> PageMeta {
     }
 }
 
-pub(crate) async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io::Result<()> {
+pub async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io::Result<()> {
     let path = meta_path(config, slug).await;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;

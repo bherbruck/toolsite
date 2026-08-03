@@ -15,7 +15,7 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
     }
     std::fs::create_dir_all(root.join("dist"))?;
 
-    std::fs::write(root.join("toolsite.toml"), format!("slug = \"{name}\"\nspa = {spa}\n"))?;
+    std::fs::write(root.join("toolsite.toml"), manifest(name, spa, handler))?;
     std::fs::write(root.join("dist/index.html"), index_html(name, handler))?;
 
     if handler {
@@ -35,6 +35,29 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
         println!("Building with Vite? Set base: '/p/{name}/' — assets 404 without it.");
     }
     Ok(())
+}
+
+/// What the app needs, in one file that travels with the source. `deploy`
+/// applies it, so this is the thing to edit rather than remembering commands.
+fn manifest(name: &str, spa: bool, handler: bool) -> String {
+    let jobs = if handler {
+        "\n# Work this app does on its own. Six cron fields, seconds first.\n\
+         # [[job]]\n# name = \"refresh\"\n# schedule = \"0 */5 * * * *\"\n\
+         # path = \"/api/refresh\"\n"
+    } else {
+        ""
+    };
+    format!(
+        "slug = \"{name}\"\n\
+         spa = {spa}\n\
+         \n\
+         # public, authenticated, or granted.\n\
+         gate = \"public\"\n\
+         \n\
+         # Guard part of the app. Longest matching prefix wins.\n\
+         # [[route]]\n# path = \"/admin\"\n# gate = \"granted\"\n\
+         {jobs}"
+    )
 }
 
 fn index_html(name: &str, handler: bool) -> String {

@@ -301,6 +301,42 @@ Nothing stored beside an app is reachable under `/p/` — not `.source`, not
 `.notes`, not `.meta`. If a visitor should be able to read a file, put it in
 the bundle; that is the whole rule.
 
+## toolsite.toml
+
+An app says what it needs in one file that travels with its source, so
+`toolsite fetch` brings back the intent along with the code and a redeploy
+reproduces it:
+
+```toml
+slug = "board"
+spa  = false
+gate = "public"
+icon = "📋"
+
+# Anyone can submit; only signed-in people read the pile.
+[[route]]
+path = "/triage"
+gate = "authenticated"
+
+[[job]]
+name = "rollup"
+schedule = "0 0 3 * * *"
+path = "/api/rollup"
+```
+
+`toolsite deploy` applies it before the app is reachable. Without the CLI it
+is `curl -f -T toolsite.toml '<upload-url>?manifest'`.
+
+**What it declares, it owns.** Routes and jobs are replaced wholesale, so
+deleting a line removes the thing — no drift between the file and the server.
+What it does not mention is left alone, so hiding an app by hand survives the
+next deploy. A job whose schedule did not change keeps its history. A manifest
+with a mistake anywhere is rejected whole rather than half-applied.
+
+Commands still work and are right for a one-off (`toolsite gate`,
+`toolsite job`). The manifest is for anything meant to outlive the session
+that set it.
+
 ## Scheduled work
 
 An app can do things nobody asked for — refresh a cache, pull from an API,

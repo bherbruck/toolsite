@@ -50,6 +50,8 @@ pub(crate) struct UploadQuery {
     pub(crate) handler: Option<String>,
     /// The project the bundle was built from, kept private.
     pub(crate) source: Option<String>,
+    /// toolsite.toml: what the app needs, rather than a list of commands.
+    pub(crate) manifest: Option<String>,
 }
 
 pub(crate) enum UploadKind {
@@ -58,6 +60,7 @@ pub(crate) enum UploadKind {
     Bundle { spa: bool },
     Handler,
     Source,
+    Manifest,
 }
 
 /// Ticket-authenticated write. The ticket itself is the credential, so this
@@ -101,6 +104,27 @@ pub(crate) async fn store_upload(
 
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
+    }
+
+    if let UploadKind::Manifest = kind {
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        let Ok(text) = String::from_utf8(body.to_vec()) else {
+            return (StatusCode::BAD_REQUEST, "toolsite.toml must be UTF-8\n").into_response();
+        };
+        return match crate::platform::manifest::apply(config, &app, &text).await {
+            Ok(changed) if changed.is_empty() => {
+                (StatusCode::OK, format!("{app} already matches its manifest\n")).into_response()
+            }
+            Ok(changed) => {
+                tracing::info!(app = %app, changed = ?changed, "manifest applied");
+                (
+                    StatusCode::OK,
+                    format!("{app}: applied {}\n", changed.join(", ")),
+                )
+                    .into_response()
+            }
+            Err(message) => (StatusCode::BAD_REQUEST, format!("{message}\n")).into_response(),
+        };
     }
 
     // The project, not the output. Stored whole and never served: what a
@@ -290,7 +314,9 @@ pub(crate) async fn upload_sub(
 }
 
 pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
-    if query.source.is_some() {
+    if query.manifest.is_some() {
+        UploadKind::Manifest
+    } else if query.source.is_some() {
         UploadKind::Source
     } else if query.handler.is_some() {
         UploadKind::Handler

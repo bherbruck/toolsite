@@ -529,6 +529,22 @@ fn deploy(
         print!("{body}");
     }
 
+    // The manifest goes first, so the app is configured before it is reachable
+    // rather than a moment after.
+    if let Ok(manifest) = std::fs::read_to_string(dir.join("toolsite.toml")) {
+        let response = client
+            .put(format!("{upload_url}?manifest"))
+            .body(manifest)
+            .send()?;
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        if status.is_success() {
+            print!("{body}");
+        } else {
+            bail!("toolsite.toml was rejected ({status}): {}", body.trim());
+        }
+    }
+
     // Kept by default: a bundle cannot be turned back into what built it, and
     // the next session would otherwise start from the rendered page.
     if keep_source {
