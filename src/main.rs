@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::fs;
-use toolsite::{build_router, config::Config, oauth::OAuth};
+use toolsite::{build_router, config::Config, oauth::OAuth, wasm::Runtime};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         uploads: Mutex::new(HashMap::new()),
     });
 
-    let app = build_router(config);
+    let app = build_router(config, Runtime::new()?);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");

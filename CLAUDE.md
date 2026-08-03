@@ -38,6 +38,7 @@ oauth.rs    the minimal single-user OAuth 2.1 shim
 web.rs      the public site: page serving, icons, index rendering
 mcp.rs      MCP tool definitions and the ServerHandler
 wasm.rs     the guest sandbox: engine, guards, host imports
+db.rs       per-app SQLite, with the authorizer that keeps apps apart
 ```
 
 Dependency direction is one-way: `web`/`mcp`/`upload` depend on `store`, which

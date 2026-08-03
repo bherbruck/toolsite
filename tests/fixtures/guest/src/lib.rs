@@ -21,7 +21,11 @@ fn respond(status: u16, body: String) -> Response {
 
 impl Guest for Handler {
     fn handle(req: Request) -> Response {
-        match req.path.as_str() {
+        // The host passes the path relative to the app, /api included, so a
+        // handler that answers both API calls and rendered routes sees one
+        // path space. Strip the prefix the way any router would.
+        let route = req.path.strip_prefix("/api").unwrap_or(&req.path).to_string();
+        match route.as_str() {
             "/echo" => respond(200, format!("{} {}?{}", req.method, req.path, req.query)),
 
             "/whoami" => match identity::current_user() {

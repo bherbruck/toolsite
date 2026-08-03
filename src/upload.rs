@@ -1,5 +1,7 @@
 use crate::{
     bundle::unpack_bundle,
+    wasm::Runtime,
+    AppState,
     config::Config,
     slug::valid_slug,
     store::{page_url, read_meta, write_meta},
@@ -43,12 +45,14 @@ pub(crate) struct UploadQuery {
     pub(crate) icon: Option<String>,
     pub(crate) bundle: Option<String>,
     pub(crate) spa: Option<String>,
+    pub(crate) handler: Option<String>,
 }
 
 pub(crate) enum UploadKind {
     Page,
     Icon,
     Bundle { spa: bool },
+    Handler,
 }
 
 /// Ticket-authenticated write. The ticket itself is the credential, so this
@@ -56,6 +60,7 @@ pub(crate) enum UploadKind {
 /// without ever being handed the server's real token.
 pub(crate) async fn store_upload(
     config: &Config,
+    runtime: &Runtime,
     ticket: &str,
     sub: Option<String>,
     kind: UploadKind,
@@ -91,6 +96,31 @@ pub(crate) async fn store_upload(
 
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
+    }
+
+    if let UploadKind::Handler = kind {
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        if let Err(error) = runtime.validate(&body) {
+            tracing::warn!(app = %app, error = %error, "handler rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("not a valid handler component: {error}\n"),
+            )
+                .into_response();
+        }
+
+        let dir = config.data_dir.join(&app);
+        if fs::create_dir_all(&dir).await.is_err()
+            || fs::write(dir.join("handler.wasm"), &body).await.is_err()
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
+        }
+        tracing::info!(app = %app, bytes = body.len(), "handler published");
+        return (
+            StatusCode::OK,
+            format!("handler live at {}/api/\n", page_url(config, &app)),
+        )
+            .into_response();
     }
 
     if let UploadKind::Bundle { spa } = kind {
@@ -192,25 +222,43 @@ pub(crate) async fn store_upload(
 }
 
 pub(crate) async fn upload_root(
-    State(config): State<Arc<Config>>,
+    State(state): State<AppState>,
     Path(ticket): Path<String>,
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    store_upload(&config, &ticket, None, upload_kind(&query), body).await
+    store_upload(
+        &state.config,
+        &state.runtime,
+        &ticket,
+        None,
+        upload_kind(&query),
+        body,
+    )
+    .await
 }
 
 pub(crate) async fn upload_sub(
-    State(config): State<Arc<Config>>,
+    State(state): State<AppState>,
     Path((ticket, sub)): Path<(String, String)>,
     Query(query): Query<UploadQuery>,
     body: Bytes,
 ) -> Response {
-    store_upload(&config, &ticket, Some(sub), upload_kind(&query), body).await
+    store_upload(
+        &state.config,
+        &state.runtime,
+        &ticket,
+        Some(sub),
+        upload_kind(&query),
+        body,
+    )
+    .await
 }
 
 pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
-    if query.bundle.is_some() {
+    if query.handler.is_some() {
+        UploadKind::Handler
+    } else if query.bundle.is_some() {
         UploadKind::Bundle {
             spa: query.spa.is_some(),
         }

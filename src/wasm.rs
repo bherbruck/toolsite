@@ -205,6 +205,15 @@ impl Runtime {
         }))
     }
 
+    /// Checks that bytes really are a component satisfying our world, so a
+    /// broken handler is rejected at upload rather than on a visitor's first
+    /// request.
+    pub fn validate(&self, wasm: &[u8]) -> anyhow::Result<()> {
+        let component = Component::new(&self.engine, wasm)?;
+        AppPre::new(self.linker.instantiate_pre(&component)?)?;
+        Ok(())
+    }
+
     /// Compiles and links an app's handler, reusing the result while cached.
     fn handler(&self, key: &str, wasm: &[u8]) -> anyhow::Result<AppPre<StoreState>> {
         if let Some((handler, last_used)) = self.handlers.lock().unwrap().get_mut(key) {

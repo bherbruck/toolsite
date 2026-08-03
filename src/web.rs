@@ -6,11 +6,19 @@ use crate::{
         relative_time, Icon,
     },
 };
+use crate::{
+    wasm::{Guards, Request as WasmRequest},
+    AppState,
+};
 use axum::{
+    body::Body,
     extract::{Path, State},
-    http::{header, StatusCode, Uri},
+    http::{header, Request, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
+
+/// Ceiling on a request body handed to a guest.
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 use std::{sync::Arc, time::SystemTime};
 use tokio::fs;
 
@@ -101,19 +109,48 @@ pub(crate) async fn serve_icon(State(config): State<Arc<Config>>, Path(slug): Pa
         .into_response()
 }
 
+/// Reserved prefix. A bundle that happens to ship `api/config.json` must not
+/// be able to shadow its own handler, so this wins before any file lookup.
+const API_PREFIX: &str = "api";
+
+/// Serves one request for a published page, in a fixed order:
+///
+/// 1. `/p/<app>/api/...` — the app's wasm handler, always.
+/// 2. an exact file on disk — static, no wasm involved.
+/// 3. no file but a handler exists — the handler, so it can render routes.
+/// 4. no file, no handler, `spa` set — the app's index.html.
+/// 5. otherwise 404.
 pub(crate) async fn serve_page(
-    State(config): State<Arc<Config>>,
-    Path(slug): Path<String>,
-    uri: Uri,
-) -> impl IntoResponse {
-    let slug = slug.trim_end_matches('/');
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let config = &state.config;
+    let uri_path = request.uri().path().to_string();
+    let Some(raw) = uri_path.strip_prefix("/p/") else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let had_trailing_slash = raw.ends_with('/');
+    let slug = raw.trim_end_matches('/');
     if !valid_asset_path(slug) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     // A hidden page is indistinguishable from one that never existed. Hiding
     // an app takes its assets down with it.
-    if is_hidden(&config, slug).await {
+    if is_hidden(config, slug).await {
         return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    let (app, rest) = match slug.split_once('/') {
+        Some((app, rest)) => (app, rest),
+        None => (slug, ""),
+    };
+    let is_api = rest == API_PREFIX || rest.starts_with(&format!("{API_PREFIX}/"));
+
+    if is_api {
+        return match handler_wasm(config, app).await {
+            Some(wasm) => run_handler(&state, app, &wasm, request).await,
+            None => (StatusCode::NOT_FOUND, "this app has no handler").into_response(),
+        };
     }
 
     // A file inside a bundle: styles, scripts, images, fonts.
@@ -133,19 +170,117 @@ pub(crate) async fn serve_page(
     // against the app directory rather than one level above it.
     let index = config.data_dir.join(format!("{slug}/index.html"));
     if let Ok(html) = fs::read_to_string(&index).await {
-        if !uri.path().ends_with('/') {
+        if !had_trailing_slash {
             return Redirect::permanent(&format!("/p/{slug}/")).into_response();
         }
         return Html(html).into_response();
     }
 
+    // Nothing on disk, but the app ships code: let it answer for its own
+    // routes, which is what server-rendered pages need.
+    if let Some(wasm) = handler_wasm(config, app).await {
+        return run_handler(&state, app, &wasm, request).await;
+    }
+
     // Client-routed bundle: /p/app/some/route is the app's own concern, so
     // hand back its index and let the router sort it out.
-    if let Some(html) = spa_fallback(&config, slug).await {
+    if let Some(html) = spa_fallback(config, slug).await {
         return Html(html).into_response();
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
+    if !valid_slug(app) {
+        return None;
+    }
+    fs::read(config.data_dir.join(app).join("handler.wasm"))
+        .await
+        .ok()
+}
+
+async fn run_handler(
+    state: &AppState,
+    app: &str,
+    wasm: &[u8],
+    request: Request<Body>,
+) -> Response {
+    let method = request.method().to_string();
+    let uri = request.uri().clone();
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+
+    let body = match axum::body::to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request too large").into_response(),
+    };
+
+    // The path the guest sees is relative to its own app, so a handler never
+    // has to know where it is mounted.
+    let path = uri
+        .path()
+        .strip_prefix(&format!("/p/{app}"))
+        .unwrap_or(uri.path())
+        .to_string();
+    let guest_request = WasmRequest {
+        method,
+        path: if path.is_empty() { "/".into() } else { path },
+        query: uri.query().unwrap_or_default().to_string(),
+        headers,
+        body,
+    };
+
+    let runtime = state.runtime.clone();
+    let config = state.config.clone();
+    let owned_app = app.to_string();
+    let wasm = wasm.to_vec();
+    // Guest execution is blocking and CPU-bound, and the database import
+    // blocks too, so it must not run on an async worker.
+    let outcome = tokio::task::spawn_blocking(move || {
+        // No session layer yet, so every request is anonymous.
+        runtime.handle(
+            config,
+            &owned_app,
+            &wasm,
+            None,
+            guest_request,
+            Guards::default(),
+        )
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(response)) => {
+            let status =
+                StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut builder = axum::response::Response::builder().status(status);
+            for (name, value) in &response.headers {
+                builder = builder.header(name, value);
+            }
+            builder
+                .body(Body::from(response.body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        // A trap is the app's bug, not the site's: report it without leaking
+        // the host's internals to a visitor.
+        Ok(Err(error)) => {
+            tracing::warn!(app, error = %error, "handler failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "handler error").into_response()
+        }
+        Err(error) => {
+            tracing::error!(app, error = %error, "handler task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, "handler error").into_response()
+        }
+    }
 }
 
 pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> {

@@ -272,6 +272,9 @@ impl PageHost {
              \nWith a router, set its basename to '{trimmed}' too (e.g. \
              createBrowserRouter(routes, {{ basename: '{trimmed}' }})).\n\
              \nAfter uploading, verify with: curl -I {page}/assets/<one-built-file>\n\
+             \nServer-side code — a component built for wasm32-wasip2 against wit/toolsite.wit,              which gets this app's own SQLite database and nothing else:\n\
+             \n  curl -f -T handler.wasm '{upload}?handler'\n\
+             \nIt then answers every request under {page}/api/, and any route with no file              behind it. It is rejected at upload if it is not a valid component.\n\
              \nEach upload replies with the page's public URL. Single-file page lands at {page}",
             page = page_url(&self.config, &slug),
             base = format!("/p/{slug}/"),

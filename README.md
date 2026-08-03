@@ -45,7 +45,8 @@ Streamable HTTP — the session is issued by `initialize`.
 
 | Tool | Use |
 |---|---|
-| `create_upload(slug?)` | **The default.** Returns a short-lived upload URL to `curl` files to. Handles single pages, multi-page apps, and bundles. |
+| `create_upload(slug?)` | **The default.** Returns a short-lived upload URL to `curl` files to. Handles single pages, multi-page apps, bundles, and handlers. |
+| `run_sql(app, sql, params?)` | Schema and seed work against an app's own database. MCP only — never reachable from a published page. |
 | `list_pages(include_all?)` | What already exists: slug, title, URL, last modified, visibility. Newest first. |
 | `set_visibility(slug, hidden?, listed?)` | Take a page down or hide it from the index. Reversible; nothing is deleted. |
 | `set_icon(slug, icon)` | An emoji, inline `<svg>`, or `data:` URI. Optional. |
@@ -103,6 +104,41 @@ Limits: 64 MB compressed, 128 MB unpacked, 2000 files. Paths containing `..`
 or a leading `/` abort the upload. Symlinks and dotfiles are skipped, and the
 response says so rather than silently shipping less.
 
+## Server-side code
+
+An app can ship a wasm component that answers requests. It is built for
+`wasm32-wasip2` against [`wit/toolsite.wit`](wit/toolsite.wit) and uploaded
+alongside the bundle:
+
+```
+curl -f -T handler.wasm '<upload-url>?handler'
+```
+
+Requests are then resolved in a fixed order:
+
+1. `/p/<app>/api/...` → the handler, always. The prefix is reserved so a file
+   can't shadow it.
+2. an exact file on disk → served statically, no wasm involved.
+3. no file, but a handler exists → the handler, so it can render its own
+   routes server-side.
+4. no file, no handler, `spa` set → the app's `index.html`.
+5. otherwise 404.
+
+The guest sees the path relative to its app (`/api/echo`, not
+`/p/myapp/api/echo`), so a handler never needs to know where it is mounted.
+
+**What a handler can and cannot do.** It gets two imports: `db.query`, bound
+to its own app's database with parameters bound rather than interpolated, and
+`identity.current-user`, which it cannot forge. It gets no filesystem, no
+environment, no sockets, and no clock beyond what the world imports. wasi is
+linked because a `wasm32-wasip2` guest imports it through std, so the sandbox
+is the context — which grants nothing, and the test suite proves each denial.
+
+Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
+wall-clock deadline. A handler that loops forever is killed and returns 500;
+the server keeps serving. Because instances are never reused, state must live
+in the database.
+
 ## The index
 
 `GET /` lists published pages, newest first, each with an icon and title.
@@ -120,8 +156,8 @@ pages don't appear. There's a client-side filter over slugs and titles.
 | Route | Auth | Purpose |
 |---|---|---|
 | `POST /mcp` | token or OAuth | The MCP server. |
-| `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed. 64 MB. |
-| `GET /p/<slug>` | public | The page. An app root redirects to `/p/<slug>/` so relative links resolve. |
+| `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed, `?handler` installs a wasm component. 64 MB. |
+| `ANY /p/<slug>` | public | The page, a bundle asset, or the app's handler. An app root redirects to `/p/<slug>/` so relative links resolve. |
 | `GET /icon/<slug>` | public | A page's icon, if set. |
 | `GET /` | public | The index. |
 

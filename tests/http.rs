@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use toolsite::{build_router, upload::UploadTicket, Config};
+use toolsite::{build_router, upload::UploadTicket, wasm::Runtime, Config};
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
@@ -22,7 +22,7 @@ fn server() -> (TempDir, Arc<Config>) {
 }
 
 async fn send(config: &Arc<Config>, request: Request<Body>) -> (StatusCode, String, Vec<(String, String)>) {
-    let response = build_router(config.clone())
+    let response = build_router(config.clone(), Runtime::new().unwrap())
         .oneshot(request)
         .await
         .unwrap();
@@ -290,4 +290,143 @@ async fn the_index_lists_an_app_once_at_its_root() {
     assert!(!body.contains("/p/app/about"), "inner page was listed");
     assert!(body.contains("My App"), "title was not picked up");
     assert!(body.contains("Loose Page"));
+}
+
+fn publish_handler(config: &Config, app: &str) {
+    let dir = config.data_dir.join(app);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("handler.wasm"), HANDLER).unwrap();
+}
+
+const HANDLER: &[u8] = include_bytes!("fixtures/handler.wasm");
+
+#[tokio::test]
+async fn api_requests_reach_the_apps_handler() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+
+    let (status, body, _) = send(&config, get("/p/app/api/echo")).await;
+    assert_eq!(status, StatusCode::OK);
+    // The guest sees a path relative to its own app, not the mount point.
+    assert_eq!(body, "GET /api/echo?");
+}
+
+#[tokio::test]
+async fn a_handler_can_use_its_apps_database_over_http() {
+    let (_dir, config) = server();
+    publish_handler(&config, "counter");
+
+    let (_, first, _) = send(&config, get("/p/counter/api/count")).await;
+    let (_, second, _) = send(&config, get("/p/counter/api/count")).await;
+    assert_eq!((first.as_str(), second.as_str()), ("1", "2"));
+}
+
+#[tokio::test]
+async fn api_requests_carry_method_and_body_through() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/p/app/api/echo-param")
+        .body(Body::from("hello from the browser"))
+        .unwrap();
+    let (status, body, _) = send(&config, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello from the browser");
+}
+
+#[tokio::test]
+async fn static_files_win_over_the_handler_but_api_never_does() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+    std::fs::write(config.data_dir.join("app/index.html"), "<h1>static</h1>").unwrap();
+    // A file that would otherwise shadow the reserved prefix.
+    std::fs::create_dir_all(config.data_dir.join("app/api")).unwrap();
+    std::fs::write(config.data_dir.join("app/api/echo"), "STATIC SHADOW").unwrap();
+
+    let (_, body, _) = send(&config, get("/p/app/")).await;
+    assert!(body.contains("static"), "handler answered for a real file");
+
+    let (_, body, _) = send(&config, get("/p/app/api/echo")).await;
+    assert_eq!(body, "GET /api/echo?", "a file shadowed the handler");
+}
+
+#[tokio::test]
+async fn an_app_without_a_handler_says_so_rather_than_erroring() {
+    let (_dir, config) = server();
+    std::fs::create_dir_all(config.data_dir.join("static")).unwrap();
+    std::fs::write(config.data_dir.join("static/index.html"), "<h1>hi</h1>").unwrap();
+
+    let (status, ..) = send(&config, get("/p/static/api/anything")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_handler_answers_for_routes_with_no_file_behind_them() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+    std::fs::write(config.data_dir.join("app/index.html"), "<h1>static</h1>").unwrap();
+
+    // Not a file, not /api — the handler gets a chance before the 404.
+    let (status, body, _) = send(&config, get("/p/app/echo")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "GET /echo?");
+}
+
+#[tokio::test]
+async fn a_trapping_handler_returns_500_and_leaves_the_server_up() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+
+    let (status, body, _) = send(&config, get("/p/app/api/spin")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("wasm"), "internals leaked to the visitor: {body}");
+
+    let (status, ..) = send(&config, get("/p/app/api/echo")).await;
+    assert_eq!(status, StatusCode::OK, "server did not survive the trap");
+}
+
+#[tokio::test]
+async fn hiding_an_app_takes_its_handler_down_too() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+    std::fs::write(config.data_dir.join("app/index.html"), "<h1>hi</h1>").unwrap();
+    std::fs::write(
+        config.data_dir.join("app/index.meta"),
+        r#"{"listed":false,"hidden":true,"spa":false}"#,
+    )
+    .unwrap();
+
+    let (status, ..) = send(&config, get("/p/app/api/echo")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_handler_is_validated_when_it_is_uploaded() {
+    let (_dir, config) = server();
+    let token = ticket(&config, "app", Duration::from_secs(60));
+
+    let bad = Request::builder()
+        .method("PUT")
+        .uri(format!("/upload/{token}?handler"))
+        .body(Body::from("this is not a wasm component"))
+        .unwrap();
+    let (status, body, _) = send(&config, bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("not a valid handler"), "{body}");
+    assert!(!config.data_dir.join("app/handler.wasm").exists());
+
+    let good = Request::builder()
+        .method("PUT")
+        .uri(format!("/upload/{token}?handler"))
+        .body(Body::from(HANDLER))
+        .unwrap();
+    let (status, body, _) = send(&config, good).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(config.data_dir.join("app/handler.wasm").exists());
+
+    let (status, body, _) = send(&config, get("/p/app/api/echo")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "GET /api/echo?");
 }

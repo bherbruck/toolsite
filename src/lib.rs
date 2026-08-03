@@ -22,11 +22,12 @@ use crate::{
     upload::{upload_root, upload_sub, MAX_UPLOAD_BYTES},
     web::{index, serve_icon, serve_page},
 };
+use crate::wasm::Runtime;
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, FromRef},
     http::Uri,
     middleware,
-    routing::{get, post, put},
+    routing::{any, get, post, put},
     Router,
 };
 use rmcp::transport::streamable_http_server::{
@@ -34,9 +35,24 @@ use rmcp::transport::streamable_http_server::{
 };
 use std::sync::Arc;
 
+/// Shared by every handler. Split from `Config` so the data layer never has
+/// to know the wasm runtime exists; `FromRef` lets handlers that only want
+/// config keep asking for exactly that.
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub runtime: Arc<Runtime>,
+}
+
+impl FromRef<AppState> for Arc<Config> {
+    fn from_ref(state: &AppState) -> Self {
+        state.config.clone()
+    }
+}
+
 /// Assembles every route. Kept out of `main` so tests can drive the whole
 /// surface in-process instead of over a socket.
-pub fn build_router(config: Arc<Config>) -> Router {
+pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     // rmcp's Streamable HTTP transport validates the inbound `Host` header
     // (DNS-rebinding protection) against an allowlist that defaults to
     // localhost only. Deployed behind a real domain, that must include the
@@ -69,7 +85,7 @@ pub fn build_router(config: Arc<Config>) -> Router {
 
     let mut public_router = Router::new()
         .route("/", get(index))
-        .route("/p/{*slug}", get(serve_page))
+        .route("/p/{*slug}", any(serve_page))
         .route("/icon/{*slug}", get(serve_icon))
         .route("/upload/{ticket}", put(upload_root).post(upload_root))
         .route("/upload/{ticket}/{*sub}", put(upload_sub).post(upload_sub))
@@ -93,7 +109,10 @@ pub fn build_router(config: Arc<Config>) -> Router {
             .route("/token", post(token_endpoint));
     }
 
-    let public_router = public_router.with_state(config.clone());
+    let public_router = public_router.with_state(AppState {
+        config: config.clone(),
+        runtime,
+    });
 
     Router::new().merge(mcp_router).merge(public_router)
 }
