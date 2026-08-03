@@ -64,10 +64,37 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Accounts that may sign in to gated apps.
+    #[command(subcommand)]
+    User(UserCommand),
+    /// Let an account reach an app whose gate is 'granted'.
+    Grant { app: String, email: String },
+    /// Take that access away again.
+    Revoke { app: String, email: String },
+    /// Decide who may reach an app.
+    Gate {
+        app: String,
+        /// public (anyone), authenticated (any account), or granted (only
+        /// accounts you have granted).
+        gate: String,
+    },
     /// Take a page down, reversibly.
     Hide { slug: String },
     /// Restore a hidden page.
     Unhide { slug: String },
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+    /// Create an account. There is no public signup, so this is how every
+    /// account comes into being.
+    Add {
+        email: String,
+        /// Read from $TOOLSITE_PASSWORD when omitted, so it stays out of
+        /// shell history.
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 fn main() {
@@ -111,6 +138,40 @@ fn run() -> Result<()> {
         Command::List { all } => {
             let text = mcp.call("list_pages", json!({ "include_all": all }))?;
             print_pages(&text);
+            Ok(())
+        }
+        Command::User(UserCommand::Add { email, password }) => {
+            let password = password
+                .or_else(|| std::env::var("TOOLSITE_PASSWORD").ok())
+                .ok_or_else(|| anyhow!("pass --password or set TOOLSITE_PASSWORD"))?;
+            println!(
+                "{}",
+                mcp.call(
+                    "create_user",
+                    json!({ "email": email, "password": password })
+                )?
+            );
+            Ok(())
+        }
+        Command::Grant { app, email } => {
+            println!(
+                "{}",
+                mcp.call("set_access", json!({ "app": app, "email": email, "allow": true }))?
+            );
+            Ok(())
+        }
+        Command::Revoke { app, email } => {
+            println!(
+                "{}",
+                mcp.call("set_access", json!({ "app": app, "email": email, "allow": false }))?
+            );
+            Ok(())
+        }
+        Command::Gate { app, gate } => {
+            println!(
+                "{}",
+                mcp.call("set_visibility", json!({ "slug": app, "gate": gate }))?
+            );
             Ok(())
         }
         Command::Hide { slug } => {

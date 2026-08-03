@@ -705,34 +705,44 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> &'h str {
 }
 
 pub async fn login_form(Query(params): Query<NextPage>) -> Response {
-    let next = crate::content::slug::escape_html(&safe_next(params.next.as_deref()));
-    Html(format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in</title>
-<style>
-  body {{ font: 16px/1.6 system-ui, sans-serif; color-scheme: light dark;
-         display: grid; place-items: center; min-height: 100vh; margin: 0; }}
-  form {{ display: flex; flex-direction: column; gap: .75rem; width: min(20rem, 90vw); }}
-  input {{ padding: .6rem .7rem; border-radius: .4rem; border: 1px solid #8884;
-          background: transparent; color: inherit; font-size: 1rem; }}
-  button {{ padding: .6rem; border-radius: .4rem; border: 0; font-size: 1rem;
-           background: #4f46e5; color: #fff; cursor: pointer; }}
-  h1 {{ font-size: 1.2rem; margin: 0 0 .5rem; }}
-</style></head>
-<body>
-<form method="post" action="/auth/login">
-  <h1>Sign in</h1>
-  <input type="hidden" name="next" value="{next}">
-  <input name="email" type="email" placeholder="Email" autocomplete="username" required autofocus>
-  <input name="password" type="password" placeholder="Password" autocomplete="current-password" required>
-  <button type="submit">Sign in</button>
-</form>
-</body></html>"#
-    ))
-    .into_response()
+    let next = safe_next(params.next.as_deref());
+    let markup = maud::html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Sign in" }
+                style { (maud::PreEscaped(LOGIN_STYLE)) }
+            }
+            body {
+                form method="post" action="/auth/login" {
+                    h1 { "Sign in" }
+                    // Escaped by the template rather than by remembering to
+                    // call something.
+                    input type="hidden" name="next" value=(next);
+                    input name="email" type="email" placeholder="Email"
+                          autocomplete="username" required autofocus;
+                    input name="password" type="password" placeholder="Password"
+                          autocomplete="current-password" required;
+                    button type="submit" { "Sign in" }
+                }
+            }
+        }
+    };
+    Html(markup.into_string()).into_response()
 }
+
+const LOGIN_STYLE: &str = r#"
+  body { font: 16px/1.6 system-ui, sans-serif; color-scheme: light dark;
+         display: grid; place-items: center; min-height: 100vh; margin: 0; }
+  form { display: flex; flex-direction: column; gap: .75rem; width: min(20rem, 90vw); }
+  input { padding: .6rem .7rem; border-radius: .4rem; border: 1px solid #8884;
+          background: transparent; color: inherit; font-size: 1rem; }
+  button { padding: .6rem; border-radius: .4rem; border: 0; font-size: 1rem;
+           background: #4f46e5; color: #fff; cursor: pointer; }
+  h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
+"#;
 
 #[derive(serde::Deserialize)]
 pub struct Credentials {

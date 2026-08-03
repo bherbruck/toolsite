@@ -38,6 +38,9 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
 | `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
 | `toolsite list [--all]` | What is published, newest first. |
 | `toolsite hide <slug>` / `unhide` | Reversible takedown. |
+| `toolsite user add <email> [--password p]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
+| `toolsite gate <app> <public\|authenticated\|granted>` | Decide who may reach an app. |
+| `toolsite grant <app> <email>` / `revoke` | Access for a `granted` app. |
 
 `deploy` warns when `index.html` references `/assets/…` from the domain root,
 which is the mistake that ships a blank page while looking like a success.
@@ -175,6 +178,42 @@ Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
 wall-clock deadline. A handler that loops forever is killed and returns 500;
 the server keeps serving. Because instances are never reused, state must live
 in the database.
+
+## Accounts
+
+Visitors are separate from publishing: `BEARER_TOKEN` says who may deploy, an
+account says who may look. There is no public signup — every account is
+created by the owner, so there is nothing to abuse.
+
+```
+toolsite user add someone@example.com --password '…'
+toolsite gate reports granted
+toolsite grant reports someone@example.com
+```
+
+An app's gate is one of:
+
+| Gate | Who gets in |
+|---|---|
+| `public` (default) | anyone |
+| `authenticated` | any signed-in account |
+| `granted` | only accounts granted access to that app |
+
+A gate covers the app's handler and its assets, not just its pages. Signing in
+happens at `/auth/login`; a handler sees the visitor through
+`identity.current-user` and cannot forge it.
+
+Sessions come in two tiers. The site session proves who someone is; an app
+session, in a cookie scoped to `/p/<app>/`, is the only thing that satisfies a
+gate. `/auth/handoff` mints the second from the first, and refuses to do so
+for anything the browser reports as a background fetch.
+
+**Scope note.** Every app shares one origin, so cookie `Path` decides which
+requests carry a session, not which page asked. That contains accidents
+between apps but does not stop a deliberate one: a script can navigate the
+visitor through the handoff and then use the resulting cookie. This is a fine
+trade when every app is one you deployed, and it is the reason to reach for a
+subdomain per app if that ever stops being true.
 
 ## The index
 

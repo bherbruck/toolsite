@@ -992,3 +992,18 @@ async fn the_app_root_without_a_slash_does_not_loop() {
         "the handoff would return to a path the cookie is not sent to"
     );
 }
+
+#[tokio::test]
+async fn the_login_form_cannot_be_used_to_inject_markup() {
+    let (_dir, config) = server();
+    // ?next= is attacker-controlled and lands in a value attribute.
+    let (status, body, _) = send(
+        &config,
+        // Percent-encoded so it is a legal URI; axum hands the handler the
+        // raw characters, which is the point.
+        get("/auth/login?next=%2Fp%2Fx%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("<script>alert(1)</script>"), "markup was injected");
+}
