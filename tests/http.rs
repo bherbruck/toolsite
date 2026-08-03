@@ -1236,3 +1236,98 @@ async fn an_admin_cannot_disable_itself_and_lock_everyone_out() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(send(&config, get_as("/admin", &boss)).await.0, StatusCode::OK);
 }
+
+// --- invitations --------------------------------------------------------
+
+#[tokio::test]
+async fn an_invited_account_sets_its_own_password_and_is_signed_in() {
+    let (_dir, config) = server();
+    let (_, token) =
+        toolsite::accounts::users::invite(&config, "new@example.com", false).unwrap();
+
+    // The form names who it is for, so the person knows what they are joining.
+    let (status, body, _) = send(&config, get(&format!("/auth/setup?token={token}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("new@example.com"));
+
+    let (status, _, headers) = send(
+        &config,
+        Request::builder()
+            .method("POST")
+            .uri("/auth/setup")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "token={token}&password=correct+horse+battery"
+            )))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Signed in already: they just proved they hold the link and chose the
+    // password, so asking for it again would be theatre.
+    let cookie = headers.iter().find(|(k, _)| k == "set-cookie").unwrap();
+    let session = cookie.1.split(';').next().unwrap().trim_start_matches("ts_session=");
+    let (status, me, _) = send(&config, get_as("/auth/me", session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(me.contains("new@example.com"));
+
+    // And the password works from the front door too.
+    assert!(
+        toolsite::accounts::users::log_in(&config, "new@example.com", "correct horse battery")
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn an_invitation_works_exactly_once() {
+    let (_dir, config) = server();
+    let (_, token) =
+        toolsite::accounts::users::invite(&config, "new@example.com", false).unwrap();
+
+    let accept = |password: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/auth/setup")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("token={token}&password={password}")))
+            .unwrap()
+    };
+
+    assert_eq!(send(&config, accept("correct+horse+battery")).await.0, StatusCode::SEE_OTHER);
+    // A second use must not let anyone reset the password out from under them.
+    assert_eq!(send(&config, accept("someone+elses+choice")).await.0, StatusCode::BAD_REQUEST);
+    assert!(
+        toolsite::accounts::users::log_in(&config, "new@example.com", "correct horse battery")
+            .is_ok(),
+        "the password was changed by a replayed link"
+    );
+}
+
+#[tokio::test]
+async fn an_account_awaiting_its_password_cannot_sign_in() {
+    let (_dir, config) = server();
+    toolsite::accounts::users::invite(&config, "new@example.com", false).unwrap();
+
+    // No password is set yet, so nothing should get past the login form.
+    for attempt in ["", "correct horse battery", "anything"] {
+        assert!(
+            toolsite::accounts::users::log_in(&config, "new@example.com", attempt).is_err(),
+            "signed in with {attempt:?} before a password existed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_made_up_or_expired_invitation_is_refused() {
+    let (_dir, config) = server();
+    let (status, ..) = send(&config, get("/auth/setup?token=not-a-real-invitation")).await;
+    assert_eq!(status, StatusCode::GONE);
+
+    let (_, token) =
+        toolsite::accounts::users::invite(&config, "new@example.com", false).unwrap();
+    // Re-inviting replaces the outstanding link, so the first one dies.
+    toolsite::accounts::users::reinvite(&config, "new@example.com").unwrap();
+    let (status, ..) = send(&config, get(&format!("/auth/setup?token={token}"))).await;
+    assert_eq!(status, StatusCode::GONE, "a replaced link still worked");
+}

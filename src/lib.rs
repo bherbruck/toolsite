@@ -88,6 +88,10 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/auth/login", get(users::login_form).post(users::login_submit))
         .route("/auth/logout", post(users::logout).get(users::logout))
         .route("/auth/me", get(users::me))
+        .route(
+            "/auth/setup",
+            get(users::setup_form).post(users::setup_submit),
+        )
         .route("/admin", get(admin::page))
         .route("/admin/users", post(admin::add_account))
         .route("/admin/access", post(admin::change_access))

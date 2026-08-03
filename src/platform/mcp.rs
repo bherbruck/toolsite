@@ -106,8 +106,10 @@ pub(crate) struct PullAppRequest {
 pub(crate) struct CreateUserRequest {
     #[schemars(description = "Email address, which is the account's identity across every app on this site.")]
     pub(crate) email: String,
-    #[schemars(description = "Initial password, at least 8 characters. Stored hashed with argon2.")]
-    pub(crate) password: String,
+    #[schemars(
+        description = "Optional. Leave it out and the reply carries a one-time link the person opens to choose their own password, which is usually what you want — nobody else ever handles it."
+    )]
+    pub(crate) password: Option<String>,
     #[schemars(
         description = "Make this account an admin, able to see every account and change any app's access at /admin. Defaults to false."
     )]
@@ -375,23 +377,36 @@ impl PageHost {
     ) -> Result<CallToolResult, McpError> {
         let config = self.config.clone();
         let outcome =
-            tokio::task::spawn_blocking(move || {
-                crate::accounts::users::sign_up_as(
+            tokio::task::spawn_blocking(move || match password {
+                Some(password) => crate::accounts::users::sign_up_as(
                     &config,
                     &email,
                     &password,
                     admin.unwrap_or(false),
                 )
+                .map(|user| (user, None)),
+                None => crate::accounts::users::invite(&config, &email, admin.unwrap_or(false))
+                    .map(|(user, token)| {
+                        let url = crate::accounts::users::invite_url(&config, &token);
+                        (user, Some(url))
+                    }),
             })
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match outcome {
-            Ok(user) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "created {}{} ({})",
-                user.email,
-                if user.is_admin { " as an admin" } else { "" },
-                user.id
-            ))])),
+            Ok((user, invite)) => {
+                let admin = if user.is_admin { " as an admin" } else { "" };
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    match invite {
+                        Some(url) => format!(
+                            "created {}{}. Send them this link to choose a password \
+                             (good for 48 hours, works once):\n{url}",
+                            user.email, admin
+                        ),
+                        None => format!("created {}{} ({})", user.email, admin, user.id),
+                    },
+                )]))
+            }
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }
     }

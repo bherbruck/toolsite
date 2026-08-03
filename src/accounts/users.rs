@@ -1006,3 +1006,220 @@ pub fn derive_form_token(config: &Config, user_id: &str) -> String {
     let secret = config.valid_tokens.first().map(String::as_str).unwrap_or("");
     URL_SAFE_NO_PAD.encode(Sha256::digest(format!("form:{secret}:{user_id}").as_bytes()))
 }
+
+// --- invitations --------------------------------------------------------
+
+/// Long enough to reach someone by whatever channel, short enough that a
+/// forgotten link is not a standing way in.
+const INVITE_LIFETIME: Duration = Duration::from_secs(60 * 60 * 48);
+
+/// Creates an account nobody can sign in to yet, and a one-time link for
+/// setting its password. The password never passes through whoever is doing
+/// the inviting — not their shell history, not their clipboard.
+pub fn invite(config: &Config, email: &str, is_admin: bool) -> Result<(User, String), String> {
+    let email = normalise(email);
+    if !email.contains('@') || email.len() < 3 {
+        return Err("that does not look like an email address".into());
+    }
+
+    let conn = open(config)?;
+    let id = crate::content::slug::random_token(16);
+    conn.execute(
+        "insert into users (id, email, password_hash, created_at, is_admin)
+         values (?, ?, null, ?, ?)",
+        rusqlite::params![&id, &email, now() as i64, is_admin as i64],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE") {
+            "that email is already registered".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+
+    let token = new_invite(&conn, &id)?;
+    Ok((
+        User {
+            id,
+            email,
+            is_admin,
+        },
+        token,
+    ))
+}
+
+/// Issues a fresh invitation for an existing account, replacing any
+/// outstanding one so an old link stops working.
+pub fn reinvite(config: &Config, email: &str) -> Result<String, String> {
+    let conn = open(config)?;
+    let email = normalise(email);
+    let id: String = conn
+        .query_row("select id from users where email = ?", [&email], |row| {
+            row.get(0)
+        })
+        .map_err(|_| format!("no account for {email}"))?;
+    new_invite(&conn, &id)
+}
+
+fn new_invite(conn: &Connection, user_id: &str) -> Result<String, String> {
+    conn.execute("delete from invites where user_id = ?", [user_id])
+        .map_err(|e| e.to_string())?;
+    let token = crate::content::slug::random_token(48);
+    conn.execute(
+        "insert into invites (token_hash, user_id, expires_at) values (?, ?, ?)",
+        rusqlite::params![
+            hash_token(&token),
+            user_id,
+            (now() + INVITE_LIFETIME.as_secs()) as i64
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(token)
+}
+
+/// Who an invitation is for, without spending it.
+pub fn invited_account(config: &Config, token: &str) -> Option<User> {
+    let conn = open(config).ok()?;
+    conn.query_row(
+        "select users.id, users.email, users.is_admin
+           from invites join users on users.id = invites.user_id
+          where invites.token_hash = ? and invites.expires_at >= ?
+            and users.disabled_at is null",
+        rusqlite::params![hash_token(token), now() as i64],
+        |row| {
+            Ok(User {
+                id: row.get(0)?,
+                email: row.get(1)?,
+                is_admin: row.get::<_, i64>(2)? != 0,
+            })
+        },
+    )
+    .ok()
+}
+
+/// Spends an invitation: sets the password and signs the person in. The
+/// invitation is consumed whether or not anything else follows, so a link
+/// works exactly once.
+pub fn accept_invite(
+    config: &Config,
+    token: &str,
+    password: &str,
+) -> Result<(User, String), String> {
+    let user = invited_account(config, token).ok_or("this link is no longer valid")?;
+    if password.chars().count() < 8 {
+        return Err("password must be at least 8 characters".into());
+    }
+
+    let salt = new_salt()?;
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| e.to_string())?
+        .to_string();
+
+    let conn = open(config)?;
+    conn.execute(
+        "update users set password_hash = ? where id = ?",
+        rusqlite::params![&hash, &user.id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute("delete from invites where token_hash = ?", [hash_token(token)])
+        .map_err(|e| e.to_string())?;
+
+    let session = crate::content::slug::random_token(48);
+    conn.execute(
+        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, null)",
+        rusqlite::params![
+            hash_token(&session),
+            &user.id,
+            (now() + SESSION_LIFETIME.as_secs()) as i64
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok((user, session))
+}
+
+/// Where to send someone to finish setting up. Absolute when the deployment
+/// knows its own address, since this is meant to be pasted into a message.
+pub fn invite_url(config: &Config, token: &str) -> String {
+    let base = config.base_url.as_deref().unwrap_or(&config.local_base);
+    format!("{base}/auth/setup?token={token}")
+}
+
+#[derive(serde::Deserialize)]
+pub struct InviteToken {
+    token: String,
+}
+
+pub async fn setup_form(
+    State(config): State<Arc<Config>>,
+    Query(params): Query<InviteToken>,
+) -> Response {
+    let token = params.token.clone();
+    let config2 = config.clone();
+    let account =
+        tokio::task::spawn_blocking(move || invited_account(&config2, &token))
+            .await
+            .ok()
+            .flatten();
+
+    let Some(account) = account else {
+        return (
+            StatusCode::GONE,
+            "this link has expired or has already been used",
+        )
+            .into_response();
+    };
+
+    let markup = maud::html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Choose a password" }
+                style { (maud::PreEscaped(LOGIN_STYLE)) }
+            }
+            body {
+                form method="post" action="/auth/setup" {
+                    h1 { "Choose a password" }
+                    p."muted" { (account.email) }
+                    input type="hidden" name="token" value=(params.token);
+                    input name="password" type="password" placeholder="Password (8+)"
+                          autocomplete="new-password" required autofocus;
+                    button type="submit" { "Set password and sign in" }
+                }
+            }
+        }
+    };
+    Html(markup.into_string()).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct NewPassword {
+    token: String,
+    password: String,
+}
+
+pub async fn setup_submit(
+    State(config): State<Arc<Config>>,
+    Form(form): Form<NewPassword>,
+) -> Response {
+    let config2 = config.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        accept_invite(&config2, &form.token, &form.password)
+    })
+    .await;
+
+    match outcome {
+        // Signed in on the spot: having just proved they hold the link and
+        // chosen the password, asking them to type it again is theatre.
+        Ok(Ok((user, session))) => (
+            [(header::SET_COOKIE, set_cookie_header(&session))],
+            Redirect::to(if user.is_admin { "/admin" } else { "/" }),
+        )
+            .into_response(),
+        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not set the password").into_response(),
+    }
+}

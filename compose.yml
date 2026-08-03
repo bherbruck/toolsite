@@ -17,20 +17,20 @@ services:
       - "${PORT:-8080}:8080"
 
     environment:
-      - DATA_DIR=/data
+      - TOOLSITE_DATA_DIR=/data
       - PORT=8080
       # At least one auth mode is required, or the server refuses to start.
-      - BEARER_TOKEN=${BEARER_TOKEN:?set BEARER_TOKEN in .env}
+      - TOOLSITE_TOKEN=${TOOLSITE_TOKEN:?set TOOLSITE_TOKEN in .env}
       # OAuth is for clients that cannot send a bearer token, such as
       # claude.ai connectors. Set both together or leave them empty; empty
       # values are treated as unset.
-      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
-      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET:-}
+      - TOOLSITE_OAUTH_CLIENT_ID=${TOOLSITE_OAUTH_CLIENT_ID:-}
+      - TOOLSITE_OAUTH_CLIENT_SECRET=${TOOLSITE_OAUTH_CLIENT_SECRET:-}
       # Required once OAuth is set, since discovery metadata needs absolute
       # URLs. A bare host gets https:// prepended.
-      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - TOOLSITE_BASE_URL=${TOOLSITE_BASE_URL:-}
       # Per-app SQLite, which handlers reach through db.query.
-      - DATABASES=${DATABASES:-on}
+      - TOOLSITE_DATABASES=${TOOLSITE_DATABASES:-on}
       - RUST_LOG=${RUST_LOG:-info}
 
     volumes:

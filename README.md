@@ -186,12 +186,32 @@ Visitors are separate from publishing: `BEARER_TOKEN` says who may deploy, an
 account says who may look. There is no public signup — every account is
 created by the owner, so there is nothing to abuse.
 
+From a shell on the machine itself — no token, no network, which is how the
+first account gets created:
+
 ```
-toolsite user add boss@example.com --password '…' --admin   # the first admin
-toolsite user add someone@example.com --password '…'
+toolsite user add you@example.com --admin
+  created you@example.com as an admin
+
+  Open this to choose a password (48 hours, one use):
+  https://yourdomain.com/auth/setup?token=…
+
+toolsite user list
+toolsite user invite someone@example.com     # a fresh link
+toolsite user disable someone@example.com
+```
+
+Or remotely, with the CLI against a running server:
+
+```
+toolsite user add someone@example.com        # prints the same link
 toolsite gate reports granted
 toolsite grant reports someone@example.com
 ```
+
+A password is never typed by whoever does the inviting: the account is created
+without one, and the link is the only way to set it. `--password` exists for
+scripts, at the cost of putting it in shell history.
 
 An admin account can do all of that from `/admin` instead: list accounts, add
 one, disable or re-enable it, set any app's gate, and grant or revoke access.
@@ -266,13 +286,18 @@ Two independent modes — use either, or both at once. At least one is required.
 
 | Variable | Required | Description |
 |---|---|---|
-| `BEARER_TOKEN` | if not using OAuth | Static token for `/mcp`. Also read from `MCP_TOKEN`, its former name, with a warning at boot. |
-| `OAUTH_CLIENT_ID` | if using OAuth | Paste into the client's "OAuth Client ID" field. |
-| `OAUTH_CLIENT_SECRET` | if using OAuth | Paste into the client's "OAuth Client Secret" field. |
-| `PUBLIC_BASE_URL` | if using OAuth | Base URL of the deployment, e.g. `https://host.com`. A bare host gets `https://` prepended. Without it, published URLs come back relative. |
-| `DATA_DIR` | no (default `/data`) | Where pages are stored. |
-| `PORT` | no (default `8080`) | Port to listen on. |
-| `RUST_LOG` | no (default `info`) | Log filter. |
+| `TOOLSITE_TOKEN` | if not using OAuth | Static token for `/mcp`. |
+| `TOOLSITE_OAUTH_CLIENT_ID` | if using OAuth | Paste into the client's "OAuth Client ID" field. |
+| `TOOLSITE_OAUTH_CLIENT_SECRET` | if using OAuth | Paste into the client's "OAuth Client Secret" field. |
+| `TOOLSITE_BASE_URL` | if using OAuth | Base URL of the deployment, e.g. `https://host.com`. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
+| `TOOLSITE_DATA_DIR` | no (default `/data`) | Where pages are stored. |
+| `TOOLSITE_DATABASES` | no (default off) | `on` gives each app a SQLite database. |
+| `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
+| `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
+
+Every `TOOLSITE_`-prefixed name above also answers to its old unprefixed form
+(`BEARER_TOKEN`, `OAUTH_CLIENT_ID`, `PUBLIC_BASE_URL`, `DATA_DIR`,
+`DATABASES`), plus `MCP_TOKEN`, so an existing deployment needs no changes.
 
 Boot logs the effective configuration, so a misconfigured deploy is visible
 without a client to test against:

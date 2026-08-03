@@ -22,6 +22,12 @@ CREATE TABLE identities (
     user_id     text not null references users(id),
     primary key (provider, provider_id)
 )
+CREATE TABLE invites (
+    token_hash text primary key,
+    user_id    text not null references users(id),
+    expires_at integer not null
+)
+CREATE INDEX invites_by_user on invites(user_id)
 CREATE TABLE sessions (
     token_hash text primary key,
     user_id    text not null references users(id),
