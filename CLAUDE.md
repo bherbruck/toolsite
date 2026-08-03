@@ -57,6 +57,13 @@ types.
 - Anything that rejects a request should log why, at `warn`, including the
   headers that arrived — but never a token, and never file contents.
 
+## Transports
+
+The same `PageHost` serves two ways: HTTP (`POST /mcp`, token or OAuth) and
+stdio (`--stdio`, for local clients). In stdio mode stdout is the protocol
+channel, so logging must go to stderr — anything printed to stdout corrupts
+the stream.
+
 ## Testing
 
 `cargo test`. The crate is split so this is possible: `lib.rs` owns

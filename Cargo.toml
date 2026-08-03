@@ -10,7 +10,7 @@ base64 = "0.22.1"
 dotenvy = "0.15.7"
 flate2 = "1.1.9"
 rand = "0.10.2"
-rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io", "schemars"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits"] }
 schemars = "1.2.1"
 serde = { version = "1.0.229", features = ["derive"] }

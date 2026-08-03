@@ -113,7 +113,7 @@ pub(crate) struct RunSqlRequest {
 }
 
 #[derive(Clone)]
-pub(crate) struct PageHost {
+pub struct PageHost {
     pub(crate) config: Arc<Config>,
     #[allow(dead_code)]
     pub(crate) tool_router: ToolRouter<PageHost>,
@@ -121,7 +121,7 @@ pub(crate) struct PageHost {
 
 #[tool_router]
 impl PageHost {
-    pub(crate) fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
         Self {
             config,
             tool_router: Self::tool_router(),

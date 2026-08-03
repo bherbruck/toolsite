@@ -56,6 +56,25 @@ suffix.** Responses are SSE-framed, but the path is still `/mcp`.
   to `claude.ai`, so use `BEARER_TOKEN`.
 - **Claude Code** — add it as a remote MCP server with a bearer token.
 
+### Locally, over stdio
+
+`toolsite --stdio` (or `MCP_STDIO=1`) speaks MCP on stdin/stdout instead of
+requiring a network round trip, which is how a local client like Claude Code
+can use it with no token and no OAuth:
+
+```json
+{ "mcpServers": { "toolsite": {
+    "command": "/path/to/toolsite",
+    "args": ["--stdio"],
+    "env": { "DATA_DIR": "/path/to/data", "DATABASES": "on" }
+} } }
+```
+
+The web server keeps running alongside, so uploads still have somewhere to go
+and pages are viewable at `http://localhost:8080`. No token is needed in this
+mode — the client already owns the process — but HTTP `/mcp` still refuses
+everything without one. Logs go to stderr, since stdout is the protocol.
+
 `GET /mcp` on its own returns `400 Session ID is required`. That's normal for
 Streamable HTTP — the session is issued by `initialize`.
 

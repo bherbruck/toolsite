@@ -27,9 +27,10 @@ write file  ->  create_upload  ->  curl -fT
 ```
 
 The bytes go from disk to the server without passing through the model. A 40 KB
-page pasted into a tool call costs ~10k tokens and buys nothing. `create_upload`
+page pasted into a tool call costs ~10k tokens and buys nothing — `create_upload`
 exists precisely so that never has to happen. `push_page` / `push_app` are the
-fallback for clients with no shell, not a shortcut.
+fallback for clients with no shell, not a shortcut. Don't read a published page
+back into the conversation either; `curl` it to a file and edit that.
 
 ## The CLI (preferred when installed)
 
@@ -71,10 +72,8 @@ What `deploy` decides for you:
 
 After uploading it GETs the page, fails if that isn't a success, and warns if
 `index.html` still references `/assets/…` from the domain root — the blank-page
-failure below.
-
-If the CLI isn't installed and you can't install it, use the MCP tools plus
-`curl` as described next. Both paths hit the same endpoints.
+failure below. Without the CLI, use the MCP tools plus `curl`; both paths hit
+the same endpoints.
 
 ## The manual path
 
@@ -184,12 +183,9 @@ or statics.**
 
 ### Minimal Rust handler
 
-`toolsite init <name> --handler` scaffolds this whole crate. Build it by hand
-when you don't have the CLI: a standalone `cdylib` crate depending on
-`wit-bindgen`, with `wit/toolsite.wit` copied in beside `src/`. Full `Cargo.toml`
-in [reference.md](reference.md).
-
-`src/lib.rs`:
+`toolsite init <name> --handler` scaffolds this crate. By hand: a standalone
+`cdylib` crate depending on `wit-bindgen`, with `wit/toolsite.wit` copied in
+beside `src/`. Full `Cargo.toml` in [reference.md](reference.md). `src/lib.rs`:
 
 ```rust
 wit_bindgen::generate!({

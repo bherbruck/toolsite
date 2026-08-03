@@ -4,21 +4,30 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::fs;
-use toolsite::{build_router, config::Config, oauth::OAuth, wasm::Runtime};
+use rmcp::ServiceExt;
+use toolsite::{build_router, config::Config, mcp::PageHost, oauth::OAuth, wasm::Runtime};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Local dev convenience; in a container the env is set directly.
     dotenvy::dotenv().ok();
 
+    // Speaking MCP over stdio makes stdout the protocol channel, so every log
+    // line has to go to stderr or it corrupts the stream.
+    let stdio = std::env::args().any(|arg| arg == "--stdio")
+        || std::env::var("MCP_STDIO").is_ok_and(|v| v != "0");
+
     // Without this the default filter drops everything, so a deployed instance
     // looks silent even while it's rejecting requests.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    if stdio {
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
 
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     fs::create_dir_all(&data_dir).await?;
@@ -39,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
         _ => panic!("set both OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET together, or neither"),
     };
 
-    if bearer_token.is_none() && oauth.is_none() {
+    // Over stdio the client already owns the process, so there is nothing for
+    // a token to protect; HTTP still refuses everything without one.
+    if !stdio && bearer_token.is_none() && oauth.is_none() {
         panic!("set BEARER_TOKEN, or OAUTH_CLIENT_ID + OAUTH_CLIENT_SECRET (or both)");
     }
 
@@ -99,10 +110,27 @@ async fn main() -> anyhow::Result<()> {
         uploads: Mutex::new(HashMap::new()),
     });
 
-    let app = build_router(config, Runtime::new()?);
+    let app = build_router(config.clone(), Runtime::new()?);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
-    axum::serve(listener, app).await?;
+
+    if !stdio {
+        axum::serve(listener, app).await?;
+        return Ok(());
+    }
+
+    // The web server keeps running alongside: an agent talks MCP over stdio
+    // but still needs somewhere to curl uploads to, and somewhere to view the
+    // published page.
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!(%error, "web server stopped");
+        }
+    });
+
+    tracing::info!("serving MCP on stdio");
+    let service = PageHost::new(config).serve(rmcp::transport::stdio()).await?;
+    service.waiting().await?;
     Ok(())
 }
