@@ -442,12 +442,50 @@ fn sign_in(config: &Arc<Config>, email: &str, password: &str) -> String {
     token
 }
 
+/// A request carrying the site session cookie, which the browser sends to
+/// every path on the origin.
 fn get_as(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
         .header("cookie", format!("ts_session={token}"))
         .body(Body::empty())
         .unwrap()
+}
+
+/// A request carrying one app's session cookie. The browser would only attach
+/// this under `/p/<app>/`; the tests attach it by hand so they can also ask
+/// what happens when it turns up somewhere it should not.
+fn get_as_app(uri: &str, app: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("cookie", format!("ts_app_{app}={token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Walks a signed-in visitor through the handoff and returns the app session
+/// token the browser would have stored, plus the Set-Cookie it came in.
+async fn hand_off(config: &Arc<Config>, site_token: &str, app: &str) -> (String, String) {
+    let request = Request::builder()
+        .uri(format!("/auth/handoff?app={app}&next=/p/{app}/"))
+        .header("cookie", format!("ts_session={site_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, headers) = send(config, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "handoff did not redirect");
+    let cookie = headers
+        .iter()
+        .find(|(k, _)| k == "set-cookie")
+        .expect("handoff set no cookie")
+        .1
+        .clone();
+    let token = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .trim_start_matches(&format!("ts_app_{app}="))
+        .to_string();
+    (token, cookie)
 }
 
 fn gate(config: &Config, app: &str, gate: &str) {
@@ -480,8 +518,16 @@ async fn an_authenticated_gate_sends_a_visitor_to_sign_in() {
     assert!(location.1.starts_with("/auth/login?next="), "{}", location.1);
 
     account(&config, "someone@example.com", "correct horse battery");
-    let token = sign_in(&config, "someone@example.com", "correct horse battery");
-    let (status, body, _) = send(&config, get_as("/p/members/", &token)).await;
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+    // Signing in is not itself entry: the visitor is sent to collect a
+    // credential for this app first.
+    let (status, _, headers) = send(&config, get_as("/p/members/", &site)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+    assert!(location.1.starts_with("/auth/handoff?app=members"), "{}", location.1);
+
+    let (app_token, _) = hand_off(&config, &site, "members").await;
+    let (status, body, _) = send(&config, get_as_app("/p/members/", "members", &app_token)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("members"));
 }
@@ -494,13 +540,19 @@ async fn a_granted_gate_needs_that_specific_grant() {
     account(&config, "allowed@example.com", "correct horse battery");
     account(&config, "outsider@example.com", "correct horse battery");
 
+    // A stranger is refused outright rather than sent round the handoff: the
+    // site session would not satisfy this gate either.
     let outsider = sign_in(&config, "outsider@example.com", "correct horse battery");
     let (status, ..) = send(&config, get_as("/p/private/", &outsider)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a signed-in stranger got in");
+    let (outsider_app, _) = hand_off(&config, &outsider, "private").await;
+    let (status, ..) = send(&config, get_as_app("/p/private/", "private", &outsider_app)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the handoff granted the app itself");
 
     toolsite::accounts::users::grant(&config, "allowed@example.com", "private", "viewer").unwrap();
     let allowed = sign_in(&config, "allowed@example.com", "correct horse battery");
-    let (status, ..) = send(&config, get_as("/p/private/", &allowed)).await;
+    let (allowed_app, _) = hand_off(&config, &allowed, "private").await;
+    let (status, ..) = send(&config, get_as_app("/p/private/", "private", &allowed_app)).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -529,8 +581,15 @@ async fn a_handler_learns_who_is_signed_in() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     account(&config, "someone@example.com", "correct horse battery");
-    let token = sign_in(&config, "someone@example.com", "correct horse battery");
-    let (status, body, _) = send(&config, get_as("/p/app/api/whoami", &token)).await;
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+    // Being signed in to the site tells this app nothing — identity reaches a
+    // guest through the app's own session, or not at all.
+    let (status, ..) = send(&config, get_as("/p/app/api/whoami", &site)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the site cookie leaked into a guest");
+
+    let (app_token, _) = hand_off(&config, &site, "app").await;
+    let (status, body, _) =
+        send(&config, get_as_app("/p/app/api/whoami", "app", &app_token)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.ends_with(":someone@example.com"), "got {body}");
 }
@@ -546,6 +605,13 @@ async fn an_invented_cookie_buys_nothing() {
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     let (status, ..) = send(&config, get_as("/p/app/api/whoami", "forged-token")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Nor does inventing the app-scoped one, which is the cookie that counts.
+    let (status, ..) = send(&config, get_as_app("/p/members/", "members", "forged-token")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, ..) = send(&config, get_as_app("/p/app/api/whoami", "app", "forged")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -655,4 +721,274 @@ async fn a_hostile_icon_cannot_break_out_of_its_attribute() {
 
     let (_, body, _) = send(&config, get("/")).await;
     assert!(!body.contains(r#"onerror="alert(1)"#), "attribute was broken out of");
+}
+
+// --- one origin, many apps ----------------------------------------------
+//
+// Every app is served from the same host, so the browser is no help: it will
+// hand any cookie it holds to whichever app asks for the path. Isolation is
+// the cookie's `Path`, and these tests are what says so.
+
+#[tokio::test]
+async fn a_site_session_alone_opens_no_app() {
+    let (_dir, config) = server();
+    publish_handler(&config, "members");
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    // The page: not served, only an offer to go and earn a credential.
+    let (status, body, headers) = send(&config, get_as("/p/members/", &site)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "the site cookie opened the page");
+    assert!(!body.contains("members</h1>"));
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+    assert!(location.1.starts_with("/auth/handoff?app=members"), "{}", location.1);
+
+    // The API: refused with a status, never redirected into a sign-in page,
+    // and never quietly upgraded to an app session on a script's say-so.
+    let (status, _, headers) = send(&config, get_as("/p/members/api/echo", &site)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the site cookie opened the API");
+    assert!(headers.iter().all(|(k, _)| k != "set-cookie"), "the API minted a session");
+}
+
+#[tokio::test]
+async fn the_handoff_admits_the_visitor_the_site_session_names() {
+    let (_dir, config) = server();
+    publish_handler(&config, "members");
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    let (app_token, _) = hand_off(&config, &site, "members").await;
+
+    let (status, body, _) = send(&config, get_as_app("/p/members/", "members", &app_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("members"));
+
+    // And the app learns who it is talking to.
+    let (status, body, _) =
+        send(&config, get_as_app("/p/members/api/whoami", "members", &app_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.ends_with(":someone@example.com"), "got {body}");
+}
+
+#[tokio::test]
+async fn the_handoff_cookie_is_confined_to_one_apps_path() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    let (_, cookie) = hand_off(&config, &site, "members").await;
+
+    // The Path is the isolation: the browser will not send this cookie to
+    // /p/anything-else/, so no other app can spend it.
+    assert!(cookie.contains("Path=/p/members/"), "{cookie}");
+    assert!(cookie.starts_with("ts_app_members="), "{cookie}");
+    assert!(cookie.contains("HttpOnly"), "{cookie}");
+    assert!(cookie.contains("Secure"), "{cookie}");
+    assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+}
+
+/// The vulnerability itself: one origin, so the only thing standing between
+/// app A and the visitor's standing with app B is that the token is scoped.
+#[tokio::test]
+async fn one_apps_session_is_worthless_against_another_app() {
+    let (_dir, config) = server();
+    for app in ["alpha", "beta"] {
+        publish_handler(&config, app);
+        write_page(&config, &format!("{app}/index"), &format!("<h1>{app}</h1>"));
+        gate(&config, app, "authenticated");
+    }
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (alpha, _) = hand_off(&config, &site, "alpha").await;
+
+    // Alpha's own app works.
+    let (status, ..) = send(&config, get_as_app("/p/alpha/", "alpha", &alpha)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Alpha's token, presented for beta under beta's own cookie name, buys
+    // nothing — a scope is checked, not just a cookie's presence.
+    let (status, ..) = send(&config, get_as_app("/p/beta/", "beta", &alpha)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "alpha's session opened beta");
+    let (status, ..) = send(&config, get_as_app("/p/beta/api/whoami", "beta", &alpha)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "alpha's session reached beta's API");
+
+    // And the cookie alpha's script actually holds is not beta's to begin
+    // with, so beta sees an anonymous stranger.
+    let request = Request::builder()
+        .uri("/p/beta/api/whoami")
+        .header("cookie", format!("ts_app_alpha={alpha}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, ..) = send(&config, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "beta honoured alpha's cookie");
+}
+
+/// A scoped cookie must not outlive the sign-out that ended the session it
+/// came from — the browser will not send it to /auth/logout to be cleared, so
+/// the server has to be the one that kills it.
+#[tokio::test]
+async fn signing_out_ends_the_app_sessions_too() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (app_token, _) = hand_off(&config, &site, "members").await;
+
+    let (status, ..) = send(&config, get_as_app("/p/members/", "members", &app_token)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let logout = Request::builder()
+        .method("POST")
+        .uri("/auth/logout")
+        .header("cookie", format!("ts_session={site}"))
+        .body(Body::empty())
+        .unwrap();
+    send(&config, logout).await;
+
+    let (status, ..) = send(&config, get_as_app("/p/members/", "members", &app_token)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "an app session survived sign-out");
+}
+
+#[tokio::test]
+async fn a_public_app_serves_with_no_cookies_at_all() {
+    let (_dir, config) = server();
+    publish_handler(&config, "open");
+    write_page(&config, "open/index", "<h1>open</h1>");
+
+    let (status, body, _) = send(&config, get("/p/open/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("open"));
+    let (status, body, _) = send(&config, get("/p/open/api/echo")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Nobody is signed in, so the guest is told nobody is.
+    let (status, ..) = send(&config, get("/p/open/api/whoami")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A visitor who has been through the handoff still gets identity, even
+    // though this app never required it.
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (app_token, _) = hand_off(&config, &site, "open").await;
+    let (status, body, _) = send(&config, get_as_app("/p/open/api/whoami", "open", &app_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.ends_with(":someone@example.com"), "got {body}");
+}
+
+#[tokio::test]
+async fn the_handoff_refuses_an_app_name_that_is_not_one() {
+    let (_dir, config) = server();
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    for hostile in ["../etc/passwd", "a%2Fb", ".site", "with%20space", ""] {
+        let request = Request::builder()
+            .uri(format!("/auth/handoff?app={hostile}&next=/"))
+            .header("cookie", format!("ts_session={site}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, headers) = send(&config, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "minted a session for {hostile:?}");
+        assert!(
+            headers.iter().all(|(k, _)| k != "set-cookie"),
+            "set a cookie for {hostile:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_handoff_cannot_bounce_a_visitor_off_site() {
+    let (_dir, config) = server();
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    for hostile in ["https://evil.example.com/", "//evil.example.com/"] {
+        let request = Request::builder()
+            .uri(format!(
+                "/auth/handoff?app=members&next={}",
+                urlencoding::encode(hostile)
+            ))
+            .header("cookie", format!("ts_session={site}"))
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, headers) = send(&config, request).await;
+        let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+        assert_eq!(location.1, "/", "open redirect via {hostile}");
+    }
+}
+
+/// The handoff is where the two tiers meet, so it is also where a hostile app
+/// would try to mint itself a neighbour's cookie. Fetch metadata is the only
+/// thing that distinguishes the visitor navigating from a script asking on
+/// their behalf, and script cannot forge it.
+#[tokio::test]
+async fn a_script_cannot_mint_itself_a_session_for_a_neighbour() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    // What `fetch('/auth/handoff?app=members')` from another app looks like.
+    let fetched = Request::builder()
+        .uri("/auth/handoff?app=members&next=/p/members/")
+        .header("cookie", format!("ts_session={site}"))
+        .header("sec-fetch-mode", "cors")
+        .header("sec-fetch-dest", "empty")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, headers) = send(&config, fetched).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(headers.iter().all(|(k, _)| k != "set-cookie"), "a script got a cookie");
+
+    // And the gate does not send one there either, so following redirects
+    // gains nothing.
+    let fetched = Request::builder()
+        .uri("/p/members/")
+        .header("cookie", format!("ts_session={site}"))
+        .header("sec-fetch-mode", "cors")
+        .header("sec-fetch-dest", "empty")
+        .body(Body::empty())
+        .unwrap();
+    let (status, ..) = send(&config, fetched).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a background fetch was sent to the handoff");
+
+    // The same request as a navigation is the visitor, and is let through.
+    let navigated = Request::builder()
+        .uri("/p/members/")
+        .header("cookie", format!("ts_session={site}"))
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, headers) = send(&config, navigated).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+    assert!(location.1.starts_with("/auth/handoff?app=members"), "{}", location.1);
+}
+
+/// The cookie's Path ends in a slash, and a browser will not send it to the
+/// bare `/p/<app>`, so the gate has to send the visitor somewhere the cookie
+/// will actually come back — or the two bounce off each other forever.
+#[tokio::test]
+async fn the_app_root_without_a_slash_does_not_loop() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    let (_, _, headers) = send(&config, get_as("/p/members", &site)).await;
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+    assert_eq!(
+        location.1, "/auth/handoff?app=members&next=%2Fp%2Fmembers%2F",
+        "the handoff would return to a path the cookie is not sent to"
+    );
 }

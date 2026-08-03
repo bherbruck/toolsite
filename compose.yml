@@ -1,0 +1,52 @@
+# Run toolsite with `docker compose up -d`.
+#
+# Values below come from .env in this directory, which compose reads for
+# substitution only — nothing reaches the container unless it is named here.
+# That is deliberate: .env sets DATA_DIR=./data and PORT=8099 for `cargo run`,
+# and neither of those is right inside a container.
+
+services:
+  toolsite:
+    build: .
+    image: toolsite
+    restart: unless-stopped
+
+    # The server always listens on 8080 inside the container; PORT only
+    # decides which host port reaches it.
+    ports:
+      - "${PORT:-8080}:8080"
+
+    environment:
+      - DATA_DIR=/data
+      - PORT=8080
+      # At least one auth mode is required, or the server refuses to start.
+      - BEARER_TOKEN=${BEARER_TOKEN:?set BEARER_TOKEN in .env}
+      # OAuth is for clients that cannot send a bearer token, such as
+      # claude.ai connectors. Set both together or leave them empty; empty
+      # values are treated as unset.
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET:-}
+      # Required once OAuth is set, since discovery metadata needs absolute
+      # URLs. A bare host gets https:// prepended.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      # Per-app SQLite, which handlers reach through db.query.
+      - DATABASES=${DATABASES:-on}
+      - RUST_LOG=${RUST_LOG:-info}
+
+    volumes:
+      # Pages, bundles, handlers, per-app databases and the account database
+      # all live here. Losing it loses every published app.
+      # Swap for `- ./data:/data` to read the files from the host.
+      - toolsite-data:/data
+
+    # The image is debian-slim with no curl or wget, so this checks the port
+    # is accepting connections rather than making an HTTP request.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  toolsite-data:

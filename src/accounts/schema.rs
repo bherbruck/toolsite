@@ -16,7 +16,10 @@ use std::sync::LazyLock;
 /// Append only. Editing a step that has already run somewhere means databases
 /// disagree about what version 1 was.
 static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
-    Migrations::new(vec![M::up(include_str!("../../migrations/001_initial.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("../../migrations/001_initial.sql")),
+        M::up(include_str!("../../migrations/002_app_sessions.sql")),
+    ])
 });
 
 /// Brings a connection's schema up to date. Cheap once it already is: the

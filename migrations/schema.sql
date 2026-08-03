@@ -26,7 +26,10 @@ CREATE TABLE sessions (
     token_hash text primary key,
     user_id    text not null references users(id),
     expires_at integer not null
-)
+-- Null for the site session that proves identity; an app slug for a session
+-- that may only speak for that one app.
+, scope text)
+CREATE INDEX sessions_by_scope on sessions(user_id, scope)
 CREATE INDEX sessions_expiry on sessions(expires_at)
 CREATE TABLE users (
     id            text primary key,
