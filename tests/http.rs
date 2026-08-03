@@ -1331,3 +1331,49 @@ async fn a_made_up_or_expired_invitation_is_refused() {
     let (status, ..) = send(&config, get(&format!("/auth/setup?token={token}"))).await;
     assert_eq!(status, StatusCode::GONE, "a replaced link still worked");
 }
+
+#[tokio::test]
+async fn public_and_gated_apps_coexist_without_leaking_into_each_other() {
+    let (_dir, config) = server();
+    write_page(&config, "openapp/index", "<!doctype html><title>Public Thing</title>");
+    write_page(&config, "members/index", "<!doctype html><title>Members Only</title>");
+    write_page(&config, "secretapp/index", "<!doctype html><title>Salary Review 2026</title>");
+    gate(&config, "members", "authenticated");
+    gate(&config, "secretapp", "granted");
+
+    account(&config, "someone@example.com", "correct horse battery");
+    toolsite::accounts::users::grant(&config, "someone@example.com", "secretapp", "viewer").unwrap();
+
+    // Anonymous: the public app only. A gated app's *title* is as sensitive
+    // as its contents, so it must not appear either.
+    let (_, index, _) = send(&config, get("/")).await;
+    assert!(index.contains("Public Thing"));
+    assert!(!index.contains("Members Only"), "an authenticated app was advertised");
+    assert!(!index.contains("Salary Review 2026"), "a granted app was advertised");
+    assert_eq!(send(&config, get("/p/openapp/")).await.0, StatusCode::OK);
+    assert_eq!(send(&config, get("/p/members/")).await.0, StatusCode::SEE_OTHER);
+
+    // Signed in: the authenticated app appears, and so does the one granted.
+    let token = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (_, index, _) = send(&config, get_as("/", &token)).await;
+    assert!(index.contains("Public Thing"));
+    assert!(index.contains("Members Only"));
+    assert!(index.contains("Salary Review 2026"));
+}
+
+#[tokio::test]
+async fn a_grant_on_one_app_does_not_reveal_another() {
+    let (_dir, config) = server();
+    write_page(&config, "mine/index", "<!doctype html><title>Mine</title>");
+    write_page(&config, "theirs/index", "<!doctype html><title>Theirs</title>");
+    gate(&config, "mine", "granted");
+    gate(&config, "theirs", "granted");
+
+    account(&config, "someone@example.com", "correct horse battery");
+    toolsite::accounts::users::grant(&config, "someone@example.com", "mine", "viewer").unwrap();
+    let token = sign_in(&config, "someone@example.com", "correct horse battery");
+
+    let (_, index, _) = send(&config, get_as("/", &token)).await;
+    assert!(index.contains("Mine"));
+    assert!(!index.contains("Theirs"), "an app they cannot open was listed");
+}

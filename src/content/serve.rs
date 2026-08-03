@@ -557,7 +557,14 @@ pub(crate) struct PageCard {
     pub(crate) modified: Option<SystemTime>,
 }
 
-pub(crate) async fn index(State(config): State<Arc<Config>>) -> impl IntoResponse {
+pub(crate) async fn index(
+    State(config): State<Arc<Config>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Listing an app the viewer cannot open would leak its name and title,
+    // and a title is exactly the sort of thing worth gating — "Salary Review
+    // 2026" says plenty on its own.
+    let viewer = crate::accounts::users::current_site_user(&config, &headers).await;
     let mut slugs = Vec::new();
     collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
 
@@ -565,6 +572,9 @@ pub(crate) async fn index(State(config): State<Arc<Config>>) -> impl IntoRespons
     for slug in &slugs {
         let meta = read_meta(&config, slug).await;
         if meta.hidden || !meta.listed {
+            continue;
+        }
+        if !admits(&config, &meta.gate, slug, viewer.as_ref()).await {
             continue;
         }
         let path = page_path(&config, slug).await;

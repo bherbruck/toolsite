@@ -229,7 +229,9 @@ An app's gate is one of:
 | `authenticated` | any signed-in account |
 | `granted` | only accounts granted access to that app |
 
-A gate covers the app's handler and its assets, not just its pages. Signing in
+Gates are per app, so public and gated apps sit side by side on one instance;
+each is decided on its own. A gate covers the app's handler and its assets,
+not just its pages, and keeps it off the index of anyone who cannot open it. Signing in
 happens at `/auth/login`; a handler sees the visitor through
 `identity.current-user` and cannot forge it.
 
@@ -249,7 +251,9 @@ subdomain per app if that ever stops being true.
 
 `GET /` lists published pages, newest first, each with an icon and title.
 Multi-page apps and bundles appear once, as their root. Hidden and unlisted
-pages don't appear. There's a client-side filter over slugs and titles.
+pages don't appear, and neither does anything the viewer could not open — a
+gated app's title is as sensitive as its contents, so signing in changes what
+the index shows. There's a client-side filter over slugs and titles.
 
 - **Title** — from the page's own `<title>` (first 8 KB scanned). Pages
   without one are listed by slug.
