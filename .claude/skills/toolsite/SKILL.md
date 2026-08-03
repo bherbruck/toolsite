@@ -243,6 +243,19 @@ curl -f -T target/wasm32-wasip2/release/<crate_name>.wasm '<upload-url>?handler'
 Create the schema with `run_sql` (or `toolsite sql <app> "..."`) before first
 use, or have the handler run `create table if not exists ...` itself.
 
+## Keep the project, and start from it
+
+A bundle cannot be turned back into the sources that built it, so publish the
+project alongside it. Visitors only ever see what the bundle contained.
+
+```bash
+tar -czf - --exclude node_modules --exclude target . | curl -f -T - '<upload-url>?source'
+curl -s '<upload-url>?source' | tar xz          # a later session picks it up
+```
+
+With the CLI this is automatic: `toolsite deploy` keeps the project, and
+`toolsite fetch` brings it back.
+
 ## Leave notes, and read them first
 
 A published app is a rendered page — its source does not come back out of it,

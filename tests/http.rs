@@ -1525,3 +1525,82 @@ async fn notes_survive_for_the_next_session_but_never_reach_a_visitor() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_agent_can_fetch_back_the_project_it_published() {
+    let (_dir, config) = server();
+    let token = ticket(&config, "myapp", Duration::from_secs(60));
+
+    // Nothing stored yet: say so, and say what to do about it.
+    let (status, body, _) = send(&config, get(&format!("/upload/{token}?source"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("PUT ?source"), "the error should say how to fix it");
+
+    // A project archive, whatever the agent decides that means.
+    let project = b"\x1f\x8b\x08\x00pretend this is a tar.gz of src/".to_vec();
+    let (status, body, _) = send(
+        &config,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/upload/{token}?source"))
+            .body(Body::from(project.clone()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, returned) = send_bytes(&config, get(&format!("/upload/{token}?source"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(returned, project, "what came back was not what went in");
+}
+
+#[tokio::test]
+async fn source_is_never_served_to_a_visitor() {
+    let (_dir, config) = server();
+    let token = ticket(&config, "myapp", Duration::from_secs(60));
+    send(
+        &config,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/upload/{token}?source"))
+            .body(Body::from("SECRET SOURCE"))
+            .unwrap(),
+    )
+    .await;
+
+    // The whole point: a visitor sees the built output, never the project.
+    for path in ["/p/myapp.source", "/p/myapp/source", "/p/myapp/.source"] {
+        let (status, body, _) = send(&config, get(path)).await;
+        assert!(
+            status != StatusCode::OK || !body.contains("SECRET SOURCE"),
+            "{path} served the source"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_ticket_reads_only_its_own_app() {
+    let (_dir, config) = server();
+    let mine = ticket(&config, "mine", Duration::from_secs(60));
+    let theirs = ticket(&config, "theirs", Duration::from_secs(60));
+
+    send(
+        &config,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/upload/{theirs}?source"))
+            .body(Body::from("THEIR SOURCE"))
+            .unwrap(),
+    )
+    .await;
+
+    // A ticket is scoped to one slug in both directions.
+    let (status, body) = send_bytes(&config, get(&format!("/upload/{mine}?source"))).await;
+    assert!(
+        status != StatusCode::OK || !String::from_utf8_lossy(&body).contains("THEIR SOURCE"),
+        "one app's ticket read another's source"
+    );
+
+    let (status, ..) = send(&config, get("/upload/not-a-ticket?source")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

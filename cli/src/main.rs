@@ -38,6 +38,14 @@ enum Command {
         #[arg(long)]
         handler: bool,
     },
+    /// Fetch back the project a previous deploy stored.
+    Fetch {
+        /// App to fetch. Defaults to toolsite.toml, else the directory name.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Where to unpack it. Defaults to the current directory.
+        dir: Option<PathBuf>,
+    },
     /// Build if needed, upload, and verify.
     Deploy {
         /// Project directory. Defaults to the current one.
@@ -49,6 +57,10 @@ enum Command {
         /// Serve index.html for unknown paths.
         #[arg(long)]
         spa: bool,
+        /// Publish the built output only, without keeping the project with
+        /// it. The next session then has nothing to work from.
+        #[arg(long)]
+        without_source: bool,
     },
     /// Run SQL against one app's database.
     Sql {
@@ -141,9 +153,21 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Init { .. } => unreachable!("handled above"),
-        Command::Deploy { dir, slug, spa } => {
-            deploy(&mcp, &url, &token, dir.unwrap_or_else(|| PathBuf::from(".")), slug, spa)
-        }
+        Command::Deploy {
+            dir,
+            slug,
+            spa,
+            without_source,
+        } => deploy(
+            &mcp,
+            &url,
+            &token,
+            dir.unwrap_or_else(|| PathBuf::from(".")),
+            slug,
+            spa,
+            !without_source,
+        ),
+        Command::Fetch { slug, dir } => fetch(&mcp, slug, dir.unwrap_or_else(|| PathBuf::from("."))),
         Command::Sql { app, sql, params } => {
             let params: Vec<serde_json::Value> = params.into_iter().map(json_scalar).collect();
             let text = mcp.call("run_sql", json!({ "app": app, "sql": sql, "params": params }))?;
@@ -337,6 +361,38 @@ fn build_handler(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(wasm))
 }
 
+/// Unpacks the project a previous deploy stored, so a later session starts
+/// from the sources rather than from the rendered page.
+fn fetch(mcp: &Mcp, slug: Option<String>, dir: PathBuf) -> Result<()> {
+    let slug = slug
+        .or_else(|| read_slug(&dir))
+        .or_else(|| {
+            dir.canonicalize()
+                .ok()?
+                .file_name()?
+                .to_str()
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow!("could not work out a slug; pass --slug"))?;
+
+    let ticket = mcp.call("create_upload", json!({ "slug": slug }))?;
+    let upload_url = find_upload_url(&ticket)
+        .ok_or_else(|| anyhow!("could not find an upload URL in the server's reply"))?;
+
+    let response = reqwest::blocking::Client::new()
+        .get(format!("{upload_url}?source"))
+        .send()?;
+    if !response.status().is_success() {
+        bail!("{}", response.text().unwrap_or_default().trim());
+    }
+
+    let bytes = response.bytes()?;
+    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    tar::Archive::new(decoder).unpack(&dir)?;
+    println!("unpacked {slug} into {}", dir.display());
+    Ok(())
+}
+
 fn deploy(
     mcp: &Mcp,
     base_url: &str,
@@ -344,6 +400,7 @@ fn deploy(
     dir: PathBuf,
     slug: Option<String>,
     spa: bool,
+    keep_source: bool,
 ) -> Result<()> {
     let project = read_project(&dir, slug, spa)?;
     println!("publishing {} from {}", project.slug, project.web_root.display());
@@ -380,7 +437,69 @@ fn deploy(
         print!("{body}");
     }
 
+    // Kept by default: a bundle cannot be turned back into what built it, and
+    // the next session would otherwise start from the rendered page.
+    if keep_source {
+        match project_archive(&dir) {
+            Ok(archive) => {
+                let response = client
+                    .put(format!("{upload_url}?source"))
+                    .body(archive)
+                    .send()?;
+                if response.status().is_success() {
+                    println!("kept the project with it; `toolsite fetch` brings it back");
+                } else {
+                    eprintln!("warning: could not store the project alongside the app");
+                }
+            }
+            Err(error) => eprintln!("warning: could not package the project: {error}"),
+        }
+    }
+
     verify(&client, base_url, token, &project)
+}
+
+/// Everything except what a package manager or compiler can restore.
+///
+/// Build output is kept deliberately: for a project with no build step the
+/// dist directory *is* the source, and dropping it would send back an archive
+/// with the app missing from it.
+fn project_archive(dir: &Path) -> Result<Vec<u8>> {
+    const SKIP: [&str; 3] = ["node_modules", "target", ".git"];
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if SKIP.contains(&name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            builder.append_dir_all(&name, &path)?;
+        } else {
+            builder.append_path_with_name(&path, &name)?;
+        }
+    }
+    let tar = builder.into_inner()?;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &tar)?;
+    Ok(encoder.finish()?)
+}
+
+/// The slug recorded in toolsite.toml, if there is one.
+fn read_slug(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("toolsite.toml")).ok()?;
+    text.lines().find_map(|line| {
+        line.strip_prefix("slug").map(|value| {
+            value
+                .trim_start_matches([' ', '='])
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        })
+    })
 }
 
 /// A deploy that reports success without checking is how a blank page ships.

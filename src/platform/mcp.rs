@@ -330,6 +330,11 @@ impl PageHost {
              \n  cargo build --release --target wasm32-wasip2\n\
              \n  curl -f -T target/wasm32-wasip2/release/*.wasm '{upload}?handler'\n\
              \nThe contract alone is at {site}/wit/toolsite.wit.\n\
+             \nKeep the project with the app, since a bundle cannot be turned back into the \
+             sources that built it. Visitors only ever see what the bundle contained:\n\
+             \n  tar -czf - --exclude node_modules --exclude target . | curl -f -T - '{upload}?source'\n\
+             \nAnd to pick up where a previous session left off:\n\
+             \n  curl -s '{upload}?source' | tar xz\n\
              \nIt then answers every request under {page}/api/, and any route with no file              behind it. It is rejected at upload if it is not a valid component.\n\
              \nEach upload replies with the page's public URL. Single-file page lands at {page}",
             page = page_url(&self.config, &slug),

@@ -259,6 +259,25 @@ visitor through the handoff and then use the resulting cookie. This is a fine
 trade when every app is one you deployed, and it is the reason to reach for a
 subdomain per app if that ever stops being true.
 
+## Source, and what a visitor can see
+
+A visitor only ever sees what the bundle contained — the built output. The
+project that produced it is stored separately and is never served:
+
+```
+toolsite deploy            # uploads the bundle, and keeps the project with it
+toolsite fetch             # a later session unpacks the project and carries on
+```
+
+Over HTTP that is `PUT <upload-url>?source` and `GET <upload-url>?source`: the
+same ticket, both directions, scoped to the same slug. `node_modules`,
+`target` and `.git` are left out; build output is kept, because a project with
+no build step has nothing else.
+
+Nothing stored beside an app is reachable under `/p/` — not `.source`, not
+`.notes`, not `.meta`. If a visitor should be able to read a file, put it in
+the bundle; that is the whole rule.
+
 ## Notes for the next session
 
 A published app is a rendered page; its source does not come back out of it.

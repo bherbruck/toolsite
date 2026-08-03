@@ -188,7 +188,7 @@ pub(crate) async fn serve_page(
     // would hand them out: .meta says whether a page is hidden and which gate
     // it is behind, and .notes is written for the next agent, not the public.
     if slug.rsplit('.').next().is_some_and(|extension| {
-        matches!(extension, "meta" | "notes" | "icon")
+        matches!(extension, "meta" | "notes" | "icon" | "source")
     }) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }

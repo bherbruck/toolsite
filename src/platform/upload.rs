@@ -11,7 +11,7 @@ use crate::{
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -48,6 +48,8 @@ pub(crate) struct UploadQuery {
     pub(crate) bundle: Option<String>,
     pub(crate) spa: Option<String>,
     pub(crate) handler: Option<String>,
+    /// The project the bundle was built from, kept private.
+    pub(crate) source: Option<String>,
 }
 
 pub(crate) enum UploadKind {
@@ -55,6 +57,7 @@ pub(crate) enum UploadKind {
     Icon,
     Bundle { spa: bool },
     Handler,
+    Source,
 }
 
 /// Ticket-authenticated write. The ticket itself is the credential, so this
@@ -98,6 +101,35 @@ pub(crate) async fn store_upload(
 
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
+    }
+
+    // The project, not the output. Stored whole and never served: what a
+    // visitor may see is exactly what the bundle contained, and a later
+    // session needs the sources that produced it.
+    if let UploadKind::Source = kind {
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        if body.len() > MAX_UPLOAD_BYTES {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "source archive too large\n").into_response();
+        }
+        let path = config.data_dir.join(format!("{app}.source"));
+        if let Some(parent) = path.parent() {
+            if fs::create_dir_all(parent).await.is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
+            }
+        }
+        if fs::write(&path, &body).await.is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
+        }
+        tracing::info!(app = %app, bytes = body.len(), "source stored");
+        return (
+            StatusCode::OK,
+            format!(
+                "stored {} bytes of source for {app}; fetch it back with GET on this \
+                 same URL with ?source\n",
+                body.len()
+            ),
+        )
+            .into_response();
     }
 
     if let UploadKind::Handler = kind {
@@ -258,7 +290,9 @@ pub(crate) async fn upload_sub(
 }
 
 pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
-    if query.handler.is_some() {
+    if query.source.is_some() {
+        UploadKind::Source
+    } else if query.handler.is_some() {
         UploadKind::Handler
     } else if query.bundle.is_some() {
         UploadKind::Bundle {
@@ -269,4 +303,69 @@ pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
     } else {
         UploadKind::Page
     }
+}
+
+/// The same ticket, read side. An agent that can write an app can fetch what
+/// it needs to change it: the project it was built from, or the page as
+/// served. Scoped to the ticket's own slug, like every write is.
+pub(crate) async fn download(
+    State(state): State<AppState>,
+    Path(ticket): Path<String>,
+    Query(query): Query<UploadQuery>,
+) -> Response {
+    let config = &state.config;
+    let Some(slug) = ticket_slug(config, &ticket) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "upload ticket unknown or expired; call create_upload again\n",
+        )
+            .into_response();
+    };
+    let app = slug.split('/').next().unwrap_or(&slug).to_string();
+
+    if query.source.is_some() {
+        return match fs::read(config.data_dir.join(format!("{app}.source"))).await {
+            Ok(bytes) => (
+                [
+                    (header::CONTENT_TYPE, "application/gzip".to_string()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{app}-source.tar.gz\""),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no source stored for {app}. Whoever published it did not upload one; \
+                     send yours with PUT ?source so the next session has it.\n"
+                ),
+            )
+                .into_response(),
+        };
+    }
+
+    // Without a flag, hand back the page itself — the same thing a visitor
+    // would get, but reachable when the app is gated.
+    match fs::read_to_string(config.data_dir.join(format!("{slug}.html"))).await {
+        Ok(html) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response(),
+        Err(_) => match fs::read_to_string(config.data_dir.join(format!("{slug}/index.html"))).await
+        {
+            Ok(html) => {
+                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+            }
+            Err(_) => (StatusCode::NOT_FOUND, "nothing published at that slug yet\n")
+                .into_response(),
+        },
+    }
+}
+
+/// The slug a live ticket writes to, sweeping expired ones on the way.
+fn ticket_slug(config: &Config, ticket: &str) -> Option<String> {
+    let now = Instant::now();
+    let mut tickets = config.uploads.lock().unwrap();
+    tickets.retain(|_, t| t.expires_at > now);
+    tickets.get(ticket).map(|t| t.slug.clone())
 }
