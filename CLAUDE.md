@@ -37,6 +37,9 @@ platform/          the site as its owner uses it
   bearer.rs        bearer/x-api-key middleware for /mcp
   client_oauth.rs  OAuth shim for MCP clients — who may PUBLISH
   upload.rs        upload tickets and the PUT endpoints they authorise
+  scaffold.rs      the WIT and a buildable crate, served to agents
+  secrets.rs       per-app settings, sealed at rest, entered by a person
+  schedule.rs      cron jobs, run through the same handler a request uses
 
 content/           what gets published, and how it is served
   slug.rs          naming rules (what may become a path), tokens, escaping

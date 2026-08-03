@@ -142,6 +142,8 @@ For when the CLI isn't installed, or there is no shell at all.
 | `push_page(html, slug?)` | No-shell fallback, HTML inline. |
 | `push_app(app, pages)` | No-shell fallback, multi-page. A page named `index` also serves at the app root. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
+| `app_jobs(app, name?, schedule?, path?, run_now?)` | Scheduled work. Cron with seconds first; fires the app's own handler at a path. |
+| `app_settings(app, name?, value?, link?)` | API keys the handler reads. Pass `link: true` for a URL the owner pastes into — never ask for a secret directly. |
 | `app_notes(slug, notes?)` | Markdown kept with an app for the next session. Reads when `notes` is omitted. |
 
 **There is deliberately no delete tool.** Nothing here destroys data. Retract

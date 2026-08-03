@@ -189,7 +189,8 @@ async fn main() -> anyhow::Result<()> {
         uploads: Mutex::new(HashMap::new()),
     });
 
-    let app = build_router(config.clone(), Runtime::new()?);
+    let runtime = Runtime::new()?;
+    let app = build_router(config.clone(), runtime.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
@@ -209,7 +210,9 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tracing::info!("serving MCP on stdio");
-    let service = PageHost::new(config).serve(rmcp::transport::stdio()).await?;
+    let service = PageHost::new(config, runtime)
+        .serve(rmcp::transport::stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }

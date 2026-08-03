@@ -278,6 +278,30 @@ Nothing stored beside an app is reachable under `/p/` — not `.source`, not
 `.notes`, not `.meta`. If a visitor should be able to read a file, put it in
 the bundle; that is the whole rule.
 
+## Scheduled work
+
+An app can do things nobody asked for — refresh a cache, pull from an API,
+tidy a table. A job is a cron expression and a path, and when it fires the
+host calls the app's own handler exactly as a request would: same sandbox,
+same limits, same database, no signed-in user.
+
+```
+toolsite job myapp refresh --schedule '0 */5 * * * *' --path /api/refresh
+toolsite job myapp refresh --now      # run it immediately
+toolsite job myapp                    # what is scheduled, and how each went
+toolsite job myapp refresh --remove
+```
+
+Six cron fields, seconds first: `0 */5 * * * *` is every five minutes,
+`0 0 3 * * *` is 03:00 daily. A bad expression is refused when you set it
+rather than silently never firing.
+
+The handler sees an `x-toolsite-scheduled` header naming the job, so a route
+can behave differently when nobody is waiting on the other end. A job that
+missed its turn while the server was down fires once when it comes back, not
+once per missed interval, and a job still running when its next turn arrives
+is skipped rather than stacked.
+
 ## Settings
 
 An app's handler can read values its bundle must not contain — API keys,

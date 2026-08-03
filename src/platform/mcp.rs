@@ -117,6 +117,24 @@ pub(crate) struct CreateUserRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ScheduleRequest {
+    #[schemars(description = "App whose jobs these are.")]
+    pub(crate) app: String,
+    #[schemars(description = "Job name. Omit to list what is scheduled.")]
+    pub(crate) name: Option<String>,
+    #[schemars(
+        description = "Cron with seconds first, six fields: '0 */5 * * * *' is every five minutes, '0 0 3 * * *' is 03:00 daily. Omit with a name to remove that job."
+    )]
+    pub(crate) schedule: Option<String>,
+    #[schemars(
+        description = "Path handed to the app's handler when it fires, e.g. /api/refresh. The handler sees a x-toolsite-scheduled header and no signed-in user."
+    )]
+    pub(crate) path: Option<String>,
+    #[schemars(description = "Run the named job now, whatever its schedule says.")]
+    pub(crate) run_now: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SecretRequest {
     #[schemars(description = "App the setting belongs to.")]
     pub(crate) app: String,
@@ -183,15 +201,18 @@ pub(crate) struct RunSqlRequest {
 #[derive(Clone)]
 pub struct PageHost {
     pub(crate) config: Arc<Config>,
+    /// Needed to run a job on demand, which is the same call a request makes.
+    pub(crate) runtime: Arc<crate::runtime::wasm::Runtime>,
     #[allow(dead_code)]
     pub(crate) tool_router: ToolRouter<PageHost>,
 }
 
 #[tool_router]
 impl PageHost {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, runtime: Arc<crate::runtime::wasm::Runtime>) -> Self {
         Self {
             config,
+            runtime,
             tool_router: Self::tool_router(),
         }
     }
@@ -440,6 +461,70 @@ impl PageHost {
                     },
                 )]))
             }
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
+    }
+
+    #[tool(
+        description = "Schedule an app's handler to run on its own — refreshing a cache, pulling from an API, tidying a table. A job is a cron expression and a path, and firing it calls the same handler a request would, with the same sandbox and limits. Give run_now to trigger one immediately, or no name to list them with when each last ran."
+    )]
+    pub(crate) async fn app_jobs(
+        &self,
+        Parameters(ScheduleRequest {
+            app,
+            name,
+            schedule,
+            path,
+            run_now,
+        }): Parameters<ScheduleRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+        let state = crate::AppState {
+            config: self.config.clone(),
+            runtime: self.runtime.clone(),
+        };
+
+        let outcome: Result<String, String> = match (name, schedule, path, run_now) {
+            (Some(name), _, _, Some(true)) => {
+                crate::platform::schedule::run_job(&state, &app, &name)
+                    .await
+                    .map(|status| format!("{name} ran: {status}"))
+            }
+            (Some(name), Some(schedule), Some(path), _) => {
+                crate::platform::schedule::set_job(&self.config, &app, &name, &schedule, &path)
+                    .map(|next| format!("{name} scheduled; {next}"))
+            }
+            (Some(name), None, None, _) => {
+                crate::platform::schedule::remove_job(&self.config, &app, &name)
+                    .map(|()| format!("{name} is no longer scheduled"))
+            }
+            (Some(_), _, _, _) => Err("give both schedule and path, or neither to remove".into()),
+            (None, _, _, _) => {
+                let jobs = crate::platform::schedule::read_jobs(&self.config, &app);
+                Ok(if jobs.is_empty() {
+                    format!("{app} has no scheduled jobs")
+                } else {
+                    jobs.iter()
+                        .map(|(name, job)| {
+                            format!(
+                                "{name}: {} -> {} (last: {})",
+                                job.schedule,
+                                job.path,
+                                job.last_status.as_deref().unwrap_or("never run")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+        };
+
+        match outcome {
+            Ok(message) => Ok(CallToolResult::success(vec![ContentBlock::text(message)])),
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }
     }

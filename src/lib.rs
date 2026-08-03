@@ -73,8 +73,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     };
 
     let mcp_config = config.clone();
+    let mcp_runtime = runtime.clone();
     let mcp_service = StreamableHttpService::new(
-        move || Ok(PageHost::new(mcp_config.clone())),
+        move || Ok(PageHost::new(mcp_config.clone(), mcp_runtime.clone())),
         LocalSessionManager::default().into(),
         host_config,
     );
@@ -134,10 +135,14 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
             .route("/token", post(token_endpoint));
     }
 
-    let public_router = public_router.with_state(AppState {
+    let state = AppState {
         config: config.clone(),
         runtime,
-    });
+    };
+    // Nothing fires until something asks the clock, so the scheduler starts
+    // with the router that serves the same apps.
+    crate::platform::schedule::spawn(state.clone());
+    let public_router = public_router.with_state(state);
 
     Router::new().merge(mcp_router).merge(public_router)
 }

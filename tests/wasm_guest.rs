@@ -250,3 +250,54 @@ fn a_handler_reads_its_own_settings_and_no_one_elses() {
         (200, String::new())
     );
 }
+
+/// A scheduled run is the same call a request makes, so a job is just a route
+/// the app already has. This runs one and checks it left a mark.
+#[tokio::test]
+async fn a_scheduled_job_runs_the_apps_handler_and_records_what_happened() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config::local(dir.path().to_path_buf(), "test-token"));
+    let state = toolsite::AppState {
+        config: config.clone(),
+        runtime: Runtime::new().unwrap(),
+    };
+    std::fs::create_dir_all(config.data_dir.join("app")).unwrap();
+    std::fs::write(config.data_dir.join("app/handler.wasm"), HANDLER).unwrap();
+
+    // /api/count writes to the app's database and returns how many times.
+    toolsite::platform::schedule::set_job(&config, "app", "tick", "0 * * * * *", "/api/count")
+        .unwrap();
+
+    let status = toolsite::platform::schedule::run_job(&state, "app", "tick")
+        .await
+        .unwrap();
+    assert_eq!(status, "200");
+
+    // The work actually happened: a second run sees the first one's row.
+    toolsite::platform::schedule::run_job(&state, "app", "tick").await.unwrap();
+    let jobs = toolsite::platform::schedule::read_jobs(&config, "app");
+    let job = jobs.get("tick").unwrap();
+    assert_eq!(job.last_status.as_deref(), Some("200"));
+    assert!(job.last_run.is_some(), "the run was not recorded");
+
+    let counted = toolsite::runtime::db::run(&config, "app", "select count(*) from hits", &[])
+        .unwrap();
+    assert_eq!(counted.rows[0][0], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn a_job_for_an_app_with_no_handler_says_so_rather_than_failing_silently() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config::local(dir.path().to_path_buf(), "test-token"));
+    let state = toolsite::AppState {
+        config: config.clone(),
+        runtime: Runtime::new().unwrap(),
+    };
+    toolsite::platform::schedule::set_job(&config, "static", "tick", "0 * * * * *", "/api/x")
+        .unwrap();
+
+    let error = toolsite::platform::schedule::run_job(&state, "static", "tick")
+        .await
+        .unwrap_err();
+    assert!(error.contains("no handler"), "got {error}");
+}

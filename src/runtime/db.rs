@@ -116,17 +116,17 @@ fn from_sql(value: ValueRef<'_>) -> Value {
 }
 
 #[derive(Debug)]
-pub(crate) struct SqlOutcome {
-    pub(crate) columns: Vec<String>,
-    pub(crate) rows: Vec<Vec<Value>>,
-    pub(crate) truncated: bool,
-    pub(crate) rows_affected: usize,
+pub struct SqlOutcome {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    pub truncated: bool,
+    pub rows_affected: usize,
 }
 
 /// Runs caller SQL against one app's database. A single statement may carry
 /// bound parameters and return rows; a parameterless script may hold several
 /// statements, which is what schema migrations look like.
-pub(crate) fn run(
+pub fn run(
     config: &Config,
     app: &str,
     sql: &str,

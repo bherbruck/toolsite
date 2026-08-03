@@ -90,6 +90,24 @@ enum Command {
         /// accounts you have granted).
         gate: String,
     },
+    /// Work an app does on its own: refreshing, scraping, tidying.
+    Job {
+        app: String,
+        /// Job name. Omit to list what is scheduled.
+        name: Option<String>,
+        /// Cron with seconds first: '0 */5 * * * *' is every five minutes.
+        #[arg(long)]
+        schedule: Option<String>,
+        /// Path the handler is called with, e.g. /api/refresh.
+        #[arg(long)]
+        path: Option<String>,
+        /// Run it now, whatever the schedule says.
+        #[arg(long)]
+        now: bool,
+        /// Unschedule it.
+        #[arg(long)]
+        remove: bool,
+    },
     /// An app's settings: API keys and the like, readable only by its handler.
     Secret {
         app: String,
@@ -245,6 +263,27 @@ fn run() -> Result<()> {
                 "{}",
                 mcp.call("set_visibility", json!({ "slug": app, "gate": gate }))?
             );
+            Ok(())
+        }
+        Command::Job {
+            app,
+            name,
+            schedule,
+            path,
+            now,
+            remove,
+        } => {
+            let arguments = match (&name, now, remove) {
+                (Some(name), true, _) => json!({ "app": app, "name": name, "run_now": true }),
+                (Some(name), _, true) => json!({ "app": app, "name": name }),
+                (Some(name), _, _) => json!({
+                    "app": app, "name": name,
+                    "schedule": schedule.ok_or_else(|| anyhow!("pass --schedule and --path"))?,
+                    "path": path.ok_or_else(|| anyhow!("pass --schedule and --path"))?,
+                }),
+                (None, ..) => json!({ "app": app }),
+            };
+            println!("{}", mcp.call("app_jobs", arguments)?);
             Ok(())
         }
         Command::Secret {
