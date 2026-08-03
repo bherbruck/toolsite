@@ -14,6 +14,10 @@ Two more that this codebase already leans on:
 
 - **Nothing destroys data.** There is no delete tool by design; retraction is
   a visibility flag, so every action is reversible.
+- **The platform decides who arrives; the app decides what they may do.**
+  Gates admit a request — per app, or per path prefix. Beyond that the handler
+  is told the caller's identity and granted role and makes its own call, which
+  is why a role is an opaque string here and never interpreted.
 - **Capabilities are granted, never assumed.** A guest can only do what the
   linker hands it. wasi is linked (a wasm32-wasip2 guest imports it via std
   whether it uses it or not), so the sandbox is the *context*, which grants no

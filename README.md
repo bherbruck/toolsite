@@ -246,6 +246,24 @@ An app's gate is one of:
 | `authenticated` | any signed-in account |
 | `granted` | only accounts granted access to that app |
 
+A gate can cover one part of an app instead of all of it, which is how a
+public page and a private one live in the same bundle:
+
+```
+toolsite gate board public                          # the app
+toolsite gate board authenticated --path /triage    # this corner of it
+toolsite gate board authenticated --path /api/all
+```
+
+Longest matching prefix wins, so `/admin` can be closed while `/admin/help`
+stays open. The arrangement works in reverse too: a `granted` app with
+`--path / --gate public` has a front page anyone can read.
+
+Beyond that, what a signed-in caller may *do* is the app's decision. A grant
+carries a role — `toolsite grant board someone@example.com --role editor` —
+and the handler reads it with `identity::current-role()`. The platform never
+interprets it.
+
 Gates are per app, so public and gated apps sit side by side on one instance;
 each is decided on its own. A gate covers the app's handler and its assets,
 not just its pages, and keeps it off the index of anyone who cannot open it. Signing in

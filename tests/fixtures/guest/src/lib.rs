@@ -29,6 +29,11 @@ impl Guest for Handler {
         match route.as_str() {
             "/echo" => respond(200, format!("{} {}?{}", req.method, req.path, req.query)),
 
+            "/myrole" => match identity::current_role() {
+                Some(role) => respond(200, role),
+                None => respond(200, "none".to_string()),
+            },
+
             "/whoami" => match identity::current_user() {
                 Some(user) => respond(200, format!("{}:{}", user.id, user.email)),
                 None => respond(401, "anonymous".to_string()),

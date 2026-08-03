@@ -136,7 +136,7 @@ For when the CLI isn't installed, or there is no shell at all.
 |---|---|
 | `create_upload(slug?)` | The default. Returns the upload URL and the base path to build for. |
 | `list_pages(include_all?)` | Slug, title, URL, last modified, visibility. Newest first. |
-| `set_visibility(slug, hidden?, listed?)` | `hidden: true` 404s the URL and drops it from the index. `listed: false` keeps it live but off the index. |
+| `set_visibility(slug, hidden?, listed?, gate?, path?)` | `hidden: true` 404s the URL. `listed: false` keeps it live but off the index. `gate` with `path` guards one part of an app. |
 | `set_icon(slug, icon)` | Emoji, inline `<svg>`, or `data:` URI. Optional — pages without one get a generated badge. |
 | `run_sql(app, sql, params?)` | Schema and seed work against one app's database. MCP only; never reachable from a published page. |
 | `push_page(html, slug?)` | No-shell fallback, HTML inline. |
@@ -170,7 +170,13 @@ rejected at upload.
 The guest sees the path relative to its app **with `/api` still attached** —
 `/api/echo`, not `/p/myapp/api/echo`. Strip that prefix yourself.
 
-**Capabilities.** A handler gets exactly two imports: `db.query`, bound to its
+**Access.** A gate decides whether a request arrives; what it may then do is
+yours to decide. Guard part of an app with `set_visibility(slug, gate, path)`
+— longest matching prefix wins — and inside the handler read
+`identity::current-role()`, which returns whatever the owner granted
+(`viewer`, `editor`, anything). The platform never interprets a role.
+
+**Capabilities.** A handler gets three imports: `db.query`, bound to its
 own app's SQLite with parameters bound rather than interpolated, and
 `identity.current-user`, which it cannot forge. No filesystem, no environment,
 no sockets. wasi is linked because a `wasm32-wasip2` guest imports it through

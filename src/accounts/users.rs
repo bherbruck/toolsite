@@ -335,6 +335,17 @@ pub fn revoke(config: &Config, email: &str, app: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// What this account was granted on this app, if anything.
+pub fn role_for(config: &Config, user_id: &str, app: &str) -> Option<String> {
+    let conn = open(config).ok()?;
+    conn.query_row(
+        "select role from grants where user_id = ? and app = ?",
+        rusqlite::params![user_id, app],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
 pub fn has_grant(config: &Config, user: &User, app: &str) -> bool {
     let Ok(conn) = open(config) else {
         return false;

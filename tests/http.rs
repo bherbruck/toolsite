@@ -1698,3 +1698,105 @@ async fn settings_are_absent_from_everything_a_visitor_or_agent_can_fetch() {
         "a value rode along in the source archive"
     );
 }
+
+// --- gates on part of an app -------------------------------------------
+
+fn rules(config: &Config, app: &str, gate: &str, rules: &str) {
+    std::fs::create_dir_all(config.data_dir.join(app)).unwrap();
+    std::fs::write(
+        config.data_dir.join(app).join("index.meta"),
+        format!(r#"{{"listed":true,"hidden":false,"spa":false,"gate":"{gate}","rules":{rules}}}"#),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_public_app_can_have_a_private_corner() {
+    let (_dir, config) = server();
+    write_page(&config, "board/index", "<!doctype html><title>Board</title>");
+    write_page(&config, "board/triage", "<!doctype html><title>Triage</title>");
+    rules(
+        &config,
+        "board",
+        "public",
+        r#"[{"prefix":"/triage","gate":"authenticated"}]"#,
+    );
+    account(&config, "someone@example.com", "correct horse battery");
+
+    // The front page is open to anyone…
+    assert_eq!(send(&config, get("/p/board/")).await.0, StatusCode::OK);
+    // …while the corner behind the rule is not.
+    assert_eq!(send(&config, get("/p/board/triage")).await.0, StatusCode::SEE_OTHER);
+
+    let token = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (status, ..) = send(&config, get_as("/p/board/triage", &token)).await;
+    // Signed in, the handoff sends them on rather than turning them away.
+    assert!(
+        status == StatusCode::OK || status == StatusCode::SEE_OTHER,
+        "a signed-in visitor was refused outright: {status}"
+    );
+}
+
+#[tokio::test]
+async fn a_private_app_can_have_a_public_front_page() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<!doctype html><title>Members</title>");
+    write_page(&config, "members/inside", "<!doctype html><title>Inside</title>");
+    // The reverse arrangement, from the same mechanism.
+    rules(
+        &config,
+        "members",
+        "authenticated",
+        r#"[{"prefix":"/","gate":"public"},{"prefix":"/inside","gate":"authenticated"}]"#,
+    );
+
+    assert_eq!(send(&config, get("/p/members/")).await.0, StatusCode::OK);
+    assert_eq!(send(&config, get("/p/members/inside")).await.0, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn the_longest_matching_rule_wins() {
+    let (_dir, config) = server();
+    write_page(&config, "app/index", "<!doctype html><title>App</title>");
+    std::fs::create_dir_all(config.data_dir.join("app/admin")).unwrap();
+    std::fs::write(
+        config.data_dir.join("app/admin/index.html"),
+        "<!doctype html><title>Admin</title>",
+    )
+    .unwrap();
+    std::fs::write(
+        config.data_dir.join("app/admin/help.html"),
+        "<!doctype html><title>Help</title>",
+    )
+    .unwrap();
+    rules(
+        &config,
+        "app",
+        "public",
+        r#"[{"prefix":"/admin","gate":"authenticated"},{"prefix":"/admin/help","gate":"public"}]"#,
+    );
+
+    // Order in the file must not matter, only specificity.
+    assert_eq!(send(&config, get("/p/app/admin/help")).await.0, StatusCode::OK);
+    assert_eq!(send(&config, get("/p/app/admin/")).await.0, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_rule_covers_the_api_as_well_as_the_pages() {
+    let (_dir, config) = server();
+    publish_handler(&config, "board");
+    rules(
+        &config,
+        "board",
+        "public",
+        r#"[{"prefix":"/api/all","gate":"authenticated"}]"#,
+    );
+
+    // The open route stays open…
+    assert_eq!(send(&config, get("/p/board/api/echo")).await.0, StatusCode::OK);
+    // …and the guarded one answers with a status, not a redirect into a form.
+    assert_eq!(
+        send(&config, get("/p/board/api/all")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}

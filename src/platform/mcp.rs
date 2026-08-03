@@ -86,6 +86,10 @@ pub(crate) struct SetVisibilityRequest {
         description = "Who may reach the app: 'public' (anyone), 'authenticated' (any signed-in account), or 'granted' (only accounts given access with set_access)."
     )]
     pub(crate) gate: Option<String>,
+    #[schemars(
+        description = "Apply the gate to paths starting with this prefix instead of the whole app, e.g. '/admin' or '/api/all'. Longest matching prefix wins, so a public app can have a private corner and a private app a public front page. Pass the prefix with no gate to drop the rule."
+    )]
+    pub(crate) path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -180,6 +184,10 @@ pub(crate) struct AccessRequest {
     pub(crate) email: String,
     #[schemars(description = "Set false to take the grant away. Defaults to true.")]
     pub(crate) allow: Option<bool>,
+    #[schemars(
+        description = "What this account is on this app — 'viewer', 'editor', anything the app understands. The handler reads it through identity.current-role and decides what it means. Defaults to 'viewer'."
+    )]
+    pub(crate) role: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -642,7 +650,12 @@ impl PageHost {
     )]
     pub(crate) async fn set_access(
         &self,
-        Parameters(AccessRequest { app, email, allow }): Parameters<AccessRequest>,
+        Parameters(AccessRequest {
+            app,
+            email,
+            allow,
+            role,
+        }): Parameters<AccessRequest>,
     ) -> Result<CallToolResult, McpError> {
         if !valid_slug(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
@@ -654,7 +667,12 @@ impl PageHost {
         let (owned_app, owned_email) = (app.clone(), email.clone());
         let outcome = tokio::task::spawn_blocking(move || {
             if allow {
-                crate::accounts::users::grant(&config, &owned_email, &owned_app, "viewer")
+                crate::accounts::users::grant(
+                    &config,
+                    &owned_email,
+                    &owned_app,
+                    role.as_deref().unwrap_or("viewer"),
+                )
             } else {
                 crate::accounts::users::revoke(&config, &owned_email, &owned_app)
             }
@@ -734,6 +752,7 @@ impl PageHost {
             hidden,
             listed,
             gate,
+            path,
         }): Parameters<SetVisibilityRequest>,
     ) -> Result<CallToolResult, McpError> {
         if !valid_slug(&slug) {
@@ -741,7 +760,7 @@ impl PageHost {
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
             )]));
         }
-        if hidden.is_none() && listed.is_none() && gate.is_none() {
+        if hidden.is_none() && listed.is_none() && gate.is_none() && path.is_none() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "pass hidden, listed or gate",
             )]));
@@ -766,17 +785,50 @@ impl PageHost {
         if let Some(listed) = listed {
             meta.listed = listed;
         }
-        if let Some(gate) = gate {
-            meta.gate = gate;
+        match (path, gate) {
+            // A rule for one corner of the app.
+            (Some(prefix), Some(gate)) => {
+                meta.rules.retain(|rule| rule.prefix != prefix);
+                meta.rules.push(crate::content::store::PathRule { prefix, gate });
+            }
+            (Some(prefix), None) => {
+                let before = meta.rules.len();
+                meta.rules.retain(|rule| rule.prefix != prefix);
+                if meta.rules.len() == before {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "{slug} has no rule for {prefix}"
+                    ))]));
+                }
+            }
+            (None, Some(gate)) => meta.gate = gate,
+            (None, None) => {}
         }
         write_meta(&self.config, &slug, &meta)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        let rules = if meta.rules.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                meta.rules
+                    .iter()
+                    .map(|rule| format!("{} is {}", rule.prefix, rule.gate))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         let state = match (meta.hidden, meta.listed) {
             (true, _) => "hidden (URL returns 404; set hidden=false to restore)".to_string(),
-            (false, false) => format!("live but unlisted at {}", page_url(&self.config, &slug)),
-            (false, true) => format!("live and listed at {}", page_url(&self.config, &slug)),
+            (false, false) => format!(
+                "live but unlisted at {}{rules}",
+                page_url(&self.config, &slug)
+            ),
+            (false, true) => format!(
+                "live and listed at {}{rules}",
+                page_url(&self.config, &slug)
+            ),
         };
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "{slug}: {state}"

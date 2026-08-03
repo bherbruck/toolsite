@@ -80,15 +80,26 @@ enum Command {
     #[command(subcommand)]
     User(UserCommand),
     /// Let an account reach an app whose gate is 'granted'.
-    Grant { app: String, email: String },
+    Grant {
+        app: String,
+        email: String,
+        /// What they are on this app. The handler reads it and decides what
+        /// it means. Defaults to viewer.
+        #[arg(long)]
+        role: Option<String>,
+    },
     /// Take that access away again.
     Revoke { app: String, email: String },
-    /// Decide who may reach an app.
+    /// Decide who may reach an app, or one path within it.
     Gate {
         app: String,
         /// public (anyone), authenticated (any account), or granted (only
         /// accounts you have granted).
         gate: String,
+        /// Apply it to paths starting here instead of the whole app, e.g.
+        /// --path /admin. Longest matching prefix wins.
+        #[arg(long)]
+        path: Option<String>,
     },
     /// Work an app does on its own: refreshing, scraping, tidying.
     Job {
@@ -244,11 +255,12 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Grant { app, email } => {
-            println!(
-                "{}",
-                mcp.call("set_access", json!({ "app": app, "email": email, "allow": true }))?
-            );
+        Command::Grant { app, email, role } => {
+            let mut arguments = json!({ "app": app, "email": email, "allow": true });
+            if let Some(role) = role {
+                arguments["role"] = json!(role);
+            }
+            println!("{}", mcp.call("set_access", arguments)?);
             Ok(())
         }
         Command::Revoke { app, email } => {
@@ -258,11 +270,12 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Gate { app, gate } => {
-            println!(
-                "{}",
-                mcp.call("set_visibility", json!({ "slug": app, "gate": gate }))?
-            );
+        Command::Gate { app, gate, path } => {
+            let mut arguments = json!({ "slug": app, "gate": gate });
+            if let Some(path) = path {
+                arguments["path"] = json!(path);
+            }
+            println!("{}", mcp.call("set_visibility", arguments)?);
             Ok(())
         }
         Command::Job {

@@ -139,6 +139,11 @@ impl self::toolsite::app::identity::Host for StoreState {
     fn current_user(&mut self) -> Option<User> {
         self.user.clone()
     }
+
+    fn current_role(&mut self) -> Option<String> {
+        let user = self.user.as_ref()?;
+        crate::accounts::users::role_for(&self.site, &user.id, &self.app)
+    }
 }
 
 fn json_of(value: WitValue) -> serde_json::Value {

@@ -257,7 +257,13 @@ async fn gate_check(
     is_api: bool,
     may_hand_off: bool,
 ) -> Option<Response> {
-    let gate = read_meta(config, app).await.gate;
+    // The path within the app, so a rule reads the way its author wrote it:
+    // "/admin", not "/p/myapp/admin".
+    let within = path
+        .strip_prefix(&format!("/p/{app}"))
+        .unwrap_or(path)
+        .to_string();
+    let gate = read_meta(config, app).await.gate_for(&within).to_string();
     if admits(config, &gate, app, visitor).await {
         return None;
     }
@@ -495,7 +501,7 @@ pub(crate) async fn index(
         if meta.hidden || !meta.listed {
             continue;
         }
-        if !admits(&config, &meta.gate, slug, viewer.as_ref()).await {
+        if !admits(&config, meta.gate_for("/"), slug, viewer.as_ref()).await {
             continue;
         }
         let path = page_path(&config, slug).await;

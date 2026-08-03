@@ -301,3 +301,38 @@ async fn a_job_for_an_app_with_no_handler_says_so_rather_than_failing_silently()
         .unwrap_err();
     assert!(error.contains("no handler"), "got {error}");
 }
+
+/// Gates decide whether a request arrives; what it may then do is the app's
+/// call, so the handler is told what the caller was granted.
+#[test]
+fn a_handler_is_told_what_the_caller_was_granted() {
+    let runtime = Runtime::new().unwrap();
+    let (_dir, site) = site();
+    let user = toolsite::accounts::users::sign_up(&site, "someone@example.com", "correct horse battery")
+        .unwrap();
+    let as_user = toolsite::runtime::wasm::User {
+        id: user.id.clone(),
+        email: user.email.clone(),
+    };
+
+    // Signed in with no grant: present, but nothing granted.
+    assert_eq!(
+        call_as(&runtime, &site, "app", request("/api/myrole"), Some(as_user.clone()), Guards::default()),
+        (200, "none".into())
+    );
+
+    toolsite::accounts::users::grant(&site, "someone@example.com", "app", "editor").unwrap();
+    assert_eq!(
+        call_as(&runtime, &site, "app", request("/api/myrole"), Some(as_user.clone()), Guards::default()),
+        (200, "editor".into())
+    );
+
+    // A grant on one app says nothing about another.
+    assert_eq!(
+        call_as(&runtime, &site, "other", request("/api/myrole"), Some(as_user), Guards::default()),
+        (200, "none".into())
+    );
+
+    // And an anonymous caller has no role at all.
+    assert_eq!(call(&runtime, &site, "app", request("/api/myrole")), (200, "none".into()));
+}

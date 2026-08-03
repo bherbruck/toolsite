@@ -54,6 +54,32 @@ pub(crate) struct PageMeta {
     /// Who may reach this app: "public", "authenticated", or "granted".
     #[serde(default = "public")]
     pub(crate) gate: String,
+    /// Exceptions, by path prefix. A public app with a private corner and a
+    /// private app with a public front page are the same feature, so both are
+    /// this. Longest matching prefix wins.
+    #[serde(default)]
+    pub(crate) rules: Vec<PathRule>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct PathRule {
+    /// Matched against the path within the app, e.g. "/admin" or "/api/all".
+    pub prefix: String,
+    pub gate: String,
+}
+
+impl PageMeta {
+    /// The gate that applies to one path within this app.
+    pub(crate) fn gate_for(&self, path: &str) -> &str {
+        self.rules
+            .iter()
+            .filter(|rule| path.starts_with(&rule.prefix))
+            // Longest prefix wins, so /admin/reports can be stricter than
+            // /admin without ordering mattering.
+            .max_by_key(|rule| rule.prefix.len())
+            .map(|rule| rule.gate.as_str())
+            .unwrap_or(&self.gate)
+    }
 }
 
 pub(crate) fn public() -> String {
@@ -71,6 +97,7 @@ impl Default for PageMeta {
             hidden: false,
             spa: false,
             gate: public(),
+            rules: Vec::new(),
         }
     }
 }

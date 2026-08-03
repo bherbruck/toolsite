@@ -60,6 +60,14 @@ interface identity {
     }
 
     current-user: func() -> option<user>;
+
+    /// What this account was granted on this app, if anything: "viewer",
+    /// "editor", whatever the owner chose. Absent for a visitor with no
+    /// grant, including on a public app.
+    ///
+    /// A separate function rather than a field on `user` on purpose: changing
+    /// that record would stop every handler already published from linking.
+    current-role: func() -> option<string>;
 }
 
 /// What a request handler sees and returns. Deliberately small: enough to
