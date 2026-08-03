@@ -165,7 +165,7 @@ async fn hiding_a_page_takes_down_its_url_without_deleting_it() {
     assert!(config.data_dir.join("secret.html").exists());
 
     let (_, index, _) = send(&config, get("/")).await;
-    assert!(!index.contains("secret"), "hidden page appeared on the index");
+    assert!(!index.contains("/p/secret"), "hidden page appeared on the index");
 }
 
 #[tokio::test]
@@ -182,7 +182,8 @@ async fn unlisted_pages_still_serve() {
     assert_eq!(status, StatusCode::OK);
 
     let (_, index, _) = send(&config, get("/")).await;
-    assert!(!index.contains("quiet"), "unlisted page appeared on the index");
+    // Match the link, not the word: the stylesheet has classes too.
+    assert!(!index.contains("/p/quiet"), "unlisted page appeared on the index");
 }
 
 #[tokio::test]
@@ -1376,4 +1377,42 @@ async fn a_grant_on_one_app_does_not_reveal_another() {
     let (_, index, _) = send(&config, get_as("/", &token)).await;
     assert!(index.contains("Mine"));
     assert!(!index.contains("Theirs"), "an app they cannot open was listed");
+}
+
+#[tokio::test]
+async fn the_password_form_names_the_account_so_a_manager_can_save_it() {
+    let (_dir, config) = server();
+    let (_, invite) =
+        toolsite::accounts::users::invite(&config, "new@example.com", false).unwrap();
+
+    let (status, body, _) = send(&config, get(&format!("/auth/setup?token={invite}"))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A password manager needs a username field in the same form, or it saves
+    // a password with nothing to associate it with.
+    assert!(body.contains(r#"autocomplete="username""#), "no username field");
+    assert!(body.contains(r#"value="new@example.com""#), "the email was not filled in");
+    assert!(body.contains(r#"autocomplete="new-password""#));
+}
+
+#[tokio::test]
+async fn every_page_toolsite_serves_itself_shares_one_stylesheet() {
+    let (_dir, config) = server();
+    write_page(&config, "page", "<!doctype html><title>A page</title>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, invite) = toolsite::accounts::users::invite(&config, "new@example.com", false).unwrap();
+
+    // A token from the shared theme, present only if the page uses it.
+    let marker = "--accent:";
+    for (name, request) in [
+        ("index", get("/")),
+        ("sign in", get("/auth/login")),
+        ("choose a password", get(&format!("/auth/setup?token={invite}"))),
+        ("admin", get_as("/admin", &boss)),
+    ] {
+        let (status, body, _) = send(&config, request).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert!(body.contains(marker), "{name} does not use the shared theme");
+    }
 }

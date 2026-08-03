@@ -444,94 +444,6 @@ pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> 
     None
 }
 
-pub(crate) const INDEX_STYLE: &str = r#"
-:root {
-  color-scheme: light dark;
-  --bg: #f7f7f8;
-  --fg: #1a1a1a;
-  --muted: #6b7280;
-  --card-bg: #ffffff;
-  --border: #e5e7eb;
-  --accent: #4f46e5;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #111114;
-    --fg: #e8e8ea;
-    --muted: #9198a1;
-    --card-bg: #1a1a1f;
-    --border: #2a2a30;
-    --accent: #818cf8;
-  }
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  padding: 3rem 1.5rem;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-.container { max-width: 640px; margin: 0 auto; }
-h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
-.count { color: var(--muted); font-size: .9rem; margin: 0 0 1.5rem; }
-input[type="search"] {
-  width: 100%;
-  padding: .6rem .8rem;
-  border-radius: .5rem;
-  border: 1px solid var(--border);
-  background: var(--card-bg);
-  color: var(--fg);
-  font-size: .95rem;
-  margin-bottom: 1.25rem;
-}
-input[type="search"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-ul.pages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; }
-ul.pages li a {
-  display: flex;
-  align-items: center;
-  gap: .75rem;
-  padding: .7rem .9rem;
-  border-radius: .5rem;
-  border: 1px solid var(--border);
-  background: var(--card-bg);
-  color: var(--fg);
-  text-decoration: none;
-  font-size: .95rem;
-  transition: border-color .15s ease;
-}
-ul.pages li a:hover { border-color: var(--accent); }
-ul.pages li a::after { content: "\2192"; color: var(--muted); margin-left: auto; }
-.icon {
-  flex: 0 0 2.25rem;
-  width: 2.25rem;
-  height: 2.25rem;
-  border-radius: .45rem;
-  display: grid;
-  place-items: center;
-  overflow: hidden;
-  background: var(--bg);
-  border: 1px solid var(--border);
-}
-.icon img { width: 100%; height: 100%; object-fit: contain; }
-.icon-text { font-size: 1.25rem; line-height: 1; border: none; background: none; }
-.icon-gen {
-  background: hsl(var(--h) 55% 45%);
-  border-color: transparent;
-  color: #fff;
-  font-size: .8rem;
-  font-weight: 600;
-  letter-spacing: .02em;
-}
-.meta { display: flex; flex-direction: column; min-width: 0; }
-.meta .title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.meta .slug { color: var(--muted); font-size: .8rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.meta .when { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-.meta .when::before { content: "\00b7"; margin-right: .35rem; }
-.empty, .no-match { color: var(--muted); text-align: center; padding: 2rem 0; }
-.no-match { display: none; }
-"#;
-
 pub(crate) const INDEX_SEARCH_SCRIPT: &str = r#"
 <script>
   const input = document.getElementById('q');
@@ -606,55 +518,43 @@ pub(crate) async fn index(
         n => format!("{n} pages"),
     };
 
-    let markup = html! {
-        (maud::DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Pages" }
-                style { (PreEscaped(INDEX_STYLE)) }
-            }
-            body {
-                div."container" {
-                    h1 { "Pages" }
-                    p."count" { (count_label) }
+    let body = html! {
+        h1 { "Pages" }
+        p."muted" { (count_label) }
 
-                    @if cards.is_empty() {
-                        p."empty" { "No pages yet. Push one to see it here." }
-                    } @else {
-                        input type="search" id="q" placeholder="Filter pages…" autocomplete="off";
-                        ul."pages" id="list" {
-                            @for card in &cards {
-                                li data-slug=(card.slug.to_lowercase())
-                                   data-title=(card.title.as_deref().unwrap_or_default().to_lowercase()) {
-                                    a href={ "/p/" (card.slug) } {
-                                        (icon_markup(&card.icon))
-                                        span."meta" {
-                                            // With a title the slug becomes the
-                                            // subtitle; without one it is all
-                                            // there is to show.
-                                            span."title" { (card.title.as_deref().unwrap_or(&card.slug)) }
-                                            span."slug" {
-                                                @if card.title.is_some() { (card.slug) }
-                                                @if let Some(modified) = card.modified {
-                                                    " " span."when" { (relative_time(modified)) }
-                                                }
-                                            }
-                                        }
+        @if cards.is_empty() {
+            p."empty" { "No pages yet. Push one to see it here." }
+        } @else {
+            input type="search" id="q" placeholder="Filter pages…" autocomplete="off";
+            ul."stack" id="list" {
+                @for card in &cards {
+                    li data-slug=(card.slug.to_lowercase())
+                       data-title=(card.title.as_deref().unwrap_or_default().to_lowercase()) {
+                        a."card" href={ "/p/" (card.slug) } {
+                            (icon_markup(&card.icon))
+                            span."meta" {
+                                // With a title the slug becomes the subtitle;
+                                // without one it is all there is to show.
+                                span."title" { (card.title.as_deref().unwrap_or(&card.slug)) }
+                                span."slug" {
+                                    @if card.title.is_some() { (card.slug) }
+                                    @if let Some(modified) = card.modified {
+                                        span."when" { (relative_time(modified)) }
                                     }
                                 }
                             }
                         }
-                        p."no-match" id="no-match" { "No pages match that." }
                     }
                 }
-                @if !cards.is_empty() {
-                    (PreEscaped(INDEX_SEARCH_SCRIPT))
-                }
             }
+            p."no-match" id="no-match" { "No pages match that." }
         }
     };
+    let markup = crate::ui::page(
+        "Pages",
+        body,
+        (!cards.is_empty()).then_some(INDEX_SEARCH_SCRIPT),
+    );
     Html(markup.into_string())
 }
 

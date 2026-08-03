@@ -19,7 +19,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use maud::{html, Markup, DOCTYPE};
+use maud::{html, Markup};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -98,22 +98,13 @@ fn render(
     grants: &[(String, String)],
     token: &str,
 ) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Admin" }
-                style { (maud::PreEscaped(STYLE)) }
-            }
-            body {
-                header {
-                    h1 { "Admin" }
-                    p."muted" { "Signed in as " (admin.email) " · " a href="/auth/logout" { "sign out" } }
-                }
+    crate::ui::page(
+        "Admin",
+        html! {
+            h1 { "Admin" }
+            p."muted" { "Signed in as " (admin.email) " · " a href="/auth/logout" { "sign out" } }
 
-                section {
+            section {
                     h2 { "Accounts" }
                     @if accounts.is_empty() {
                         p."muted" { "No accounts yet." }
@@ -128,7 +119,7 @@ fn render(
                                         td { @if account.is_admin { "yes" } @else { "" } }
                                         td { @if account.is_active { "active" } @else { "disabled" } }
                                         td {
-                                            form method="post" action="/admin/active" {
+                                            form."row" method="post" action="/admin/active" {
                                                 input type="hidden" name="token" value=(token);
                                                 input type="hidden" name="email" value=(account.email);
                                                 input type="hidden" name="active"
@@ -146,7 +137,7 @@ fn render(
                         }
                     }
 
-                    form method="post" action="/admin/users" {
+                    form."row" method="post" action="/admin/users" {
                         input type="hidden" name="token" value=(token);
                         input name="email" type="email" placeholder="Email" required;
                         input name="password" type="password" placeholder="Password (8+)" required;
@@ -155,7 +146,7 @@ fn render(
                     }
                 }
 
-                section {
+            section {
                     h2 { "Apps" }
                     @if apps.is_empty() {
                         p."muted" { "Nothing published yet." }
@@ -168,7 +159,7 @@ fn render(
                                         td { a href={ "/p/" (app) "/" } { (app) } }
                                         td { code { (gate) } }
                                         td {
-                                            form method="post" action="/admin/gate" {
+                                            form."row" method="post" action="/admin/gate" {
                                                 input type="hidden" name="token" value=(token);
                                                 input type="hidden" name="app" value=(app);
                                                 select name="gate" {
@@ -186,7 +177,7 @@ fn render(
                     }
                 }
 
-                section {
+            section {
                     h2 { "Access" }
                     p."muted" { "Only matters for apps gated " code { "granted" } "." }
                     @if grants.is_empty() {
@@ -200,7 +191,7 @@ fn render(
                                         td { (app) }
                                         td { (email) }
                                         td {
-                                            form method="post" action="/admin/access" {
+                                            form."row" method="post" action="/admin/access" {
                                                 input type="hidden" name="token" value=(token);
                                                 input type="hidden" name="app" value=(app);
                                                 input type="hidden" name="email" value=(email);
@@ -214,17 +205,17 @@ fn render(
                         }
                     }
 
-                    form method="post" action="/admin/access" {
-                        input type="hidden" name="token" value=(token);
-                        input type="hidden" name="allow" value="1";
-                        input name="app" placeholder="App" required;
-                        input name="email" type="email" placeholder="Account email" required;
-                        button type="submit" { "Grant" }
-                    }
+                form."row" method="post" action="/admin/access" {
+                    input type="hidden" name="token" value=(token);
+                    input type="hidden" name="allow" value="1";
+                    input name="app" placeholder="App" required;
+                    input name="email" type="email" placeholder="Account email" required;
+                    button type="submit" { "Grant" }
                 }
             }
-        }
-    }
+        },
+        None,
+    )
 }
 
 #[derive(Deserialize)]
@@ -380,21 +371,3 @@ pub fn no_store() -> (header::HeaderName, &'static str) {
     (header::CACHE_CONTROL, "no-store")
 }
 
-const STYLE: &str = r#"
-  body { font: 16px/1.6 system-ui, sans-serif; color-scheme: light dark;
-         max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.4rem; margin: 0; }
-  h2 { font-size: 1.05rem; margin: 2rem 0 .5rem; }
-  .muted { color: #8a8a8a; font-size: .9rem; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: .75rem; }
-  th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid #8883; }
-  th { font-weight: 600; font-size: .85rem; color: #8a8a8a; }
-  form { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .5rem 0; }
-  input, select { padding: .4rem .5rem; border-radius: .35rem; border: 1px solid #8884;
-                  background: transparent; color: inherit; font-size: .95rem; }
-  input[type=checkbox] { width: auto; }
-  button { padding: .4rem .8rem; border-radius: .35rem; border: 0; cursor: pointer;
-           background: #4f46e5; color: #fff; font-size: .9rem; }
-  button.danger { background: #b91c1c; }
-  code { background: #8882; padding: .05rem .3rem; border-radius: .25rem; font-size: .85em; }
-"#;

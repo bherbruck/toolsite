@@ -29,6 +29,7 @@ Two more that this codebase already leans on:
 main.rs            startup: env -> Config, listener, --stdio
 lib.rs             build_router: every route, assembled in one place
 config.rs          Config shared by every layer
+ui.rs              the theme for pages toolsite serves itself
 
 platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
@@ -53,6 +54,10 @@ accounts/          people who USE published apps
 wit/               the contract guests compile against
 cli/               the `toolsite` command (standalone crate)
 ```
+
+Pages toolsite serves itself — index, sign-in, admin — go through `ui::page`
+or `ui::form_page`, so a new one inherits the theme rather than growing its
+own stylesheet. Published apps are not styled from here; they bring their own.
 
 Two auth systems live here and must never be conflated: `platform/` decides
 who may publish, `accounts/` decides who may visit. They were adjacent files

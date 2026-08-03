@@ -3,6 +3,7 @@ pub mod config;
 pub mod content;
 pub mod platform;
 pub mod runtime;
+pub mod ui;
 
 pub use config::Config;
 

@@ -727,43 +727,23 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> &'h str {
 
 pub async fn login_form(Query(params): Query<NextPage>) -> Response {
     let next = safe_next(params.next.as_deref());
-    let markup = maud::html! {
-        (maud::DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Sign in" }
-                style { (maud::PreEscaped(LOGIN_STYLE)) }
+    let markup = crate::ui::form_page(
+        "Sign in",
+        maud::html! {
+            form."column" method="post" action="/auth/login" {
+                h1 { "Sign in" }
+                input type="hidden" name="next" value=(next);
+                input name="email" type="email" placeholder="Email"
+                      autocomplete="username" required autofocus;
+                input name="password" type="password" placeholder="Password"
+                      autocomplete="current-password" required;
+                button type="submit" { "Sign in" }
             }
-            body {
-                form method="post" action="/auth/login" {
-                    h1 { "Sign in" }
-                    // Escaped by the template rather than by remembering to
-                    // call something.
-                    input type="hidden" name="next" value=(next);
-                    input name="email" type="email" placeholder="Email"
-                          autocomplete="username" required autofocus;
-                    input name="password" type="password" placeholder="Password"
-                          autocomplete="current-password" required;
-                    button type="submit" { "Sign in" }
-                }
-            }
-        }
-    };
+        },
+    );
     Html(markup.into_string()).into_response()
 }
 
-const LOGIN_STYLE: &str = r#"
-  body { font: 16px/1.6 system-ui, sans-serif; color-scheme: light dark;
-         display: grid; place-items: center; min-height: 100vh; margin: 0; }
-  form { display: flex; flex-direction: column; gap: .75rem; width: min(20rem, 90vw); }
-  input { padding: .6rem .7rem; border-radius: .4rem; border: 1px solid #8884;
-          background: transparent; color: inherit; font-size: 1rem; }
-  button { padding: .6rem; border-radius: .4rem; border: 0; font-size: 1rem;
-           background: #4f46e5; color: #fff; cursor: pointer; }
-  h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
-"#;
 
 #[derive(serde::Deserialize)]
 pub struct Credentials {
@@ -1171,27 +1151,23 @@ pub async fn setup_form(
             .into_response();
     };
 
-    let markup = maud::html! {
-        (maud::DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Choose a password" }
-                style { (maud::PreEscaped(LOGIN_STYLE)) }
+    let markup = crate::ui::form_page(
+        "Choose a password",
+        maud::html! {
+            form."column" method="post" action="/auth/setup" {
+                h1 { "Choose a password" }
+                input type="hidden" name="token" value=(params.token);
+                // A password manager needs the account name in the same form
+                // to save the pair; without it, it stores a password with no
+                // username and asks the person to type the email by hand.
+                input type="email" name="email" value=(account.email)
+                      autocomplete="username" readonly;
+                input name="password" type="password" placeholder="Password (8+)"
+                      autocomplete="new-password" required autofocus;
+                button type="submit" { "Set password and sign in" }
             }
-            body {
-                form method="post" action="/auth/setup" {
-                    h1 { "Choose a password" }
-                    p."muted" { (account.email) }
-                    input type="hidden" name="token" value=(params.token);
-                    input name="password" type="password" placeholder="Password (8+)"
-                          autocomplete="new-password" required autofocus;
-                    button type="submit" { "Set password and sign in" }
-                }
-            }
-        }
-    };
+        },
+    );
     Html(markup.into_string()).into_response()
 }
 
