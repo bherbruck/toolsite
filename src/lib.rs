@@ -7,6 +7,7 @@ pub mod oauth;
 pub mod slug;
 pub mod store;
 pub mod upload;
+pub mod wasm;
 pub mod web;
 
 pub use config::Config;
