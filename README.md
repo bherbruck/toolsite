@@ -41,6 +41,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
 | `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
 | `toolsite gate <app> <public\|authenticated\|granted>` | Decide who may reach an app. |
 | `toolsite grant <app> <email>` / `revoke` | Access for a `granted` app. |
+| `toolsite user disable <email>` / `enable` | Stop an account signing in and end its live sessions. Reversible. |
 
 `deploy` warns when `index.html` references `/assets/…` from the domain root,
 which is the mistake that ships a blank page while looking like a success.
@@ -193,7 +194,9 @@ toolsite grant reports someone@example.com
 ```
 
 An admin account can do all of that from `/admin` instead: list accounts, add
-one, set any app's gate, and grant or revoke access. It is a platform route
+one, disable or re-enable it, set any app's gate, and grant or revoke access.
+Disabling ends the account's live sessions immediately rather than waiting for
+them to expire, and destroys nothing — enabling restores the same password. It is a platform route
 rather than a published app because an app cannot read the account database —
 that isolation is what the rest of the security rests on, so an admin app
 could only exist by breaking it.

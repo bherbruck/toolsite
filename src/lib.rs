@@ -91,6 +91,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin", get(admin::page))
         .route("/admin/users", post(admin::add_account))
         .route("/admin/access", post(admin::change_access))
+        .route("/admin/active", post(admin::change_active))
         .route("/admin/gate", post(admin::change_gate))
         // Trades the site session for one scoped to a single app; the only
         // way an app ever sees a visitor.

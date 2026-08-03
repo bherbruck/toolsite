@@ -98,6 +98,10 @@ enum UserCommand {
         #[arg(long)]
         admin: bool,
     },
+    /// Stop an account signing in, and end its live sessions now.
+    Disable { email: String },
+    /// Let a disabled account back in.
+    Enable { email: String },
 }
 
 fn main() {
@@ -157,6 +161,20 @@ fn run() -> Result<()> {
                     "create_user",
                     json!({ "email": email, "password": password, "admin": admin })
                 )?
+            );
+            Ok(())
+        }
+        Command::User(UserCommand::Disable { email }) => {
+            println!(
+                "{}",
+                mcp.call("set_user_active", json!({ "email": email, "active": false }))?
+            );
+            Ok(())
+        }
+        Command::User(UserCommand::Enable { email }) => {
+            println!(
+                "{}",
+                mcp.call("set_user_active", json!({ "email": email, "active": true }))?
             );
             Ok(())
         }

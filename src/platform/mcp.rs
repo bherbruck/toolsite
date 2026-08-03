@@ -115,6 +115,16 @@ pub(crate) struct CreateUserRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SetActiveRequest {
+    #[schemars(description = "Email of the account to turn off or back on.")]
+    pub(crate) email: String,
+    #[schemars(
+        description = "false disables the account: it cannot sign in and its existing sessions stop working immediately. Nothing is deleted, so true restores it."
+    )]
+    pub(crate) active: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct AccessRequest {
     #[schemars(description = "App the grant applies to.")]
     pub(crate) app: String,
@@ -381,6 +391,30 @@ impl PageHost {
                 user.email,
                 if user.is_admin { " as an admin" } else { "" },
                 user.id
+            ))])),
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
+    }
+
+    #[tool(
+        description = "Turn an account off or back on. A disabled account cannot sign in and its live sessions stop working at once, but it is not deleted."
+    )]
+    pub(crate) async fn set_user_active(
+        &self,
+        Parameters(SetActiveRequest { email, active }): Parameters<SetActiveRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = self.config.clone();
+        let owned = email.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || crate::accounts::users::set_active(&config, &owned, active))
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match outcome {
+            Ok(()) if active => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{email} is active again"
+            ))])),
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{email} is disabled; its sessions are gone"
             ))])),
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }

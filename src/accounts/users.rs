@@ -162,7 +162,8 @@ pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, Str
 
     let found: Option<(String, Option<String>, bool)> = conn
         .query_row(
-            "select id, password_hash, is_admin from users where email = ?",
+            "select id, password_hash, is_admin from users
+              where email = ? and disabled_at is null",
             [&email],
             |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
         )
@@ -219,7 +220,7 @@ pub fn create_app_session(
             "select users.id, users.email, users.is_admin, sessions.expires_at
                from sessions join users on users.id = sessions.user_id
               where sessions.token_hash = ? and sessions.expires_at >= ?
-                and sessions.scope is null",
+                and sessions.scope is null and users.disabled_at is null",
             rusqlite::params![hash_token(site_token), now as i64],
             |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0, row.get(3)?)),
         )
@@ -289,7 +290,7 @@ fn session_user(config: &Config, token: &str, scope: Option<&str>) -> Option<Use
         "select users.id, users.email, users.is_admin
            from sessions join users on users.id = sessions.user_id
           where sessions.token_hash = ? and sessions.expires_at >= ?
-            and sessions.scope is ?",
+            and sessions.scope is ? and users.disabled_at is null",
         rusqlite::params![hash_token(token), now() as i64, scope],
         |row| {
             Ok(User {
@@ -933,12 +934,38 @@ pub struct Account {
     pub email: String,
     pub created: String,
     pub is_admin: bool,
+    pub is_active: bool,
+}
+
+/// Turns an account off, or back on. Existing sessions are dropped rather
+/// than left to expire, so access ends now; the session lookup also refuses a
+/// disabled account, which covers anything issued in between.
+pub fn set_active(config: &Config, email: &str, active: bool) -> Result<(), String> {
+    let conn = open(config)?;
+    let email = normalise(email);
+    let changed = conn
+        .execute(
+            "update users set disabled_at = ? where email = ?",
+            rusqlite::params![if active { None } else { Some(now() as i64) }, &email],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err(format!("no account for {email}"));
+    }
+    if !active {
+        conn.execute(
+            "delete from sessions where user_id in (select id from users where email = ?)",
+            [&email],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
     let conn = open(config)?;
     let mut statement = conn
-        .prepare("select email, created_at, is_admin from users order by email")
+        .prepare("select email, created_at, is_admin, disabled_at from users order by email")
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -949,6 +976,7 @@ pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
                 // would mean a date-formatting dependency.
                 created: format!("{} days ago", (now().saturating_sub(created as u64)) / 86_400),
                 is_admin: row.get::<_, i64>(2)? != 0,
+                is_active: row.get::<_, Option<i64>>(3)?.is_none(),
             })
         })
         .map_err(|e| e.to_string())?;

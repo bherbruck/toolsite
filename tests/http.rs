@@ -1161,3 +1161,78 @@ async fn an_ordinary_account_cannot_drive_admin_actions_directly() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn disabling_an_account_ends_the_sessions_it_already_has() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+
+    // Signed in and working before anything changes.
+    let token = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (status, ..) = send(&config, get_as("/p/members/", &token)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "expected the handoff");
+
+    toolsite::accounts::users::set_active(&config, "someone@example.com", false).unwrap();
+
+    // The point: a live session stops working, rather than lasting until it
+    // expires. Checking the flag only at sign-in would miss this.
+    let (status, ..) = send(&config, get_as("/auth/me", &token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    assert!(
+        toolsite::accounts::users::log_in(&config, "someone@example.com", "correct horse battery")
+            .is_err(),
+        "a disabled account signed in"
+    );
+}
+
+#[tokio::test]
+async fn enabling_an_account_lets_it_back_in() {
+    let (_dir, config) = server();
+    account(&config, "someone@example.com", "correct horse battery");
+    toolsite::accounts::users::set_active(&config, "someone@example.com", false).unwrap();
+    toolsite::accounts::users::set_active(&config, "someone@example.com", true).unwrap();
+
+    // Nothing was destroyed, so the same password still works.
+    let (_, token) =
+        toolsite::accounts::users::log_in(&config, "someone@example.com", "correct horse battery")
+            .unwrap();
+    let (status, ..) = send(&config, get_as("/auth/me", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_disabled_admin_loses_the_admin_page() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    admin_account(&config, "other@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    assert_eq!(send(&config, get_as("/admin", &boss)).await.0, StatusCode::OK);
+
+    toolsite::accounts::users::set_active(&config, "boss@example.com", false).unwrap();
+    let (status, ..) = send(&config, get_as("/admin", &boss)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "a disabled admin kept the page");
+}
+
+#[tokio::test]
+async fn an_admin_cannot_disable_itself_and_lock_everyone_out() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/admin", &boss)).await;
+    let token = form_token_from(&page);
+
+    let (status, ..) = send(
+        &config,
+        post_form(
+            "/admin/active",
+            &boss,
+            format!("token={token}&email=boss@example.com&active=0"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(send(&config, get_as("/admin", &boss)).await.0, StatusCode::OK);
+}

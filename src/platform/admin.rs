@@ -119,13 +119,27 @@ fn render(
                         p."muted" { "No accounts yet." }
                     } @else {
                         table {
-                            thead { tr { th { "Email" } th { "Created" } th { "Admin" } } }
+                            thead { tr { th { "Email" } th { "Created" } th { "Admin" } th { "Status" } th {} } }
                             tbody {
                                 @for account in accounts {
                                     tr {
                                         td { (account.email) }
                                         td."muted" { (account.created) }
                                         td { @if account.is_admin { "yes" } @else { "" } }
+                                        td { @if account.is_active { "active" } @else { "disabled" } }
+                                        td {
+                                            form method="post" action="/admin/active" {
+                                                input type="hidden" name="token" value=(token);
+                                                input type="hidden" name="email" value=(account.email);
+                                                input type="hidden" name="active"
+                                                      value=(if account.is_active { "0" } else { "1" });
+                                                @if account.is_active {
+                                                    button."danger" type="submit" { "Disable" }
+                                                } @else {
+                                                    button type="submit" { "Enable" }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -245,6 +259,42 @@ pub async fn add_account(
         Ok(Ok(_)) => Redirect::to("/admin").into_response(),
         Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not add account").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ActiveChange {
+    token: String,
+    email: String,
+    active: String,
+}
+
+pub async fn change_active(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<ActiveChange>,
+) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    if !check_form_token(&config, &admin, &form.token) {
+        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
+    }
+    // Disabling yourself would lock the last admin out of this page.
+    if form.email.trim().eq_ignore_ascii_case(&admin.email) && form.active != "1" {
+        return (StatusCode::BAD_REQUEST, "you cannot disable your own account").into_response();
+    }
+
+    let active = form.active == "1";
+    let config2 = config.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || users::set_active(&config2, &form.email, active)).await;
+
+    match outcome {
+        Ok(Ok(())) => Redirect::to("/admin").into_response(),
+        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not change the account").into_response(),
     }
 }
 
