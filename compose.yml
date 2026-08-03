@@ -20,17 +20,19 @@ services:
       - TOOLSITE_DATA_DIR=/data
       - PORT=8080
       # At least one auth mode is required, or the server refuses to start.
-      - TOOLSITE_TOKEN=${TOOLSITE_TOKEN:?set TOOLSITE_TOKEN in .env}
+      # The old unprefixed names are accepted here too, so an existing .env
+      # keeps working.
+      - TOOLSITE_TOKEN=${TOOLSITE_TOKEN:-${BEARER_TOKEN:?set TOOLSITE_TOKEN in .env}}
       # OAuth is for clients that cannot send a bearer token, such as
       # claude.ai connectors. Set both together or leave them empty; empty
       # values are treated as unset.
-      - TOOLSITE_OAUTH_CLIENT_ID=${TOOLSITE_OAUTH_CLIENT_ID:-}
-      - TOOLSITE_OAUTH_CLIENT_SECRET=${TOOLSITE_OAUTH_CLIENT_SECRET:-}
+      - TOOLSITE_OAUTH_CLIENT_ID=${TOOLSITE_OAUTH_CLIENT_ID:-${OAUTH_CLIENT_ID:-}}
+      - TOOLSITE_OAUTH_CLIENT_SECRET=${TOOLSITE_OAUTH_CLIENT_SECRET:-${OAUTH_CLIENT_SECRET:-}}
       # Required once OAuth is set, since discovery metadata needs absolute
       # URLs. A bare host gets https:// prepended.
-      - TOOLSITE_BASE_URL=${TOOLSITE_BASE_URL:-}
+      - TOOLSITE_BASE_URL=${TOOLSITE_BASE_URL:-${PUBLIC_BASE_URL:-}}
       # Per-app SQLite, which handlers reach through db.query.
-      - TOOLSITE_DATABASES=${TOOLSITE_DATABASES:-on}
+      - TOOLSITE_DATABASES=${TOOLSITE_DATABASES:-${DATABASES:-on}}
       - RUST_LOG=${RUST_LOG:-info}
 
     volumes:
