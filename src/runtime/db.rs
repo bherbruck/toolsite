@@ -18,7 +18,7 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 
 /// Every app gets its own file. The path comes from an already-validated slug
 /// and never from anything a caller supplied verbatim.
-pub(crate) fn db_path(config: &Config, app: &str) -> Option<PathBuf> {
+pub fn db_path(config: &Config, app: &str) -> Option<PathBuf> {
     valid_slug(app).then(|| config.data_dir.join(app).join("data.db"))
 }
 

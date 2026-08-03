@@ -210,3 +210,31 @@ fn a_guest_has_no_filesystem_no_environment_and_no_sockets() {
         "guest saw host environment variables: {body}"
     );
 }
+
+/// The platform's account database sits under `.site/`, and app databases are
+/// resolved from a validated slug. This asserts a guest cannot reach across
+/// that line — by naming it, by attaching it, or by querying its tables.
+#[test]
+fn a_guest_cannot_reach_the_platforms_account_database() {
+    let runtime = Runtime::new().unwrap();
+    let (_dir, site) = site();
+
+    // Put a real account in the platform database.
+    toolsite::accounts::users::sign_up(&site, "someone@example.com", "correct horse battery")
+        .unwrap();
+    assert!(site.data_dir.join(".site/auth.db").exists());
+
+    // 1. An app cannot be named after the platform directory: a slug may not
+    //    contain a dot, so `.site` never resolves to a path.
+    assert!(toolsite::runtime::db::db_path(&site, ".site").is_none());
+
+    // 2. Its own database has no idea those tables exist.
+    let (status, body) = call(&runtime, &site, "app", request("/api/read-users"));
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains("no such table"), "{body}");
+
+    // 3. ATTACH is refused, so it cannot pull the file in sideways.
+    let (status, body) = call(&runtime, &site, "app", request("/api/steal-auth"));
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("not authorized"), "{body}");
+}

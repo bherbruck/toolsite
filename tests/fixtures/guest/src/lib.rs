@@ -63,6 +63,20 @@ impl Guest for Handler {
             }
 
             // The host must refuse this, not the guest.
+            // Can a guest read the platform's own account tables?
+            "/read-users" => match db::query("select email from users", &[]) {
+                Ok(rows) => respond(200, format!("LEAKED {:?}", rows.values)),
+                Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
+                Err(db::Error::Failed(m)) => respond(500, format!("failed: {m}")),
+            },
+
+            // Or pull the platform database in sideways?
+            "/steal-auth" => match db::query("attach database '../.site/auth.db' as site", &[]) {
+                Ok(_) => respond(200, "ATTACHED".to_string()),
+                Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
+                Err(db::Error::Failed(m)) => respond(500, format!("failed: {m}")),
+            },
+
             "/escape" => match db::query("attach database '../victim/data.db' as v", &[]) {
                 Ok(_) => respond(200, "ATTACHED".to_string()),
                 Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
