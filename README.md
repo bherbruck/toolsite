@@ -147,13 +147,24 @@ response says so rather than silently shipping less.
 
 ## Server-side code
 
-An app can ship a wasm component that answers requests. It is built for
-`wasm32-wasip2` against [`wit/toolsite.wit`](wit/toolsite.wit) and uploaded
-alongside the bundle:
+An app can ship a wasm component that answers requests. The server hands out
+everything needed to build one, so an agent with a shell needs nothing from
+this repository:
 
 ```
-curl -f -T handler.wasm '<upload-url>?handler'
+curl -s https://yourdomain.com/scaffold/myapp | tar xz && cd myapp-handler
+rustup target add wasm32-wasip2
+cargo build --release --target wasm32-wasip2
+curl -f -T target/wasm32-wasip2/release/*.wasm '<upload-url>?handler'
 ```
+
+The scaffold is a complete crate: the contract vendored into `wit/`, a
+`Cargo.toml` with the right crate type, and a handler that already reads and
+writes its own database. `create_upload` prints these commands with the real
+slug filled in.
+
+The contract on its own is at `GET /wit/toolsite.wit`, and mirrors
+[`wit/toolsite.wit`](wit/toolsite.wit).
 
 Requests are then resolved in a fixed order:
 
@@ -269,6 +280,8 @@ the index shows. There's a client-side filter over slugs and titles.
 | `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed, `?handler` installs a wasm component. 64 MB. |
 | `ANY /p/<slug>` | public | The page, a bundle asset, or the app's handler. An app root redirects to `/p/<slug>/` so relative links resolve. |
 | `GET /icon/<slug>` | public | A page's icon, if set. |
+| `GET /wit/toolsite.wit` | public | The contract a handler compiles against. |
+| `GET /scaffold/<app>` | public | A gzipped tar of a handler crate ready to build. |
 | `GET /` | public | The index. |
 
 ## Auth

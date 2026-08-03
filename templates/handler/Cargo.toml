@@ -1,0 +1,18 @@
+# Built for wasm32-wasip2, so it must stay out of any host workspace.
+[workspace]
+
+[package]
+name = "NAME-handler"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+
+[profile.release]
+opt-level = "s"
+strip = true

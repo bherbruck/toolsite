@@ -38,6 +38,20 @@ async fn send(config: &Arc<Config>, request: Request<Body>) -> (StatusCode, Stri
     (status, String::from_utf8_lossy(&bytes).to_string(), headers)
 }
 
+/// Like `send`, but keeps the body as bytes — a gzip does not survive being
+/// read as lossy UTF-8.
+async fn send_bytes(config: &Arc<Config>, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let response = build_router(config.clone(), Runtime::new().unwrap())
+        .oneshot(request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
 fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
@@ -1415,4 +1429,46 @@ async fn every_page_toolsite_serves_itself_shares_one_stylesheet() {
         assert_eq!(status, StatusCode::OK, "{name}");
         assert!(body.contains(marker), "{name} does not use the shared theme");
     }
+}
+
+#[tokio::test]
+async fn an_agent_can_fetch_the_contract_and_a_crate_that_builds_against_it() {
+    let (_dir, config) = server();
+
+    // Public: the WIT describes an interface and the scaffold is a template.
+    // Neither says anything about what is published here.
+    let (status, wit, _) = send(&config, get("/wit/toolsite.wit")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(wit.contains("world app"), "not the contract");
+    assert!(wit.contains("export handle:"), "the export is what a guest must satisfy");
+
+    let (status, body) = send_bytes(&config, get("/scaffold/notes")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The archive must carry everything needed to build without the repo.
+    let decoder = flate2::read::GzDecoder::new(&body[..]);
+    let mut archive = tar::Archive::new(decoder);
+    let mut names: Vec<String> = archive
+        .entries()
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().unwrap().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "notes-handler/Cargo.toml",
+            "notes-handler/README.md",
+            "notes-handler/src/lib.rs",
+            "notes-handler/wit/toolsite.wit",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_scaffold_cannot_be_asked_for_under_a_bad_name() {
+    let (_dir, config) = server();
+    let (status, ..) = send(&config, get("/scaffold/../../etc")).await;
+    assert_ne!(status, StatusCode::OK);
 }

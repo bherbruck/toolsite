@@ -312,11 +312,22 @@ impl PageHost {
              \nWith a router, set its basename to '{trimmed}' too (e.g. \
              createBrowserRouter(routes, {{ basename: '{trimmed}' }})).\n\
              \nAfter uploading, verify with: curl -I {page}/assets/<one-built-file>\n\
-             \nServer-side code — a component built for wasm32-wasip2 against wit/toolsite.wit,              which gets this app's own SQLite database and nothing else:\n\
-             \n  curl -f -T handler.wasm '{upload}?handler'\n\
+             \nServer-side code — a wasm component that gets this app's own SQLite database \
+             and nothing else. Start from the scaffold; it vendors the contract and builds \
+             as-is:\n\
+             \n  curl -s {site}/scaffold/{slug} | tar xz && cd {slug}-handler\n\
+             \n  rustup target add wasm32-wasip2\n\
+             \n  cargo build --release --target wasm32-wasip2\n\
+             \n  curl -f -T target/wasm32-wasip2/release/*.wasm '{upload}?handler'\n\
+             \nThe contract alone is at {site}/wit/toolsite.wit.\n\
              \nIt then answers every request under {page}/api/, and any route with no file              behind it. It is rejected at upload if it is not a valid component.\n\
              \nEach upload replies with the page's public URL. Single-file page lands at {page}",
             page = page_url(&self.config, &slug),
+            site = self
+                .config
+                .base_url
+                .as_deref()
+                .unwrap_or(&self.config.local_base),
             base = format!("/p/{slug}/"),
             trimmed = format!("/p/{slug}"),
         ))]))

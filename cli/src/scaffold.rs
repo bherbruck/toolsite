@@ -77,82 +77,12 @@ fn write_handler(root: &Path, name: &str) -> Result<()> {
 
     std::fs::write(
         root.join("handler/Cargo.toml"),
-        format!(
-            r#"# Built for wasm32-wasip2, so it must stay out of any host workspace.
-[workspace]
-
-[package]
-name = "{name}-handler"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-wit-bindgen = "0.51"
-
-[profile.release]
-opt-level = "s"
-strip = true
-"#
-        ),
+        include_str!("../../templates/handler/Cargo.toml").replace("NAME", name),
     )?;
 
     std::fs::write(
         root.join("handler/src/lib.rs"),
-        r#"wit_bindgen::generate!({
-    path: "wit",
-    world: "app",
-});
-
-use toolsite::app::db;
-
-struct Handler;
-
-fn text(status: u16, body: impl Into<String>) -> Response {
-    Response {
-        status,
-        headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
-        body: body.into().into_bytes(),
-    }
-}
-
-impl Guest for Handler {
-    fn handle(req: Request) -> Response {
-        // The host passes the path relative to this app, with /api still on
-        // it, so strip the prefix the way any router would.
-        let route = req.path.strip_prefix("/api").unwrap_or(&req.path);
-
-        match (req.method.as_str(), route) {
-            ("GET", "/hello") => {
-                // State must live in the database: every request gets a fresh
-                // instance, so globals do not survive.
-                if let Err(e) = db::query(
-                    "create table if not exists visits (at integer)",
-                    &[],
-                ) {
-                    return text(500, format!("{e:?}"));
-                }
-                if let Err(e) = db::query("insert into visits values (0)", &[]) {
-                    return text(500, format!("{e:?}"));
-                }
-                match db::query("select count(*) from visits", &[]) {
-                    Ok(rows) => match rows.values.first().and_then(|r| r.first()) {
-                        Some(db::Value::Integer(n)) => text(200, format!("visit #{n}")),
-                        _ => text(500, "unexpected shape"),
-                    },
-                    Err(e) => text(500, format!("{e:?}")),
-                }
-            }
-            _ => text(404, "not found"),
-        }
-    }
-}
-
-export!(Handler);
-"#,
+        include_str!("../../templates/handler/src/lib.rs"),
     )?;
     Ok(())
 }

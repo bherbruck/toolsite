@@ -18,6 +18,7 @@ use crate::{
             token_endpoint,
         },
         mcp::PageHost,
+        scaffold,
         upload::{upload_root, upload_sub, MAX_UPLOAD_BYTES},
     },
 };
@@ -86,6 +87,11 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/", get(index))
         .route("/p/{*slug}", any(serve_page))
         .route("/icon/{*slug}", get(serve_icon))
+        // What an agent needs to build a handler: the contract, and a crate
+        // already wired to it.
+        .route("/wit/toolsite.wit", get(scaffold::wit))
+        .route("/scaffold/handler.tar.gz", get(scaffold::handler_scaffold))
+        .route("/scaffold/{app}", get(scaffold::handler_scaffold_named))
         .route("/auth/login", get(users::login_form).post(users::login_submit))
         .route("/auth/logout", post(users::logout).get(users::logout))
         .route("/auth/me", get(users::me))
