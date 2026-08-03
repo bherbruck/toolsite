@@ -1,0 +1,63 @@
+# toolsite
+
+MCP server + web host in one container. An agent publishes HTML, a multi-page
+app, or a compiled front-end bundle and gets a working URL back. See README.md
+for the user-facing surface.
+
+## Design principles
+
+**Abstract, high cohesion, low coupling.** Each module owns one concern and
+exposes the smallest surface that lets the others do their job. If a change
+forces edits across three modules, the boundary is in the wrong place.
+
+Two more that this codebase already leans on:
+
+- **Nothing destroys data.** There is no delete tool by design; retraction is
+  a visibility flag, so every action is reversible.
+- **Page content never passes through the model.** Tools hand back an upload
+  URL; the agent writes a file and curls it. Inline-HTML tools exist only as a
+  fallback for clients with no shell, and say so in their descriptions.
+
+## Module layout
+
+```
+main.rs     startup: env -> Config, router wiring, listener
+config.rs   Config struct shared by every layer
+slug.rs     naming rules (what may become a path), random tokens, escaping
+store.rs    the data layer: page/icon/meta paths, titles, visibility, listing
+bundle.rs   tar unpacking, entry classification, traversal defence
+upload.rs   upload tickets and the PUT endpoints they authorise
+auth.rs     bearer/x-api-key middleware for /mcp
+oauth.rs    the minimal single-user OAuth 2.1 shim
+web.rs      the public site: page serving, icons, index rendering
+mcp.rs      MCP tool definitions and the ServerHandler
+```
+
+Dependency direction is one-way: `web`/`mcp`/`upload` depend on `store`, which
+depends on `config` and `slug`. Nothing in `store` reaches back up into HTTP
+types.
+
+## Conventions
+
+- Storage is plain files under `DATA_DIR`; there is no database. A page is
+  `<slug>.html`, its icon `<slug>.icon`, its state `<slug>.meta`. An app is a
+  directory whose `index.html` serves at the app root.
+- Slugs are validated before they touch the filesystem (`slug.rs`). Page slugs
+  allow only `[A-Za-z0-9_-]` per segment; bundle asset paths additionally
+  allow `.` inside a segment but never at the start, which rules out `..` and
+  dotfiles at once. Never join user input to `DATA_DIR` without one of these.
+- Anything that rejects a request should log why, at `warn`, including the
+  headers that arrived — but never a token, and never file contents.
+
+## Testing
+
+No test suite yet; changes are verified by driving a local instance:
+
+```
+cargo build --release && ./target/release/toolsite      # reads .env, port 8099
+```
+
+Then exercise `/mcp` over JSON-RPC (initialize, then `tools/call`) and the
+public routes with curl. Cover the security cases when touching upload or
+serving code: path traversal, absolute paths, symlinks in bundles, expired
+tickets, and unauthenticated `/mcp`.
