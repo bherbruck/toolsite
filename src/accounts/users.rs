@@ -77,6 +77,9 @@ fn open(config: &Config) -> Result<Connection, String> {
 pub struct User {
     pub id: String,
     pub email: String,
+    /// May see and change other people's access. Not a grant, because it is
+    /// not about any one app.
+    pub is_admin: bool,
 }
 
 fn now() -> u64 {
@@ -103,6 +106,17 @@ fn normalise(email: &str) -> String {
 }
 
 pub fn sign_up(config: &Config, email: &str, password: &str) -> Result<User, String> {
+    sign_up_as(config, email, password, false)
+}
+
+/// The admin flag is set here rather than granted later so the first account
+/// can be made one at creation, before any admin exists to do it.
+pub fn sign_up_as(
+    config: &Config,
+    email: &str,
+    password: &str,
+    is_admin: bool,
+) -> Result<User, String> {
     let email = normalise(email);
     if !email.contains('@') || email.len() < 3 {
         return Err("that does not look like an email address".into());
@@ -120,8 +134,9 @@ pub fn sign_up(config: &Config, email: &str, password: &str) -> Result<User, Str
     let conn = open(config)?;
     let id = crate::content::slug::random_token(16);
     conn.execute(
-        "insert into users (id, email, password_hash, created_at) values (?, ?, ?, ?)",
-        rusqlite::params![&id, &email, &hash, now() as i64],
+        "insert into users (id, email, password_hash, created_at, is_admin)
+         values (?, ?, ?, ?, ?)",
+        rusqlite::params![&id, &email, &hash, now() as i64, is_admin as i64],
     )
     .map_err(|e| {
         if e.to_string().contains("UNIQUE") {
@@ -131,7 +146,11 @@ pub fn sign_up(config: &Config, email: &str, password: &str) -> Result<User, Str
         }
     })?;
 
-    Ok(User { id, email })
+    Ok(User {
+        id,
+        email,
+        is_admin,
+    })
 }
 
 /// Returns a session token on success. The same message is given whether the
@@ -141,17 +160,17 @@ pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, Str
     let conn = open(config)?;
     let email = normalise(email);
 
-    let found: Option<(String, Option<String>)> = conn
+    let found: Option<(String, Option<String>, bool)> = conn
         .query_row(
-            "select id, password_hash from users where email = ?",
+            "select id, password_hash, is_admin from users where email = ?",
             [&email],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
         )
         .ok();
 
     // A row with no password signed up through a provider, so there is
     // nothing here to verify against.
-    let Some((id, Some(stored))) = found else {
+    let Some((id, Some(stored), is_admin)) = found else {
         // Spend comparable time on an unknown address so timing does not leak
         // which half was wrong.
         if let Ok(salt) = new_salt() {
@@ -176,7 +195,7 @@ pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, Str
     )
     .map_err(|e| e.to_string())?;
 
-    Ok((User { id, email }, token))
+    Ok((User { id, email, is_admin }, token))
 }
 
 /// Mints a token good for one app, from a proven site session. Returns the
@@ -195,14 +214,14 @@ pub fn create_app_session(
     }
     let conn = open(config)?;
     let now = now();
-    let (id, email, site_expires): (String, String, i64) = conn
+    let (id, email, is_admin, site_expires): (String, String, bool, i64) = conn
         .query_row(
-            "select users.id, users.email, sessions.expires_at
+            "select users.id, users.email, users.is_admin, sessions.expires_at
                from sessions join users on users.id = sessions.user_id
               where sessions.token_hash = ? and sessions.expires_at >= ?
                 and sessions.scope is null",
             rusqlite::params![hash_token(site_token), now as i64],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0, row.get(3)?)),
         )
         .map_err(|_| "not signed in".to_string())?;
 
@@ -221,7 +240,7 @@ pub fn create_app_session(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok((User { id, email }, token, expires.saturating_sub(now)))
+    Ok((User { id, email, is_admin }, token, expires.saturating_sub(now)))
 }
 
 pub fn log_out(config: &Config, token: &str) -> Result<(), String> {
@@ -267,7 +286,7 @@ fn session_user(config: &Config, token: &str, scope: Option<&str>) -> Option<Use
     let _ = conn.execute("delete from sessions where expires_at < ?", [now() as i64]);
 
     conn.query_row(
-        "select users.id, users.email
+        "select users.id, users.email, users.is_admin
            from sessions join users on users.id = sessions.user_id
           where sessions.token_hash = ? and sessions.expires_at >= ?
             and sessions.scope is ?",
@@ -276,6 +295,7 @@ fn session_user(config: &Config, token: &str, scope: Option<&str>) -> Option<Use
             Ok(User {
                 id: row.get(0)?,
                 email: row.get(1)?,
+                is_admin: row.get::<_, i64>(2)? != 0,
             })
         },
     )
@@ -905,4 +925,56 @@ pub async fn current_app_user(config: &Arc<Config>, app: &str, headers: &HeaderM
         .await
         .ok()
         .flatten()
+}
+
+// --- admin queries ------------------------------------------------------
+
+pub struct Account {
+    pub email: String,
+    pub created: String,
+    pub is_admin: bool,
+}
+
+pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
+    let conn = open(config)?;
+    let mut statement = conn
+        .prepare("select email, created_at, is_admin from users order by email")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            let created: i64 = row.get(1)?;
+            Ok(Account {
+                email: row.get(0)?,
+                // Whole days is all this needs to convey; anything finer
+                // would mean a date-formatting dependency.
+                created: format!("{} days ago", (now().saturating_sub(created as u64)) / 86_400),
+                is_admin: row.get::<_, i64>(2)? != 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+pub fn list_grants(config: &Config) -> Result<Vec<(String, String)>, String> {
+    let conn = open(config)?;
+    let mut statement = conn
+        .prepare(
+            "select grants.app, users.email
+               from grants join users on users.id = grants.user_id
+              order by grants.app, users.email",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// A value only this server can produce for this account, used to tie an
+/// admin form to the session that rendered it. Derived from the account and
+/// the server's own secret, so it is not the session token and cannot be
+/// replayed as one.
+pub fn derive_form_token(config: &Config, user_id: &str) -> String {
+    let secret = config.valid_tokens.first().map(String::as_str).unwrap_or("");
+    URL_SAFE_NO_PAD.encode(Sha256::digest(format!("form:{secret}:{user_id}").as_bytes()))
 }

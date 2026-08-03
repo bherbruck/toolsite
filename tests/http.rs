@@ -1007,3 +1007,157 @@ async fn the_login_form_cannot_be_used_to_inject_markup() {
     assert_eq!(status, StatusCode::OK);
     assert!(!body.contains("<script>alert(1)</script>"), "markup was injected");
 }
+
+// --- admin --------------------------------------------------------------
+
+fn admin_account(config: &Config, email: &str, password: &str) {
+    toolsite::accounts::users::sign_up_as(config, email, password, true).unwrap();
+}
+
+/// The token an admin's own forms carry. Pulled from a rendered page rather
+/// than computed, so the test exercises what a browser would actually send.
+fn form_token_from(body: &str) -> String {
+    let marker = r#"name="token" value=""#;
+    let start = body.find(marker).expect("no form token on the page") + marker.len();
+    body[start..].split('"').next().unwrap().to_string()
+}
+
+fn post_form(uri: &str, token: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("cookie", format!("ts_session={token}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_admin_page_is_for_admins_only() {
+    let (_dir, config) = server();
+    account(&config, "ordinary@example.com", "correct horse battery");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+
+    // Signed out: sent to sign in.
+    let (status, ..) = send(&config, get("/admin")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Signed in but ordinary: refused, and not bounced into a login loop.
+    let ordinary = sign_in(&config, "ordinary@example.com", "correct horse battery");
+    let (status, ..) = send(&config, get_as("/admin", &ordinary)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (status, body, _) = send(&config, get_as("/admin", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("ordinary@example.com"), "accounts were not listed");
+}
+
+#[tokio::test]
+async fn an_admin_can_create_an_account_and_it_can_sign_in() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+
+    let (_, page, _) = send(&config, get_as("/admin", &boss)).await;
+    let token = form_token_from(&page);
+
+    let (status, ..) = send(
+        &config,
+        post_form(
+            "/admin/users",
+            &boss,
+            format!("token={token}&email=new@example.com&password=correct+horse+battery"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // The proof it worked is that the account can actually sign in.
+    assert!(toolsite::accounts::users::log_in(&config, "new@example.com", "correct horse battery").is_ok());
+}
+
+#[tokio::test]
+async fn an_admin_can_gate_an_app_and_grant_access_to_it() {
+    let (_dir, config) = server();
+    write_page(&config, "reports/index", "<h1>reports</h1>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+
+    let (_, page, _) = send(&config, get_as("/admin", &boss)).await;
+    let token = form_token_from(&page);
+
+    send(
+        &config,
+        post_form("/admin/gate", &boss, format!("token={token}&app=reports&gate=granted")),
+    )
+    .await;
+    let (status, ..) = send(&config, get("/p/reports/")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "gate did not take effect");
+
+    send(
+        &config,
+        post_form(
+            "/admin/access",
+            &boss,
+            format!("token={token}&app=reports&email=reader@example.com&allow=1"),
+        ),
+    )
+    .await;
+    let reader = toolsite::accounts::users::log_in(&config, "reader@example.com", "correct horse battery")
+        .unwrap()
+        .0;
+    assert!(toolsite::accounts::users::has_grant(&config, &reader, "reports"));
+}
+
+#[tokio::test]
+async fn an_admin_action_needs_the_form_token_from_this_session() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+
+    // A page on this origin can make the admin's browser POST, since the
+    // cookie is same-site. The token is what stops it landing.
+    for forged in ["", "guessed-token"] {
+        let (status, ..) = send(
+            &config,
+            post_form(
+                "/admin/users",
+                &boss,
+                format!("token={forged}&email=sneak@example.com&password=correct+horse+battery"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "token {forged:?} was accepted");
+    }
+    assert!(
+        toolsite::accounts::users::log_in(&config, "sneak@example.com", "correct horse battery")
+            .is_err(),
+        "an account was created without a valid form token"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_account_cannot_drive_admin_actions_directly() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "ordinary@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let ordinary = sign_in(&config, "ordinary@example.com", "correct horse battery");
+
+    let (_, page, _) = send(&config, get_as("/admin", &boss)).await;
+    let token = form_token_from(&page);
+
+    // Even holding a real admin's form token, the session decides.
+    let (status, ..) = send(
+        &config,
+        post_form(
+            "/admin/users",
+            &ordinary,
+            format!("token={token}&email=sneak@example.com&password=correct+horse+battery&admin=1"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

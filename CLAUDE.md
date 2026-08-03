@@ -31,6 +31,7 @@ lib.rs             build_router: every route, assembled in one place
 config.rs          Config shared by every layer
 
 platform/          the site as its owner uses it
+  admin.rs         /admin: accounts, gates and grants for whoever runs it
   mcp.rs           MCP tool definitions and the ServerHandler
   bearer.rs        bearer/x-api-key middleware for /mcp
   client_oauth.rs  OAuth shim for MCP clients — who may PUBLISH

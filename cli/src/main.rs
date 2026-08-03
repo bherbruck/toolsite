@@ -94,6 +94,9 @@ enum UserCommand {
         /// shell history.
         #[arg(long)]
         password: Option<String>,
+        /// Can see every account and change any app's access at /admin.
+        #[arg(long)]
+        admin: bool,
     },
 }
 
@@ -140,7 +143,11 @@ fn run() -> Result<()> {
             print_pages(&text);
             Ok(())
         }
-        Command::User(UserCommand::Add { email, password }) => {
+        Command::User(UserCommand::Add {
+            email,
+            password,
+            admin,
+        }) => {
             let password = password
                 .or_else(|| std::env::var("TOOLSITE_PASSWORD").ok())
                 .ok_or_else(|| anyhow!("pass --password or set TOOLSITE_PASSWORD"))?;
@@ -148,7 +155,7 @@ fn run() -> Result<()> {
                 "{}",
                 mcp.call(
                     "create_user",
-                    json!({ "email": email, "password": password })
+                    json!({ "email": email, "password": password, "admin": admin })
                 )?
             );
             Ok(())

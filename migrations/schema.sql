@@ -36,4 +36,4 @@ CREATE TABLE users (
     email         text not null unique,
     password_hash text,
     created_at    integer not null
-)
+, is_admin integer not null default 0)

@@ -3,6 +3,7 @@
 //! `client_oauth` here is for MCP *clients* — it decides who may publish.
 //! Visitor sign-in lives in `accounts`, and the two must never be conflated.
 
+pub mod admin;
 pub mod bearer;
 pub mod client_oauth;
 pub mod mcp;

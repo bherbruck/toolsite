@@ -38,7 +38,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
 | `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
 | `toolsite list [--all]` | What is published, newest first. |
 | `toolsite hide <slug>` / `unhide` | Reversible takedown. |
-| `toolsite user add <email> [--password p]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
+| `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
 | `toolsite gate <app> <public\|authenticated\|granted>` | Decide who may reach an app. |
 | `toolsite grant <app> <email>` / `revoke` | Access for a `granted` app. |
 
@@ -186,10 +186,17 @@ account says who may look. There is no public signup — every account is
 created by the owner, so there is nothing to abuse.
 
 ```
+toolsite user add boss@example.com --password '…' --admin   # the first admin
 toolsite user add someone@example.com --password '…'
 toolsite gate reports granted
 toolsite grant reports someone@example.com
 ```
+
+An admin account can do all of that from `/admin` instead: list accounts, add
+one, set any app's gate, and grant or revoke access. It is a platform route
+rather than a published app because an app cannot read the account database —
+that isolation is what the rest of the security rests on, so an admin app
+could only exist by breaking it.
 
 An app's gate is one of:
 

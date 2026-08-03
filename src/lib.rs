@@ -10,6 +10,7 @@ use crate::{
     accounts::users,
     content::serve::{index, serve_icon, serve_page},
     platform::{
+        admin,
         bearer::require_bearer,
         client_oauth::{
             authorize, oauth_authorization_server_metadata, oauth_protected_resource_metadata,
@@ -87,6 +88,10 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/auth/login", get(users::login_form).post(users::login_submit))
         .route("/auth/logout", post(users::logout).get(users::logout))
         .route("/auth/me", get(users::me))
+        .route("/admin", get(admin::page))
+        .route("/admin/users", post(admin::add_account))
+        .route("/admin/access", post(admin::change_access))
+        .route("/admin/gate", post(admin::change_gate))
         // Trades the site session for one scoped to a single app; the only
         // way an app ever sees a visitor.
         .route("/auth/handoff", get(users::handoff))

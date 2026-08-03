@@ -108,6 +108,10 @@ pub(crate) struct CreateUserRequest {
     pub(crate) email: String,
     #[schemars(description = "Initial password, at least 8 characters. Stored hashed with argon2.")]
     pub(crate) password: String,
+    #[schemars(
+        description = "Make this account an admin, able to see every account and change any app's access at /admin. Defaults to false."
+    )]
+    pub(crate) admin: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -353,17 +357,30 @@ impl PageHost {
     )]
     pub(crate) async fn create_user(
         &self,
-        Parameters(CreateUserRequest { email, password }): Parameters<CreateUserRequest>,
+        Parameters(CreateUserRequest {
+            email,
+            password,
+            admin,
+        }): Parameters<CreateUserRequest>,
     ) -> Result<CallToolResult, McpError> {
         let config = self.config.clone();
         let outcome =
-            tokio::task::spawn_blocking(move || crate::accounts::users::sign_up(&config, &email, &password))
+            tokio::task::spawn_blocking(move || {
+                crate::accounts::users::sign_up_as(
+                    &config,
+                    &email,
+                    &password,
+                    admin.unwrap_or(false),
+                )
+            })
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match outcome {
             Ok(user) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "created {} ({})",
-                user.email, user.id
+                "created {}{} ({})",
+                user.email,
+                if user.is_admin { " as an admin" } else { "" },
+                user.id
             ))])),
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }
