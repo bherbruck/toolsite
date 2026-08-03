@@ -18,7 +18,7 @@ use crate::{
             token_endpoint,
         },
         mcp::PageHost,
-        scaffold,
+        scaffold, secrets,
         upload::{self, upload_root, upload_sub, MAX_UPLOAD_BYTES},
     },
 };
@@ -95,6 +95,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/auth/login", get(users::login_form).post(users::login_submit))
         .route("/auth/logout", post(users::logout).get(users::logout))
         .route("/auth/me", get(users::me))
+        .route("/settings/{token}", get(secrets::entry_form))
+        .route("/settings", get(secrets::entry_form_query).post(secrets::entry_submit))
         .route(
             "/auth/setup",
             get(users::setup_form).post(users::setup_submit),

@@ -278,6 +278,37 @@ Nothing stored beside an app is reachable under `/p/` — not `.source`, not
 `.notes`, not `.meta`. If a visitor should be able to read a file, put it in
 the bundle; that is the whole rule.
 
+## Settings
+
+An app's handler can read values its bundle must not contain — API keys,
+endpoints. They are stored encrypted, beside the app, and nothing the platform
+serves ever returns one: listings give names, the source archive omits them,
+and no URL exposes them.
+
+The good way to set them is a link, so a secret never enters a conversation
+with an agent:
+
+```
+toolsite secret myapp --link     # prints a URL to hand over
+```
+
+Whoever holds the credentials opens it and pastes them, one `NAME=value` per
+line — a `.env` file works as-is, `export` prefixes, quotes and `#` comments
+included. For scripting there is still `toolsite secret myapp API_KEY --value
+…`, and `toolsite secret myapp` lists the names.
+
+A handler reads them through the `secrets` import:
+
+```rust
+let key = secrets::get("API_KEY").ok_or("API_KEY is not set")?;
+```
+
+**Encryption at rest.** Values are sealed with XChaCha20-Poly1305. The key
+comes from `TOOLSITE_SECRET_KEY` (base64, 32 bytes) when set — worth doing,
+since then a copy of the data volume is not a copy of the secrets. Without it
+one is generated at `.site/secret.key` beside them, which protects a stray
+backup of the database file and no more; the log says so at startup.
+
 ## Notes for the next session
 
 A published app is a rendered page; its source does not come back out of it.
@@ -345,6 +376,7 @@ Two independent modes — use either, or both at once. At least one is required.
 | `TOOLSITE_BASE_URL` | if using OAuth | Base URL of the deployment, e.g. `https://host.com`. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where pages are stored. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
+| `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker — see Settings. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
 
 `MCP` is in those three names because they authenticate MCP *clients* — who

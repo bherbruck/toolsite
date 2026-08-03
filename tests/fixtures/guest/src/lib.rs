@@ -8,6 +8,7 @@ wit_bindgen::generate!({
 
 use toolsite::app::db;
 use toolsite::app::identity;
+use toolsite::app::secrets;
 
 struct Handler;
 
@@ -85,6 +86,14 @@ impl Guest for Handler {
 
             // wasi is linked because std needs it, so these prove the empty
             // context actually withholds the capabilities.
+            // Settings the owner set for this app.
+            "/secret" => match secrets::get("API_KEY") {
+                Some(value) => respond(200, format!("key={value}")),
+                None => respond(404, "no API_KEY set".to_string()),
+            },
+
+            "/secret-names" => respond(200, secrets::names().join(",")),
+
             "/read-file" => match std::fs::read_to_string("/etc/passwd") {
                 Ok(contents) => respond(200, format!("READ {} bytes", contents.len())),
                 Err(e) => respond(403, format!("denied: {e}")),

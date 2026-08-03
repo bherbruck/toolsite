@@ -227,3 +227,26 @@ fn a_guest_cannot_reach_the_platforms_account_database() {
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("not authorized"), "{body}");
 }
+
+/// A handler is the only thing that can read an app's settings — that is the
+/// point of storing them outside the bundle.
+#[test]
+fn a_handler_reads_its_own_settings_and_no_one_elses() {
+    let runtime = Runtime::new().unwrap();
+    let (_dir, site) = site();
+
+    assert_eq!(call(&runtime, &site, "app", request("/api/secret")).0, 404);
+
+    toolsite::platform::secrets::set(&site, "app", "API_KEY", Some("hunter2")).unwrap();
+    assert_eq!(
+        call(&runtime, &site, "app", request("/api/secret")),
+        (200, "key=hunter2".into())
+    );
+
+    // Same code, different app: nothing.
+    assert_eq!(call(&runtime, &site, "other", request("/api/secret")).0, 404);
+    assert_eq!(
+        call(&runtime, &site, "other", request("/api/secret-names")),
+        (200, String::new())
+    );
+}

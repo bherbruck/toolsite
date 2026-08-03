@@ -35,6 +35,21 @@ interface db {
     query: func(sql: string, params: list<value>) -> result<rows, error>;
 }
 
+/// Values the site's owner set for this app: API keys, endpoints, anything
+/// that should not be in the bundle a visitor downloads.
+///
+/// Only this app's own settings are reachable, and only from inside a
+/// handler. Nothing the platform serves ever returns a value — not the API,
+/// not the source archive, not the admin page, which lists names alone.
+interface secrets {
+    /// The value set under `name`, or nothing if the owner never set one.
+    get: func(name: string) -> option<string>;
+
+    /// Which settings exist, so a handler can fail with something useful
+    /// instead of silently behaving as though a key were empty.
+    names: func() -> list<string>;
+}
+
 /// Who is making this request, as established by the host's session handling.
 /// A guest cannot forge this: it is not derived from anything the client sent
 /// except a session cookie the host verified.
@@ -76,6 +91,7 @@ world app {
 
     import db;
     import identity;
+    import secrets;
 
     export handle: func(req: request) -> response;
 }

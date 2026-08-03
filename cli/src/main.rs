@@ -90,6 +90,22 @@ enum Command {
         /// accounts you have granted).
         gate: String,
     },
+    /// An app's settings: API keys and the like, readable only by its handler.
+    Secret {
+        app: String,
+        /// Name to set or remove. Omit to list the names already set.
+        name: Option<String>,
+        /// Value to store. Omit while naming to remove it; read from
+        /// $TOOLSITE_SECRET when set, so it stays out of shell history.
+        #[arg(long)]
+        value: Option<String>,
+        /// Remove the named setting.
+        #[arg(long)]
+        remove: bool,
+        /// Print a link to paste values into instead of passing one here.
+        #[arg(long)]
+        link: bool,
+    },
     /// Read or write the notes kept with an app for the next session.
     Notes {
         slug: String,
@@ -229,6 +245,30 @@ fn run() -> Result<()> {
                 "{}",
                 mcp.call("set_visibility", json!({ "slug": app, "gate": gate }))?
             );
+            Ok(())
+        }
+        Command::Secret {
+            app,
+            name,
+            value,
+            remove,
+            link,
+        } => {
+            if link {
+                println!("{}", mcp.call("app_settings", json!({ "app": app, "link": true }))?);
+                return Ok(());
+            }
+            let arguments = match (name, remove) {
+                (None, _) => json!({ "app": app }),
+                (Some(name), true) => json!({ "app": app, "name": name }),
+                (Some(name), false) => {
+                    let value = value
+                        .or_else(|| std::env::var("TOOLSITE_SECRET").ok())
+                        .ok_or_else(|| anyhow!("pass --value or set TOOLSITE_SECRET"))?;
+                    json!({ "app": app, "name": name, "value": value })
+                }
+            };
+            println!("{}", mcp.call("app_settings", arguments)?);
             Ok(())
         }
         Command::Notes { slug, file } => {

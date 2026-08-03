@@ -125,6 +125,16 @@ impl self::toolsite::app::db::Host for StoreState {
 /// the trait to be present.
 impl self::toolsite::app::http::Host for StoreState {}
 
+impl self::toolsite::app::secrets::Host for StoreState {
+    fn get(&mut self, name: String) -> Option<String> {
+        crate::platform::secrets::get(&self.site, &self.app, &name)
+    }
+
+    fn names(&mut self) -> Vec<String> {
+        crate::platform::secrets::names(&self.site, &self.app)
+    }
+}
+
 impl self::toolsite::app::identity::Host for StoreState {
     fn current_user(&mut self) -> Option<User> {
         self.user.clone()

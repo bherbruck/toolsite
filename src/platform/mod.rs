@@ -8,4 +8,5 @@ pub mod bearer;
 pub mod client_oauth;
 pub mod mcp;
 pub mod scaffold;
+pub mod secrets;
 pub mod upload;

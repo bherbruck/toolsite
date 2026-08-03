@@ -1604,3 +1604,97 @@ async fn a_ticket_reads_only_its_own_app() {
     let (status, ..) = send(&config, get("/upload/not-a-ticket?source")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// --- settings -----------------------------------------------------------
+
+#[tokio::test]
+async fn an_owner_pastes_settings_through_a_link_the_agent_never_reads() {
+    let (_dir, config) = server();
+    let link = toolsite::platform::secrets::create_entry(&config, "scraper").unwrap();
+    let token = link.rsplit('/').next().unwrap().to_string();
+
+    let (status, form, _) = send(&config, get(&format!("/settings/{token}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(form.contains("Settings for"), "not the entry form");
+
+    let (status, ..) = send(
+        &config,
+        Request::builder()
+            .method("POST")
+            .uri("/settings")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "token={token}&pasted=%23+comment%0Aexport+API_KEY%3D%22hunter2%22%0AENDPOINT%3Dhttps%3A%2F%2Fexample.com"
+            )))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Names come back; values never do.
+    let listed = toolsite::platform::secrets::names(&config, "scraper");
+    assert_eq!(listed, ["API_KEY", "ENDPOINT"]);
+    let (_, form, _) = send(&config, get(&format!("/settings/{token}"))).await;
+    assert!(form.contains("API_KEY"), "the form should say what is set");
+    assert!(!form.contains("hunter2"), "the form showed a value back");
+
+    // Only the app's own code can read one.
+    assert_eq!(
+        toolsite::platform::secrets::get(&config, "scraper", "API_KEY").as_deref(),
+        Some("hunter2")
+    );
+}
+
+#[tokio::test]
+async fn a_settings_link_is_scoped_and_expires() {
+    let (_dir, config) = server();
+    toolsite::platform::secrets::create_entry(&config, "mine").unwrap();
+
+    let (status, ..) = send(&config, get("/settings/not-a-real-token")).await;
+    assert_eq!(status, StatusCode::GONE);
+
+    let (status, ..) = send(
+        &config,
+        Request::builder()
+            .method("POST")
+            .uri("/settings")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("token=not-a-real-token&pasted=API_KEY%3Dx"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn settings_are_absent_from_everything_a_visitor_or_agent_can_fetch() {
+    let (_dir, config) = server();
+    write_page(&config, "scraper/index", "<!doctype html><title>Scraper</title>");
+    toolsite::platform::secrets::set(&config, "scraper", "API_KEY", Some("hunter2")).unwrap();
+
+    // Not under /p/, by any spelling.
+    for path in ["/p/scraper.secrets", "/p/scraper/secrets", "/p/scraper/.secrets"] {
+        let (status, body, _) = send(&config, get(path)).await;
+        assert!(
+            status != StatusCode::OK || !body.contains("hunter2"),
+            "{path} served a value"
+        );
+    }
+
+    // Not in the source archive an agent pulls back either.
+    let ticket = ticket(&config, "scraper", Duration::from_secs(60));
+    send(
+        &config,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/upload/{ticket}?source"))
+            .body(Body::from("the project, without its secrets"))
+            .unwrap(),
+    )
+    .await;
+    let (_, archive) = send_bytes(&config, get(&format!("/upload/{ticket}?source"))).await;
+    assert!(
+        !String::from_utf8_lossy(&archive).contains("hunter2"),
+        "a value rode along in the source archive"
+    );
+}

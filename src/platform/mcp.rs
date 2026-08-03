@@ -117,6 +117,24 @@ pub(crate) struct CreateUserRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SecretRequest {
+    #[schemars(description = "App the setting belongs to.")]
+    pub(crate) app: String,
+    #[schemars(
+        description = "Name the handler reads it by, e.g. API_KEY. Letters, numbers and '_'. Omit to list the names already set."
+    )]
+    pub(crate) name: Option<String>,
+    #[schemars(
+        description = "The value. Prefer leaving this out and passing link: true instead, so the value never enters the conversation. Omit while giving a name to remove that setting."
+    )]
+    pub(crate) value: Option<String>,
+    #[schemars(
+        description = "Return a link the site's owner opens to paste values in themselves, one NAME=value per line. Use this rather than asking someone to tell you a secret."
+    )]
+    pub(crate) link: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct NotesRequest {
     #[schemars(description = "App or page slug the notes belong to.")]
     pub(crate) slug: String,
@@ -422,6 +440,58 @@ impl PageHost {
                     },
                 )]))
             }
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
+    }
+
+    #[tool(
+        description = "An app's settings — API keys and the like, which its handler reads through the secrets import. Pass link: true to get a URL the owner opens to paste values in, which is the right way: a secret you never see cannot leak through you. Values never come back out: this lists names only, they are absent from the source archive, and no URL serves them. Give a name and value to set, a name alone to remove, neither to list."
+    )]
+    pub(crate) async fn app_settings(
+        &self,
+        Parameters(SecretRequest {
+            app,
+            name,
+            value,
+            link,
+        }): Parameters<SecretRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+
+        if link.unwrap_or(false) {
+            let url = crate::platform::secrets::create_entry(&self.config, &app)
+                .map_err(|e| McpError::internal_error(e, None))?;
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Send this to whoever holds the credentials. It lasts an hour, takes one \
+                 NAME=value per line, and the values never come back through here:\n{url}"
+            ))]));
+        }
+
+        let config = self.config.clone();
+        let outcome = tokio::task::spawn_blocking(move || match name {
+            Some(name) => crate::platform::secrets::set(&config, &app, &name, value.as_deref())
+                .map(|()| match value {
+                    Some(_) => format!("{name} is set for {app}"),
+                    None => format!("{name} is gone from {app}"),
+                }),
+            None => {
+                let names = crate::platform::secrets::names(&config, &app);
+                Ok(if names.is_empty() {
+                    format!("{app} has no settings")
+                } else {
+                    format!("{app}: {}", names.join(", "))
+                })
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match outcome {
+            Ok(message) => Ok(CallToolResult::success(vec![ContentBlock::text(message)])),
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }
     }
