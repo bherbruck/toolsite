@@ -21,6 +21,11 @@ docker run -d -p 8080:8080 -v ./data:/data \
   toolsite
 ```
 
+Set `TOOLSITE_BASE_URL` to where the outside world reaches it. Without it the
+upload URLs handed to an agent point at the container's own port, which
+nothing outside can use; compose defaults it to `http://localhost:$PORT` for
+that reason.
+
 On Railway: attach a Volume at `/data` (the Dockerfile deliberately has no
 `VOLUME` line — Railway's builder rejects it) and set the variables below.
 
