@@ -286,17 +286,22 @@ Two independent modes — use either, or both at once. At least one is required.
 
 | Variable | Required | Description |
 |---|---|---|
-| `TOOLSITE_TOKEN` | if not using OAuth | Static token for `/mcp`. |
-| `TOOLSITE_OAUTH_CLIENT_ID` | if using OAuth | Paste into the client's "OAuth Client ID" field. |
-| `TOOLSITE_OAUTH_CLIENT_SECRET` | if using OAuth | Paste into the client's "OAuth Client Secret" field. |
+| `TOOLSITE_MCP_TOKEN` | if not using OAuth | Static token an MCP client sends to `/mcp`. |
+| `TOOLSITE_MCP_OAUTH_CLIENT_ID` | if using OAuth | Paste into the client's "OAuth Client ID" field. |
+| `TOOLSITE_MCP_OAUTH_CLIENT_SECRET` | if using OAuth | Paste into the client's "OAuth Client Secret" field. |
 | `TOOLSITE_BASE_URL` | if using OAuth | Base URL of the deployment, e.g. `https://host.com`. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where pages are stored. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
 
-Every `TOOLSITE_`-prefixed name above also answers to its old unprefixed form
-(`BEARER_TOKEN`, `OAUTH_CLIENT_ID`, `PUBLIC_BASE_URL`, `DATA_DIR`), plus
-`MCP_TOKEN`, so an existing deployment needs no changes.
+`MCP` is in those three names because they authenticate MCP *clients* — who
+may publish — and nothing else. Signing a visitor in through a provider will
+need its own credentials, and an unqualified `OAUTH_CLIENT_ID` would then be
+ambiguous about which of the two it meant.
+
+Older names still answer (`TOOLSITE_TOKEN`, `BEARER_TOKEN`, `MCP_TOKEN`,
+`TOOLSITE_OAUTH_CLIENT_ID`, `OAUTH_CLIENT_ID`, `PUBLIC_BASE_URL`, `DATA_DIR`
+and so on), so an existing deployment needs no changes.
 
 Every app gets a SQLite database; there is nothing to switch on. `db.query`
 and `run_sql` always work.

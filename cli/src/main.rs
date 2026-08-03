@@ -128,6 +128,7 @@ fn run() -> Result<()> {
         .token
         .clone()
         .or_else(|| std::env::var("TOOLSITE_TOKEN").ok())
+        .or_else(|| std::env::var("TOOLSITE_MCP_TOKEN").ok())
         .ok_or_else(|| anyhow!("set --token or TOOLSITE_TOKEN"))?;
     let mcp = Mcp::connect(&url, &token)?;
 

@@ -98,9 +98,26 @@ async fn main() -> anyhow::Result<()> {
         return run_user_command(command, data_dir, read(&["TOOLSITE_BASE_URL", "PUBLIC_BASE_URL"]));
     }
 
-    let bearer_token = read(&["TOOLSITE_TOKEN", "BEARER_TOKEN", "MCP_TOKEN"]);
-    let oauth_client_id = read(&["TOOLSITE_OAUTH_CLIENT_ID", "OAUTH_CLIENT_ID"]);
-    let oauth_client_secret = read(&["TOOLSITE_OAUTH_CLIENT_SECRET", "OAUTH_CLIENT_SECRET"]);
+    // These three authenticate MCP *clients* — who may publish — and nothing
+    // else. Signing a visitor in through a provider will need its own
+    // credentials, and an unqualified OAUTH_CLIENT_ID would then be ambiguous
+    // about which of the two it meant.
+    let bearer_token = read(&[
+        "TOOLSITE_MCP_TOKEN",
+        "TOOLSITE_TOKEN",
+        "BEARER_TOKEN",
+        "MCP_TOKEN",
+    ]);
+    let oauth_client_id = read(&[
+        "TOOLSITE_MCP_OAUTH_CLIENT_ID",
+        "TOOLSITE_OAUTH_CLIENT_ID",
+        "OAUTH_CLIENT_ID",
+    ]);
+    let oauth_client_secret = read(&[
+        "TOOLSITE_MCP_OAUTH_CLIENT_SECRET",
+        "TOOLSITE_OAUTH_CLIENT_SECRET",
+        "OAUTH_CLIENT_SECRET",
+    ]);
 
     let oauth = match (oauth_client_id, oauth_client_secret) {
         (Some(client_id), Some(client_secret)) => Some(OAuth {
@@ -116,8 +133,8 @@ async fn main() -> anyhow::Result<()> {
     // a token to protect; HTTP still refuses everything without one.
     if !stdio && bearer_token.is_none() && oauth.is_none() {
         panic!(
-            "set TOOLSITE_TOKEN, or TOOLSITE_OAUTH_CLIENT_ID + \
-             TOOLSITE_OAUTH_CLIENT_SECRET (or both)"
+            "set TOOLSITE_MCP_TOKEN, or TOOLSITE_MCP_OAUTH_CLIENT_ID + \
+             TOOLSITE_MCP_OAUTH_CLIENT_SECRET (or both)"
         );
     }
 
