@@ -130,6 +130,40 @@ pub(crate) fn relative_time(then: SystemTime) -> String {
     }
 }
 
+/// Whatever the last agent wanted the next one to know: schema, decisions,
+/// what is half-finished. Kept beside the app rather than inside the bundle,
+/// so it is not served to visitors and does not need a place in the build.
+pub(crate) async fn notes_path(config: &Config, slug: &str) -> PathBuf {
+    let direct = config.data_dir.join(format!("{slug}.notes"));
+    if fs::metadata(&direct).await.is_ok() {
+        return direct;
+    }
+    let inner = config.data_dir.join(format!("{slug}/index.notes"));
+    if fs::metadata(&inner).await.is_ok() {
+        return inner;
+    }
+    if fs::metadata(config.data_dir.join(format!("{slug}.html")))
+        .await
+        .is_ok()
+    {
+        direct
+    } else {
+        inner
+    }
+}
+
+pub async fn read_notes(config: &Config, slug: &str) -> Option<String> {
+    fs::read_to_string(notes_path(config, slug).await).await.ok()
+}
+
+pub async fn write_notes(config: &Config, slug: &str, notes: &str) -> std::io::Result<()> {
+    let path = notes_path(config, slug).await;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, notes).await
+}
+
 pub(crate) async fn page_title(path: &std::path::Path) -> Option<String> {
     use tokio::io::AsyncReadExt;
     let file = fs::File::open(path).await.ok()?;

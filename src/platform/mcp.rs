@@ -117,6 +117,16 @@ pub(crate) struct CreateUserRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct NotesRequest {
+    #[schemars(description = "App or page slug the notes belong to.")]
+    pub(crate) slug: String,
+    #[schemars(
+        description = "Markdown for whoever works on this next: the schema, decisions and their reasons, what is unfinished. Omit to read what is already there instead of writing."
+    )]
+    pub(crate) notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SetActiveRequest {
     #[schemars(description = "Email of the account to turn off or back on.")]
     pub(crate) email: String,
@@ -412,6 +422,38 @@ impl PageHost {
     }
 
     #[tool(
+        description = "Read or write notes kept with an app for the next session to find. Call it with no notes to read. Write down the database schema, why things are the way they are, and what is half-finished — a later session sees only the rendered page otherwise, and a bundle's source is not recoverable from it."
+    )]
+    pub(crate) async fn app_notes(
+        &self,
+        Parameters(NotesRequest { slug, notes }): Parameters<NotesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&slug) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+
+        match notes {
+            Some(notes) => {
+                crate::content::store::write_notes(&self.config, &slug, &notes)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "saved {} characters of notes for {slug}",
+                    notes.len()
+                ))]))
+            }
+            None => match crate::content::store::read_notes(&self.config, &slug).await {
+                Some(notes) => Ok(CallToolResult::success(vec![ContentBlock::text(notes)])),
+                None => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "no notes for {slug} yet"
+                ))])),
+            },
+        }
+    }
+
+    #[tool(
         description = "Turn an account off or back on. A disabled account cannot sign in and its live sessions stop working at once, but it is not deleted."
     )]
     pub(crate) async fn set_user_active(
@@ -693,7 +735,10 @@ impl ServerHandler for PageHost {
                  assets 404.\n\
                  \n\
                  Call list_pages to see what already exists before picking a slug or editing \
-                 something. To edit, fetch the page with `curl <page-url>` into a file (or \
+                 something, and app_notes to read what a previous session left about an app \
+                 before changing it — a bundle's source cannot be recovered from the page it \
+                 serves, so those notes may be the only record. Leave your own when you \
+                 finish. To edit, fetch the page with `curl <page-url>` into a file (or \
                  pull_page / pull_app when you have no shell), edit it, then re-upload to the \
                  same slug. set_visibility retracts a page without deleting it — nothing here \
                  destroys data. Icons are optional: set_icon takes an emoji or SVG, an image \

@@ -38,6 +38,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
 | `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
 | `toolsite list [--all]` | What is published, newest first. |
 | `toolsite hide <slug>` / `unhide` | Reversible takedown. |
+| `toolsite notes <slug> [--file notes.md]` | Read or write the notes kept with an app. |
 | `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
 | `toolsite gate <app> <public\|authenticated\|granted>` | Decide who may reach an app. |
 | `toolsite grant <app> <email>` / `revoke` | Access for a `granted` app. |
@@ -257,6 +258,22 @@ between apps but does not stop a deliberate one: a script can navigate the
 visitor through the handoff and then use the resulting cookie. This is a fine
 trade when every app is one you deployed, and it is the reason to reach for a
 subdomain per app if that ever stops being true.
+
+## Notes for the next session
+
+A published app is a rendered page; its source does not come back out of it.
+So each app can carry markdown written for whoever works on it next — the
+schema, why something is the way it is, what is half-finished:
+
+```
+toolsite notes myapp --file NOTES.md    # write
+toolsite notes myapp                    # read
+```
+
+Over MCP that is `app_notes(slug, notes?)`, reading when `notes` is omitted.
+They are stored beside the app rather than inside the bundle, so they are
+never served to a visitor and need no place in the build. The same applies to
+the `.meta` and `.icon` sidecars: none of the three is reachable under `/p/`.
 
 ## The index
 

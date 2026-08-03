@@ -184,6 +184,15 @@ pub(crate) async fn serve_page(
         };
     }
 
+    // Sidecars sit beside the files they describe, so an exact-path lookup
+    // would hand them out: .meta says whether a page is hidden and which gate
+    // it is behind, and .notes is written for the next agent, not the public.
+    if slug.rsplit('.').next().is_some_and(|extension| {
+        matches!(extension, "meta" | "notes" | "icon")
+    }) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
     // A file inside a bundle: styles, scripts, images, fonts.
     let asset = config.data_dir.join(slug);
     if asset.is_file() {

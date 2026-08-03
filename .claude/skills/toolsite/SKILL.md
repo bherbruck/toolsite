@@ -142,6 +142,7 @@ For when the CLI isn't installed, or there is no shell at all.
 | `push_page(html, slug?)` | No-shell fallback, HTML inline. |
 | `push_app(app, pages)` | No-shell fallback, multi-page. A page named `index` also serves at the app root. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
+| `app_notes(slug, notes?)` | Markdown kept with an app for the next session. Reads when `notes` is omitted. |
 
 **There is deliberately no delete tool.** Nothing here destroys data. Retract
 with `set_visibility(slug, hidden: true)`, which is instantly reversible with
@@ -241,6 +242,17 @@ curl -f -T target/wasm32-wasip2/release/<crate_name>.wasm '<upload-url>?handler'
 
 Create the schema with `run_sql` (or `toolsite sql <app> "..."`) before first
 use, or have the handler run `create table if not exists ...` itself.
+
+## Leave notes, and read them first
+
+A published app is a rendered page — its source does not come back out of it,
+and a bundle's `dist/` is gone once uploaded. Before changing an app, read
+`app_notes(slug)`; those notes may be the only record of why it is built the
+way it is. Before finishing, write what the next session needs: the database
+schema, decisions and their reasons, what is half-finished.
+
+Notes live beside the app, not inside the bundle, so they are never served to
+a visitor and need no place in the build.
 
 ## Verify before you report success
 

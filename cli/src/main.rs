@@ -78,6 +78,13 @@ enum Command {
         /// accounts you have granted).
         gate: String,
     },
+    /// Read or write the notes kept with an app for the next session.
+    Notes {
+        slug: String,
+        /// Markdown file to store. Reads the existing notes when omitted.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     /// Take a page down, reversibly.
     Hide { slug: String },
     /// Restore a hidden page.
@@ -198,6 +205,18 @@ fn run() -> Result<()> {
                 "{}",
                 mcp.call("set_visibility", json!({ "slug": app, "gate": gate }))?
             );
+            Ok(())
+        }
+        Command::Notes { slug, file } => {
+            let arguments = match file {
+                Some(path) => {
+                    let notes = std::fs::read_to_string(&path)
+                        .with_context(|| format!("could not read {}", path.display()))?;
+                    json!({ "slug": slug, "notes": notes })
+                }
+                None => json!({ "slug": slug }),
+            };
+            println!("{}", mcp.call("app_notes", arguments)?);
             Ok(())
         }
         Command::Hide { slug } => {

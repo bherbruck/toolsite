@@ -1472,3 +1472,56 @@ async fn a_scaffold_cannot_be_asked_for_under_a_bad_name() {
     let (status, ..) = send(&config, get("/scaffold/../../etc")).await;
     assert_ne!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn sidecars_are_not_reachable_from_the_public_route() {
+    let (_dir, config) = server();
+    write_page(&config, "page", "<!doctype html><title>A page</title>");
+    std::fs::write(
+        config.data_dir.join("page.meta"),
+        r#"{"listed":false,"hidden":false,"spa":false,"gate":"public"}"#,
+    )
+    .unwrap();
+    std::fs::write(config.data_dir.join("page.notes"), "internal: rotate the key").unwrap();
+    std::fs::write(config.data_dir.join("page.icon"), "🔑").unwrap();
+
+    // .meta would say whether a page is hidden and what gate it is behind;
+    // .notes is written for the next agent session, not for visitors.
+    for sidecar in ["/p/page.meta", "/p/page.notes", "/p/page.icon"] {
+        let (status, body, _) = send(&config, get(sidecar)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{sidecar} was served: {body}");
+    }
+
+    // The page itself is unaffected, and icons still have their own route.
+    assert_eq!(send(&config, get("/p/page")).await.0, StatusCode::OK);
+    assert_eq!(send(&config, get("/icon/page")).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn notes_survive_for_the_next_session_but_never_reach_a_visitor() {
+    let (_dir, config) = server();
+    write_page(&config, "notes-app/index", "<!doctype html><title>App</title>");
+    let markdown = "## schema\n\ntodos(id, user_id, text)\n\nTODO: pagination is unfinished.";
+    toolsite::content::store::write_notes(&config, "notes-app", markdown)
+        .await
+        .unwrap();
+
+    // A later session reads them back verbatim.
+    assert_eq!(
+        toolsite::content::store::read_notes(&config, "notes-app").await.unwrap(),
+        markdown
+    );
+
+    // They are not part of what the app serves, by any spelling.
+    for path in [
+        "/p/notes-app/index.notes",
+        "/p/notes-app.notes",
+        "/p/notes-app/notes",
+    ] {
+        let (status, body, _) = send(&config, get(path)).await;
+        assert!(
+            status != StatusCode::OK || !body.contains("pagination"),
+            "{path} served the notes"
+        );
+    }
+}
