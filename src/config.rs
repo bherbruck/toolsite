@@ -13,6 +13,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// A standalone Config carrying only what a background task needs: the
+    /// data directory and where URLs point.
+    pub fn clone_for_task(&self) -> Config {
+        Config {
+            data_dir: self.data_dir.clone(),
+            base_url: self.base_url.clone(),
+            local_base: self.local_base.clone(),
+            valid_tokens: Vec::new(),
+            oauth: None,
+            uploads: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// A bearer-only instance backed by `data_dir`. Used by tests and by
     /// anything embedding the server without the OAuth shim.
     pub fn local(data_dir: PathBuf, token: impl Into<String>) -> Self {

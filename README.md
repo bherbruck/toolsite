@@ -301,6 +301,37 @@ Nothing stored beside an app is reachable under `/p/` — not `.source`, not
 `.notes`, not `.meta`. If a visitor should be able to read a file, put it in
 the bundle; that is the whole rule.
 
+## An app's schema
+
+Put numbered `.sql` files in `migrations/` beside the source. `toolsite
+deploy` sends them and applies them before the app is reachable:
+
+```
+migrations/001_initial.sql
+migrations/002_add_note.sql
+```
+
+```
+notes: 2 migration(s) stored, 1 applied, now at version 2
+```
+
+Each runs once, in order, in a transaction, tracked by SQLite's own
+`user_version` on that app's database. **Add a file for the next change
+rather than editing an old one** — a database that already ran it will never
+run it again.
+
+This is what `create table if not exists` in a handler cannot do: the table
+already exists, so adding a column silently does nothing and the failure
+arrives later as "no such column" against real rows. A broken migration is
+rolled back whole, so a failed deploy leaves the database as it was.
+
+Without the CLI: `curl -f -T migrations.tar.gz '<upload-url>?migrations'`, or
+`app_migrations(app, files)` over MCP. `toolsite sql` remains for looking
+around and one-off fixes.
+
+The platform never reads what migrations create. Tables, columns and their
+meaning are entirely the app's business; only the ladder is shared.
+
 ## toolsite.toml
 
 An app says what it needs in one file that travels with its source, so

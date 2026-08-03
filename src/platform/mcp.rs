@@ -121,6 +121,16 @@ pub(crate) struct CreateUserRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct MigrationsRequest {
+    #[schemars(description = "App whose schema this is.")]
+    pub(crate) app: String,
+    #[schemars(
+        description = "Every migration the app has, as a map of file name to SQL, e.g. {\"001_initial.sql\": \"create table ...\"}. Send the whole set each time — names order them, and each runs once. Omit to see what is stored and which version the database is at."
+    )]
+    pub(crate) files: Option<std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ScheduleRequest {
     #[schemars(description = "App whose jobs these are.")]
     pub(crate) app: String,
@@ -469,6 +479,58 @@ impl PageHost {
                     },
                 )]))
             }
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
+    }
+
+    #[tool(
+        description = "An app's own database schema, as numbered migrations. Each runs once, in order, in a transaction, so adding a column later reaches databases that already exist — which 'create table if not exists' in a handler cannot do. The platform never reads what they create; tables and their meaning are the app's business."
+    )]
+    pub(crate) async fn app_migrations(
+        &self,
+        Parameters(MigrationsRequest { app, files }): Parameters<MigrationsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+        let config = self.config.clone_for_task();
+
+        let outcome = tokio::task::spawn_blocking(move || match files {
+            Some(files) => {
+                let files: Vec<(String, String)> = files.into_iter().collect();
+                let count = files.len();
+                crate::runtime::migrate::store(&config, &app, files)?;
+                let (version, ran) = crate::runtime::migrate::apply(&config, &app)?;
+                Ok::<_, String>(format!(
+                    "{count} migration(s) stored, {ran} applied, now at version {version}"
+                ))
+            }
+            None => {
+                let stored = crate::runtime::migrate::stored(&config, &app);
+                Ok(if stored.is_empty() {
+                    format!("{app} has no migrations")
+                } else {
+                    format!(
+                        "{}\n(database at version {})",
+                        stored
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        crate::runtime::migrate::apply(&config, &app)
+                            .map(|(version, _)| version)
+                            .unwrap_or(0)
+                    )
+                })
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match outcome {
+            Ok(message) => Ok(CallToolResult::success(vec![ContentBlock::text(message)])),
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }
     }

@@ -20,6 +20,11 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
 
     if handler {
         write_handler(root, name)?;
+        std::fs::create_dir_all(root.join("migrations"))?;
+        std::fs::write(
+            root.join("migrations/001_initial.sql"),
+            "-- Numbered, applied in order, each exactly once. Add a file for\n             -- the next change rather than editing this one: databases that\n             -- already ran it will never run it again.\n\n             create table visits (\n    at integer not null\n);\n",
+        )?;
     }
 
     println!("created {name}/");
@@ -27,7 +32,10 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
     if handler {
         println!("  handler/             server-side code, gets its own database");
     }
-    println!("  toolsite.toml        slug and routing mode");
+    if handler {
+        println!("  migrations/          the app's schema, applied on deploy");
+    }
+    println!("  toolsite.toml        gate, routes and jobs");
     println!();
     println!("Next: cd {name} && toolsite deploy");
     if spa {

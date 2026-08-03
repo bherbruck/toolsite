@@ -52,6 +52,8 @@ pub(crate) struct UploadQuery {
     pub(crate) source: Option<String>,
     /// toolsite.toml: what the app needs, rather than a list of commands.
     pub(crate) manifest: Option<String>,
+    /// A gzipped tar of migrations/*.sql — the app's own schema.
+    pub(crate) migrations: Option<String>,
 }
 
 pub(crate) enum UploadKind {
@@ -61,6 +63,7 @@ pub(crate) enum UploadKind {
     Handler,
     Source,
     Manifest,
+    Migrations,
 }
 
 /// Ticket-authenticated write. The ticket itself is the credential, so this
@@ -104,6 +107,40 @@ pub(crate) async fn store_upload(
 
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
+    }
+
+    // The app's schema, applied before anything can ask for a table.
+    if let UploadKind::Migrations = kind {
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        let files = match crate::content::bundle::read_sql_files(&body) {
+            Ok(files) => files,
+            Err(message) => return (StatusCode::BAD_REQUEST, format!("{message}\n")).into_response(),
+        };
+        if files.is_empty() {
+            return (StatusCode::BAD_REQUEST, "no .sql files in that archive\n").into_response();
+        }
+
+        let count = files.len();
+        let owned_app = app.clone();
+        let config_handle = config.clone_for_task();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::runtime::migrate::store(&config_handle, &owned_app, files)?;
+            crate::runtime::migrate::apply(&config_handle, &owned_app)
+        })
+        .await;
+
+        return match outcome {
+            Ok(Ok((version, ran))) => {
+                tracing::info!(app = %app, version, ran, "schema migrated");
+                (
+                    StatusCode::OK,
+                    format!("{app}: {count} migration(s) stored, {ran} applied, now at version {version}\n"),
+                )
+                    .into_response()
+            }
+            Ok(Err(message)) => (StatusCode::BAD_REQUEST, format!("{message}\n")).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "migration failed\n").into_response(),
+        };
     }
 
     if let UploadKind::Manifest = kind {
@@ -314,7 +351,9 @@ pub(crate) async fn upload_sub(
 }
 
 pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
-    if query.manifest.is_some() {
+    if query.migrations.is_some() {
+        UploadKind::Migrations
+    } else if query.manifest.is_some() {
         UploadKind::Manifest
     } else if query.source.is_some() {
         UploadKind::Source

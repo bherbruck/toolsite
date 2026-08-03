@@ -55,7 +55,7 @@ pub(crate) fn open_at(path: &std::path::Path) -> Result<Connection, String> {
 /// account database uses this, and only long enough to run migrations, which
 /// need `pragma user_version` — a pragma the authorizer refuses once it is
 /// in place. Never hand a connection from here to a guest.
-pub(crate) fn open_unguarded(path: &std::path::Path) -> Result<Connection, String> {
+pub fn open_unguarded(path: &std::path::Path) -> Result<Connection, String> {
     {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -85,7 +85,7 @@ pub(crate) fn open_unguarded(path: &std::path::Path) -> Result<Connection, Strin
 
 /// Closes the door: from here on the connection refuses ATTACH, DETACH and
 /// any pragma.
-pub(crate) fn lock_down(conn: &Connection) -> Result<(), String> {
+pub fn lock_down(conn: &Connection) -> Result<(), String> {
     conn.authorizer(Some(deny_escapes)).map_err(|e| e.to_string())
 }
 

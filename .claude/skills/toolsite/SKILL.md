@@ -251,6 +251,25 @@ curl -f -T target/wasm32-wasip2/release/<crate_name>.wasm '<upload-url>?handler'
 Create the schema with `run_sql` (or `toolsite sql <app> "..."`) before first
 use, or have the handler run `create table if not exists ...` itself.
 
+## Schema goes in migrations/, not in the handler
+
+Never write `create table if not exists` in a handler. It cannot evolve
+anything: once the table exists, adding a column does nothing and the failure
+surfaces later as "no such column" against real data.
+
+Put numbered files in `migrations/` beside the source; `toolsite deploy`
+applies them before the app is reachable, each once, in order, in a
+transaction.
+
+```
+migrations/001_initial.sql      create table todos (...)
+migrations/002_add_done.sql     alter table todos add column done integer
+```
+
+Add a file for the next change rather than editing an old one — a database
+that already ran it will never run it again. Without the CLI:
+`app_migrations(app, files)` over MCP, sending the whole set each time.
+
 ## Configure in the file, not in commands
 
 Put an app's gate, route rules, jobs and icon in `toolsite.toml` beside its

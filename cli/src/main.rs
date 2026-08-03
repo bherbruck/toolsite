@@ -529,6 +529,28 @@ fn deploy(
         print!("{body}");
     }
 
+    // Schema first: a handler that goes live before its tables exist fails on
+    // the first request, and that request may be a scheduled job nobody sees.
+    if dir.join("migrations").is_dir() {
+        match sql_archive(&dir.join("migrations")) {
+            Ok(archive) if !archive.is_empty() => {
+                let response = client
+                    .put(format!("{upload_url}?migrations"))
+                    .body(archive)
+                    .send()?;
+                let status = response.status();
+                let body = response.text().unwrap_or_default();
+                if status.is_success() {
+                    print!("{body}");
+                } else {
+                    bail!("migrations were rejected ({status}): {}", body.trim());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => bail!("could not package migrations: {error}"),
+        }
+    }
+
     // The manifest goes first, so the app is configured before it is reachable
     // rather than a moment after.
     if let Ok(manifest) = std::fs::read_to_string(dir.join("toolsite.toml")) {
@@ -565,6 +587,27 @@ fn deploy(
     }
 
     verify(&client, base_url, token, &project)
+}
+
+/// The .sql files in a directory, as a gzipped tar.
+fn sql_archive(dir: &Path) -> Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut any = false;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "sql") {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            builder.append_path_with_name(&path, &name)?;
+            any = true;
+        }
+    }
+    if !any {
+        return Ok(Vec::new());
+    }
+    let tar = builder.into_inner()?;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &tar)?;
+    Ok(encoder.finish()?)
 }
 
 /// Everything except what a package manager or compiler can restore.

@@ -84,6 +84,34 @@ pub(crate) fn bundle_strip_prefix(paths: &[String]) -> Option<String> {
     (all_share && !root_has_index).then_some(first)
 }
 
+/// The .sql files in a gzipped tar, by name, without writing anything to
+/// disk. Same entry rules as a bundle, so a migration cannot be a symlink or
+/// a path that climbs out.
+pub(crate) fn read_sql_files(body: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let decoder = flate2::read::GzDecoder::new(body);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = Vec::new();
+
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let rel = match classify_entry(&entry) {
+            EntryVerdict::Take(rel) => rel,
+            EntryVerdict::Ignore | EntryVerdict::Skip(_) => continue,
+            EntryVerdict::Reject(message) => return Err(message),
+        };
+        if !rel.ends_with(".sql") {
+            continue;
+        }
+        let mut sql = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut sql).map_err(|e| e.to_string())?;
+        // The directory a file sat in says nothing; its name orders it.
+        let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        files.push((name, sql));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
 #[derive(Debug)]
 pub(crate) struct Unpacked {
     pub(crate) files: Vec<String>,

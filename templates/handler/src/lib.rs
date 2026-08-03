@@ -23,14 +23,9 @@ impl Guest for Handler {
 
         match (req.method.as_str(), route) {
             ("GET", "/hello") => {
-                // State must live in the database: every request gets a fresh
-                // instance, so globals do not survive.
-                if let Err(e) = db::query(
-                    "create table if not exists visits (at integer)",
-                    &[],
-                ) {
-                    return text(500, format!("{e:?}"));
-                }
+                // The table comes from migrations/001_initial.sql, applied at
+                // deploy. State must live here rather than in a global: every
+                // request gets a fresh instance.
                 if let Err(e) = db::query("insert into visits values (0)", &[]) {
                     return text(500, format!("{e:?}"));
                 }

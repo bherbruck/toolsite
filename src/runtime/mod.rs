@@ -2,4 +2,5 @@
 //! SQLite database its handler is allowed to reach.
 
 pub mod db;
+pub mod migrate;
 pub mod wasm;
