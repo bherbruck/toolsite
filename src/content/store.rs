@@ -1,4 +1,4 @@
-use crate::{config::Config, content::slug::escape_html};
+use crate::config::Config;
 use serde::Deserialize;
 use std::{path::PathBuf, time::SystemTime};
 use tokio::fs;
@@ -142,7 +142,7 @@ pub(crate) async fn page_title(path: &std::path::Path) -> Option<String> {
     let text_start = lower[open..].find('>')? + open + 1;
     let text_end = lower[text_start..].find("</title>")? + text_start;
     let title = html[text_start..text_end].trim();
-    (!title.is_empty()).then(|| escape_html(title))
+    (!title.is_empty()).then(|| title.to_string())
 }
 
 pub(crate) enum Icon {
@@ -170,11 +170,11 @@ pub(crate) async fn page_icon(config: &Config, slug: &str) -> Icon {
             if let Ok(text) = std::str::from_utf8(&bytes) {
                 let text = text.trim();
                 if text.starts_with("data:") {
-                    return Icon::Src(escape_html(text));
+                    return Icon::Src(text.to_string());
                 }
                 // Short, non-markup text is an emoji or a letter or two.
                 if !text.is_empty() && !text.starts_with('<') && text.chars().count() <= 4 {
-                    return Icon::Text(escape_html(text));
+                    return Icon::Text(text.to_string());
                 }
             }
             if !bytes.is_empty() {

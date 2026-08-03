@@ -621,3 +621,38 @@ async fn the_next_parameter_cannot_bounce_a_visitor_off_site() {
         assert_eq!(location.1, "/", "open redirect via {hostile}");
     }
 }
+
+#[tokio::test]
+async fn a_hostile_page_title_cannot_inject_script_into_the_index() {
+    let (_dir, config) = server();
+    // A title is attacker-influenced content: it comes from a published page.
+    write_page(
+        &config,
+        "nasty",
+        r#"<!doctype html><title><script>alert(1)</script></title>"#,
+    );
+
+    let (status, body, _) = send(&config, get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("<script>alert(1)</script>"),
+        "the title was written into the index unescaped"
+    );
+    assert!(body.contains("&lt;script&gt;"), "expected an escaped title");
+}
+
+#[tokio::test]
+async fn a_hostile_icon_cannot_break_out_of_its_attribute() {
+    let (_dir, config) = server();
+    write_page(&config, "nasty", "<!doctype html><title>ok</title>");
+    // data: URIs are rendered as an img src, so a quote here would escape the
+    // attribute if it were interpolated rather than escaped.
+    std::fs::write(
+        config.data_dir.join("nasty.icon"),
+        r#"data:image/svg+xml,x" onerror="alert(1)"#,
+    )
+    .unwrap();
+
+    let (_, body, _) = send(&config, get("/")).await;
+    assert!(!body.contains(r#"onerror="alert(1)"#), "attribute was broken out of");
+}

@@ -10,6 +10,7 @@ axum = "0.8.9"
 base64 = "0.22.1"
 dotenvy = "0.15.7"
 flate2 = "1.1.9"
+maud = "0.27.0"
 rand = "0.10.2"
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io", "schemars"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits"] }

@@ -10,6 +10,8 @@ use crate::{
     runtime::wasm::{Guards, Request as WasmRequest},
     AppState,
 };
+use maud::{html, Markup, PreEscaped};
+
 use axum::{
     body::Body,
     extract::{Path, State},
@@ -53,13 +55,16 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
 }
 
 
-pub(crate) fn icon_html(icon: &Icon) -> String {
+/// Escaping is maud's job here, not the caller's: values arrive raw from the
+/// store and get escaped on the way out, so a new field cannot silently skip
+/// the step the way a hand-written `format!` could.
+pub(crate) fn icon_markup(icon: &Icon) -> Markup {
     match icon {
-        Icon::Text(text) => format!(r#"<span class="icon icon-text">{text}</span>"#),
-        Icon::Src(src) => format!(r#"<span class="icon"><img src="{src}" alt=""></span>"#),
-        Icon::Generated(initials, hue) => {
-            format!(r#"<span class="icon icon-gen" style="--h:{hue}">{initials}</span>"#)
-        }
+        Icon::Text(text) => html! { span."icon"."icon-text" { (text) } },
+        Icon::Src(src) => html! { span."icon" { img src=(src) alt=""; } },
+        Icon::Generated(initials, hue) => html! {
+            span."icon"."icon-gen" style={ "--h:" (hue) } { (initials) }
+        },
     }
 }
 
@@ -513,69 +518,56 @@ pub(crate) async fn index(State(config): State<Arc<Config>>) -> impl IntoRespons
         n => format!("{n} pages"),
     };
 
-    let (body, script) = if cards.is_empty() {
-        (
-            r#"<p class="empty">No pages yet. Push one to see it here.</p>"#.to_string(),
-            "",
-        )
-    } else {
-        let items: String = cards
-            .iter()
-            .map(|card| {
-                let slug = &card.slug;
-                let icon = icon_html(&card.icon);
-                // With a title, the slug becomes the subtitle; without one the
-                // slug is all there is to show.
-                let when = card
-                    .modified
-                    .map(|t| format!(r#" <span class="when">{}</span>"#, relative_time(t)))
-                    .unwrap_or_default();
-                let meta = match &card.title {
-                    Some(title) => format!(
-                        r#"<span class="meta"><span class="title">{title}</span><span class="slug">{slug}{when}</span></span>"#
-                    ),
-                    None => format!(
-                        r#"<span class="meta"><span class="title">{slug}</span><span class="slug">{when}</span></span>"#
-                    ),
-                };
-                format!(
-                    r#"<li data-slug="{slug_lower}" data-title="{title_lower}"><a href="/p/{slug}">{icon}{meta}</a></li>"#,
-                    slug_lower = slug.to_lowercase(),
-                    title_lower = card.title.as_deref().unwrap_or_default().to_lowercase(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let body = format!(
-            r#"<input type="search" id="q" placeholder="Filter pages&hellip;" autocomplete="off">
-<ul class="pages" id="list">
-{items}
-</ul>
-<p class="no-match" id="no-match">No pages match that.</p>"#
-        );
-        (body, INDEX_SEARCH_SCRIPT)
-    };
+    let markup = html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Pages" }
+                style { (PreEscaped(INDEX_STYLE)) }
+            }
+            body {
+                div."container" {
+                    h1 { "Pages" }
+                    p."count" { (count_label) }
 
-    let style = INDEX_STYLE;
-    Html(format!(
-        r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pages</title>
-<style>{style}</style>
-</head>
-<body>
-<div class="container">
-<h1>Pages</h1>
-<p class="count">{count_label}</p>
-{body}
-</div>
-{script}
-</body>
-</html>"#
-    ))
+                    @if cards.is_empty() {
+                        p."empty" { "No pages yet. Push one to see it here." }
+                    } @else {
+                        input type="search" id="q" placeholder="Filter pages…" autocomplete="off";
+                        ul."pages" id="list" {
+                            @for card in &cards {
+                                li data-slug=(card.slug.to_lowercase())
+                                   data-title=(card.title.as_deref().unwrap_or_default().to_lowercase()) {
+                                    a href={ "/p/" (card.slug) } {
+                                        (icon_markup(&card.icon))
+                                        span."meta" {
+                                            // With a title the slug becomes the
+                                            // subtitle; without one it is all
+                                            // there is to show.
+                                            span."title" { (card.title.as_deref().unwrap_or(&card.slug)) }
+                                            span."slug" {
+                                                @if card.title.is_some() { (card.slug) }
+                                                @if let Some(modified) = card.modified {
+                                                    " " span."when" { (relative_time(modified)) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p."no-match" id="no-match" { "No pages match that." }
+                    }
+                }
+                @if !cards.is_empty() {
+                    (PreEscaped(INDEX_SEARCH_SCRIPT))
+                }
+            }
+        }
+    };
+    Html(markup.into_string())
 }
 
 // --- Minimal OAuth 2.1 shim (only mounted when OAuth is configured) -----
