@@ -1,4 +1,8 @@
+# Build output, anywhere in the tree.
 target
+**/target
+
 .git
 .env
 data
+.claude
