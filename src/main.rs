@@ -503,7 +503,7 @@ impl ServerHandler for PageHost {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
-            .with_server_info(Implementation::new("page-host", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("toolsite", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Publishes self-contained HTML pages at public URLs.\n\
                  \n\

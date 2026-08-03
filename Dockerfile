@@ -12,9 +12,9 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 WORKDIR /app
-COPY --from=builder /app/target/release/page-host /usr/local/bin/page-host
+COPY --from=builder /app/target/release/toolsite /usr/local/bin/toolsite
 
 ENV DATA_DIR=/data
 EXPOSE 8080
 
-CMD ["page-host"]
+CMD ["toolsite"]
