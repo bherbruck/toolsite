@@ -87,6 +87,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/auth/login", get(users::login_form).post(users::login_submit))
         .route("/auth/logout", post(users::logout).get(users::logout))
         .route("/auth/me", get(users::me))
+        // Trades the site session for one scoped to a single app; the only
+        // way an app ever sees a visitor.
+        .route("/auth/handoff", get(users::handoff))
         .route("/upload/{ticket}", put(upload_root).post(upload_root))
         .route("/upload/{ticket}/{*sub}", put(upload_sub).post(upload_sub))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));

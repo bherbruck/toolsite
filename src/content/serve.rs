@@ -125,7 +125,6 @@ pub(crate) async fn serve_page(
     request: Request<Body>,
 ) -> Response {
     let config = &state.config;
-    let visitor = crate::accounts::users::current_user(config, request.headers()).await;
     let uri_path = request.uri().path().to_string();
     let Some(raw) = uri_path.strip_prefix("/p/") else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -147,7 +146,29 @@ pub(crate) async fn serve_page(
     };
     let is_api = rest == API_PREFIX || rest.starts_with(&format!("{API_PREFIX}/"));
 
-    if let Some(denied) = gate_check(&state.config, app, visitor.as_ref(), &uri_path, is_api).await {
+    // Only the cookie scoped to *this* app speaks for the visitor here. The
+    // site cookie is sent to every path on the origin, so honouring it would
+    // let any published app act as the visitor against every other one.
+    let visitor = crate::accounts::users::current_app_user(config, app, request.headers()).await;
+    let site_token = crate::accounts::users::token_from_cookies(
+        request
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let may_hand_off = crate::accounts::users::is_visitor_navigation(request.headers());
+
+    if let Some(denied) = gate_check(
+        &state.config,
+        app,
+        visitor.as_ref(),
+        site_token.as_deref(),
+        &uri_path,
+        is_api,
+        may_hand_off,
+    )
+    .await
+    {
         return denied;
     }
 
@@ -205,18 +226,95 @@ async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Refuses a request the app's gate does not admit. A browser is sent to sign
-/// in; an API call gets a status, since redirecting a fetch to an HTML form
-/// only produces a confusing parse error.
+/// Refuses a request the app's gate does not admit.
+///
+/// Only an app session opens a gate. A visitor holding a site session but not
+/// yet a session for this app is sent through the handoff to earn one; a
+/// visitor holding neither is sent to sign in. An API call gets a status
+/// instead of either redirect, since sending a fetch to an HTML form only
+/// produces a confusing parse error — and because an automatic handoff on a
+/// background request is precisely the hole the app cookie exists to close.
 async fn gate_check(
     config: &Arc<Config>,
     app: &str,
     visitor: Option<&crate::accounts::users::User>,
+    site_token: Option<&str>,
     path: &str,
     is_api: bool,
+    may_hand_off: bool,
 ) -> Option<Response> {
     let gate = read_meta(config, app).await.gate;
-    let allowed = match gate.as_str() {
+    if admits(config, &gate, app, visitor).await {
+        return None;
+    }
+
+    // Resolved only once the app session has already failed, so a public app
+    // costs no database work at all.
+    let site_user = match site_token {
+        Some(token) => {
+            let (config, token) = (config.clone(), token.to_string());
+            tokio::task::spawn_blocking(move || {
+                crate::accounts::users::site_session_user(&config, &token)
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        None => None,
+    };
+    let next = app_scoped_next(app, path);
+
+    // Worth a trip through the handoff only if the site session would in fact
+    // satisfy this gate — otherwise the answer is already no, and minting a
+    // session for the app would tell it about a visitor it just refused.
+    if !is_api && may_hand_off && admits(config, &gate, app, site_user.as_ref()).await {
+        return Some(
+            Redirect::to(&format!(
+                "/auth/handoff?app={app}&next={}",
+                urlencoding::encode(&next)
+            ))
+            .into_response(),
+        );
+    }
+
+    // Signing in again cannot help someone we have already identified, by
+    // either tier, so say no rather than sending them round the loop.
+    let known = visitor.is_some() || site_user.is_some();
+    Some(if is_api {
+        let status = if known {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        (status, "not permitted").into_response()
+    } else if known {
+        (StatusCode::FORBIDDEN, "you do not have access to this app").into_response()
+    } else {
+        Redirect::to(&format!("/auth/login?next={}", urlencoding::encode(&next))).into_response()
+    })
+}
+
+/// Where to send a visitor so that the app's cookie will actually be sent
+/// back. A cookie scoped `/p/<app>/` is not attached to a request for
+/// `/p/<app>` — the path must match up to and including that slash — so the
+/// bare app root would otherwise bounce between gate and handoff forever.
+/// Both forms serve the same content.
+fn app_scoped_next(app: &str, path: &str) -> String {
+    if path == format!("/p/{app}") {
+        format!("/p/{app}/")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Whether this gate admits this visitor. `None` is an anonymous request.
+async fn admits(
+    config: &Arc<Config>,
+    gate: &str,
+    app: &str,
+    visitor: Option<&crate::accounts::users::User>,
+) -> bool {
+    match gate {
         "public" => true,
         "authenticated" => visitor.is_some(),
         "granted" => match visitor {
@@ -232,27 +330,7 @@ async fn gate_check(
         },
         // An unknown gate is treated as closed rather than open.
         _ => false,
-    };
-    if allowed {
-        return None;
     }
-
-    Some(if is_api {
-        let status = if visitor.is_some() {
-            StatusCode::FORBIDDEN
-        } else {
-            StatusCode::UNAUTHORIZED
-        };
-        (status, "not permitted").into_response()
-    } else if visitor.is_some() {
-        (StatusCode::FORBIDDEN, "you do not have access to this app").into_response()
-    } else {
-        Redirect::to(&format!(
-            "/auth/login?next={}",
-            urlencoding::encode(path)
-        ))
-        .into_response()
-    })
 }
 
 async fn run_handler(
@@ -299,8 +377,9 @@ async fn run_handler(
     let config = state.config.clone();
     let owned_app = app.to_string();
     let wasm = wasm.to_vec();
-    // The guest's identity import is fed from a verified session, never from
-    // anything the request claimed.
+    // The guest's identity import is fed from a session scoped to this app,
+    // never from anything the request claimed and never from a session that
+    // belongs to a neighbour.
     let user = visitor.map(|user| crate::runtime::wasm::User {
         id: user.id,
         email: user.email,
@@ -308,7 +387,6 @@ async fn run_handler(
     // Guest execution is blocking and CPU-bound, and the database import
     // blocks too, so it must not run on an async worker.
     let outcome = tokio::task::spawn_blocking(move || {
-        // No session layer yet, so every request is anonymous.
         runtime.handle(
             config,
             &owned_app,
