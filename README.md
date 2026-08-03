@@ -355,8 +355,9 @@ schedule = "0 0 3 * * *"
 path = "/api/rollup"
 ```
 
-`toolsite deploy` applies it before the app is reachable. Without the CLI it
-is `curl -f -T toolsite.toml '<upload-url>?manifest'`.
+`toolsite deploy` sends it first, before the bundle or handler, so a private
+app is never briefly public. Without the CLI it is
+`curl -f -T toolsite.toml '<upload-url>?manifest'`.
 
 **What it declares, it owns.** Routes and jobs are replaced wholesale, so
 deleting a line removes the thing — no drift between the file and the server.

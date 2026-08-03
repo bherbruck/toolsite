@@ -500,9 +500,48 @@ fn deploy(
     let ticket = mcp.call("create_upload", json!({ "slug": project.slug }))?;
     let upload_url = find_upload_url(&ticket)
         .ok_or_else(|| anyhow!("could not find an upload URL in the server's reply"))?;
+    let client = reqwest::blocking::Client::new();
+
+    // Everything that must be true before the app answers anything goes
+    // first. A handler live before its tables exist fails on its first
+    // request — which may be a scheduled job nobody is watching — and a
+    // bundle live before its gate is public for that moment.
+    if dir.join("migrations").is_dir() {
+        match sql_archive(&dir.join("migrations")) {
+            Ok(archive) if !archive.is_empty() => {
+                let response = client
+                    .put(format!("{upload_url}?migrations"))
+                    .body(archive)
+                    .send()?;
+                let status = response.status();
+                let body = response.text().unwrap_or_default();
+                if status.is_success() {
+                    print!("{body}");
+                } else {
+                    bail!("migrations were rejected ({status}): {}", body.trim());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => bail!("could not package migrations: {error}"),
+        }
+    }
+
+    // Gates and routes, before there is anything behind them to reach.
+    if let Ok(manifest) = std::fs::read_to_string(dir.join("toolsite.toml")) {
+        let response = client
+            .put(format!("{upload_url}?manifest"))
+            .body(manifest)
+            .send()?;
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        if status.is_success() {
+            print!("{body}");
+        } else {
+            bail!("toolsite.toml was rejected ({status}): {}", body.trim());
+        }
+    }
 
     let tarball = tar_gz(&project.web_root)?;
-    let client = reqwest::blocking::Client::new();
     let query = if project.spa { "?bundle&spa" } else { "?bundle" };
     let response = client
         .put(format!("{upload_url}{query}"))
@@ -527,44 +566,6 @@ fn deploy(
             bail!("handler upload failed ({status}): {body}");
         }
         print!("{body}");
-    }
-
-    // Schema first: a handler that goes live before its tables exist fails on
-    // the first request, and that request may be a scheduled job nobody sees.
-    if dir.join("migrations").is_dir() {
-        match sql_archive(&dir.join("migrations")) {
-            Ok(archive) if !archive.is_empty() => {
-                let response = client
-                    .put(format!("{upload_url}?migrations"))
-                    .body(archive)
-                    .send()?;
-                let status = response.status();
-                let body = response.text().unwrap_or_default();
-                if status.is_success() {
-                    print!("{body}");
-                } else {
-                    bail!("migrations were rejected ({status}): {}", body.trim());
-                }
-            }
-            Ok(_) => {}
-            Err(error) => bail!("could not package migrations: {error}"),
-        }
-    }
-
-    // The manifest goes first, so the app is configured before it is reachable
-    // rather than a moment after.
-    if let Ok(manifest) = std::fs::read_to_string(dir.join("toolsite.toml")) {
-        let response = client
-            .put(format!("{upload_url}?manifest"))
-            .body(manifest)
-            .send()?;
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        if status.is_success() {
-            print!("{body}");
-        } else {
-            bail!("toolsite.toml was rejected ({status}): {}", body.trim());
-        }
     }
 
     // Kept by default: a bundle cannot be turned back into what built it, and
