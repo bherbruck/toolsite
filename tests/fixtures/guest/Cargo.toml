@@ -1,0 +1,19 @@
+# Standalone on purpose: this is built for wasm32-wasip2, not for the host, so
+# it must not join the parent workspace.
+[workspace]
+
+[package]
+name = "toolsite-test-guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+
+[profile.release]
+opt-level = "s"
+strip = true

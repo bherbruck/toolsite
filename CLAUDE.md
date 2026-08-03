@@ -14,6 +14,11 @@ Two more that this codebase already leans on:
 
 - **Nothing destroys data.** There is no delete tool by design; retraction is
   a visibility flag, so every action is reversible.
+- **Capabilities are granted, never assumed.** A guest can only do what the
+  linker hands it. wasi is linked (a wasm32-wasip2 guest imports it via std
+  whether it uses it or not), so the sandbox is the *context*, which grants no
+  directory, no environment, no sockets. Tests prove each denial rather than
+  trusting the config.
 - **Page content never passes through the model.** Tools hand back an upload
   URL; the agent writes a file and curls it. Inline-HTML tools exist only as a
   fallback for clients with no shell, and say so in their descriptions.
@@ -21,7 +26,8 @@ Two more that this codebase already leans on:
 ## Module layout
 
 ```
-main.rs     startup: env -> Config, router wiring, listener
+main.rs     startup: env -> Config, listener
+lib.rs      build_router: every route, assembled in one place
 config.rs   Config struct shared by every layer
 slug.rs     naming rules (what may become a path), random tokens, escaping
 store.rs    the data layer: page/icon/meta paths, titles, visibility, listing
@@ -31,6 +37,7 @@ auth.rs     bearer/x-api-key middleware for /mcp
 oauth.rs    the minimal single-user OAuth 2.1 shim
 web.rs      the public site: page serving, icons, index rendering
 mcp.rs      MCP tool definitions and the ServerHandler
+wasm.rs     the guest sandbox: engine, guards, host imports
 ```
 
 Dependency direction is one-way: `web`/`mcp`/`upload` depend on `store`, which
@@ -74,3 +81,10 @@ enforces one as DNS-rebinding protection, and `oneshot` doesn't add it.
 
 Anything touching upload, serving, or SQL needs a test for the security
 property it rests on, not just the happy path.
+
+**Wasm fixtures.** `tests/fixtures/handler.wasm` is a committed build of
+`tests/fixtures/guest`, so the suite needs no wasm toolchain. Rebuild it with
+`scripts/build-fixtures.sh` after any change to `wit/toolsite.wit` or the
+guest — a stale fixture is how a breaking WIT change slips through. Low-level
+limit tests use the `wat` crate inline instead, which needs no toolchain at
+all.

@@ -1,0 +1,81 @@
+package toolsite:app@0.1.0;
+
+/// The app's own SQLite database. The host resolves which file this is from
+/// the app's slug, so a guest can neither name another app's database nor
+/// reach the filesystem to open one.
+interface db {
+    /// A SQLite value. Blobs are deliberately absent for now: nothing needs
+    /// them yet, and adding a case later is backwards compatible.
+    variant value {
+        null,
+        integer(s64),
+        real(f64),
+        text(string),
+    }
+
+    record rows {
+        columns: list<string>,
+        values: list<list<value>>,
+        /// True when the result hit the host's row cap, so a guest can tell a
+        /// short page from a truncated one.
+        truncated: bool,
+        rows-affected: u64,
+    }
+
+    variant error {
+        /// The statement was rejected or failed.
+        failed(string),
+        /// The guest asked for something the host refuses outright, such as
+        /// ATTACH.
+        denied(string),
+    }
+
+    /// Runs one statement. Values are bound, never interpolated — there is no
+    /// string-building entry point on purpose.
+    query: func(sql: string, params: list<value>) -> result<rows, error>;
+}
+
+/// Who is making this request, as established by the host's session handling.
+/// A guest cannot forge this: it is not derived from anything the client sent
+/// except a session cookie the host verified.
+interface identity {
+    record user {
+        id: string,
+        email: string,
+    }
+
+    current-user: func() -> option<user>;
+}
+
+/// What a request handler sees and returns. Deliberately small: enough to
+/// route, read a body and answer.
+interface http {
+    record request {
+        method: string,
+        /// Path within the app, with the /p/<app> prefix already stripped.
+        path: string,
+        query: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+}
+
+/// What an app's handler.wasm must satisfy.
+///
+/// Note what is absent: no filesystem, no sockets, no environment, no clock
+/// beyond what is imported here. A capability the host does not hand over is
+/// one the guest cannot exercise.
+world app {
+    use http.{request, response};
+
+    import db;
+    import identity;
+
+    export handle: func(req: request) -> response;
+}
