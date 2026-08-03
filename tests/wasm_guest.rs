@@ -5,7 +5,7 @@
 use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use toolsite::{
-    wasm::{Guards, Runtime},
+    runtime::wasm::{Guards, Runtime},
     Config,
 };
 
@@ -17,8 +17,8 @@ fn site() -> (TempDir, Arc<Config>) {
     (dir, config)
 }
 
-fn request(path: &str) -> toolsite::wasm::Request {
-    toolsite::wasm::Request {
+fn request(path: &str) -> toolsite::runtime::wasm::Request {
+    toolsite::runtime::wasm::Request {
         method: "GET".to_string(),
         path: path.to_string(),
         query: String::new(),
@@ -31,7 +31,7 @@ fn call(
     runtime: &Runtime,
     site: &Arc<Config>,
     app: &str,
-    request: toolsite::wasm::Request,
+    request: toolsite::runtime::wasm::Request,
 ) -> (u16, String) {
     call_as(runtime, site, app, request, None, Guards::default())
 }
@@ -40,8 +40,8 @@ fn call_as(
     runtime: &Runtime,
     site: &Arc<Config>,
     app: &str,
-    request: toolsite::wasm::Request,
-    user: Option<toolsite::wasm::User>,
+    request: toolsite::runtime::wasm::Request,
+    user: Option<toolsite::runtime::wasm::User>,
     guards: Guards,
 ) -> (u16, String) {
     let response = runtime
@@ -117,7 +117,7 @@ fn identity_comes_from_the_host_not_the_guest() {
 
     assert_eq!(call(&runtime, &site, "app", request("/whoami")).0, 401);
 
-    let user = toolsite::wasm::User {
+    let user = toolsite::runtime::wasm::User {
         id: "u1".to_string(),
         email: "someone@example.com".to_string(),
     };

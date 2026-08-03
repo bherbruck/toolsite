@@ -1,4 +1,4 @@
-use crate::{config::Config, slug::escape_html};
+use crate::{config::Config, content::slug::escape_html};
 use serde::Deserialize;
 use std::{path::PathBuf, time::SystemTime};
 use tokio::fs;

@@ -1,4 +1,4 @@
-use crate::slug::valid_asset_path;
+use crate::content::slug::valid_asset_path;
 
 /// Zip-bomb guards: a bundle is a built front-end, not an archive dump.
 pub(crate) const MAX_BUNDLE_UNPACKED: u64 = 128 * 1024 * 1024;

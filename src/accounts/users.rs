@@ -7,7 +7,7 @@
 //! site, with a grant naming which apps it may reach. That way a private app
 //! is "these people", not "a shared password", and a person has one login.
 
-use crate::{config::Config, db, slug::valid_slug};
+use crate::{config::Config, content::slug::valid_slug, runtime::db};
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -110,7 +110,7 @@ pub fn sign_up(config: &Config, email: &str, password: &str) -> Result<User, Str
         .to_string();
 
     let conn = open(config)?;
-    let id = crate::slug::random_token(16);
+    let id = crate::content::slug::random_token(16);
     conn.execute(
         "insert into users (id, email, password_hash, created_at) values (?, ?, ?, ?)",
         rusqlite::params![&id, &email, &hash, now() as i64],
@@ -160,7 +160,7 @@ pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, Str
         return Err("email or password is incorrect".into());
     }
 
-    let token = crate::slug::random_token(48);
+    let token = crate::content::slug::random_token(48);
     let expires = now() + SESSION_LIFETIME.as_secs();
     conn.execute(
         "insert into sessions (token_hash, user_id, expires_at) values (?, ?, ?)",
@@ -431,7 +431,7 @@ fn safe_next(next: Option<&str>) -> String {
 }
 
 pub async fn login_form(Query(params): Query<NextPage>) -> Response {
-    let next = crate::slug::escape_html(&safe_next(params.next.as_deref()));
+    let next = crate::content::slug::escape_html(&safe_next(params.next.as_deref()));
     Html(format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">

@@ -1,4 +1,4 @@
-use crate::{config::Config, slug::valid_slug};
+use crate::{config::Config, content::slug::valid_slug};
 use rusqlite::{
     hooks::{AuthAction, AuthContext, Authorization},
     limits::Limit,

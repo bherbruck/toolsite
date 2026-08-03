@@ -1,9 +1,11 @@
 use crate::{
-    db,
     config::Config,
-    slug::{random_slug, random_token, valid_segment, valid_slug},
-    store::{collect_slugs, page_path, page_title, page_url, read_meta, relative_time, write_meta},
-    upload::{upload_url, UploadTicket, UPLOAD_TTL, MAX_ICON_BYTES},
+    content::{
+        slug::{random_slug, random_token, valid_segment, valid_slug},
+        store::{collect_slugs, page_path, page_title, page_url, read_meta, relative_time, write_meta},
+    },
+    platform::upload::{upload_url, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
+    runtime::db,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -355,7 +357,7 @@ impl PageHost {
     ) -> Result<CallToolResult, McpError> {
         let config = self.config.clone();
         let outcome =
-            tokio::task::spawn_blocking(move || crate::users::sign_up(&config, &email, &password))
+            tokio::task::spawn_blocking(move || crate::accounts::users::sign_up(&config, &email, &password))
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match outcome {
@@ -384,9 +386,9 @@ impl PageHost {
         let (owned_app, owned_email) = (app.clone(), email.clone());
         let outcome = tokio::task::spawn_blocking(move || {
             if allow {
-                crate::users::grant(&config, &owned_email, &owned_app, "viewer")
+                crate::accounts::users::grant(&config, &owned_email, &owned_app, "viewer")
             } else {
-                crate::users::revoke(&config, &owned_email, &owned_app)
+                crate::accounts::users::revoke(&config, &owned_email, &owned_app)
             }
         })
         .await

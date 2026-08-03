@@ -1,4 +1,4 @@
-use crate::{config::Config, slug::random_token};
+use crate::{config::Config, content::slug::random_token};
 use axum::{
     extract::{Form, Query, State},
     http::{header, HeaderMap, StatusCode, Uri},

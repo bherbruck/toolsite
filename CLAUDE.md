@@ -26,24 +26,40 @@ Two more that this codebase already leans on:
 ## Module layout
 
 ```
-main.rs     startup: env -> Config, listener
-lib.rs      build_router: every route, assembled in one place
-config.rs   Config struct shared by every layer
-slug.rs     naming rules (what may become a path), random tokens, escaping
-store.rs    the data layer: page/icon/meta paths, titles, visibility, listing
-bundle.rs   tar unpacking, entry classification, traversal defence
-upload.rs   upload tickets and the PUT endpoints they authorise
-auth.rs     bearer/x-api-key middleware for /mcp
-oauth.rs    the minimal single-user OAuth 2.1 shim
-web.rs      the public site: page serving, icons, index rendering
-mcp.rs      MCP tool definitions and the ServerHandler
-wasm.rs     the guest sandbox: engine, guards, host imports
-db.rs       per-app SQLite, with the authorizer that keeps apps apart
+main.rs            startup: env -> Config, listener, --stdio
+lib.rs             build_router: every route, assembled in one place
+config.rs          Config shared by every layer
+
+platform/          the site as its owner uses it
+  mcp.rs           MCP tool definitions and the ServerHandler
+  bearer.rs        bearer/x-api-key middleware for /mcp
+  client_oauth.rs  OAuth shim for MCP clients — who may PUBLISH
+  upload.rs        upload tickets and the PUT endpoints they authorise
+
+content/           what gets published, and how it is served
+  slug.rs          naming rules (what may become a path), tokens, escaping
+  store.rs         page/icon/meta paths, titles, visibility, listing
+  bundle.rs        tar unpacking, entry classification, traversal defence
+  serve.rs         the public site: pages, assets, handler dispatch, index
+
+runtime/           executing an app's own code and data
+  wasm.rs          engine, guards, host imports
+  db.rs            per-app SQLite and the authorizer keeping apps apart
+
+accounts/          people who USE published apps
+  users.rs         accounts, sessions, grants, sign-in routes
+
+wit/               the contract guests compile against
+cli/               the `toolsite` command (standalone crate)
 ```
 
-Dependency direction is one-way: `web`/`mcp`/`upload` depend on `store`, which
-depends on `config` and `slug`. Nothing in `store` reaches back up into HTTP
-types.
+Two auth systems live here and must never be conflated: `platform/` decides
+who may publish, `accounts/` decides who may visit. They were adjacent files
+called `auth.rs` and `users.rs` once, which invited exactly that mistake.
+
+Dependency direction is one-way: `platform` and `content` depend on
+`runtime` and `accounts`; everything depends on `config` and `content::slug`.
+Nothing in `runtime` reaches back up into HTTP types.
 
 ## Conventions
 

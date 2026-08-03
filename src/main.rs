@@ -5,7 +5,12 @@ use std::{
 };
 use tokio::fs;
 use rmcp::ServiceExt;
-use toolsite::{build_router, config::Config, mcp::PageHost, oauth::OAuth, wasm::Runtime};
+use toolsite::{
+    build_router,
+    config::Config,
+    platform::{client_oauth::OAuth, mcp::PageHost},
+    runtime::wasm::Runtime,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use toolsite::{build_router, upload::UploadTicket, wasm::Runtime, Config};
+use toolsite::{build_router, platform::upload::UploadTicket, runtime::wasm::Runtime, Config};
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
@@ -434,11 +434,11 @@ async fn a_handler_is_validated_when_it_is_uploaded() {
 // --- accounts and gates -------------------------------------------------
 
 fn account(config: &Config, email: &str, password: &str) {
-    toolsite::users::sign_up(config, email, password).unwrap();
+    toolsite::accounts::users::sign_up(config, email, password).unwrap();
 }
 
 fn sign_in(config: &Arc<Config>, email: &str, password: &str) -> String {
-    let (_, token) = toolsite::users::log_in(config, email, password).unwrap();
+    let (_, token) = toolsite::accounts::users::log_in(config, email, password).unwrap();
     token
 }
 
@@ -498,7 +498,7 @@ async fn a_granted_gate_needs_that_specific_grant() {
     let (status, ..) = send(&config, get_as("/p/private/", &outsider)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a signed-in stranger got in");
 
-    toolsite::users::grant(&config, "allowed@example.com", "private", "viewer").unwrap();
+    toolsite::accounts::users::grant(&config, "allowed@example.com", "private", "viewer").unwrap();
     let allowed = sign_in(&config, "allowed@example.com", "correct horse battery");
     let (status, ..) = send(&config, get_as("/p/private/", &allowed)).await;
     assert_eq!(status, StatusCode::OK);

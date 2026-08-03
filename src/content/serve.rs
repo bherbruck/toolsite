@@ -1,13 +1,13 @@
 use crate::{
     config::Config,
-    slug::{valid_asset_path, valid_slug},
-    store::{
-        collect_slugs, icon_path, is_hidden, page_icon, page_path, page_title, read_meta,
-        relative_time, Icon,
+    content::{
+        slug::{valid_asset_path, valid_slug},
+        store::{
+            collect_slugs, icon_path, is_hidden, page_icon, page_path, page_title, read_meta,
+            relative_time, Icon,
+        },
     },
-};
-use crate::{
-    wasm::{Guards, Request as WasmRequest},
+    runtime::wasm::{Guards, Request as WasmRequest},
     AppState,
 };
 use axum::{
@@ -125,7 +125,7 @@ pub(crate) async fn serve_page(
     request: Request<Body>,
 ) -> Response {
     let config = &state.config;
-    let visitor = crate::users::current_user(config, request.headers()).await;
+    let visitor = crate::accounts::users::current_user(config, request.headers()).await;
     let uri_path = request.uri().path().to_string();
     let Some(raw) = uri_path.strip_prefix("/p/") else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -211,7 +211,7 @@ async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
 async fn gate_check(
     config: &Arc<Config>,
     app: &str,
-    visitor: Option<&crate::users::User>,
+    visitor: Option<&crate::accounts::users::User>,
     path: &str,
     is_api: bool,
 ) -> Option<Response> {
@@ -223,7 +223,7 @@ async fn gate_check(
             Some(user) => {
                 let (config, user, app) = (config.clone(), user.clone(), app.to_string());
                 tokio::task::spawn_blocking(move || {
-                    crate::users::has_grant(&config, &user, &app)
+                    crate::accounts::users::has_grant(&config, &user, &app)
                 })
                 .await
                 .unwrap_or(false)
@@ -260,7 +260,7 @@ async fn run_handler(
     app: &str,
     wasm: &[u8],
     request: Request<Body>,
-    visitor: Option<crate::users::User>,
+    visitor: Option<crate::accounts::users::User>,
 ) -> Response {
     let method = request.method().to_string();
     let uri = request.uri().clone();
@@ -301,7 +301,7 @@ async fn run_handler(
     let wasm = wasm.to_vec();
     // The guest's identity import is fed from a verified session, never from
     // anything the request claimed.
-    let user = visitor.map(|user| crate::wasm::User {
+    let user = visitor.map(|user| crate::runtime::wasm::User {
         id: user.id,
         email: user.email,
     });

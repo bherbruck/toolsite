@@ -1,4 +1,4 @@
-use crate::{oauth::OAuth, upload::UploadTicket};
+use crate::platform::{client_oauth::OAuth, upload::UploadTicket};
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 pub struct Config {

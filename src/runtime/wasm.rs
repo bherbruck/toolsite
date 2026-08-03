@@ -11,7 +11,7 @@
 //! A store is built fresh per request. Reusing one would leak state between
 //! requests, and app state belongs in that app's database instead.
 
-use crate::{config::Config as SiteConfig, db};
+use crate::{config::Config as SiteConfig, runtime::db};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},

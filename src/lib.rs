@@ -1,29 +1,25 @@
-pub mod auth;
-pub mod bundle;
+pub mod accounts;
 pub mod config;
-pub mod db;
-pub mod mcp;
-pub mod oauth;
-pub mod slug;
-pub mod store;
-pub mod upload;
-pub mod users;
-pub mod wasm;
-pub mod web;
+pub mod content;
+pub mod platform;
+pub mod runtime;
 
 pub use config::Config;
 
 use crate::{
-    auth::require_bearer,
-    mcp::PageHost,
-    oauth::{
-        authorize, oauth_authorization_server_metadata, oauth_protected_resource_metadata,
-        token_endpoint,
+    accounts::users,
+    content::serve::{index, serve_icon, serve_page},
+    platform::{
+        bearer::require_bearer,
+        client_oauth::{
+            authorize, oauth_authorization_server_metadata, oauth_protected_resource_metadata,
+            token_endpoint,
+        },
+        mcp::PageHost,
+        upload::{upload_root, upload_sub, MAX_UPLOAD_BYTES},
     },
-    upload::{upload_root, upload_sub, MAX_UPLOAD_BYTES},
-    web::{index, serve_icon, serve_page},
 };
-use crate::wasm::Runtime;
+use crate::runtime::wasm::Runtime;
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
     http::Uri,

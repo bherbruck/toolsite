@@ -1,10 +1,12 @@
 use crate::{
-    bundle::unpack_bundle,
-    wasm::Runtime,
-    AppState,
     config::Config,
-    slug::valid_slug,
-    store::{page_url, read_meta, write_meta},
+    content::{
+        bundle::unpack_bundle,
+        slug::valid_slug,
+        store::{page_url, read_meta, write_meta},
+    },
+    runtime::wasm::Runtime,
+    AppState,
 };
 use axum::{
     body::Bytes,
