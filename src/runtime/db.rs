@@ -206,7 +206,7 @@ mod tests {
 
     fn config() -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::local(dir.path().to_path_buf(), "test-token", true);
+        let config = Config::local(dir.path().to_path_buf(), "test-token");
         (dir, config)
     }
 

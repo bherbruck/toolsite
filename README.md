@@ -291,13 +291,15 @@ Two independent modes — use either, or both at once. At least one is required.
 | `TOOLSITE_OAUTH_CLIENT_SECRET` | if using OAuth | Paste into the client's "OAuth Client Secret" field. |
 | `TOOLSITE_BASE_URL` | if using OAuth | Base URL of the deployment, e.g. `https://host.com`. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where pages are stored. |
-| `TOOLSITE_DATABASES` | no (default off) | `on` gives each app a SQLite database. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
 
 Every `TOOLSITE_`-prefixed name above also answers to its old unprefixed form
-(`BEARER_TOKEN`, `OAUTH_CLIENT_ID`, `PUBLIC_BASE_URL`, `DATA_DIR`,
-`DATABASES`), plus `MCP_TOKEN`, so an existing deployment needs no changes.
+(`BEARER_TOKEN`, `OAUTH_CLIENT_ID`, `PUBLIC_BASE_URL`, `DATA_DIR`), plus
+`MCP_TOKEN`, so an existing deployment needs no changes.
+
+Every app gets a SQLite database; there is nothing to switch on. `db.query`
+and `run_sql` always work.
 
 Boot logs the effective configuration, so a misconfigured deploy is visible
 without a client to test against:

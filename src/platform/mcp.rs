@@ -329,17 +329,6 @@ impl PageHost {
         &self,
         Parameters(RunSqlRequest { app, sql, params }): Parameters<RunSqlRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.config.databases {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "databases are off; set DATABASES=on to enable them",
-            )]));
-        }
-        if !valid_slug(&app) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
-            )]));
-        }
-
         let config = self.config.clone();
         let params = params.unwrap_or_default();
         let outcome =

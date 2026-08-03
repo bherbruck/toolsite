@@ -17,7 +17,7 @@ const TOKEN: &str = "test-token";
 
 fn server() -> (TempDir, Arc<Config>) {
     let dir = tempfile::tempdir().unwrap();
-    let config = Arc::new(Config::local(dir.path().to_path_buf(), TOKEN, true));
+    let config = Arc::new(Config::local(dir.path().to_path_buf(), TOKEN));
     (dir, config)
 }
 

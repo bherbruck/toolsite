@@ -147,9 +147,6 @@ For when the CLI isn't installed, or there is no shell at all.
 with `set_visibility(slug, hidden: true)`, which is instantly reversible with
 `hidden: false`.
 
-`run_sql` returns "databases are off" unless the server was started with
-`DATABASES=on`.
-
 ## Server-side handlers
 
 An app can ship `handler.wasm`: a component built for `wasm32-wasip2` against

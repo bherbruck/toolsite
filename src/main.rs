@@ -151,11 +151,6 @@ async fn main() -> anyhow::Result<()> {
         valid_tokens.push(o.client_secret.clone());
     }
 
-    let databases = read(&["TOOLSITE_DATABASES", "DATABASES"])
-        .is_some_and(|value| {
-            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")
-        });
-
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
 
@@ -165,7 +160,6 @@ async fn main() -> anyhow::Result<()> {
         bearer_auth = bearer_token.is_some(),
         oauth_auth = oauth.is_some(),
         base_url = base_url.as_deref().unwrap_or("<unset>"),
-        databases,
         "auth configuration"
     );
 
@@ -175,7 +169,6 @@ async fn main() -> anyhow::Result<()> {
         local_base: format!("http://localhost:{port}"),
         valid_tokens,
         oauth,
-        databases,
         uploads: Mutex::new(HashMap::new()),
     });
 
@@ -226,7 +219,6 @@ fn run_user_command(
         local_base: "http://localhost:8080".to_string(),
         valid_tokens: Vec::new(),
         oauth: None,
-        databases: false,
         uploads: Mutex::new(HashMap::new()),
     };
 

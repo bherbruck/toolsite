@@ -396,7 +396,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         (
             tempfile::tempdir().unwrap(),
-            Config::local(dir.keep(), "test-token", true),
+            Config::local(dir.keep(), "test-token"),
         )
     }
 

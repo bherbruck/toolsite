@@ -13,7 +13,7 @@ const HANDLER: &[u8] = include_bytes!("fixtures/handler.wasm");
 
 fn site() -> (TempDir, Arc<Config>) {
     let dir = tempfile::tempdir().unwrap();
-    let config = Arc::new(Config::local(dir.path().to_path_buf(), "test-token", true));
+    let config = Arc::new(Config::local(dir.path().to_path_buf(), "test-token"));
     (dir, config)
 }
 
@@ -172,17 +172,6 @@ fn a_wall_clock_deadline_stops_a_spinning_handler() {
         Some(&wasmtime::Trap::Interrupt),
         "expected an epoch deadline, got {error:?}"
     );
-}
-
-#[test]
-fn databases_stay_unreachable_when_the_feature_is_off() {
-    let runtime = Runtime::new().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let site = Arc::new(Config::local(dir.path().to_path_buf(), "test-token", false));
-
-    let (status, body) = call(&runtime, &site, "app", request("/count"));
-    assert_eq!(status, 500);
-    assert!(body.contains("not enabled"), "{body}");
 }
 
 /// wasi is linked because a wasm32-wasip2 guest imports it through std. The

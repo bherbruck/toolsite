@@ -99,10 +99,6 @@ impl self::toolsite::app::db::Host for StoreState {
         sql: String,
         params: Vec<WitValue>,
     ) -> Result<WitRows, WitDbError> {
-        if !self.site.databases {
-            return Err(WitDbError::Denied("databases are not enabled".into()));
-        }
-
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
         match db::run(&self.site, &self.app, &sql, &params) {
             Ok(outcome) => Ok(WitRows {
@@ -324,7 +320,6 @@ mod tests {
         Arc::new(SiteConfig::local(
             std::env::temp_dir().join("toolsite-wasm-tests"),
             "test-token",
-            true,
         ))
     }
 
