@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+argon2 = "0.5.3"
 axum = "0.8.9"
 base64 = "0.22.1"
 dotenvy = "0.15.7"

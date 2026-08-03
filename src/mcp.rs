@@ -80,6 +80,10 @@ pub(crate) struct SetVisibilityRequest {
         description = "false keeps the page working at its URL but removes it from the site index. Use for scratch or link-only pages."
     )]
     pub(crate) listed: Option<bool>,
+    #[schemars(
+        description = "Who may reach the app: 'public' (anyone), 'authenticated' (any signed-in account), or 'granted' (only accounts given access with set_access)."
+    )]
+    pub(crate) gate: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -94,6 +98,24 @@ pub(crate) struct ListPagesRequest {
 pub(crate) struct PullAppRequest {
     #[schemars(description = "App namespace to fetch all pages for.")]
     pub(crate) app: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CreateUserRequest {
+    #[schemars(description = "Email address, which is the account's identity across every app on this site.")]
+    pub(crate) email: String,
+    #[schemars(description = "Initial password, at least 8 characters. Stored hashed with argon2.")]
+    pub(crate) password: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AccessRequest {
+    #[schemars(description = "App the grant applies to.")]
+    pub(crate) app: String,
+    #[schemars(description = "Email of an existing account.")]
+    pub(crate) email: String,
+    #[schemars(description = "Set false to take the grant away. Defaults to true.")]
+    pub(crate) allow: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -325,6 +347,63 @@ impl PageHost {
     }
 
     #[tool(
+        description = "Create an account someone can sign in with. Accounts are global to the site; use set_access to say which apps they may reach. There is no public signup, so this is the only way an account comes into being."
+    )]
+    pub(crate) async fn create_user(
+        &self,
+        Parameters(CreateUserRequest { email, password }): Parameters<CreateUserRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = self.config.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || crate::users::sign_up(&config, &email, &password))
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match outcome {
+            Ok(user) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "created {} ({})",
+                user.email, user.id
+            ))])),
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
+    }
+
+    #[tool(
+        description = "Give or take away one account's access to one app. Only matters for apps whose gate is 'granted'."
+    )]
+    pub(crate) async fn set_access(
+        &self,
+        Parameters(AccessRequest { app, email, allow }): Parameters<AccessRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+        let allow = allow.unwrap_or(true);
+        let config = self.config.clone();
+        let (owned_app, owned_email) = (app.clone(), email.clone());
+        let outcome = tokio::task::spawn_blocking(move || {
+            if allow {
+                crate::users::grant(&config, &owned_email, &owned_app, "viewer")
+            } else {
+                crate::users::revoke(&config, &owned_email, &owned_app)
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match outcome {
+            Ok(()) if allow => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{email} can now reach {app}"
+            ))])),
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{email} can no longer reach {app}"
+            ))])),
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
+    }
+
+    #[tool(
         description = "List published pages: slug, title, URL, when each was last changed, and its visibility. Call this to find out what already exists before editing or reusing a slug."
     )]
     async fn list_pages(
@@ -384,6 +463,7 @@ impl PageHost {
             slug,
             hidden,
             listed,
+            gate,
         }): Parameters<SetVisibilityRequest>,
     ) -> Result<CallToolResult, McpError> {
         if !valid_slug(&slug) {
@@ -391,10 +471,17 @@ impl PageHost {
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
             )]));
         }
-        if hidden.is_none() && listed.is_none() {
+        if hidden.is_none() && listed.is_none() && gate.is_none() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "pass hidden, listed, or both",
+                "pass hidden, listed or gate",
             )]));
+        }
+        if let Some(gate) = &gate {
+            if !matches!(gate.as_str(), "public" | "authenticated" | "granted") {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "gate must be 'public', 'authenticated' or 'granted'",
+                )]));
+            }
         }
         if page_path(&self.config, &slug).await.is_none() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
@@ -408,6 +495,9 @@ impl PageHost {
         }
         if let Some(listed) = listed {
             meta.listed = listed;
+        }
+        if let Some(gate) = gate {
+            meta.gate = gate;
         }
         write_meta(&self.config, &slug, &meta)
             .await

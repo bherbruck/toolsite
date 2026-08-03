@@ -51,6 +51,13 @@ pub(crate) struct PageMeta {
     /// index.html instead of 404ing.
     #[serde(default)]
     pub(crate) spa: bool,
+    /// Who may reach this app: "public", "authenticated", or "granted".
+    #[serde(default = "public")]
+    pub(crate) gate: String,
+}
+
+pub(crate) fn public() -> String {
+    "public".to_string()
 }
 
 pub(crate) fn yes() -> bool {
@@ -63,6 +70,7 @@ impl Default for PageMeta {
             listed: true,
             hidden: false,
             spa: false,
+            gate: public(),
         }
     }
 }

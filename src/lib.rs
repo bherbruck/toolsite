@@ -7,6 +7,7 @@ pub mod oauth;
 pub mod slug;
 pub mod store;
 pub mod upload;
+pub mod users;
 pub mod wasm;
 pub mod web;
 
@@ -87,6 +88,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/", get(index))
         .route("/p/{*slug}", any(serve_page))
         .route("/icon/{*slug}", get(serve_icon))
+        .route("/auth/login", get(users::login_form).post(users::login_submit))
+        .route("/auth/logout", post(users::logout).get(users::logout))
+        .route("/auth/me", get(users::me))
         .route("/upload/{ticket}", put(upload_root).post(upload_root))
         .route("/upload/{ticket}/{*sub}", put(upload_sub).post(upload_sub))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));

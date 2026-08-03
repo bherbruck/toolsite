@@ -1,6 +1,6 @@
 use rand::RngExt;
 
-pub(crate) fn random_token(len: usize) -> String {
+pub fn random_token(len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rand::rng();
     (0..len)
@@ -34,7 +34,7 @@ pub(crate) fn valid_asset_path(s: &str) -> bool {
         })
 }
 
-pub(crate) fn escape_html(s: &str) -> String {
+pub fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

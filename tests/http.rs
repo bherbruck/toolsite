@@ -430,3 +430,194 @@ async fn a_handler_is_validated_when_it_is_uploaded() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "GET /api/echo?");
 }
+
+// --- accounts and gates -------------------------------------------------
+
+fn account(config: &Config, email: &str, password: &str) {
+    toolsite::users::sign_up(config, email, password).unwrap();
+}
+
+fn sign_in(config: &Arc<Config>, email: &str, password: &str) -> String {
+    let (_, token) = toolsite::users::log_in(config, email, password).unwrap();
+    token
+}
+
+fn get_as(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("cookie", format!("ts_session={token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn gate(config: &Config, app: &str, gate: &str) {
+    std::fs::create_dir_all(config.data_dir.join(app)).unwrap();
+    std::fs::write(
+        config.data_dir.join(app).join("index.meta"),
+        format!(r#"{{"listed":true,"hidden":false,"spa":false,"gate":"{gate}"}}"#),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_public_app_needs_no_account() {
+    let (_dir, config) = server();
+    write_page(&config, "open/index", "<h1>open</h1>");
+
+    let (status, ..) = send(&config, get("/p/open/")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_authenticated_gate_sends_a_visitor_to_sign_in() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+
+    let (status, _, headers) = send(&config, get("/p/members/")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+    assert!(location.1.starts_with("/auth/login?next="), "{}", location.1);
+
+    account(&config, "someone@example.com", "correct horse battery");
+    let token = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (status, body, _) = send(&config, get_as("/p/members/", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("members"));
+}
+
+#[tokio::test]
+async fn a_granted_gate_needs_that_specific_grant() {
+    let (_dir, config) = server();
+    write_page(&config, "private/index", "<h1>private</h1>");
+    gate(&config, "private", "granted");
+    account(&config, "allowed@example.com", "correct horse battery");
+    account(&config, "outsider@example.com", "correct horse battery");
+
+    let outsider = sign_in(&config, "outsider@example.com", "correct horse battery");
+    let (status, ..) = send(&config, get_as("/p/private/", &outsider)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a signed-in stranger got in");
+
+    toolsite::users::grant(&config, "allowed@example.com", "private", "viewer").unwrap();
+    let allowed = sign_in(&config, "allowed@example.com", "correct horse battery");
+    let (status, ..) = send(&config, get_as("/p/private/", &allowed)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_gate_covers_the_handler_and_assets_not_just_the_page() {
+    let (_dir, config) = server();
+    publish_handler(&config, "members");
+    gate(&config, "members", "authenticated");
+    std::fs::write(config.data_dir.join("members/secret.txt"), "classified").unwrap();
+
+    // An API call gets a status, not a redirect into an HTML form.
+    let (status, ..) = send(&config, get("/p/members/api/echo")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, ..) = send(&config, get("/p/members/secret.txt")).await;
+    assert_ne!(status, StatusCode::OK, "an asset leaked past the gate");
+}
+
+#[tokio::test]
+async fn a_handler_learns_who_is_signed_in() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+
+    // Anonymous by default.
+    let (status, ..) = send(&config, get("/p/app/api/whoami")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    account(&config, "someone@example.com", "correct horse battery");
+    let token = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (status, body, _) = send(&config, get_as("/p/app/api/whoami", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.ends_with(":someone@example.com"), "got {body}");
+}
+
+#[tokio::test]
+async fn an_invented_cookie_buys_nothing() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+    write_page(&config, "members/index", "<h1>members</h1>");
+    gate(&config, "members", "authenticated");
+
+    let (status, ..) = send(&config, get_as("/p/members/", "forged-token")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (status, ..) = send(&config, get_as("/p/app/api/whoami", "forged-token")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn signing_in_sets_a_session_and_signing_out_clears_it() {
+    let (_dir, config) = server();
+    account(&config, "someone@example.com", "correct horse battery");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(
+            "email=someone@example.com&password=correct+horse+battery&next=/p/somewhere",
+        ))
+        .unwrap();
+    let (status, _, headers) = send(&config, request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = headers.iter().find(|(k, _)| k == "set-cookie").unwrap();
+    assert!(cookie.1.contains("HttpOnly") && cookie.1.contains("Secure"), "{}", cookie.1);
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+    assert_eq!(location.1, "/p/somewhere");
+
+    let token = cookie.1.split(';').next().unwrap().trim_start_matches("ts_session=");
+    let (status, body, _) = send(&config, get_as("/auth/me", token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("someone@example.com"));
+
+    let logout = Request::builder()
+        .method("POST")
+        .uri("/auth/logout")
+        .header("cookie", format!("ts_session={token}"))
+        .body(Body::empty())
+        .unwrap();
+    send(&config, logout).await;
+
+    let (status, ..) = send(&config, get_as("/auth/me", token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "session survived sign-out");
+}
+
+#[tokio::test]
+async fn a_bad_password_does_not_hand_out_a_session() {
+    let (_dir, config) = server();
+    account(&config, "someone@example.com", "correct horse battery");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("email=someone@example.com&password=wrong"))
+        .unwrap();
+    let (status, _, headers) = send(&config, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(headers.iter().all(|(k, _)| k != "set-cookie"));
+}
+
+#[tokio::test]
+async fn the_next_parameter_cannot_bounce_a_visitor_off_site() {
+    let (_dir, config) = server();
+    account(&config, "someone@example.com", "correct horse battery");
+
+    for hostile in ["https://evil.example.com/", "//evil.example.com/"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/auth/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "email=someone@example.com&password=correct+horse+battery&next={hostile}"
+            )))
+            .unwrap();
+        let (_, _, headers) = send(&config, request).await;
+        let location = headers.iter().find(|(k, _)| k == "location").unwrap();
+        assert_eq!(location.1, "/", "open redirect via {hostile}");
+    }
+}

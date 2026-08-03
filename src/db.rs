@@ -40,12 +40,19 @@ fn deny_escapes(context: AuthContext<'_>) -> Authorization {
 
 pub(crate) fn open(config: &Config, app: &str) -> Result<Connection, String> {
     let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    open_at(&path)
+}
+
+/// Opens one SQLite file with the same guards everywhere: an authorizer that
+/// refuses anything reaching outside this file, a size ceiling, and WAL.
+pub(crate) fn open_at(path: &std::path::Path) -> Result<Connection, String> {
+    {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
     let conn = Connection::open_with_flags(
-        &path,
+        path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .map_err(|e| e.to_string())?;
@@ -65,6 +72,7 @@ pub(crate) fn open(config: &Config, app: &str) -> Result<Connection, String> {
     conn.authorizer(Some(deny_escapes))
         .map_err(|e| e.to_string())?;
     Ok(conn)
+    }
 }
 
 fn to_sql(value: &Value) -> Result<ToSqlOutput<'static>, String> {

@@ -125,6 +125,7 @@ pub(crate) async fn serve_page(
     request: Request<Body>,
 ) -> Response {
     let config = &state.config;
+    let visitor = crate::users::current_user(config, request.headers()).await;
     let uri_path = request.uri().path().to_string();
     let Some(raw) = uri_path.strip_prefix("/p/") else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -146,9 +147,13 @@ pub(crate) async fn serve_page(
     };
     let is_api = rest == API_PREFIX || rest.starts_with(&format!("{API_PREFIX}/"));
 
+    if let Some(denied) = gate_check(&state.config, app, visitor.as_ref(), &uri_path, is_api).await {
+        return denied;
+    }
+
     if is_api {
         return match handler_wasm(config, app).await {
-            Some(wasm) => run_handler(&state, app, &wasm, request).await,
+            Some(wasm) => run_handler(&state, app, &wasm, request, visitor).await,
             None => (StatusCode::NOT_FOUND, "this app has no handler").into_response(),
         };
     }
@@ -179,7 +184,7 @@ pub(crate) async fn serve_page(
     // Nothing on disk, but the app ships code: let it answer for its own
     // routes, which is what server-rendered pages need.
     if let Some(wasm) = handler_wasm(config, app).await {
-        return run_handler(&state, app, &wasm, request).await;
+        return run_handler(&state, app, &wasm, request, visitor).await;
     }
 
     // Client-routed bundle: /p/app/some/route is the app's own concern, so
@@ -200,11 +205,62 @@ async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Refuses a request the app's gate does not admit. A browser is sent to sign
+/// in; an API call gets a status, since redirecting a fetch to an HTML form
+/// only produces a confusing parse error.
+async fn gate_check(
+    config: &Arc<Config>,
+    app: &str,
+    visitor: Option<&crate::users::User>,
+    path: &str,
+    is_api: bool,
+) -> Option<Response> {
+    let gate = read_meta(config, app).await.gate;
+    let allowed = match gate.as_str() {
+        "public" => true,
+        "authenticated" => visitor.is_some(),
+        "granted" => match visitor {
+            Some(user) => {
+                let (config, user, app) = (config.clone(), user.clone(), app.to_string());
+                tokio::task::spawn_blocking(move || {
+                    crate::users::has_grant(&config, &user, &app)
+                })
+                .await
+                .unwrap_or(false)
+            }
+            None => false,
+        },
+        // An unknown gate is treated as closed rather than open.
+        _ => false,
+    };
+    if allowed {
+        return None;
+    }
+
+    Some(if is_api {
+        let status = if visitor.is_some() {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        (status, "not permitted").into_response()
+    } else if visitor.is_some() {
+        (StatusCode::FORBIDDEN, "you do not have access to this app").into_response()
+    } else {
+        Redirect::to(&format!(
+            "/auth/login?next={}",
+            urlencoding::encode(path)
+        ))
+        .into_response()
+    })
+}
+
 async fn run_handler(
     state: &AppState,
     app: &str,
     wasm: &[u8],
     request: Request<Body>,
+    visitor: Option<crate::users::User>,
 ) -> Response {
     let method = request.method().to_string();
     let uri = request.uri().clone();
@@ -243,6 +299,12 @@ async fn run_handler(
     let config = state.config.clone();
     let owned_app = app.to_string();
     let wasm = wasm.to_vec();
+    // The guest's identity import is fed from a verified session, never from
+    // anything the request claimed.
+    let user = visitor.map(|user| crate::wasm::User {
+        id: user.id,
+        email: user.email,
+    });
     // Guest execution is blocking and CPU-bound, and the database import
     // blocks too, so it must not run on an async worker.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -251,7 +313,7 @@ async fn run_handler(
             config,
             &owned_app,
             &wasm,
-            None,
+            user,
             guest_request,
             Guards::default(),
         )
