@@ -17,7 +17,11 @@ use crate::{
 };
 use serde::Deserialize;
 
+/// Unknown keys are refused rather than ignored. `[[jobs]]` instead of
+/// `[[job]]` used to parse cleanly and schedule nothing, which is the worst
+/// kind of failure: the deploy says it worked.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Named here only so a manifest reads completely; the upload ticket
     /// already decided which app this is.
@@ -43,12 +47,14 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     pub path: String,
     pub gate: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub name: String,
     pub schedule: String,
@@ -60,8 +66,14 @@ const GATES: [&str; 3] = ["public", "authenticated", "granted"];
 /// Applies a manifest to one app, reporting what changed so a deploy says
 /// what it did rather than only that it finished.
 pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<String>, String> {
-    let manifest: Manifest =
-        toml::from_str(toml_text).map_err(|e| format!("could not read toolsite.toml: {e}"))?;
+    let manifest: Manifest = toml::from_str(toml_text).map_err(|e| {
+        // serde names the offending key, which is the whole value here: the
+        // difference between [[job]] and [[jobs]] is invisible otherwise.
+        format!(
+            "could not read toolsite.toml: {e}\nKeys it takes: slug, spa, gate, icon, \
+             allow_http, [[route]] (path, gate), [[job]] (name, schedule, path)."
+        )
+    })?;
 
     // Everything is checked before anything is written: half an applied
     // manifest is worse than a rejected one.
@@ -283,6 +295,27 @@ mod tests {
         // An empty list is a decision, not an omission: it takes it away.
         apply(&config, "app", "allow_http = []\n").await.unwrap();
         assert!(read_meta(&config, "app").await.allow_http.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_key_nobody_recognises_is_refused_rather_than_ignored() {
+        let (_t, config) = config();
+        // The plural is the natural guess and used to schedule nothing while
+        // reporting success.
+        let error = apply(
+            &config,
+            "app",
+            "[[jobs]]\nname = \"rollup\"\nschedule = \"0 0 3 * * *\"\npath = \"/api/x\"\n",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("jobs"), "the error should name the key: {error}");
+        assert!(error.contains("[[job]]"), "and say what was meant: {error}");
+
+        // A misspelled field inside a table too.
+        assert!(apply(&config, "app", "[[job]]\nname = \"x\"\ncron = \"0 0 3 * * *\"\npath = \"/a\"\n")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
