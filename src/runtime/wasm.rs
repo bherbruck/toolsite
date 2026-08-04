@@ -244,6 +244,14 @@ impl Runtime {
         Ok(())
     }
 
+    /// Forgets an app's compiled handler, so the next request picks up what
+    /// was just uploaded. Without this the cache is keyed by app name and a
+    /// redeploy keeps serving the previous component until eviction — code
+    /// that is on disk but not running is a hard thing to debug.
+    pub fn forget(&self, app: &str) {
+        self.handlers.lock().unwrap().remove(app);
+    }
+
     /// Compiles and links an app's handler, reusing the result while cached.
     fn handler(&self, key: &str, wasm: &[u8]) -> anyhow::Result<AppPre<StoreState>> {
         if let Some((handler, last_used)) = self.handlers.lock().unwrap().get_mut(key) {
@@ -455,6 +463,31 @@ mod tests {
         // A store that ran to exhaustion must not affect the next one.
         let _ = run(&runtime, INFINITE_LOOP, guards);
         assert_eq!(run(&runtime, ADDER, guards).unwrap(), 42);
+    }
+
+    #[test]
+    fn uploading_a_handler_forgets_the_one_that_was_running() {
+        // The cache is keyed by app name, so without this a redeploy leaves
+        // the previous component serving: the new code sits on disk and never
+        // runs, which reads from outside as "uploads land but don't activate".
+        let runtime = runtime();
+        let component = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/handler.wasm"
+        ))
+        .unwrap();
+
+        let mut store = runtime.store(test_site(), "app", None, Guards::default());
+        let handler = runtime.handler("app", &component).unwrap();
+        let instance = handler.instantiate(&mut store).unwrap();
+        let _ = instance;
+        assert_eq!(runtime.handlers.lock().unwrap().len(), 1);
+
+        runtime.forget("app");
+        assert!(
+            runtime.handlers.lock().unwrap().is_empty(),
+            "the previous component survived an upload"
+        );
     }
 
     #[test]

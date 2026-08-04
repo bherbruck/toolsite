@@ -393,6 +393,12 @@ impl PageHost {
              'create table if not exists' in a handler — once the table exists it does \
              nothing, so a later column never arrives:\n\
              \n  tar -czf - -C migrations . | curl -f -T - '{upload}?migrations'\n\
+             \nThe app's settings — its gate, route rules, jobs, icon and allow_http — come \
+             from toolsite.toml:\n\
+             \n  curl -f -T toolsite.toml '{upload}?manifest'\n\
+             \nEvery flag this URL takes: ?bundle, ?spa, ?handler, ?migrations, ?manifest, \
+             ?icon, ?source. No flag at all publishes the body as a page. Anything else is \
+             refused rather than guessed at.\n\
              \nKeep the project with the app, since a bundle cannot be turned back into the \
              sources that built it. Visitors only ever see what the bundle contained:\n\
              \n  tar -czf - --exclude node_modules --exclude target . | curl -f -T - '{upload}?source'\n\

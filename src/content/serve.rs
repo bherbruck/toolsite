@@ -366,6 +366,12 @@ async fn run_handler(
         .headers()
         .iter()
         .filter_map(|(name, value)| {
+            // x-toolsite-* is how the host tells a handler something about the
+            // call — that it came from the scheduler, for one. Passing a
+            // client's copy through would let anyone claim the same.
+            if name.as_str().starts_with("x-toolsite-") {
+                return None;
+            }
             value
                 .to_str()
                 .ok()

@@ -303,7 +303,10 @@ pub(crate) fn collect_slugs<'a>(
         // A directory with an index page is an app: list its root only. Its
         // inner pages belong to the app's own navigation, not this index.
         if !prefix.is_empty() && fs::metadata(dir.join("index.html")).await.is_ok() {
-            out.push(prefix);
+            // A page of the same name may also exist; one slug, one entry.
+            if !out.contains(&prefix) {
+                out.push(prefix);
+            }
             return;
         }
         let Ok(mut entries) = fs::read_dir(dir).await else {
@@ -326,7 +329,9 @@ pub(crate) fn collect_slugs<'a>(
                     } else {
                         format!("{prefix}/{stem}")
                     };
-                    out.push(slug);
+                    if !out.contains(&slug) {
+                        out.push(slug);
+                    }
                 }
             }
         }

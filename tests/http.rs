@@ -1835,3 +1835,91 @@ async fn the_scaffold_carries_the_schema_its_handler_expects() {
         "the handler is doing its own DDL again"
     );
 }
+
+// --- what a real deploy got wrong --------------------------------------
+
+#[tokio::test]
+async fn an_unknown_upload_flag_is_refused_not_published() {
+    let (_dir, config) = server();
+    let token = ticket(&config, "app", Duration::from_secs(60));
+    std::fs::create_dir_all(config.data_dir.join("app")).unwrap();
+    std::fs::write(config.data_dir.join("app/index.html"), "<h1>the app</h1>").unwrap();
+
+    // Probing for a flag that does not exist used to publish the probe as the
+    // app's front page.
+    for flag in ["config", "toolsite", "settings"] {
+        let (status, body, _) = send(
+            &config,
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/upload/{token}?{flag}"))
+                .body(Body::from("slug = \"app\"\ngate = \"public\"\n"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "?{flag} was accepted");
+        assert!(body.contains("manifest"), "the error should list the real flags");
+    }
+
+    let (_, page, _) = send(&config, get("/p/app/")).await;
+    assert!(page.contains("the app"), "a probe replaced the page: {page}");
+}
+
+#[tokio::test]
+async fn a_client_cannot_claim_a_request_came_from_the_scheduler() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+
+    // The handler reports the headers it was given; the host's own marker
+    // must not be among them when a visitor sends it.
+    let request = Request::builder()
+        .uri("/p/app/api/echo")
+        .header("x-toolsite-scheduled", "nightly")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(&config, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("nightly"),
+        "a forged x-toolsite header reached the handler: {body}"
+    );
+}
+
+#[tokio::test]
+async fn publishing_an_app_replaces_a_page_of_the_same_name() {
+    let (_dir, config) = server();
+    // The shape that produced two identical entries on the live site: a page
+    // pushed first, then a bundle at the same slug.
+    write_page(&config, "releases", "<!doctype html>slug = \"releases\"");
+
+    let token = ticket(&config, "releases", Duration::from_secs(60));
+    let mut builder = tar::Builder::new(Vec::new());
+    let body = b"<!doctype html><title>Release watcher</title>";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append_data(&mut header, "index.html", &body[..]).unwrap();
+    let tar = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut encoder, &tar).unwrap();
+    let archive = encoder.finish().unwrap();
+
+    let (status, report, _) = send(
+        &config,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/upload/{token}?bundle"))
+            .body(Body::from(archive))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(report.contains("replaced"), "the replacement was silent: {report}");
+
+    // The app is what serves, and the index names it once.
+    let (_, page, _) = send(&config, get("/p/releases/")).await;
+    assert!(page.contains("Release watcher"), "the page still shadows the app");
+    let (_, index, _) = send(&config, get("/")).await;
+    assert_eq!(index.matches("/p/releases\"").count(), 1, "listed twice");
+}

@@ -210,6 +210,7 @@ pub(crate) async fn store_upload(
         {
             return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
         }
+        runtime.forget(&app);
         tracing::info!(app = %app, bytes = body.len(), "handler published");
         return (
             StatusCode::OK,
@@ -245,12 +246,22 @@ pub(crate) async fn store_upload(
             let _ = write_meta(config, &slug, &meta).await;
         }
 
+        // A single page at the same slug would shadow this app for good:
+        // serving prefers <slug>.html, so the bundle would be unreachable and
+        // the index would list the slug twice. Republishing a slug replaces
+        // what was there, which is what this is.
+        let shadow = config.data_dir.join(format!("{slug}.html"));
+        let replaced_page = fs::remove_file(&shadow).await.is_ok();
+
         let has_index = unpacked.files.iter().any(|f| f == "index.html");
         let mut body = format!(
             "unpacked {} files to {}\n",
             unpacked.files.len(),
             page_url(config, &slug)
         );
+        if replaced_page {
+            body.push_str("replaced the single page that was at this slug\n");
+        }
         if !unpacked.skipped.is_empty() {
             body.push_str(&format!("skipped {}\n", unpacked.skipped.join(", ")));
         }
@@ -320,8 +331,12 @@ pub(crate) async fn upload_root(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
     Query(query): Query<UploadQuery>,
+    uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
+    if let Some(response) = refuse_unknown_flags(&uri) {
+        return response;
+    }
     store_upload(
         &state.config,
         &state.runtime,
@@ -337,8 +352,12 @@ pub(crate) async fn upload_sub(
     State(state): State<AppState>,
     Path((ticket, sub)): Path<(String, String)>,
     Query(query): Query<UploadQuery>,
+    uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
+    if let Some(response) = refuse_unknown_flags(&uri) {
+        return response;
+    }
     store_upload(
         &state.config,
         &state.runtime,
@@ -348,6 +367,50 @@ pub(crate) async fn upload_sub(
         body,
     )
     .await
+}
+
+/// Every flag this endpoint understands. Anything else is a mistake worth
+/// reporting: an unknown flag used to fall through to "publish the body as a
+/// page", so probing for a flag that does not exist would overwrite the app's
+/// front page with whatever was being probed.
+pub(crate) const KNOWN_FLAGS: [&str; 6] = [
+    "icon", "bundle", "spa", "handler", "source", "manifest",
+];
+
+pub(crate) fn unknown_flags(uri: &axum::http::Uri) -> Vec<String> {
+    let Some(query) = uri.query() else {
+        return Vec::new();
+    };
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split('=').next().unwrap_or_default().to_string())
+        .filter(|name| !name.is_empty() && !KNOWN_FLAGS.contains(&name.as_str()) && name != "migrations")
+        .collect()
+}
+
+/// A flag nobody recognises is a question, not an instruction. Answering it
+/// by publishing the body as a page is how probing for `?config` replaced an
+/// app's front page with a TOML file.
+fn refuse_unknown_flags(uri: &axum::http::Uri) -> Option<Response> {
+    let unknown = unknown_flags(uri);
+    if unknown.is_empty() {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown upload flag(s): {}. This endpoint understands {}, \
+                 and no flag at all means publish the body as a page.\n",
+                unknown.join(", "),
+                [KNOWN_FLAGS.as_slice(), ["migrations"].as_slice()]
+                    .concat()
+                    .join(", ")
+            ),
+        )
+            .into_response(),
+    )
 }
 
 pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
