@@ -678,7 +678,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Read or write notes kept with an app for the next session to find. Call it with no notes to read. Write down the database schema, why things are the way they are, and what is half-finished — a later session sees only the rendered page otherwise, and a bundle's source is not recoverable from it."
+        description = "Read or write notes kept with one app for the next session to find. Call it with no notes to read. They are about THIS app: what it is, where things are, its schema, why it was built that way, what is half-finished. Not how the platform behaves — that is at GET /guide, which stays current, while a platform note here is wrong the moment it changes. Read the notes for the app you are changing, not a neighbour's."
     )]
     pub(crate) async fn app_notes(
         &self,
@@ -1080,6 +1080,9 @@ impl ServerHandler for PageHost {
                  build's base path accordingly — create_upload prints the exact value. \
                  Skipping that step produces a page that loads but renders blank, because its \
                  assets 404.\n\
+                 \n\
+                 GET /guide is how this platform works, kept current. Read it before \
+                 building anything with a handler, a schema or a gate.\n\
                  \n\
                  Call list_pages to see what already exists before picking a slug or editing \
                  something, and app_notes to read what a previous session left about an app \

@@ -17,10 +17,25 @@ use std::{io::Write, sync::Arc};
 use crate::{config::Config, content::slug::valid_slug};
 
 const WIT: &str = include_str!("../../wit/toolsite.wit");
+const GUIDE: &str = include_str!("../../templates/guide.md");
 const HANDLER_CARGO: &str = include_str!("../../templates/handler/Cargo.toml");
 const HANDLER_LIB: &str = include_str!("../../templates/handler/src/lib.rs");
 const HANDLER_MIGRATION: &str =
     include_str!("../../templates/handler/migrations/001_initial.sql");
+
+/// How the platform works, for an agent that would otherwise go looking in
+/// somebody's app notes for it. This is the copy that stays current; notes
+/// describe one app and go stale the moment the platform changes.
+pub async fn guide() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        GUIDE,
+    )
+        .into_response()
+}
 
 /// The contract a handler compiles against, so `curl` is enough to start.
 pub async fn wit() -> Response {

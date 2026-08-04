@@ -185,9 +185,13 @@ metadata. Keep the API key in settings, not in the bundle.
 **No clock.** `std::time` will not link — the world imports no clock. Take
 timestamps from SQLite: `select cast(strftime('%s','now') as integer)`.
 
-**Read `app_notes` for the app you are changing**, not for a neighbour: those
-notes describe that app, and platform facts in them go stale. Platform
-behaviour is here and in the server's instructions.
+**`GET <server>/guide`** is how the platform works, and it stays current.
+Fetch that rather than inferring conventions from an existing app.
+
+**`app_notes` is about one app** — what it is, where things are, its schema,
+what is unfinished. Read the notes for the app you are changing, not a
+neighbour's, and do not write platform behaviour into them: it goes stale
+there and misleads whoever reads it next.
 
 **Capabilities.** A handler gets four imports: `db.query`, bound to its
 own app's SQLite with parameters bound rather than interpolated, and

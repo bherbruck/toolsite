@@ -1923,3 +1923,24 @@ async fn publishing_an_app_replaces_a_page_of_the_same_name() {
     let (_, index, _) = send(&config, get("/")).await;
     assert_eq!(index.matches("/p/releases\"").count(), 1, "listed twice");
 }
+
+#[tokio::test]
+async fn the_platform_explains_itself_without_reading_someone_elses_app() {
+    let (_dir, config) = server();
+    let (status, guide, headers) = send(&config, get("/guide")).await;
+    assert_eq!(status, StatusCode::OK);
+    let content_type = headers.iter().find(|(k, _)| k == "content-type").unwrap();
+    assert!(content_type.1.starts_with("text/markdown"), "{}", content_type.1);
+
+    // The things an agent otherwise learns by trial, or from a neighbour's
+    // notes where they go stale.
+    for fact in [
+        "std::time",          // no clock
+        "?manifest",          // the flag it probed for
+        "create table if not exists",
+        "allow_http",
+        "/p/<app>/api/",
+    ] {
+        assert!(guide.contains(fact), "the guide never mentions {fact}");
+    }
+}

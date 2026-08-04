@@ -90,6 +90,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/icon/{*slug}", get(serve_icon))
         // What an agent needs to build a handler: the contract, and a crate
         // already wired to it.
+        .route("/guide", get(scaffold::guide))
         .route("/wit/toolsite.wit", get(scaffold::wit))
         .route("/scaffold/handler.tar.gz", get(scaffold::handler_scaffold))
         .route("/scaffold/{app}", get(scaffold::handler_scaffold_named))
