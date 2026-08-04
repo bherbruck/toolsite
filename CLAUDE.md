@@ -12,8 +12,10 @@ forces edits across three modules, the boundary is in the wrong place.
 
 Two more that this codebase already leans on:
 
-- **Nothing destroys data.** There is no delete tool by design; retraction is
-  a visibility flag, so every action is reversible.
+- **Nothing destroys data.** Retraction is a visibility flag, and the one
+  removal tool moves files to `.trash/` rather than unlinking them — so every
+  action is reversible from the server even when it is irreversible from the
+  site.
 - **The platform decides who arrives; the app decides what they may do.**
   Gates admit a request — per app, or per path prefix. Beyond that the handler
   is told the caller's identity and granted role and makes its own call, which

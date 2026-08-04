@@ -145,6 +145,14 @@ enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Take a slug down for good. Files are moved aside, not deleted.
+    Remove {
+        slug: String,
+        /// Remove only a single page of that name, leaving an app with the
+        /// same slug alone.
+        #[arg(long)]
+        page_only: bool,
+    },
     /// Take a page down, reversibly.
     Hide { slug: String },
     /// Restore a hidden page.
@@ -338,6 +346,16 @@ fn run() -> Result<()> {
                 None => json!({ "slug": slug }),
             };
             println!("{}", mcp.call("app_notes", arguments)?);
+            Ok(())
+        }
+        Command::Remove { slug, page_only } => {
+            println!(
+                "{}",
+                mcp.call(
+                    "remove_page",
+                    json!({ "slug": slug, "confirm": slug, "page_only": page_only })
+                )?
+            );
             Ok(())
         }
         Command::Hide { slug } => {

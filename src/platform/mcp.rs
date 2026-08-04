@@ -71,6 +71,20 @@ pub(crate) struct SetIconRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RemoveRequest {
+    #[schemars(description = "Slug to take down.")]
+    pub(crate) slug: String,
+    #[schemars(
+        description = "Repeat the slug here to confirm. Removal takes an app's pages, database, settings and schedule with it, so it is not something to do by accident."
+    )]
+    pub(crate) confirm: String,
+    #[schemars(
+        description = "Remove only a single page of that name, leaving an app with the same slug alone. Use this to clear a page that is shadowing an app."
+    )]
+    pub(crate) page_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SetVisibilityRequest {
     #[schemars(description = "Slug of the page to change.")]
     pub(crate) slug: String,
@@ -814,6 +828,53 @@ impl PageHost {
         let json = serde_json::to_string(&rows)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    }
+
+    #[tool(
+        description = "Take a slug down for good, moving everything belonging to it out of the site. Prefer set_visibility, which hides without removing; this is for junk — a probe published as a page, an app nobody wants. Files are moved aside rather than deleted, so a mistake is recoverable from the server, but nothing on the site refers to them again."
+    )]
+    pub(crate) async fn remove_page(
+        &self,
+        Parameters(RemoveRequest {
+            slug,
+            confirm,
+            page_only,
+        }): Parameters<RemoveRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if confirm != slug {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "pass confirm: \"{slug}\" to remove it"
+            ))]));
+        }
+        let config = self.config.clone_for_task();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let page_only = page_only.unwrap_or(false);
+        let owned = slug.clone();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            if page_only {
+                crate::platform::trash::remove_page_only(&config, &owned, at)
+            } else {
+                crate::platform::trash::remove(&config, &owned, at)
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match outcome {
+            Ok(moved) => {
+                self.runtime.forget(&slug);
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "removed {}; kept under .trash/{at}-{} on the server",
+                    moved.join(", "),
+                    slug.replace('/', "-")
+                ))]))
+            }
+            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        }
     }
 
     #[tool(

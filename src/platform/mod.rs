@@ -11,4 +11,5 @@ pub mod mcp;
 pub mod scaffold;
 pub mod schedule;
 pub mod secrets;
+pub mod trash;
 pub mod upload;

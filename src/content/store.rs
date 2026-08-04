@@ -315,6 +315,10 @@ pub(crate) fn collect_slugs<'a>(
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
+            // .trash and .site are the platform's, not anybody's app.
+            if name.starts_with('.') {
+                continue;
+            }
             if path.is_dir() {
                 let child_prefix = if prefix.is_empty() {
                     name

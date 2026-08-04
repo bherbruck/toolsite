@@ -43,6 +43,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
 | `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
 | `toolsite list [--all]` | What is published, newest first. |
 | `toolsite hide <slug>` / `unhide` | Reversible takedown. |
+| `toolsite remove <slug> [--page-only]` | Takes it down for good; files move to `.trash/`. |
 | `toolsite notes <slug> [--file notes.md]` | Read or write the notes kept with an app. |
 | `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
 | `toolsite gate <app> <public\|authenticated\|granted>` | Decide who may reach an app. |
@@ -101,8 +102,12 @@ Streamable HTTP — the session is issued by `initialize`.
 | `push_app(app, pages)` | Fallback, multi-page. A page named `index` also serves at the app root. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
 
-There is deliberately **no delete tool**. `set_visibility` covers retraction
-without destroying anything.
+| `remove_page(slug, confirm)` | Takes a slug down for good. Files move to `.trash/` on the server rather than being deleted. |
+
+Prefer `set_visibility` — it retracts without removing anything. `remove_page`
+is for junk: a probe published as a page, an app nobody wants. Pass
+`page_only` to clear a single page that is shadowing an app of the same name,
+which is what an accidental upload leaves behind.
 
 ### Upload tickets
 
