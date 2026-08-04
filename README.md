@@ -38,7 +38,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
 
 | Command | What it does |
 |---|---|
-| `toolsite init <name> [--spa] [--handler]` | Scaffolds an app with its base path already right, optionally with a wasm handler. |
+| `toolsite init <name> [--react] [--spa] [--handler]` | Scaffolds an app with its base path already right. `--react` writes a Vite + React + Tailwind project that builds unmodified; `--handler` adds a wasm handler with its own database. |
 | `toolsite deploy [dir] [--slug s]` | Runs the project's build, applies migrations and `toolsite.toml`, uploads the bundle, handler, notes and source, then fetches the page to check it. |
 | `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
 | `toolsite list [--all]` | What is published, newest first. |

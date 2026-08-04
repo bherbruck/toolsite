@@ -1,0 +1,10 @@
+slug = "unbuilt"
+spa = true
+
+# public, authenticated, or granted.
+gate = "public"
+
+# Guard part of the app. Longest matching prefix wins.
+# [[route]]
+# path = "/admin"
+# gate = "granted"

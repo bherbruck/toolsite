@@ -1071,15 +1071,20 @@ impl ServerHandler for PageHost {
                  back to push_page / push_app, which take the HTML inline.\n\
                  3. If there is no shell at all, use push_page / push_app directly.\n\
                  \n\
-                 You are not limited to hand-written HTML. If you can run a shell with network \
-                 access, scaffolding a real TypeScript/React/Vite project, building it, and \
-                 uploading the dist folder is fully supported and often the better answer for \
-                 anything interactive: `tar -czf - -C dist . | curl -f -T - \
-                 '<upload-url>?bundle'`, adding &spa if it uses a client-side router. Every \
-                 app is served from a subpath (/p/<slug>/), never the domain root, so set the \
-                 build's base path accordingly — create_upload prints the exact value. \
-                 Skipping that step produces a page that loads but renders blank, because its \
-                 assets 404.\n\
+                 Build anything interactive as a real front-end project, not as one \
+                 hand-written HTML file. If it has state, forms, or more than one screen, \
+                 scaffold Vite + React + Tailwind and upload the build: `tar -czf - -C dist \
+                 . | curl -f -T - '<upload-url>?bundle&spa'`. A single index.html with an \
+                 inline <script> is cheaper only until the second change, after which every \
+                 edit is string replacement against markup you cannot test. Plain HTML is \
+                 for genuinely static pages.\n\
+                 \n\
+                 Every app is served from a subpath (/p/<slug>/), never the domain root, so \
+                 set the build's base path accordingly — create_upload prints the exact \
+                 value, and Vite needs it as `base`. Skipping that step produces a page that \
+                 loads but renders blank, because its assets 404. The `toolsite` CLI, if it \
+                 is installed, scaffolds this already correct: `toolsite init <name> --react \
+                 [--handler]`.\n\
                  \n\
                  GET /guide is how this platform works, kept current. Read it before \
                  building anything with a handler, a schema or a gate.\n\

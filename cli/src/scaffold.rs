@@ -2,21 +2,30 @@
 //! that is easy to get wrong: apps are served from `/p/<slug>/`, never the
 //! domain root.
 
+use crate::react;
 use anyhow::{bail, Result};
 use std::path::Path;
 
 /// Vendored so a scaffolded handler compiles without the server checkout.
 const WIT: &str = include_str!("../../wit/toolsite.wit");
 
-pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
+pub fn init(name: &str, spa: bool, handler: bool, react: bool) -> Result<()> {
     let root = Path::new(name);
     if root.exists() {
         bail!("{name} already exists");
     }
-    std::fs::create_dir_all(root.join("dist"))?;
+    // A React app routes on the client, so it wants the spa fallback whether
+    // or not anybody remembered to ask for it.
+    let spa = spa || react;
 
+    std::fs::create_dir_all(root)?;
     std::fs::write(root.join("toolsite.toml"), manifest(name, spa, handler))?;
-    std::fs::write(root.join("dist/index.html"), index_html(name, handler))?;
+    if react {
+        react::write(root, name)?;
+    } else {
+        std::fs::create_dir_all(root.join("dist"))?;
+        std::fs::write(root.join("dist/index.html"), index_html(name, handler))?;
+    }
 
     std::fs::write(
         root.join("NOTES.md"),
@@ -41,7 +50,12 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
     }
 
     println!("created {name}/");
-    println!("  dist/index.html      the page, ready to deploy as-is");
+    if react {
+        println!("  src/App.tsx          the app; Tailwind classes work already");
+        println!("  vite.config.ts       base is /p/{name}/, which is the part that breaks");
+    } else {
+        println!("  dist/index.html      the page, ready to deploy as-is");
+    }
     if handler {
         println!("  handler/             server-side code, gets its own database");
     }
@@ -51,10 +65,11 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
     println!("  toolsite.toml        gate, routes and jobs");
     println!("  NOTES.md             what the next session needs to know");
     println!();
+    // deploy installs and builds; saying otherwise makes this look dearer
+    // than hand-writing a page, which is how that decision gets made wrong.
     println!("Next: cd {name} && toolsite deploy");
-    if spa {
-        println!();
-        println!("Building with Vite? Set base: '/p/{name}/' — assets 404 without it.");
+    if react {
+        println!("       (deploy runs npm install and npm run build for you)");
     }
     Ok(())
 }

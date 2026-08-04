@@ -10,13 +10,34 @@ a page and get back a URL. Pages live at `/p/<slug>`, apps at `/p/<slug>/`.
 
 ## Pick the path
 
+Decide by what the thing does, not by what is quickest to start:
+
 | What you're publishing | How |
 |---|---|
-| One self-contained HTML page | Write the file, then `curl -fT page.html <upload-url>` |
-| Multi-page static app | One PUT per page: `curl -fT about.html <upload-url>/about`, or ship a tar bundle |
-| Compiled front-end (React/Vite/TS) | `tar -czf - -C dist . \| curl -f -T - '<upload-url>?bundle&spa'` |
-| Needs server-side data or logic | Also ship a wasm handler — see [Server-side handlers](#server-side-handlers) |
+| **Anything with state, forms, or more than one screen** | **`toolsite init <name> --react`** — Vite + React + Tailwind, base path already right |
+| One static page: a document, a chart, a readout | Write the HTML, then `curl -fT page.html <upload-url>` |
+| A front-end project you already have | `toolsite deploy --slug <slug> --spa` — it installs and builds |
+| Needs server-side data or logic | Add `--handler` — see [Server-side handlers](#server-side-handlers) |
 | No shell available (claude.ai web) | Fall back to the `push_page` / `push_app` MCP tools |
+
+**Reach for `--react` by default for an app.** Hand-writing one big
+`index.html` looks cheaper because it starts with no setup, and that is the
+only point at which it is cheaper. By the third feature you are editing
+markup with string replacement, re-sending the whole file on every change,
+and hand-rolling what `useState` does for free. The scaffold below installs
+and builds unmodified, so the setup cost you are avoiding is one command:
+
+```bash
+toolsite init pantry --react --handler
+cd pantry && toolsite deploy
+```
+
+`deploy` runs the install and the build itself, so that is the whole flow —
+two commands, fewer than hand-writing a page and then fixing it twice.
+
+Vanilla HTML is the right answer for a genuinely static page. It is not the
+right answer for an app, and "there is no build step" is not a reason — there
+is a build step available and it costs 30 seconds.
 
 ## The cardinal rule
 

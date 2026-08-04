@@ -5,6 +5,7 @@
 //! result) happen the same way every time.
 
 mod mcp;
+mod react;
 mod scaffold;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -37,6 +38,11 @@ enum Command {
         /// Include a wasm handler with its own database.
         #[arg(long)]
         handler: bool,
+        /// Vite + React + Tailwind, with the base path already set. Prefer
+        /// this for anything with state or more than one screen — a
+        /// hand-written index.html costs more by the second edit.
+        #[arg(long)]
+        react: bool,
     },
     /// Fetch back the project a previous deploy stored.
     Fetch {
@@ -190,8 +196,14 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // init needs no server, so it must not demand credentials.
-    if let Command::Init { name, spa, handler } = &cli.command {
-        return scaffold::init(name, *spa, *handler);
+    if let Command::Init {
+        name,
+        spa,
+        handler,
+        react,
+    } = &cli.command
+    {
+        return scaffold::init(name, *spa, *handler, *react);
     }
 
     let url = cli
@@ -482,12 +494,28 @@ fn read_project(dir: &Path, slug: Option<String>, spa_flag: bool) -> Result<Proj
         .iter()
         .map(|candidate| dir.join(candidate))
         .find(|path| path.join("index.html").is_file())
-        .or_else(|| dir.join("index.html").is_file().then(|| dir.to_path_buf()))
+        .or_else(|| {
+            // A Vite project's root index.html is a template with an empty
+            // <div id="root"> and a /src/main.tsx that does not exist once
+            // built. Publishing it produces a blank page and no error, so a
+            // project with a package.json is never taken unbuilt.
+            (dir.join("index.html").is_file() && !dir.join("package.json").is_file())
+                .then(|| dir.to_path_buf())
+        })
         .ok_or_else(|| {
-            anyhow!(
-                "no index.html in {}, dist/, build/ or public/ — build first, or pass a directory",
-                dir.display()
-            )
+            if dir.join("package.json").is_file() {
+                anyhow!(
+                    "{} has a package.json but produced no dist/, build/ or public/ — \
+                     check that its build script is called \"build\" and that it succeeded. \
+                     Uploading the sources would publish a blank page.",
+                    dir.display()
+                )
+            } else {
+                anyhow!(
+                    "no index.html in {}, dist/, build/ or public/ — build first, or pass a directory",
+                    dir.display()
+                )
+            }
         })?;
 
     Ok(Project {

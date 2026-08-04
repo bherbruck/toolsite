@@ -13,6 +13,32 @@ something working. Written there it goes stale the moment the platform
 changes, and the next session reads a fixed bug as a live one. That is this
 document, and this document stays current.
 
+## Choosing how to build it
+
+If the thing has state, forms, or more than one screen, build it as a real
+front-end project and upload the output. If it is a static document or a
+readout, one HTML file is right.
+
+One hand-written `index.html` is cheaper only for the first version. After
+that every change is string replacement against markup with no build, no
+components and no types, which is how a session ends up rewriting an entire
+file to move a button. The scaffold removes all of it:
+
+    toolsite init myapp --react --handler
+    cd myapp && toolsite deploy
+
+That writes Vite + React + Tailwind with `base` already set to `/p/myapp/`,
+which is the setting that otherwise produces a blank page. `deploy` runs the
+install and the build, so those two commands are the whole flow.
+
+Without the CLI, the same thing by hand:
+
+    npm create vite@latest myapp -- --template react-ts
+    cd myapp && npm install && npm install -D tailwindcss @tailwindcss/vite
+    # vite.config.ts: add base: '/p/myapp/' and tailwindcss() to plugins
+    # src/index.css: replace everything with  @import "tailwindcss";
+    npm run build && tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle&spa'
+
 ## Publishing
 
 An upload URL comes from `create_upload`. It is a capability scoped to one
