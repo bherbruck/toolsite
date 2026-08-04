@@ -119,6 +119,9 @@ enforces one as DNS-rebinding protection, and `oneshot` doesn't add it.
 Anything touching upload, serving, or SQL needs a test for the security
 property it rests on, not just the happy path.
 
+A test that reaches the network is `#[ignore]`d with a reason, so the suite
+stays hermetic and `cargo test -- --ignored` still proves the real path.
+
 **Wasm fixtures.** `tests/fixtures/handler.wasm` is a committed build of
 `tests/fixtures/guest`, so the suite needs no wasm toolchain. Rebuild it with
 `scripts/build-fixtures.sh` after any change to `wit/toolsite.wit` or the

@@ -398,7 +398,9 @@ written as IPv6 are unwrapped and checked the same way, redirects are followed
 by hand so each hop is checked rather than trusted, and only `http` and
 `https` are fetched at all.
 
-Responses are capped at 8 MB with a 10 second timeout. Pair it with a setting
+A `user-agent` is sent unless the handler sets its own, since several APIs —
+GitHub among them — answer 403 without one. Responses are capped at 8 MB with
+a 10 second timeout. Pair it with a setting
 for the key: `secrets::get("API_KEY")` and `allow_http` are the two halves of
 calling somebody's API.
 

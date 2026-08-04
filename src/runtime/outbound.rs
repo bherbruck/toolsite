@@ -163,6 +163,18 @@ pub fn send(
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|_| format!("{method} is not an HTTP method"))?;
     let mut request = client.request(method.clone(), url);
+    // Plenty of APIs refuse a request without one — GitHub answers 403 — and
+    // an app should not have to learn that the hard way. A guest that sets
+    // its own still wins.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        request = request.header(
+            "user-agent",
+            concat!("toolsite/", env!("CARGO_PKG_VERSION")),
+        );
+    }
     for (name, value) in headers {
         // Hop-by-hop and identity headers are the host's to set.
         if matches!(
@@ -284,6 +296,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(refusal, Refusal::Internal(_)), "got {refusal:?}");
+    }
+
+    /// Reaches the network, so it is ignored by default: `cargo test --
+    /// --ignored` runs it. Everything else in this file is hermetic.
+    #[test]
+    #[ignore = "reaches the network"]
+    fn a_real_request_carries_a_user_agent_so_apis_answer_it() {
+        // GitHub refuses a request without one, which is exactly the sort of
+        // thing an app should not have to discover for itself.
+        let fetched = send(
+            "GET",
+            "https://api.github.com/rate_limit",
+            &[],
+            Vec::new(),
+            &allow(&["api.github.com"]),
+        )
+        .unwrap();
+        assert_eq!(fetched.status, 200, "{}", String::from_utf8_lossy(&fetched.body));
     }
 
     #[test]
