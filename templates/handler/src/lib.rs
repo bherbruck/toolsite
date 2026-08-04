@@ -1,3 +1,9 @@
+//! A handler has no clock: `std::time` does not link, because the world
+//! imports no clock capability. Timestamps come from SQLite, which is the
+//! same clock the rows are stamped with:
+//!
+//!     select cast(strftime('%s','now') as integer)
+
 wit_bindgen::generate!({
     path: "wit",
     world: "app",

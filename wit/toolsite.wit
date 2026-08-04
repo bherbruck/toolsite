@@ -116,9 +116,15 @@ interface http {
 
 /// What an app's handler.wasm must satisfy.
 ///
-/// Note what is absent: no filesystem, no sockets, no environment, no clock
-/// beyond what is imported here. A capability the host does not hand over is
-/// one the guest cannot exercise.
+/// Note what is absent: no filesystem, no sockets, no environment, and no
+/// clock. A capability the host does not hand over is one the guest cannot
+/// exercise.
+///
+/// No clock has a consequence worth stating plainly, because it is the first
+/// thing a handler tends to reach for: `std::time::SystemTime::now()` will
+/// not link. Ask the database instead —
+/// `select cast(strftime('%s','now') as integer)` — which is the same clock
+/// every row is stamped with anyway.
 world app {
     use http.{request, response};
 

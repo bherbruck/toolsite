@@ -182,6 +182,13 @@ default. Addresses inside the server's own network are refused whatever the
 allowlist says, so a URL taken from user input cannot be pointed at cloud
 metadata. Keep the API key in settings, not in the bundle.
 
+**No clock.** `std::time` will not link — the world imports no clock. Take
+timestamps from SQLite: `select cast(strftime('%s','now') as integer)`.
+
+**Read `app_notes` for the app you are changing**, not for a neighbour: those
+notes describe that app, and platform facts in them go stale. Platform
+behaviour is here and in the server's instructions.
+
 **Capabilities.** A handler gets four imports: `db.query`, bound to its
 own app's SQLite with parameters bound rather than interpolated, and
 `identity.current-user`, which it cannot forge. No filesystem, no environment,
