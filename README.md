@@ -370,6 +370,38 @@ Commands still work and are right for a one-off (`toolsite gate`,
 `toolsite job`). The manifest is for anything meant to outlive the session
 that set it.
 
+## Reaching other services
+
+A handler can make HTTP requests, but only to hosts its app named:
+
+```toml
+allow_http = ["api.github.com", "*.example.com"]
+```
+
+```rust
+let response = fetch::send(&fetch::Request {
+    method: "GET".into(),
+    url: format!("https://api.github.com/repos/{repo}"),
+    headers: vec![("authorization".into(), format!("Bearer {token}"))],
+    body: vec![],
+})?;
+```
+
+Off by default — an empty list is no capability at all. `*.example.com`
+covers subdomains but not the bare name.
+
+**Naming a host is not enough.** Every address is resolved and checked first,
+and anything inside this server's own network is refused whatever the
+allowlist says: loopback, private ranges, link-local — including
+`169.254.169.254`, which on most clouds hands out credentials. IPv4 addresses
+written as IPv6 are unwrapped and checked the same way, redirects are followed
+by hand so each hop is checked rather than trusted, and only `http` and
+`https` are fetched at all.
+
+Responses are capped at 8 MB with a 10 second timeout. Pair it with a setting
+for the key: `secrets::get("API_KEY")` and `allow_http` are the two halves of
+calling somebody's API.
+
 ## Scheduled work
 
 An app can do things nobody asked for — refresh a cache, pull from an API,

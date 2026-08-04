@@ -176,7 +176,13 @@ yours to decide. Guard part of an app with `set_visibility(slug, gate, path)`
 `identity::current-role()`, which returns whatever the owner granted
 (`viewer`, `editor`, anything). The platform never interprets a role.
 
-**Capabilities.** A handler gets three imports: `db.query`, bound to its
+**Reaching other services.** `fetch::send` works only for hosts the app
+declared in `toolsite.toml` as `allow_http = ["api.example.com"]`. Off by
+default. Addresses inside the server's own network are refused whatever the
+allowlist says, so a URL taken from user input cannot be pointed at cloud
+metadata. Keep the API key in settings, not in the bundle.
+
+**Capabilities.** A handler gets four imports: `db.query`, bound to its
 own app's SQLite with parameters bound rather than interpolated, and
 `identity.current-user`, which it cannot forge. No filesystem, no environment,
 no sockets. wasi is linked because a `wasm32-wasip2` guest imports it through

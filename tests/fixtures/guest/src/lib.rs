@@ -8,6 +8,7 @@ wit_bindgen::generate!({
 
 use toolsite::app::db;
 use toolsite::app::identity;
+use toolsite::app::fetch;
 use toolsite::app::secrets;
 
 struct Handler;
@@ -92,6 +93,24 @@ impl Guest for Handler {
             // wasi is linked because std needs it, so these prove the empty
             // context actually withholds the capabilities.
             // Settings the owner set for this app.
+            // Reaching out, which only works for hosts the app declared.
+            "/fetch" => {
+                let url = req.query.strip_prefix("url=").unwrap_or("");
+                let request = fetch::Request {
+                    method: "GET".to_string(),
+                    url: url.to_string(),
+                    headers: vec![],
+                    body: vec![],
+                };
+                match fetch::send(&request) {
+                    Ok(response) => respond(
+                        200,
+                        format!("{} {}", response.status, String::from_utf8_lossy(&response.body)),
+                    ),
+                    Err(why) => respond(502, format!("refused: {why}")),
+                }
+            }
+
             "/secret" => match secrets::get("API_KEY") {
                 Some(value) => respond(200, format!("key={value}")),
                 None => respond(404, "no API_KEY set".to_string()),

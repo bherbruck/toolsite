@@ -54,6 +54,10 @@ pub struct PageMeta {
     /// Who may reach this app: "public", "authenticated", or "granted".
     #[serde(default = "public")]
     pub gate: String,
+    /// Hosts this app's handler may reach. Empty means none, which is the
+    /// default: a capability nobody asked for is not granted.
+    #[serde(default)]
+    pub allow_http: Vec<String>,
     /// Exceptions, by path prefix. A public app with a private corner and a
     /// private app with a public front page are the same feature, so both are
     /// this. Longest matching prefix wins.
@@ -97,6 +101,7 @@ impl Default for PageMeta {
             hidden: false,
             spa: false,
             gate: public(),
+            allow_http: Vec::new(),
             rules: Vec::new(),
         }
     }
@@ -122,6 +127,20 @@ pub(crate) async fn meta_path(config: &Config, slug: &str) -> PathBuf {
     } else {
         inner
     }
+}
+
+/// The same read, without an async runtime. Host functions a guest calls run
+/// inside a blocking task, where awaiting is the wrong tool.
+pub fn read_meta_blocking(config: &Config, slug: &str) -> PageMeta {
+    for candidate in [
+        config.data_dir.join(format!("{slug}.meta")),
+        config.data_dir.join(format!("{slug}/index.meta")),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            return serde_json::from_str(&text).unwrap_or_default();
+        }
+    }
+    PageMeta::default()
 }
 
 pub async fn read_meta(config: &Config, slug: &str) -> PageMeta {

@@ -125,6 +125,25 @@ impl self::toolsite::app::db::Host for StoreState {
 /// the trait to be present.
 impl self::toolsite::app::http::Host for StoreState {}
 
+impl self::toolsite::app::fetch::Host for StoreState {
+    fn send(
+        &mut self,
+        req: self::toolsite::app::fetch::Request,
+    ) -> Result<self::toolsite::app::fetch::Response, String> {
+        // Read per call rather than cached: changing an app's allowlist takes
+        // effect on the next request, not the next restart.
+        let allow = crate::content::store::read_meta_blocking(&self.site, &self.app).allow_http;
+
+        crate::runtime::outbound::send(&req.method, &req.url, &req.headers, req.body, &allow).map(
+            |fetched| self::toolsite::app::fetch::Response {
+                status: fetched.status,
+                headers: fetched.headers,
+                body: fetched.body,
+            },
+        )
+    }
+}
+
 impl self::toolsite::app::secrets::Host for StoreState {
     fn get(&mut self, name: String) -> Option<String> {
         crate::platform::secrets::get(&self.site, &self.app, &name)

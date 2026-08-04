@@ -50,6 +50,31 @@ interface secrets {
     names: func() -> list<string>;
 }
 
+/// Reaching other services, for the hosts this app was allowed to reach.
+///
+/// Off unless the app's toolsite.toml names them under allow_http. Even then
+/// an address inside this server's own network is refused, whatever the name
+/// resolved to — a URL fetcher on someone's private network is otherwise a
+/// way to read the rest of it.
+interface fetch {
+    record request {
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// The error is the reason, so a handler can tell "you did not ask for
+    /// this host" from "that host is down".
+    send: func(req: request) -> result<response, string>;
+}
+
 /// Who is making this request, as established by the host's session handling.
 /// A guest cannot forge this: it is not derived from anything the client sent
 /// except a session cookie the host verified.
@@ -100,6 +125,7 @@ world app {
     import db;
     import identity;
     import secrets;
+    import fetch;
 
     export handle: func(req: request) -> response;
 }

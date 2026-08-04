@@ -336,3 +336,44 @@ fn a_handler_is_told_what_the_caller_was_granted() {
     // And an anonymous caller has no role at all.
     assert_eq!(call(&runtime, &site, "app", request("/api/myrole")), (200, "none".into()));
 }
+
+/// Reaching the network is the capability most worth being careful with: this
+/// server sits inside a private network, so a handler that fetches URLs is a
+/// way to read the rest of it unless it is fenced.
+#[test]
+fn a_handler_reaches_only_the_hosts_its_app_declared() {
+    let runtime = Runtime::new().unwrap();
+    let (_dir, site) = site();
+
+    let ask = |url: &str| {
+        let mut request = request("/api/fetch");
+        request.query = format!("url={url}");
+        request
+    };
+
+    // Nothing is reachable until the app says so.
+    let (status, body) = call(&runtime, &site, "app", ask("https://example.com/"));
+    assert_eq!(status, 502);
+    assert!(body.contains("not in this app's allow_http"), "{body}");
+
+    // Declaring a host does not make its address acceptable: the cloud
+    // metadata endpoint is the reason this check exists.
+    std::fs::write(
+        site.data_dir.join("app.meta"),
+        r#"{"listed":true,"hidden":false,"spa":false,"gate":"public",
+            "allow_http":["169.254.169.254","localhost","example.com"]}"#,
+    )
+    .unwrap();
+    for url in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://localhost:8080/admin",
+    ] {
+        let (status, body) = call(&runtime, &site, "app", ask(url));
+        assert_eq!(status, 502, "{url}");
+        assert!(body.contains("inside this server's own network"), "{url}: {body}");
+    }
+
+    // And a scheme that is not http is not something this fetches at all.
+    let (_, body) = call(&runtime, &site, "app", ask("file:///etc/passwd"));
+    assert!(body.contains("not a scheme"), "{body}");
+}

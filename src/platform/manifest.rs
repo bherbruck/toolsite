@@ -32,6 +32,10 @@ pub struct Manifest {
     /// Emoji or inline SVG shown beside the app on the index.
     #[serde(default)]
     pub icon: Option<String>,
+    /// Hosts the handler may reach. Absent leaves whatever is set; an empty
+    /// list takes the capability away.
+    #[serde(default)]
+    pub allow_http: Option<Vec<String>>,
     #[serde(default, rename = "route")]
     pub routes: Vec<Route>,
     #[serde(default, rename = "job")]
@@ -93,6 +97,17 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         if meta.gate != gate {
             changed.push(format!("gate = {gate}"));
             meta.gate = gate;
+        }
+    }
+
+    if let Some(allow) = manifest.allow_http {
+        if meta.allow_http != allow {
+            changed.push(if allow.is_empty() {
+                "allow_http cleared".to_string()
+            } else {
+                format!("allow_http = {}", allow.join(", "))
+            });
+            meta.allow_http = allow;
         }
     }
 
@@ -250,6 +265,24 @@ mod tests {
 
         // The valid half must not have been applied.
         assert_eq!(read_meta(&config, "board").await.gate, "public");
+    }
+
+    #[tokio::test]
+    async fn outbound_hosts_come_from_the_manifest_and_default_to_none() {
+        let (_t, config) = config();
+        assert!(read_meta(&config, "app").await.allow_http.is_empty());
+
+        apply(&config, "app", "allow_http = [\"api.github.com\"]\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_meta(&config, "app").await.allow_http,
+            ["api.github.com"]
+        );
+
+        // An empty list is a decision, not an omission: it takes it away.
+        apply(&config, "app", "allow_http = []\n").await.unwrap();
+        assert!(read_meta(&config, "app").await.allow_http.is_empty());
     }
 
     #[tokio::test]

@@ -3,4 +3,5 @@
 
 pub mod db;
 pub mod migrate;
+pub mod outbound;
 pub mod wasm;
