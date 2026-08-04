@@ -39,7 +39,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
 | Command | What it does |
 |---|---|
 | `toolsite init <name> [--spa] [--handler]` | Scaffolds an app with its base path already right, optionally with a wasm handler. |
-| `toolsite deploy [dir] [--slug s] [--spa]` | Builds the handler if there is one, tars `dist/`, uploads both, then fetches the page to check it. |
+| `toolsite deploy [dir] [--slug s]` | Runs the project's build, applies migrations and `toolsite.toml`, uploads the bundle, handler, notes and source, then fetches the page to check it. |
 | `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
 | `toolsite list [--all]` | What is published, newest first. |
 | `toolsite hide <slug>` / `unhide` | Reversible takedown. |
@@ -356,7 +356,8 @@ path = "/api/rollup"
 ```
 
 `toolsite deploy` sends it first, before the bundle or handler, so a private
-app is never briefly public. Without the CLI it is
+app is never briefly public. One deploy does the lot: build, schema, config,
+bundle, handler, notes, source. Without the CLI it is
 `curl -f -T toolsite.toml '<upload-url>?manifest'`.
 
 **What it declares, it owns.** Routes and jobs are replaced wholesale, so
@@ -430,9 +431,13 @@ A published app is a rendered page; its source does not come back out of it.
 So each app can carry markdown written for whoever works on it next — the
 schema, why something is the way it is, what is half-finished:
 
+`NOTES.md` (or `AGENTS.md`) in the project is sent on every deploy, so notes
+travel with the source instead of being a command someone remembers. The
+commands still work for reading or setting them directly:
+
 ```
-toolsite notes myapp --file NOTES.md    # write
 toolsite notes myapp                    # read
+toolsite notes myapp --file NOTES.md    # write
 ```
 
 Over MCP that is `app_notes(slug, notes?)`, reading when `notes` is omitted.

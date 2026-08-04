@@ -61,6 +61,9 @@ enum Command {
         /// it. The next session then has nothing to work from.
         #[arg(long)]
         without_source: bool,
+        /// Skip the project's own build and publish dist/ as it stands.
+        #[arg(long)]
+        no_build: bool,
     },
     /// Run SQL against one app's database.
     Sql {
@@ -203,6 +206,7 @@ fn run() -> Result<()> {
             slug,
             spa,
             without_source,
+            no_build,
         } => deploy(
             &mcp,
             &url,
@@ -211,6 +215,7 @@ fn run() -> Result<()> {
             slug,
             spa,
             !without_source,
+            no_build,
         ),
         Command::Fetch { slug, dir } => fetch(&mcp, slug, dir.unwrap_or_else(|| PathBuf::from("."))),
         Command::Sql { app, sql, params } => {
@@ -370,6 +375,59 @@ struct Project {
     handler_wasm: Option<PathBuf>,
 }
 
+/// Whichever package manager the project's lockfile implies.
+fn package_manager(dir: &Path) -> &'static str {
+    for (lockfile, manager) in [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("bun.lockb", "bun"),
+        ("bun.lock", "bun"),
+    ] {
+        if dir.join(lockfile).exists() {
+            return manager;
+        }
+    }
+    "npm"
+}
+
+/// Runs the project's own build if it has one, so `deploy` means deploy what
+/// the source says rather than whatever happens to be sitting in dist.
+fn build_front_end(dir: &Path) -> Result<()> {
+    let manifest = dir.join("package.json");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return Ok(());
+    };
+    let package: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("could not read {}", manifest.display()))?;
+    if package["scripts"]["build"].is_null() {
+        return Ok(());
+    }
+
+    let manager = package_manager(dir);
+    if !dir.join("node_modules").exists() {
+        println!("installing dependencies with {manager}…");
+        let status = std::process::Command::new(manager)
+            .arg("install")
+            .current_dir(dir)
+            .status()
+            .with_context(|| format!("could not run {manager}; is it installed?"))?;
+        if !status.success() {
+            bail!("{manager} install failed");
+        }
+    }
+
+    println!("building with {manager}…");
+    let status = std::process::Command::new(manager)
+        .args(["run", "build"])
+        .current_dir(dir)
+        .status()
+        .with_context(|| format!("could not run {manager}"))?;
+    if !status.success() {
+        bail!("the project's build failed");
+    }
+    Ok(())
+}
+
 fn read_project(dir: &Path, slug: Option<String>, spa_flag: bool) -> Result<Project> {
     let manifest = dir.join("toolsite.toml");
     let (mut slug_from_file, mut spa) = (None, false);
@@ -493,7 +551,11 @@ fn deploy(
     slug: Option<String>,
     spa: bool,
     keep_source: bool,
+    skip_build: bool,
 ) -> Result<()> {
+    if !skip_build {
+        build_front_end(&dir)?;
+    }
     let project = read_project(&dir, slug, spa)?;
     println!("publishing {} from {}", project.slug, project.web_root.display());
 
@@ -523,6 +585,17 @@ fn deploy(
             }
             Ok(_) => {}
             Err(error) => bail!("could not package migrations: {error}"),
+        }
+    }
+
+    // Notes travel as a file in the project rather than a command someone
+    // remembers to run. They are stored beside the app, not in the bundle, so
+    // they never reach a visitor.
+    for name in ["NOTES.md", "AGENTS.md"] {
+        if let Ok(notes) = std::fs::read_to_string(dir.join(name)) {
+            mcp.call("app_notes", json!({ "slug": project.slug, "notes": notes }))?;
+            println!("kept {name} with the app");
+            break;
         }
     }
 

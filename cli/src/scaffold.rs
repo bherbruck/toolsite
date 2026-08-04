@@ -18,6 +18,19 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
     std::fs::write(root.join("toolsite.toml"), manifest(name, spa, handler))?;
     std::fs::write(root.join("dist/index.html"), index_html(name, handler))?;
 
+    std::fs::write(
+        root.join("NOTES.md"),
+        format!(
+            "# {name}\n\n\
+             Written for whoever works on this next — a published app is a rendered\n\
+             page, and its source does not come back out of it.\n\n\
+             ## Schema\n\n\
+             See migrations/. Add a numbered file for each change.\n\n\
+             ## Decisions\n\n\
+             ## Unfinished\n"
+        ),
+    )?;
+
     if handler {
         write_handler(root, name)?;
         std::fs::create_dir_all(root.join("migrations"))?;
@@ -36,6 +49,7 @@ pub fn init(name: &str, spa: bool, handler: bool) -> Result<()> {
         println!("  migrations/          the app's schema, applied on deploy");
     }
     println!("  toolsite.toml        gate, routes and jobs");
+    println!("  NOTES.md             what the next session needs to know");
     println!();
     println!("Next: cd {name} && toolsite deploy");
     if spa {
