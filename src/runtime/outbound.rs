@@ -135,6 +135,19 @@ pub fn check(url: &str, allow: &[String]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// `Display` on a reqwest error prints the kind and drops the cause, so
+/// "builder error" reaches a guest with the reason removed. Walk the chain.
+fn reason(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 pub struct Fetched {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -158,7 +171,7 @@ pub fn send(
         // a redirect would walk straight past the guard above.
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("could not build an HTTP client: {}", reason(&e)))?;
 
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|_| format!("{method} is not an HTTP method"))?;
@@ -189,7 +202,7 @@ pub fn send(
         request = request.body(body);
     }
 
-    let response = request.send().map_err(|e| e.to_string())?;
+    let response = request.send().map_err(|e| reason(&e))?;
     let status = response.status().as_u16();
     let headers: Vec<(String, String)> = response
         .headers()
@@ -202,7 +215,7 @@ pub fn send(
         })
         .collect();
 
-    let bytes = response.bytes().map_err(|e| e.to_string())?;
+    let bytes = response.bytes().map_err(|e| reason(&e))?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err(format!(
             "response is larger than {} MB",

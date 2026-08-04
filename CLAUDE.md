@@ -124,6 +124,15 @@ property it rests on, not just the happy path.
 A test that reaches the network is `#[ignore]`d with a reason, so the suite
 stays hermetic and `cargo test -- --ignored` still proves the real path.
 
+**Anything touching the outside world must be tried in the container**, not
+only against `cargo run`. The host has CA certificates, a full toolchain and
+a resolver; `debian:bookworm-slim` has none of that, and outbound HTTP failed
+there for a week while every local test passed.
+
+Never `map_err(|e| e.to_string())` on a `reqwest::Error` — `Display` prints
+the kind and drops the cause, so "builder error" arrives with the reason
+removed. Walk `source()`.
+
 **Wasm fixtures.** `tests/fixtures/handler.wasm` is a committed build of
 `tests/fixtures/guest`, so the suite needs no wasm toolchain. Rebuild it with
 `scripts/build-fixtures.sh` after any change to `wit/toolsite.wit` or the
