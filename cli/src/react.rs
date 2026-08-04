@@ -28,8 +28,11 @@ pub fn write(root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ranges rather than pins, so a scaffold written today still installs in a
-/// year. The build is verified against a real install in the test suite.
+/// Caret ranges, which float within a major and not past it. That is the
+/// whole hazard: this scaffold was written with vite ^7 on the day vite 8 was
+/// latest, installed cleanly, built cleanly, and quietly handed everyone a
+/// toolchain a major behind. `npm install` succeeding proves nothing about
+/// currency, so the ignored test compares these against the registry.
 fn package_json(name: &str) -> String {
     format!(
         r#"{{
@@ -49,10 +52,10 @@ fn package_json(name: &str) -> String {
     "@tailwindcss/vite": "^4.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@vitejs/plugin-react": "^5.0.0",
+    "@vitejs/plugin-react": "^6.0.0",
     "tailwindcss": "^4.0.0",
-    "typescript": "^5.0.0",
-    "vite": "^7.0.0"
+    "typescript": "^7.0.0",
+    "vite": "^8.0.0"
   }}
 }}
 "#
@@ -199,6 +202,39 @@ mod tests {
         let app = std::fs::read_to_string(dir.path().join("dash/src/App.tsx")).unwrap();
         assert!(app.contains("fetch('api/hello')"), "{app}");
         assert!(!app.contains("fetch('/api"), "an absolute path leaves the app: {app}");
+    }
+
+    /// Every dependency's major must still be the registry's latest.
+    ///
+    /// A caret range floats inside a major and never past it, so a scaffold
+    /// keeps installing perfectly while falling further behind. That is not
+    /// hypothetical: this file shipped with vite ^7 while vite 8 was latest,
+    /// and the build test passed, because building is not the property that
+    /// broke.
+    #[test]
+    #[ignore = "asks the npm registry what is current"]
+    fn no_dependency_is_a_major_behind() {
+        let dir = scaffold("dash");
+        let text = std::fs::read_to_string(dir.path().join("dash/package.json")).unwrap();
+        let package: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let mut behind = Vec::new();
+        for section in ["dependencies", "devDependencies"] {
+            for (name, range) in package[section].as_object().unwrap() {
+                let output = std::process::Command::new("npm")
+                    .args(["view", name, "version"])
+                    .output()
+                    .expect("npm is not on PATH");
+                let latest = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let ours = range.as_str().unwrap().trim_start_matches('^');
+
+                let major = |v: &str| v.split('.').next().unwrap_or_default().to_string();
+                if major(&latest) != major(ours) {
+                    behind.push(format!("{name}: scaffold has {ours}, registry has {latest}"));
+                }
+            }
+        }
+        assert!(behind.is_empty(), "the scaffold is stale:\n  {}", behind.join("\n  "));
     }
 
     /// Needs npm and the network, so it is ignored by default: `cargo test --
