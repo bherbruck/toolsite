@@ -101,8 +101,16 @@ fn render(
     crate::ui::page(
         "Admin",
         html! {
-            h1 { "Admin" }
-            p."muted" { "Signed in as " (admin.email) " · " a href="/auth/logout" { "sign out" } }
+            div."head" {
+                div {
+                    h1 { "Admin" }
+                    p."muted" { "Signed in as " (admin.email) }
+                }
+                nav."nav" {
+                    a."btn quiet" href="/" { "Pages" }
+                    a."btn quiet" href="/auth/logout" { "Sign out" }
+                }
+            }
 
             section {
                     h2 { "Accounts" }

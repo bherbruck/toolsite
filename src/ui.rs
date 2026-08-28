@@ -93,6 +93,24 @@ th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(-
 th { font-size: .8rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 td form { margin: 0; }
 
+/* Page header: title on the left, whatever the viewer may do on the right. */
+.head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap;
+  margin-bottom: 1.5rem;
+}
+.head .muted { margin-bottom: 0; }
+.nav { display: flex; gap: .5rem; align-items: center; }
+a.btn {
+  display: inline-flex; align-items: center;
+  padding: .5rem 1rem; border-radius: .4rem;
+  border: 1px solid transparent;
+  background: var(--accent); color: #fff;
+  text-decoration: none; font-size: .95rem;
+}
+a.btn.quiet { background: transparent; color: var(--muted); border-color: var(--border); }
+a.btn.quiet:hover { border-color: var(--accent); color: var(--fg); }
+
 /* Search box on the index. */
 input[type=search] { width: 100%; margin-bottom: 1.25rem; }
 

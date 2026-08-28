@@ -540,8 +540,27 @@ pub(crate) async fn index(
     };
 
     let body = html! {
-        h1 { "Pages" }
-        p."muted" { (count_label) }
+        div."head" {
+            div {
+                h1 { "Pages" }
+                p."muted" { (count_label) }
+            }
+            // The only way in to the admin page, so it is shown to the only
+            // person it will admit; everyone else gets the door they can use.
+            nav."nav" {
+                @match &viewer {
+                    Some(user) => {
+                        @if user.is_admin {
+                            a."btn" href="/admin" { "Admin" }
+                        }
+                        a."btn quiet" href="/auth/logout" { "Sign out" }
+                    }
+                    None => {
+                        a."btn" href="/auth/login?next=/" { "Sign in" }
+                    }
+                }
+            }
+        }
 
         @if cards.is_empty() {
             p."empty" { "No pages yet. Push one to see it here." }
