@@ -111,6 +111,51 @@ a.btn {
 a.btn.quiet { background: transparent; color: var(--muted); border-color: var(--border); }
 a.btn.quiet:hover { border-color: var(--accent); color: var(--fg); }
 
+/* The admin shell: a rail pinned to the viewport, content offset past it.
+   Below 52rem the same rail slides in as a drawer. The toggle is a checkbox
+   rather than a script, because ui::page hands out exactly one script slot
+   and the index already spends it on filtering. */
+.drawer-toggle { position: absolute; opacity: 0; pointer-events: none; }
+.sidebar {
+  position: fixed; top: 0; left: 0; bottom: 0; z-index: 20;
+  width: 14rem; padding: 1.75rem 1rem; overflow-y: auto;
+  display: flex; flex-direction: column; gap: .15rem;
+  background: var(--card); border-right: 1px solid var(--border);
+}
+.brand { font-weight: 600; padding: 0 .6rem; margin-bottom: 1rem; }
+.sidebar a {
+  padding: .4rem .6rem; border-radius: .4rem;
+  color: var(--fg); text-decoration: none; font-size: .9rem;
+}
+.sidebar a:hover { background: var(--bg); }
+.sidebar a.active { background: var(--accent); color: #fff; }
+/* Sign out belongs with the navigation, one rule away. Pushing it to the
+   bottom of a full-height rail strands it half a screen from everything. */
+.sidebar .spacer {
+  margin-top: .5rem; padding-top: .5rem; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: .15rem;
+}
+.shell { margin-left: 14rem; }
+.main { max-width: 44rem; margin: 0 auto; min-width: 0; }
+.main > h1 { margin-bottom: .25rem; }
+.drawer-open { display: none; }
+.scrim {
+  position: fixed; inset: 0; z-index: 10; background: #0006;
+  opacity: 0; pointer-events: none; transition: opacity .2s ease;
+}
+
+@media (max-width: 52rem) {
+  .shell { margin-left: 0; }
+  .sidebar {
+    width: min(15rem, 80vw);
+    transform: translateX(-100%); transition: transform .2s ease;
+  }
+  .drawer-toggle:checked ~ .shell .sidebar { transform: none; }
+  .drawer-toggle:checked ~ .scrim { opacity: 1; pointer-events: auto; }
+  .drawer-open { display: inline-flex; margin-bottom: 1.25rem; }
+}
+@media (prefers-reduced-motion: reduce) { .sidebar, .scrim { transition: none; } }
+
 /* Search box on the index. */
 input[type=search] { width: 100%; margin-bottom: 1.25rem; }
 
@@ -149,6 +194,37 @@ pub fn page(title: &str, body: Markup, script: Option<&str>) -> Markup {
             }
             body {
                 div."container" { (body) }
+                @if let Some(script) = script {
+                    (PreEscaped(script))
+                }
+            }
+        }
+    }
+}
+
+/// A two-column page: navigation on the left, content on the right. Below
+/// 52rem the sidebar becomes a drawer behind a `\u{2630}` toggle. The toggle is a
+/// checkbox, so this costs the caller nothing from their one script slot.
+pub fn shell(title: &str, sidebar: Markup, body: Markup, script: Option<&str>) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                input."drawer-toggle" id="drawer" type="checkbox";
+                label."scrim" for="drawer" {}
+                div."shell" {
+                    aside."sidebar" { (sidebar) }
+                    main."main" {
+                        label."drawer-open btn quiet" for="drawer" { "\u{2630} Menu" }
+                        (body)
+                    }
+                }
                 @if let Some(script) = script {
                     (PreEscaped(script))
                 }

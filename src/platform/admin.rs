@@ -47,6 +47,36 @@ fn check_form_token(config: &Config, user: &User, presented: &str) -> bool {
     expected.len() == presented.len() && expected == presented
 }
 
+/// The rail every admin page shares. `active` names the current page so the
+/// link to it can be marked rather than followed.
+fn sidebar(active: &str) -> Markup {
+    html! {
+        div."brand" { "Admin" }
+        a."active"[active == "accounts"] href="/admin" { "Accounts" }
+        a."active"[active == "apps"] href="/admin/apps" { "Apps" }
+        a."active"[active == "access"] href="/admin/access" { "Access" }
+        div."spacer" {
+            a href="/" { "Pages" }
+            a href="/auth/logout" { "Sign out" }
+        }
+    }
+}
+
+/// Wraps a section's content, so each page differs only in what it renders.
+fn admin_page(active: &str, heading: &str, admin: &User, body: Markup) -> Response {
+    let markup = crate::ui::shell(
+        heading,
+        sidebar(active),
+        html! {
+            h1 { (heading) }
+            p."muted" { "Signed in as " (admin.email) }
+            (body)
+        },
+        None,
+    );
+    ([no_store()], Html(markup.into_string())).into_response()
+}
+
 pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
     let admin = match require_admin(&config, &headers).await {
         Ok(admin) => admin,
@@ -59,6 +89,16 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
             .await
             .unwrap_or_else(|_| Ok(Vec::new()))
             .unwrap_or_default()
+    };
+
+    let token = form_token(&config, &admin);
+    admin_page("accounts", "Accounts", &admin, render_accounts(&accounts, &token))
+}
+
+pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
     };
 
     // Apps, with the gate each one is behind.
@@ -75,6 +115,16 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
     }
     apps.sort();
 
+    let token = form_token(&config, &admin);
+    admin_page("apps", "Apps", &admin, render_apps(&apps, &token))
+}
+
+pub async fn access_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+
     let grants = {
         let config = config.clone();
         tokio::task::spawn_blocking(move || users::list_grants(&config))
@@ -84,146 +134,120 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
     };
 
     let token = form_token(&config, &admin);
-    (
-        [no_store()],
-        Html(render(&admin, &accounts, &apps, &grants, &token).into_string()),
-    )
-        .into_response()
+    admin_page("access", "Access", &admin, render_access(&grants, &token))
 }
 
-fn render(
-    admin: &User,
-    accounts: &[users::Account],
-    apps: &[(String, String)],
-    grants: &[(String, String)],
-    token: &str,
-) -> Markup {
-    crate::ui::page(
-        "Admin",
-        html! {
-            div."head" {
-                div {
-                    h1 { "Admin" }
-                    p."muted" { "Signed in as " (admin.email) }
-                }
-                nav."nav" {
-                    a."btn quiet" href="/" { "Pages" }
-                    a."btn quiet" href="/auth/logout" { "Sign out" }
+fn render_accounts(accounts: &[users::Account], token: &str) -> Markup {
+    html! {
+        @if accounts.is_empty() {
+            p."muted" { "No accounts yet." }
+        } @else {
+            table {
+                thead { tr { th { "Email" } th { "Created" } th { "Admin" } th { "Status" } th {} } }
+                tbody {
+                    @for account in accounts {
+                        tr {
+                            td { (account.email) }
+                            td."muted" { (account.created) }
+                            td { @if account.is_admin { "yes" } @else { "" } }
+                            td { @if account.is_active { "active" } @else { "disabled" } }
+                            td {
+                                form."row" method="post" action="/admin/active" {
+                                    input type="hidden" name="token" value=(token);
+                                    input type="hidden" name="email" value=(account.email);
+                                    input type="hidden" name="active"
+                                          value=(if account.is_active { "0" } else { "1" });
+                                    @if account.is_active {
+                                        button."danger" type="submit" { "Disable" }
+                                    } @else {
+                                        button type="submit" { "Enable" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        }
 
-            section {
-                    h2 { "Accounts" }
-                    @if accounts.is_empty() {
-                        p."muted" { "No accounts yet." }
-                    } @else {
-                        table {
-                            thead { tr { th { "Email" } th { "Created" } th { "Admin" } th { "Status" } th {} } }
-                            tbody {
-                                @for account in accounts {
-                                    tr {
-                                        td { (account.email) }
-                                        td."muted" { (account.created) }
-                                        td { @if account.is_admin { "yes" } @else { "" } }
-                                        td { @if account.is_active { "active" } @else { "disabled" } }
-                                        td {
-                                            form."row" method="post" action="/admin/active" {
-                                                input type="hidden" name="token" value=(token);
-                                                input type="hidden" name="email" value=(account.email);
-                                                input type="hidden" name="active"
-                                                      value=(if account.is_active { "0" } else { "1" });
-                                                @if account.is_active {
-                                                    button."danger" type="submit" { "Disable" }
-                                                } @else {
-                                                    button type="submit" { "Enable" }
-                                                }
-                                            }
+        form."row" method="post" action="/admin/users" {
+            input type="hidden" name="token" value=(token);
+            input name="email" type="email" placeholder="Email" required;
+            input name="password" type="password" placeholder="Password (8+)" required;
+            label { input type="checkbox" name="admin" value="1"; " admin" }
+            button type="submit" { "Add account" }
+        }
+    }
+}
+
+fn render_apps(apps: &[(String, String)], token: &str) -> Markup {
+    html! {
+        @if apps.is_empty() {
+            p."muted" { "Nothing published yet." }
+        } @else {
+            table {
+                thead { tr { th { "App" } th { "Gate" } th {} } }
+                tbody {
+                    @for (app, gate) in apps {
+                        tr {
+                            td { a href={ "/p/" (app) "/" } { (app) } }
+                            td { code { (gate) } }
+                            td {
+                                form."row" method="post" action="/admin/gate" {
+                                    input type="hidden" name="token" value=(token);
+                                    input type="hidden" name="app" value=(app);
+                                    select name="gate" {
+                                        @for option in ["public", "authenticated", "granted"] {
+                                            option value=(option) selected[option == gate] { (option) }
                                         }
                                     }
+                                    button type="submit" { "Set" }
                                 }
                             }
                         }
                     }
-
-                    form."row" method="post" action="/admin/users" {
-                        input type="hidden" name="token" value=(token);
-                        input name="email" type="email" placeholder="Email" required;
-                        input name="password" type="password" placeholder="Password (8+)" required;
-                        label { input type="checkbox" name="admin" value="1"; " admin" }
-                        button type="submit" { "Add account" }
-                    }
-                }
-
-            section {
-                    h2 { "Apps" }
-                    @if apps.is_empty() {
-                        p."muted" { "Nothing published yet." }
-                    } @else {
-                        table {
-                            thead { tr { th { "App" } th { "Gate" } th {} } }
-                            tbody {
-                                @for (app, gate) in apps {
-                                    tr {
-                                        td { a href={ "/p/" (app) "/" } { (app) } }
-                                        td { code { (gate) } }
-                                        td {
-                                            form."row" method="post" action="/admin/gate" {
-                                                input type="hidden" name="token" value=(token);
-                                                input type="hidden" name="app" value=(app);
-                                                select name="gate" {
-                                                    @for option in ["public", "authenticated", "granted"] {
-                                                        option value=(option) selected[option == gate] { (option) }
-                                                    }
-                                                }
-                                                button type="submit" { "Set" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-            section {
-                    h2 { "Access" }
-                    p."muted" { "Only matters for apps gated " code { "granted" } "." }
-                    @if grants.is_empty() {
-                        p."muted" { "No grants." }
-                    } @else {
-                        table {
-                            thead { tr { th { "App" } th { "Account" } th {} } }
-                            tbody {
-                                @for (app, email) in grants {
-                                    tr {
-                                        td { (app) }
-                                        td { (email) }
-                                        td {
-                                            form."row" method="post" action="/admin/access" {
-                                                input type="hidden" name="token" value=(token);
-                                                input type="hidden" name="app" value=(app);
-                                                input type="hidden" name="email" value=(email);
-                                                input type="hidden" name="allow" value="0";
-                                                button."danger" type="submit" { "Revoke" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                form."row" method="post" action="/admin/access" {
-                    input type="hidden" name="token" value=(token);
-                    input type="hidden" name="allow" value="1";
-                    input name="app" placeholder="App" required;
-                    input name="email" type="email" placeholder="Account email" required;
-                    button type="submit" { "Grant" }
                 }
             }
-        },
-        None,
-    )
+        }
+    }
+}
+
+fn render_access(grants: &[(String, String)], token: &str) -> Markup {
+    html! {
+        p."muted" { "Only matters for apps gated " code { "granted" } "." }
+        @if grants.is_empty() {
+            p."muted" { "No grants." }
+        } @else {
+            table {
+                thead { tr { th { "App" } th { "Account" } th {} } }
+                tbody {
+                    @for (app, email) in grants {
+                        tr {
+                            td { (app) }
+                            td { (email) }
+                            td {
+                                form."row" method="post" action="/admin/access" {
+                                    input type="hidden" name="token" value=(token);
+                                    input type="hidden" name="app" value=(app);
+                                    input type="hidden" name="email" value=(email);
+                                    input type="hidden" name="allow" value="0";
+                                    button."danger" type="submit" { "Revoke" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        form."row" method="post" action="/admin/access" {
+            input type="hidden" name="token" value=(token);
+            input type="hidden" name="allow" value="1";
+            input name="app" placeholder="App" required;
+            input name="email" type="email" placeholder="Account email" required;
+            button type="submit" { "Grant" }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -330,7 +354,7 @@ pub async fn change_access(
     .await;
 
     match outcome {
-        Ok(Ok(())) => Redirect::to("/admin").into_response(),
+        Ok(Ok(())) => Redirect::to("/admin/access").into_response(),
         Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not change access").into_response(),
     }
@@ -368,7 +392,7 @@ pub async fn change_gate(
     let mut meta = read_meta(&config, &form.app).await;
     meta.gate = form.gate;
     match crate::content::store::write_meta(&config, &form.app, &meta).await {
-        Ok(()) => Redirect::to("/admin").into_response(),
+        Ok(()) => Redirect::to("/admin/apps").into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not set gate").into_response(),
     }
 }
