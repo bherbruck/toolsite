@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::{config::Config, platform::client_oauth};
 use axum::{
     body::Body,
     extract::State,
@@ -38,6 +38,15 @@ pub(crate) async fn require_bearer(
     if presented.is_some_and(|token| config.valid_tokens.iter().any(|v| v == token)) {
         return next.run(request).await;
     }
+    // Not a static token: perhaps one the OAuth server issued to a person.
+    // That lookup also re-asks accounts whether the person may still publish,
+    // so a disabled account is refused on its next request, not at expiry.
+    if let Some(token) = presented.filter(|_| config.oauth_enabled())
+        && let Some(user) = client_oauth::token_user(&config, token).await
+    {
+        tracing::debug!(email = %user.email, "mcp request as a signed-in admin");
+        return next.run(request).await;
+    }
 
     // A rejected client usually reports nothing more than "can't connect", so
     // say here exactly what arrived. Never the token itself — only its shape.
@@ -65,16 +74,12 @@ pub(crate) async fn require_bearer(
     let mut response = StatusCode::UNAUTHORIZED.into_response();
     // Per MCP's auth spec, point OAuth-capable clients at the metadata rather
     // than leaving them to guess.
-    if let Some(base) = config.base_url.as_deref() {
-        if config.oauth.is_some() {
-            if let Ok(value) = format!(
-                r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource""#
-            )
-            .parse()
-            {
-                response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
-            }
-        }
+    if let Some(base) = config.base_url.as_deref()
+        && let Ok(value) =
+            format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource""#)
+                .parse()
+    {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
     }
     response
 }

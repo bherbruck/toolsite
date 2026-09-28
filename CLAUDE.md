@@ -41,8 +41,10 @@ platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
   mcp.rs           MCP tool definitions and the ServerHandler
   bearer.rs        bearer/x-api-key middleware for /mcp
-  client_oauth.rs  OAuth shim for MCP clients — who may PUBLISH
+  client_oauth.rs  the OAuth server MCP clients sign in through — who may PUBLISH
+  oauth_store.rs   its clients, codes and tokens, in .site/oauth.db
   upload.rs        upload tickets and the PUT endpoints they authorise
+  blob_upload.rs   PUT /blob/<ticket>: a browser's file, streamed to storage
   scaffold.rs      the WIT and a buildable crate, served to agents
   secrets.rs       per-app settings, sealed at rest, entered by a person
   schedule.rs      cron jobs, run through the same handler a request uses
@@ -56,6 +58,7 @@ content/           what gets published, and how it is served
 runtime/           executing an app's own code and data
   wasm.rs          engine, guards, host imports
   db.rs            per-app SQLite and the authorizer keeping apps apart
+  blobs.rs         per-app files, on the volume or in a bucket, keyed like paths
 
 accounts/          people who USE published apps
   users.rs         accounts, sessions, grants, sign-in routes
@@ -71,6 +74,10 @@ own stylesheet. Published apps are not styled from here; they bring their own.
 Two auth systems live here and must never be conflated: `platform/` decides
 who may publish, `accounts/` decides who may visit. They were adjacent files
 called `auth.rs` and `users.rs` once, which invited exactly that mistake.
+They do meet in one place: an MCP client signs in *with* an account, and
+`client_oauth` asks `accounts` who is at the consent screen — but the rule
+that only an admin may connect a publishing client is platform's, and the
+tokens it issues live in platform's own database.
 
 Dependency direction is one-way: `platform` and `content` depend on
 `runtime` and `accounts`; everything depends on `config` and `content::slug`.
@@ -80,7 +87,10 @@ Nothing in `runtime` reaches back up into HTTP types.
 
 - Storage is plain files under `DATA_DIR`; there is no database. A page is
   `<slug>.html`, its icon `<slug>.icon`, its state `<slug>.meta`. An app is a
-  directory whose `index.html` serves at the app root.
+  directory whose `index.html` serves at the app root; its files live under
+  `<app>/.blobs/`, which no slug, bundle path or blob key can name.
+- Size ceilings are `Config`'s, read from the environment, never constants
+  in a module: a deployment decides how big a database or a file may be.
 - Slugs are validated before they touch the filesystem (`slug.rs`). Page slugs
   allow only `[A-Za-z0-9_-]` per segment; bundle asset paths additionally
   allow `.` inside a segment but never at the start, which rules out `..` and

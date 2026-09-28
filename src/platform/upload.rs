@@ -54,6 +54,8 @@ pub(crate) struct UploadQuery {
     pub(crate) manifest: Option<String>,
     /// A gzipped tar of migrations/*.sql — the app's own schema.
     pub(crate) migrations: Option<String>,
+    /// One of the app's files, stored under the key given as the value.
+    pub(crate) blob: Option<String>,
 }
 
 pub(crate) enum UploadKind {
@@ -64,6 +66,7 @@ pub(crate) enum UploadKind {
     Source,
     Manifest,
     Migrations,
+    Blob(String),
 }
 
 /// Ticket-authenticated write. The ticket itself is the credential, so this
@@ -107,6 +110,37 @@ pub(crate) async fn store_upload(
 
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
+    }
+
+    // A file for the app to serve or read: seed images, a dataset, a model.
+    // The type comes from the key's extension, since this path carries no
+    // headers; a handler storing its own can say what it likes.
+    if let UploadKind::Blob(key) = kind {
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        let content_type = crate::content::serve::content_type_for(&key).to_string();
+        let size = body.len();
+        let owned = (config.clone_for_task(), app.clone(), key.clone());
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::runtime::blobs::put(&owned.0, &owned.1, &owned.2, &content_type, &body)
+        })
+        .await;
+        return match outcome {
+            Ok(Ok(())) => {
+                tracing::info!(app = %app, key = %key, size, "blob stored by upload");
+                (StatusCode::OK, format!("stored {size} bytes as {key} for {app}\n")).into_response()
+            }
+            Ok(Err(crate::runtime::blobs::Error::InvalidKey(why))) => {
+                (StatusCode::BAD_REQUEST, format!("{why}\n")).into_response()
+            }
+            Ok(Err(crate::runtime::blobs::Error::TooLarge(_))) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "over the blob size limit\n").into_response()
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(app = %app, key = %key, %error, "blob upload failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "could not store the file\n").into_response()
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not store the file\n").into_response(),
+        };
     }
 
     // The app's schema, applied before anything can ask for a table.
@@ -373,8 +407,8 @@ pub(crate) async fn upload_sub(
 /// reporting: an unknown flag used to fall through to "publish the body as a
 /// page", so probing for a flag that does not exist would overwrite the app's
 /// front page with whatever was being probed.
-pub(crate) const KNOWN_FLAGS: [&str; 6] = [
-    "icon", "bundle", "spa", "handler", "source", "manifest",
+pub(crate) const KNOWN_FLAGS: [&str; 7] = [
+    "icon", "bundle", "spa", "handler", "source", "manifest", "blob",
 ];
 
 pub(crate) fn unknown_flags(uri: &axum::http::Uri) -> Vec<String> {
@@ -414,7 +448,9 @@ fn refuse_unknown_flags(uri: &axum::http::Uri) -> Option<Response> {
 }
 
 pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
-    if query.migrations.is_some() {
+    if let Some(key) = &query.blob {
+        UploadKind::Blob(key.clone())
+    } else if query.migrations.is_some() {
         UploadKind::Migrations
     } else if query.manifest.is_some() {
         UploadKind::Manifest

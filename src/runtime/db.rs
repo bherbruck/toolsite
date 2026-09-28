@@ -8,9 +8,7 @@ use rusqlite::{
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-/// Per-app ceiling. SQLite enforces it itself via max_page_count, so a runaway
-/// insert fails its statement instead of filling the volume.
-pub(crate) const MAX_DB_BYTES: u64 = 64 * 1024 * 1024;
+/// SQLite's own page size; the ceiling is expressed to it in pages.
 const PAGE_SIZE: u64 = 4096;
 /// Cap on rows returned in one call, so a `select *` can't blow up the caller.
 pub(crate) const MAX_ROWS: usize = 1_000;
@@ -40,13 +38,13 @@ fn deny_escapes(context: AuthContext<'_>) -> Authorization {
 
 pub(crate) fn open(config: &Config, app: &str) -> Result<Connection, String> {
     let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
-    open_at(&path)
+    open_at(&path, config.max_db_bytes)
 }
 
 /// Opens one SQLite file with the same guards everywhere: an authorizer that
 /// refuses anything reaching outside this file, a size ceiling, and WAL.
-pub(crate) fn open_at(path: &std::path::Path) -> Result<Connection, String> {
-    let conn = open_unguarded(path)?;
+pub(crate) fn open_at(path: &std::path::Path, max_bytes: u64) -> Result<Connection, String> {
+    let conn = open_unguarded(path, max_bytes)?;
     lock_down(&conn)?;
     Ok(conn)
 }
@@ -55,7 +53,11 @@ pub(crate) fn open_at(path: &std::path::Path) -> Result<Connection, String> {
 /// account database uses this, and only long enough to run migrations, which
 /// need `pragma user_version` — a pragma the authorizer refuses once it is
 /// in place. Never hand a connection from here to a guest.
-pub fn open_unguarded(path: &std::path::Path) -> Result<Connection, String> {
+/// `max_bytes` is the file's ceiling, which SQLite enforces itself through
+/// `max_page_count` so a runaway insert fails its own statement instead of
+/// filling the volume. Zero leaves SQLite's default, which is no ceiling worth
+/// the name.
+pub fn open_unguarded(path: &std::path::Path, max_bytes: u64) -> Result<Connection, String> {
     {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -73,8 +75,10 @@ pub fn open_unguarded(path: &std::path::Path) -> Result<Connection, String> {
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| e.to_string())?;
-    conn.pragma_update(None, "max_page_count", (MAX_DB_BYTES / PAGE_SIZE) as i64)
-        .map_err(|e| e.to_string())?;
+    if max_bytes > 0 {
+        conn.pragma_update(None, "max_page_count", (max_bytes / PAGE_SIZE).max(1) as i64)
+            .map_err(|e| e.to_string())?;
+    }
     // Belt and braces alongside the authorizer.
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
         .map_err(|e| e.to_string())?;
@@ -308,18 +312,41 @@ mod tests {
     #[test]
     fn writes_stop_at_the_size_cap_instead_of_filling_the_volume() {
         let (dir, config) = config();
+        let cap = 8 * 1024 * 1024;
+        let config = Config {
+            max_db_bytes: cap,
+            ..config
+        };
         run(&config, "app", "create table big (x blob)", &[]).unwrap();
         let error = run(
             &config,
             "app",
-            "insert into big with recursive c(i) as (select 1 union all select i+1 from c where i<80) select randomblob(1000000) from c",
+            "insert into big with recursive c(i) as (select 1 union all select i+1 from c where i<20) select randomblob(1000000) from c",
             &[],
         )
         .unwrap_err();
         assert!(error.contains("full"), "got {error:?}");
 
         let size = std::fs::metadata(dir.path().join("app/data.db")).unwrap().len();
-        assert!(size < MAX_DB_BYTES, "database grew to {size}");
+        assert!(size <= cap, "database grew to {size}");
+    }
+
+    #[test]
+    fn a_cap_of_zero_means_none() {
+        let (_dir, config) = config();
+        let config = Config {
+            max_db_bytes: 0,
+            ..config
+        };
+        run(&config, "app", "create table big (x blob)", &[]).unwrap();
+        // Well past the old 64 MB ceiling, in one statement.
+        run(
+            &config,
+            "app",
+            "insert into big with recursive c(i) as (select 1 union all select i+1 from c where i<80) select randomblob(1000000) from c",
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]

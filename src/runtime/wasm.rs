@@ -30,6 +30,9 @@ wasmtime::component::bindgen!({
     world: "app",
 });
 
+use self::toolsite::app::blobs::{
+    Blob as WitBlob, Entry as WitEntry, Error as WitBlobError,
+};
 use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Value as WitValue};
 // Request and Response already land at module scope from bindgen; User sits
 // under its interface, so re-export it rather than making callers spell out
@@ -118,6 +121,63 @@ impl self::toolsite::app::db::Host for StoreState {
             }
             Err(message) => Err(WitDbError::Failed(message)),
         }
+    }
+}
+
+fn wit_blob_error(error: crate::runtime::blobs::Error) -> WitBlobError {
+    use crate::runtime::blobs::Error;
+    match error {
+        Error::NotFound => WitBlobError::NotFound,
+        Error::InvalidKey(why) => WitBlobError::InvalidKey(why),
+        Error::TooLarge(size) => WitBlobError::TooLarge(size),
+        Error::Failed(why) => WitBlobError::Failed(why),
+    }
+}
+
+fn wit_entry(entry: crate::runtime::blobs::Entry) -> WitEntry {
+    WitEntry {
+        key: entry.key,
+        size: entry.size,
+        content_type: entry.content_type,
+    }
+}
+
+/// Every call is scoped by `self.app`, which the guest never supplied — the
+/// same arrangement that keeps its SQL on its own database.
+impl self::toolsite::app::blobs::Host for StoreState {
+    fn put(&mut self, key: String, content_type: String, body: Vec<u8>) -> Result<(), WitBlobError> {
+        crate::runtime::blobs::put(&self.site, &self.app, &key, &content_type, &body)
+            .map_err(wit_blob_error)
+    }
+
+    fn get(&mut self, key: String) -> Result<WitBlob, WitBlobError> {
+        crate::runtime::blobs::get(&self.site, &self.app, &key)
+            .map(|blob| WitBlob {
+                content_type: blob.content_type,
+                body: blob.body,
+            })
+            .map_err(wit_blob_error)
+    }
+
+    fn stat(&mut self, key: String) -> Result<Option<WitEntry>, WitBlobError> {
+        crate::runtime::blobs::stat(&self.site, &self.app, &key)
+            .map(|entry| entry.map(wit_entry))
+            .map_err(wit_blob_error)
+    }
+
+    fn delete(&mut self, key: String) -> Result<(), WitBlobError> {
+        crate::runtime::blobs::delete(&self.site, &self.app, &key).map_err(wit_blob_error)
+    }
+
+    fn list(&mut self, prefix: String) -> Result<Vec<WitEntry>, WitBlobError> {
+        crate::runtime::blobs::list(&self.site, &self.app, &prefix)
+            .map(|entries| entries.into_iter().map(wit_entry).collect())
+            .map_err(wit_blob_error)
+    }
+
+    fn upload_url(&mut self, key: String, max_bytes: u64) -> Result<String, WitBlobError> {
+        crate::runtime::blobs::issue_upload(&self.site, &self.app, &key, max_bytes)
+            .map_err(wit_blob_error)
     }
 }
 

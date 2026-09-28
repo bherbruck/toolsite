@@ -11,11 +11,11 @@ use crate::{
     accounts::users,
     content::serve::{index, serve_icon, serve_page},
     platform::{
-        admin,
+        admin, blob_upload,
         bearer::require_bearer,
         client_oauth::{
-            authorize, oauth_authorization_server_metadata, oauth_protected_resource_metadata,
-            token_endpoint,
+            authorize_decide, authorize_form, oauth_authorization_server_metadata,
+            oauth_protected_resource_metadata, register, token_endpoint,
         },
         mcp::PageHost,
         scaffold, secrets,
@@ -117,9 +117,19 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
             put(upload_root).post(upload_root).get(upload::download),
         )
         .route("/upload/{ticket}/{*sub}", put(upload_sub).post(upload_sub))
+        // A visitor's file, streamed to storage. The ticket caps it, not the
+        // body limit below, which exists for things held in memory.
+        .route(
+            "/blob/{ticket}",
+            put(blob_upload::receive)
+                .post(blob_upload::receive)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));
 
-    if config.oauth.is_some() {
+    // The OAuth server MCP clients sign in through. Needs the site's own
+    // address for its metadata, and nothing else.
+    if config.oauth_enabled() {
         public_router = public_router
             .route(
                 "/.well-known/oauth-protected-resource",
@@ -133,7 +143,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
                 "/.well-known/oauth-authorization-server",
                 get(oauth_authorization_server_metadata),
             )
-            .route("/authorize", get(authorize))
+            .route("/register", post(register))
+            .route("/authorize", get(authorize_form).post(authorize_decide))
             .route("/token", post(token_endpoint));
     }
 

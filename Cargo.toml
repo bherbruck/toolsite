@@ -18,7 +18,7 @@ maud = "0.27.0"
 rand = "0.10.2"
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io", "schemars"] }
 # rustls plus bundled roots: no OpenSSL in the runtime image.
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "charset", "stream"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits"] }
 rusqlite_migration = "2.6.0"
 schemars = "1.2.1"
@@ -34,6 +34,10 @@ urlencoding = "2.1.3"
 wasmtime = "47.0.3"
 wasmtime-wasi = "47.0.3"
 wasmtime-wasi-http = "47.0.3"
+rusty-s3 = "0.10"
+futures-util = "0.3.34"
+bytes = "1.12.1"
+tokio-util = { version = "0.7.19", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

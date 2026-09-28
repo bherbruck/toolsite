@@ -59,13 +59,19 @@ The MCP endpoint is `POST /mcp` — Streamable HTTP transport, so **no `/sse`
 suffix.** Responses are SSE-framed, but the path is still `/mcp`.
 
 - **claude.ai** — Settings → Connectors → Add custom connector. URL
-  `https://yourdomain.com/mcp`. If a "Request headers" field is offered, use
-  `Authorization: Bearer <BEARER_TOKEN>`; otherwise fill in the OAuth Client
-  ID / Secret you configured.
-- **ChatGPT** — enable Developer Mode, add a connector with the same URL and
-  token auth. OAuth will *not* work: `/authorize` only permits redirects back
-  to `claude.ai`, so use `BEARER_TOKEN`.
-- **Claude Code** — add it as a remote MCP server with a bearer token.
+  `https://yourdomain.com/mcp`, nothing else. Claude registers itself, sends
+  you to sign in with your admin account, and asks you to allow it. No token
+  or client ID to paste. (A "Request headers" field still takes
+  `Authorization: Bearer <TOOLSITE_MCP_TOKEN>` if you would rather.)
+- **Claude Code** — `claude mcp add --transport http toolsite
+  https://yourdomain.com/mcp`, then `/mcp` to sign in; the browser opens the
+  same consent screen. Or add it with a bearer token header.
+- **ChatGPT** — enable Developer Mode and add a connector with the same URL;
+  sign in the same way, or use token auth.
+
+Signing in needs `TOOLSITE_BASE_URL` set, and an admin account to sign in
+with (see Accounts). A visitor account is told no: a connected client
+publishes with the account's full standing, which is an admin's.
 
 ### Locally, over stdio
 
@@ -202,10 +208,42 @@ wall-clock deadline. A handler that loops forever is killed and returns 500;
 the server keeps serving. Because instances are never reused, state must live
 in the database.
 
+## Files
+
+An app keeps files the way it keeps rows: in its own namespace, reached only
+through its handler. Keys look like paths (`photos/cat.jpg`) and obey the
+bundle rules, so `..` and dotfiles are refused before storage is touched.
+
+Bytes never pass through the guest, whose request body is capped at 8 MB:
+
+- **In.** The handler calls `blobs::upload_url(key, max_bytes)` and hands the
+  URL to the browser, which `PUT`s the file there. The URL works once and
+  dies in fifteen minutes. The platform streams the body to storage.
+- **Out.** The handler answers with `x-toolsite-blob: <key>` and an empty
+  body; the platform streams the file in its place, with the stored content
+  type unless the handler set one, and keeps the handler's other headers. By
+  answering, the handler has decided the visitor may have it.
+- **Small things.** `put`, `get`, `stat`, `list`, `delete` from inside the
+  handler; `get` refuses anything over 16 MB.
+- **From a shell.** `curl -f -T file '<upload-url>?blob=<key>'`, 64 MB per
+  PUT, typed by the key's extension.
+
+Where the bytes live is the deployment's choice, not the app's:
+
+- **The volume**, by default: `<app>/.blobs/` beside the app's database.
+  Removing the app trashes them with it.
+- **An S3-compatible bucket**, when `TOOLSITE_BLOB_S3_ENDPOINT` and
+  `TOOLSITE_BLOB_S3_BUCKET` are set (with the key id, secret and region),
+  under `<app>/` in that bucket. A Railway bucket injects `ENDPOINT`,
+  `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY` and `REGION` by reference,
+  and those unprefixed names are accepted as they are, so pointing at one is
+  five variable references. Set `TOOLSITE_BLOB_S3_PATH_STYLE=1` for a bucket
+  whose credentials tab says path-style.
+
 ## Accounts
 
-Visitors are separate from publishing: `BEARER_TOKEN` says who may deploy, an
-account says who may look. There is no public signup — every account is
+Visitors are separate from publishing: a token, or an admin signing a client
+in, says who may deploy; an account says who may look. There is no public signup — every account is
 created by the owner, so there is nothing to abuse.
 
 From a shell on the machine itself — no token, no network, which is how the
@@ -514,41 +552,48 @@ the index shows. There's a client-side filter over slugs and titles.
 
 Two independent modes — use either, or both at once. At least one is required.
 
-- **Bearer token** — set `BEARER_TOKEN`. Sent as
+- **Sign in** — set `TOOLSITE_BASE_URL`. The server is then an OAuth 2.1
+  authorization server for its own `/mcp`: a client registers itself
+  (RFC 7591), the person signs in with an admin account and consents on a
+  screen that names where the answer is going, and the client gets a token
+  that is theirs. Clients are public and PKCE S256 is required; codes are
+  single-use and a minute long; access tokens last a day and refresh tokens
+  a month, rotating on every use. Every request re-checks the account, so
+  disabling it ends its clients' access on their next call. Tokens live
+  hashed in `.site/oauth.db`.
+- **Bearer token** — set `TOOLSITE_MCP_TOKEN`. Sent as
   `Authorization: Bearer <token>`; `x-api-key: <token>` is also accepted,
-  since clients differ. Rejected requests are logged at `warn` with the
-  headers that arrived (never the token itself), so a client stuck on 401 is
-  diagnosable from the deploy log.
-- **OAuth 2.1** — set `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET`, for clients
-  that require a full OAuth flow. A minimal single-user shim: `/authorize`
-  auto-approves with no login screen, `/token` hands back
-  `OAUTH_CLIENT_SECRET` as the access token, and redirects are restricted to
-  `claude.ai` / `*.claude.ai`.
+  since clients differ. For scripts and the CLI, or a client with a headers
+  field. Rejected requests are logged at `warn` with the headers that
+  arrived (never the token itself), so a client stuck on 401 is diagnosable
+  from the deploy log.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `TOOLSITE_MCP_TOKEN` | if not using OAuth | Static token an MCP client sends to `/mcp`. |
-| `TOOLSITE_MCP_OAUTH_CLIENT_ID` | if using OAuth | Paste into the client's "OAuth Client ID" field. |
-| `TOOLSITE_MCP_OAUTH_CLIENT_SECRET` | if using OAuth | Paste into the client's "OAuth Client Secret" field. |
-| `TOOLSITE_BASE_URL` | if using OAuth | Base URL of the deployment, e.g. `https://host.com`. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
+| `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
+| `TOOLSITE_BASE_URL` | if clients sign in | Base URL of the deployment, e.g. `https://host.com`. Turns the OAuth server on. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where pages are stored. |
+| `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
+| `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
+| `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker — see Settings. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
 
-`MCP` is in those three names because they authenticate MCP *clients* — who
-may publish — and nothing else. Signing a visitor in through a provider will
-need its own credentials, and an unqualified `OAUTH_CLIENT_ID` would then be
-ambiguous about which of the two it meant.
+`MCP` is in the token's name because it authenticates MCP *clients* — who
+may publish — and nothing else.
 
 Older names still answer (`TOOLSITE_TOKEN`, `BEARER_TOKEN`, `MCP_TOKEN`,
-`TOOLSITE_OAUTH_CLIENT_ID`, `OAUTH_CLIENT_ID`, `PUBLIC_BASE_URL`, `DATA_DIR`
-and so on), so an existing deployment needs no changes.
+`PUBLIC_BASE_URL`, `DATA_DIR` and so on), so an existing deployment needs no
+changes. `TOOLSITE_MCP_OAUTH_CLIENT_ID` / `_SECRET` configured an earlier
+single-user OAuth shim that signing in replaces; the secret is still accepted
+as a bearer token, so a connector made under it keeps working until you
+reconnect it, after which both can go.
 
 Every app gets a SQLite database; there is nothing to switch on. `db.query`
-and `run_sql` always work.
+and `run_sql` always work. Files work the same way; a bucket is optional.
 
 Boot logs the effective configuration, so a misconfigured deploy is visible
 without a client to test against:
@@ -568,6 +613,8 @@ budget-2026.meta          {"listed":true,...}
 myapp/index.html          app root               -> /p/myapp/
 myapp/about.html          a page of the app      -> /p/myapp/about
 myapp/assets/main.js      a bundle asset         -> /p/myapp/assets/main.js
+myapp/data.db             its SQLite database    (never served)
+myapp/.blobs/data/<key>   a stored file          (only through its handler)
 ```
 
 Slugs are restricted to letters, numbers, `-`, `_` and `/`, so a slug can

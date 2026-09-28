@@ -61,7 +61,7 @@ pub fn apply(config: &Config, app: &str) -> Result<(usize, usize), String> {
     // Migrations read `pragma user_version`, which the authorizer refuses, so
     // the schema moves before the door closes — exactly as for the account
     // database.
-    let mut conn = db::open_unguarded(&path)?;
+    let mut conn = db::open_unguarded(&path, config.max_db_bytes)?;
     let before: usize = conn
         .query_row("pragma user_version", [], |row| row.get::<_, i64>(0))
         .map(|version| version as usize)

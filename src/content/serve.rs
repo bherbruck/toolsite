@@ -48,6 +48,12 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
         "otf" => "font/otf",
         "wasm" => "application/wasm",
         "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "zip" => "application/zip",
         "xml" => "application/xml",
         "webmanifest" => "application/manifest+json",
         _ => "application/octet-stream",
@@ -428,6 +434,19 @@ async fn run_handler(
         Ok(Ok(response)) => {
             let status =
                 StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // `x-toolsite-blob: <key>` asks the host to send one of the
+            // app's files in place of the body, so a gigabyte never crosses
+            // the guest boundary. The handler still chose the status and any
+            // other header — content-disposition, cache-control — and, by
+            // answering at all, decided this visitor may have it.
+            let blob_key = response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(BLOB_HEADER))
+                .map(|(_, key)| key.clone());
+            if let Some(key) = blob_key {
+                return serve_blob(&state.config, app, &key, status, &response.headers).await;
+            }
             let mut builder = axum::response::Response::builder().status(status);
             for (name, value) in &response.headers {
                 builder = builder.header(name, value);
@@ -447,6 +466,49 @@ async fn run_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, "handler error").into_response()
         }
     }
+}
+
+/// The response header a handler sets to have a stored file sent as the body.
+const BLOB_HEADER: &str = "x-toolsite-blob";
+
+async fn serve_blob(
+    config: &Config,
+    app: &str,
+    key: &str,
+    status: StatusCode,
+    handler_headers: &[(String, String)],
+) -> Response {
+    let (entry, stream) = match crate::runtime::blobs::open(config, app, key).await {
+        Ok(opened) => opened,
+        Err(crate::runtime::blobs::Error::NotFound) => {
+            tracing::warn!(app, key, "handler pointed at a blob that does not exist");
+            return (StatusCode::NOT_FOUND, "no such file").into_response();
+        }
+        Err(error) => {
+            tracing::warn!(app, key, %error, "could not open blob");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not read the file").into_response();
+        }
+    };
+    let mut builder = axum::response::Response::builder().status(status);
+    let mut typed = false;
+    for (name, value) in handler_headers {
+        // The length is the file's, and the pointer itself is not for the
+        // visitor. Everything else the handler said stands.
+        if name.eq_ignore_ascii_case(BLOB_HEADER) || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("content-type") {
+            typed = true;
+        }
+        builder = builder.header(name, value);
+    }
+    if !typed {
+        builder = builder.header(header::CONTENT_TYPE, &entry.content_type);
+    }
+    builder
+        .header(header::CONTENT_LENGTH, entry.size)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> {

@@ -1,11 +1,14 @@
 //! The site as its owner uses it: publishing, and the auth that gates it.
 //!
-//! `client_oauth` here is for MCP *clients* — it decides who may publish.
-//! Visitor sign-in lives in `accounts`, and the two must never be conflated.
+//! `client_oauth` here is for MCP *clients* — it decides who may publish,
+//! by letting an admin sign one in. Visitor sign-in lives in `accounts`, and
+//! the two must never be conflated.
 
 pub mod admin;
 pub mod bearer;
+pub mod blob_upload;
 pub mod client_oauth;
+pub mod oauth_store;
 pub mod manifest;
 pub mod mcp;
 pub mod scaffold;

@@ -79,10 +79,11 @@ strip that prefix yourself.
 A wasm component built for `wasm32-wasip2` against `<server>/wit/toolsite.wit`.
 Start from `<server>/scaffold/<app>`, which is a crate that builds unmodified.
 
-It gets four capabilities and nothing else:
+It gets five capabilities and nothing else:
 
 - `db.query` — this app's own SQLite. Parameters are bound; there is no
   string-building entry point.
+- `blobs` — this app's own files. See Files, below.
 - `identity.current-user` / `current-role` — established by the host from a
   verified session. A guest cannot forge either.
 - `secrets.get` — settings the owner entered. Never in the bundle.
@@ -99,6 +100,36 @@ survive the request that set it.
 
 The host sets `x-toolsite-scheduled` on a job run. Client copies of any
 `x-toolsite-*` header are stripped, so it means what it says.
+
+## Files
+
+Uploads, images, exports, datasets: anything too large or too opaque for a
+row is a blob. One namespace per app, keyed like a path (`photos/cat.jpg`),
+with the same rules as a bundle path — no segment may start with `.`, so
+`..` is refused before anything touches storage.
+
+The handler decides; the platform moves the bytes. A request body into a
+handler is capped at 8 MB and a blob may be gigabytes, so neither direction
+goes through guest memory:
+
+- **Taking a file from a browser.** Call `blobs::upload_url(key, max_bytes)`
+  and hand the URL to the page. The browser `PUT`s the file there with its
+  content type; the URL works once and expires in fifteen minutes. Decide who
+  gets a URL the way you decide anything else — it is the credential.
+- **Sending one.** Answer with the header `x-toolsite-blob: <key>` and an
+  empty body. The platform streams the file in its place, with the stored
+  content type unless you set one, and keeps your other headers — so
+  `content-disposition` and `cache-control` are yours to add. Gate it however
+  the route is gated: answering is the permission.
+- **Small things from inside.** `put`, `get`, `stat`, `list(prefix)` and
+  `delete`. `get` refuses anything over 16 MB rather than truncating it;
+  serve those with the header.
+
+Seeding from a shell: `curl -f -T file '<upload-url>?blob=<key>'`, up to 64 MB
+per PUT, typed by the key's extension.
+
+The ceiling per file is the deployment's, a few GB by default. Where the
+bytes live — the volume, or a bucket — is not the app's concern.
 
 ## Schema
 

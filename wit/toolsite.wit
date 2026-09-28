@@ -95,6 +95,57 @@ interface identity {
     current-role: func() -> option<string>;
 }
 
+/// Files this app keeps: uploads, images, exports — anything too large or too
+/// opaque for a row. One namespace per app, resolved by the host from the
+/// slug exactly as the database is.
+///
+/// Bytes need not pass through the handler. To take a file from a browser,
+/// hand it `upload-url` and let it PUT there; the platform stores the body
+/// and a handler never holds it. To send one, answer with the header
+/// `x-toolsite-blob: <key>` and an empty body; the platform streams the file
+/// in its place, with the stored content type unless the response set one.
+/// `get` is for things small enough to hold — anything over its ceiling is
+/// refused, not truncated.
+interface blobs {
+    record entry {
+        key: string,
+        size: u64,
+        /// What was given when it was stored. A listing does not carry
+        /// this and says `application/octet-stream`; `stat` does.
+        content-type: string,
+    }
+
+    record blob {
+        content-type: string,
+        body: list<u8>,
+    }
+
+    variant error {
+        not-found,
+        /// Keys are path segments of letters, digits, '-', '_' and '.',
+        /// none empty and none starting with '.'.
+        invalid-key(string),
+        /// Bigger than the ceiling — `get`'s, or the platform's for a put.
+        /// Carries the size.
+        too-large(u64),
+        failed(string),
+    }
+
+    put: func(key: string, content-type: string, body: list<u8>) -> result<_, error>;
+    get: func(key: string) -> result<blob, error>;
+    /// Size and type without the bytes. Absent means nothing is stored there.
+    stat: func(key: string) -> result<option<entry>, error>;
+    delete: func(key: string) -> result<_, error>;
+    /// Everything under `prefix`, sorted by key, capped by the host. An empty
+    /// prefix lists the app's whole namespace.
+    %list: func(prefix: string) -> result<list<entry>, error>;
+    /// A URL a browser may PUT one file to, once, within fifteen minutes,
+    /// storing it under `key` with the request's content type. The URL is the
+    /// credential: deciding who gets it is the handler's job. `max-bytes` of
+    /// zero means the platform's own ceiling.
+    upload-url: func(key: string, max-bytes: u64) -> result<string, error>;
+}
+
 /// What a request handler sees and returns. Deliberately small: enough to
 /// route, read a body and answer.
 interface http {
@@ -129,6 +180,7 @@ world app {
     use http.{request, response};
 
     import db;
+    import blobs;
     import identity;
     import secrets;
     import fetch;

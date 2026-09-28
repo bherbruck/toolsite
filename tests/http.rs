@@ -1944,3 +1944,613 @@ async fn the_platform_explains_itself_without_reading_someone_elses_app() {
         assert!(guide.contains(fact), "the guide never mentions {fact}");
     }
 }
+
+// --- signing an MCP client in -------------------------------------------
+//
+// A person connects Claude (or Claude Code) to the site by signing in with
+// the admin account they already have. Nothing is pasted: the client
+// registers itself, the person consents, and the token that comes out is
+// theirs, not a shared secret.
+
+const BASE: &str = "https://site.test";
+const CALLBACK: &str = "https://client.test/callback";
+// RFC 7636's own test vector.
+const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+/// A deployment that knows its own address, which is all the OAuth server
+/// needs to exist. No static token at all.
+fn public_server() -> (TempDir, Arc<Config>) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        data_dir: dir.path().to_path_buf(),
+        base_url: Some(BASE.to_string()),
+        local_base: "http://localhost:8080".to_string(),
+        valid_tokens: Vec::new(),
+        uploads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        ..Config::local(dir.path().to_path_buf(), "unused")
+    });
+    (dir, config)
+}
+
+fn admin(config: &Config, email: &str, password: &str) {
+    toolsite::accounts::users::sign_up_as(config, email, password, true).unwrap();
+}
+
+fn json_post(uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn form_post(uri: &str, body: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(token) = cookie {
+        builder = builder.header("cookie", format!("ts_session={token}"));
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
+fn location(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .map(|(_, v)| v.clone())
+        .expect("no Location header")
+}
+
+fn query_param(url: &str, name: &str) -> Option<String> {
+    let (_, query) = url.split_once('?')?;
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| urlencoding::decode(v).unwrap().into_owned())
+}
+
+/// What the client's first request does: register, and get an id back.
+async fn register(config: &Arc<Config>, redirect_uri: &str) -> String {
+    let body = format!(
+        r#"{{"client_name":"Test Client","redirect_uris":["{redirect_uri}"],"token_endpoint_auth_method":"none"}}"#
+    );
+    let (status, body, _) = send(config, json_post("/register", &body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("client_secret").is_none(), "a public client was given a secret");
+    json["client_id"].as_str().unwrap().to_string()
+}
+
+fn authorize_url(client_id: &str, redirect_uri: &str) -> String {
+    format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}&state=xyz&code_challenge={CHALLENGE}&code_challenge_method=S256&resource={}",
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(&format!("{BASE}/mcp")),
+    )
+}
+
+/// The hidden fields of the consent form, plus the answer.
+fn consent_body(page: &str, client_id: &str, redirect_uri: &str, decision: &str) -> String {
+    let token = page
+        .split("name=\"token\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("consent form carries no form token");
+    format!(
+        "token={token}&response_type=code&client_id={client_id}&redirect_uri={}&state=xyz&code_challenge={CHALLENGE}&code_challenge_method=S256&decision={decision}",
+        urlencoding::encode(redirect_uri),
+    )
+}
+
+/// Walks a signed-in admin through consent and returns the code the browser
+/// would have carried back to the client.
+async fn consent(config: &Arc<Config>, session: &str, client_id: &str, redirect_uri: &str) -> String {
+    let (status, page, _) = send(config, get_as(&authorize_url(client_id, redirect_uri), session)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let body = consent_body(&page, client_id, redirect_uri, "allow");
+    let (status, _, headers) = send(config, form_post("/authorize", &body, Some(session))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let target = location(&headers);
+    assert!(target.starts_with(redirect_uri), "sent somewhere else: {target}");
+    assert_eq!(query_param(&target, "state").as_deref(), Some("xyz"));
+    query_param(&target, "code").expect("no code in the redirect")
+}
+
+fn exchange_body(client_id: &str, code: &str, redirect_uri: &str, verifier: &str) -> String {
+    format!(
+        "grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri={}&code_verifier={verifier}",
+        urlencoding::encode(redirect_uri),
+    )
+}
+
+async fn exchange(config: &Arc<Config>, body: &str) -> (StatusCode, serde_json::Value) {
+    let (status, body, _) = send(config, form_post("/token", body, None)).await;
+    (status, serde_json::from_str(&body).unwrap_or_default())
+}
+
+fn mcp_initialize(token: &str) -> Request<Body> {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(initialize))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn discovery_tells_a_client_it_can_register_and_must_use_pkce() {
+    let (_dir, config) = public_server();
+
+    let (status, body, _) = send(&config, get("/.well-known/oauth-protected-resource")).await;
+    assert_eq!(status, StatusCode::OK);
+    let resource: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resource["resource"], format!("{BASE}/mcp"));
+    assert_eq!(resource["authorization_servers"][0], BASE);
+
+    let (status, body, _) = send(&config, get("/.well-known/oauth-authorization-server")).await;
+    assert_eq!(status, StatusCode::OK);
+    let server: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(server["issuer"], BASE);
+    assert_eq!(server["registration_endpoint"], format!("{BASE}/register"));
+    assert_eq!(server["code_challenge_methods_supported"], serde_json::json!(["S256"]));
+    assert_eq!(server["token_endpoint_auth_methods_supported"], serde_json::json!(["none"]));
+
+    // And a bare request to /mcp is pointed at all of this.
+    let (status, _, headers) = send(&config, mcp_initialize("")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let challenge = headers.iter().find(|(k, _)| k == "www-authenticate").unwrap();
+    assert!(challenge.1.contains("oauth-protected-resource"), "{}", challenge.1);
+}
+
+#[tokio::test]
+async fn without_a_public_address_there_is_no_oauth_server() {
+    let (_dir, config) = server();
+    let (status, ..) = send(&config, get("/.well-known/oauth-authorization-server")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, json_post("/register", r#"{"redirect_uris":["https://c.test/cb"]}"#)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_admin_signs_a_client_in_and_it_can_then_use_mcp() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+
+    let client_id = register(&config, CALLBACK).await;
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+
+    let (status, tokens) = exchange(&config, &exchange_body(&client_id, &code, CALLBACK, VERIFIER)).await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    assert_eq!(tokens["token_type"], "Bearer");
+    let access = tokens["access_token"].as_str().unwrap();
+    assert!(tokens["refresh_token"].as_str().is_some());
+
+    let (status, body, _) = send(&config, mcp_initialize(access)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn the_consent_screen_names_where_the_answer_goes_and_who_it_acts_as() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+
+    let (status, page, _) = send(&config, get_as(&authorize_url(&client_id, CALLBACK), &session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("client.test"), "the redirect host is not shown");
+    assert!(page.contains("Test Client"), "the client's name is not shown");
+    assert!(page.contains("owner@example.com"), "whose standing it acts with is not shown");
+}
+
+#[tokio::test]
+async fn someone_not_signed_in_is_sent_to_sign_in_and_comes_back() {
+    let (_dir, config) = public_server();
+    let client_id = register(&config, CALLBACK).await;
+    let url = authorize_url(&client_id, CALLBACK);
+
+    let (status, _, headers) = send(&config, get(&url)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let target = location(&headers);
+    assert!(target.starts_with("/auth/login?next="), "{target}");
+    assert_eq!(query_param(&target, "next").as_deref(), Some(url.as_str()));
+}
+
+#[tokio::test]
+async fn a_visitor_account_cannot_connect_a_publishing_client() {
+    let (_dir, config) = public_server();
+    account(&config, "reader@example.com", "correct horse");
+    let session = sign_in(&config, "reader@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+
+    let (status, page, _) = send(&config, get_as(&authorize_url(&client_id, CALLBACK), &session)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(page.contains("not an admin"), "{page}");
+
+    // Nor by posting the decision straight in, skipping the screen.
+    let body = format!(
+        "token=whatever&response_type=code&client_id={client_id}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256&decision=allow",
+        urlencoding::encode(CALLBACK)
+    );
+    let (status, ..) = send(&config, form_post("/authorize", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn declining_sends_the_client_away_with_no_code() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+
+    let (_, page, _) = send(&config, get_as(&authorize_url(&client_id, CALLBACK), &session)).await;
+    let body = consent_body(&page, &client_id, CALLBACK, "deny");
+    let (status, _, headers) = send(&config, form_post("/authorize", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let target = location(&headers);
+    assert_eq!(query_param(&target, "error").as_deref(), Some("access_denied"));
+    assert!(query_param(&target, "code").is_none());
+}
+
+#[tokio::test]
+async fn consent_cannot_be_forged_by_a_page_the_admin_has_open() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+
+    // A cross-site form post carries the cookie but cannot know the form
+    // token, which only the rendered consent page contains.
+    let body = format!(
+        "token=guess&response_type=code&client_id={client_id}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256&decision=allow",
+        urlencoding::encode(CALLBACK)
+    );
+    let (status, ..) = send(&config, form_post("/authorize", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_code_only_goes_where_the_client_registered() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+
+    // Answered on the page, not by redirecting to the attacker's URI.
+    let elsewhere = authorize_url(&client_id, "https://evil.test/steal");
+    let (status, _, headers) = send(&config, get_as(&elsewhere, &session)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.iter().any(|(k, _)| k == "location"));
+
+    // An unknown client likewise.
+    let (status, _, headers) = send(&config, get_as(&authorize_url("nobody", CALLBACK), &session)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.iter().any(|(k, _)| k == "location"));
+}
+
+#[tokio::test]
+async fn registering_a_plaintext_redirect_off_this_machine_is_refused() {
+    let (_dir, config) = public_server();
+    let (status, ..) = send(
+        &config,
+        json_post("/register", r#"{"redirect_uris":["http://attacker.test/cb"]}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, ..) = send(&config, json_post("/register", r#"{"redirect_uris":[]}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Loopback over plain HTTP is how a program on the person's machine
+    // (Claude Code) receives its code, so that one is allowed.
+    let (status, ..) = send(
+        &config,
+        json_post("/register", r#"{"redirect_uris":["http://localhost:3000/cb"]}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn pkce_is_required_and_a_wrong_verifier_spends_the_code() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+
+    // No challenge at all: refused before anyone is asked anything.
+    let bare = format!(
+        "/authorize?response_type=code&client_id={client_id}&redirect_uri={}",
+        urlencoding::encode(CALLBACK)
+    );
+    let (status, _, headers) = send(&config, get_as(&bare, &session)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(query_param(&location(&headers), "error").as_deref(), Some("invalid_request"));
+
+    // A code, exchanged with the wrong verifier.
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+    let (status, body) = exchange(&config, &exchange_body(&client_id, &code, CALLBACK, "not-the-verifier")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_grant");
+
+    // The right verifier no longer helps: the attempt spent it.
+    let (status, body) = exchange(&config, &exchange_body(&client_id, &code, CALLBACK, VERIFIER)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn a_code_is_bound_to_the_client_and_redirect_that_asked_for_it() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+    let other = register(&config, CALLBACK).await;
+
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+    let (status, ..) = exchange(&config, &exchange_body(&other, &code, CALLBACK, VERIFIER)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "another client redeemed the code");
+
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+    let (status, ..) = exchange(&config, &exchange_body(&client_id, &code, "https://client.test/other", VERIFIER)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a different redirect_uri was accepted");
+}
+
+#[tokio::test]
+async fn a_code_is_exchanged_once() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+
+    let body = exchange_body(&client_id, &code, CALLBACK, VERIFIER);
+    let (status, ..) = exchange(&config, &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, ..) = exchange(&config, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the code was replayed");
+}
+
+#[tokio::test]
+async fn a_refresh_token_rotates_and_the_old_one_dies() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+    let (_, first) = exchange(&config, &exchange_body(&client_id, &code, CALLBACK, VERIFIER)).await;
+    let refresh = first["refresh_token"].as_str().unwrap();
+
+    let body = format!("grant_type=refresh_token&client_id={client_id}&refresh_token={refresh}");
+    let (status, second) = exchange(&config, &body).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_ne!(second["access_token"], first["access_token"]);
+    assert_ne!(second["refresh_token"], first["refresh_token"]);
+
+    let (status, ..) = exchange(&config, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a retired refresh token still worked");
+
+    let (status, ..) = send(&config, mcp_initialize(second["access_token"].as_str().unwrap())).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn disabling_the_account_ends_its_clients_access_now() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+    let (_, tokens) = exchange(&config, &exchange_body(&client_id, &code, CALLBACK, VERIFIER)).await;
+    let access = tokens["access_token"].as_str().unwrap();
+    let refresh = tokens["refresh_token"].as_str().unwrap();
+
+    let (status, ..) = send(&config, mcp_initialize(access)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    toolsite::accounts::users::set_active(&config, "owner@example.com", false).unwrap();
+
+    let (status, ..) = send(&config, mcp_initialize(access)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a disabled account's token still worked");
+    let body = format!("grant_type=refresh_token&client_id={client_id}&refresh_token={refresh}");
+    let (status, ..) = exchange(&config, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a disabled account refreshed its way back in");
+}
+
+#[tokio::test]
+async fn an_issued_token_is_not_a_static_token_and_a_made_up_one_is_nothing() {
+    let (_dir, config) = public_server();
+    let (status, ..) = send(&config, mcp_initialize("made-up")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, ..) = send(&config, mcp_initialize("")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// --- an app's files -------------------------------------------------------
+//
+// Blobs are the app's own, like its database: one namespace per app, keys
+// that cannot leave it, and bytes that move between a browser and storage
+// without ever passing through the handler.
+
+fn put_bytes(uri: &str, content_type: &str, body: &[u8]) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", content_type)
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_handler_stores_reads_lists_and_deletes_its_own_files() {
+    let (_dir, config) = server();
+    publish_handler(&config, "gallery");
+
+    let (status, body, _) = send(
+        &config,
+        put_bytes("/p/gallery/api/blob-put?key=photos/cat.jpg", "image/jpeg", b"JPEG"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    send(&config, put_bytes("/p/gallery/api/blob-put?key=photos/dog.jpg", "image/jpeg", b"DOG")).await;
+    send(&config, put_bytes("/p/gallery/api/blob-put?key=notes.txt", "text/plain", b"hi")).await;
+
+    let (status, body, headers) = send(&config, get("/p/gallery/api/blob-get?key=photos/cat.jpg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "JPEG");
+    assert!(headers.iter().any(|(k, v)| k == "content-type" && v == "image/jpeg"));
+
+    let (_, body, _) = send(&config, get("/p/gallery/api/blob-stat?key=photos/cat.jpg")).await;
+    assert_eq!(body, "4:image/jpeg");
+
+    let (_, body, _) = send(&config, get("/p/gallery/api/blob-list?prefix=photos/")).await;
+    assert_eq!(body, "photos/cat.jpg,photos/dog.jpg");
+    let (_, body, _) = send(&config, get("/p/gallery/api/blob-list?prefix=")).await;
+    assert_eq!(body, "notes.txt,photos/cat.jpg,photos/dog.jpg");
+
+    let (status, ..) = send(&config, get("/p/gallery/api/blob-delete?key=photos/cat.jpg")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, ..) = send(&config, get("/p/gallery/api/blob-get?key=photos/cat.jpg")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, get("/p/gallery/api/blob-stat?key=photos/cat.jpg")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn one_apps_files_are_not_another_apps() {
+    let (_dir, config) = server();
+    publish_handler(&config, "alpha");
+    publish_handler(&config, "beta");
+
+    send(&config, put_bytes("/p/alpha/api/blob-put?key=private.txt", "text/plain", b"alpha's")).await;
+    let (status, ..) = send(&config, get("/p/beta/api/blob-get?key=private.txt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "beta read alpha's file");
+    let (_, body, _) = send(&config, get("/p/beta/api/blob-list?prefix=")).await;
+    assert_eq!(body, "", "beta listed alpha's files");
+    // Nor by naming the neighbour in the key.
+    let (status, ..) = send(&config, get("/p/beta/api/blob-get?key=../alpha/.blobs/data/private.txt")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_file_key_cannot_leave_the_apps_directory() {
+    let (dir, config) = server();
+    publish_handler(&config, "app");
+    write_page(&config, "victim/index", "<h1>victim</h1>");
+
+    for key in ["../victim/index.html", "../../outside", ".secret", "a/../b"] {
+        let uri = format!("/p/app/api/blob-put?key={}", urlencoding::encode(key));
+        let (status, body, _) = send(&config, put_bytes(&uri, "text/plain", b"pwned")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key} accepted: {body}");
+        let uri = format!("/p/app/api/blob-upload-url?key={}", urlencoding::encode(key));
+        let (status, ..) = send(&config, get(&uri)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "upload URL minted for {key}");
+    }
+    assert_eq!(std::fs::read_to_string(dir.path().join("victim/index.html")).unwrap(), "<h1>victim</h1>");
+    assert!(!dir.path().join("outside").exists());
+}
+
+#[tokio::test]
+async fn a_browser_uploads_straight_to_storage_and_the_handler_serves_it_back() {
+    let (_dir, config) = server();
+    publish_handler(&config, "drive");
+
+    // The handler hands out a URL; the bytes never reach it.
+    let (status, url, _) = send(&config, get("/p/drive/api/blob-upload-url?key=uploads/report.pdf")).await;
+    assert_eq!(status, StatusCode::OK, "{url}");
+    let path = url.strip_prefix("http://localhost:8080").expect("an absolute upload URL");
+    assert!(path.starts_with("/blob/"), "{url}");
+
+    let big = vec![b'x'; 3 * 1024 * 1024];
+    let (status, body, _) = send(&config, put_bytes(path, "application/pdf", &big)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The same URL is spent.
+    let (status, ..) = send(&config, put_bytes(path, "application/pdf", b"again")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, ..) = send(&config, put_bytes("/blob/made-up", "application/pdf", b"x")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (_, body, _) = send(&config, get("/p/drive/api/blob-stat?key=uploads/report.pdf")).await;
+    assert_eq!(body, format!("{}:application/pdf", big.len()));
+
+    // Served by pointing at it: the host streams the bytes, keeps the
+    // handler's other headers, and fills in type and length.
+    let (status, body, headers) = send(&config, get("/p/drive/api/blob-serve?key=uploads/report.pdf")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), big.len());
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    assert_eq!(header("content-type"), Some("application/pdf"));
+    assert_eq!(header("content-length"), Some(big.len().to_string().as_str()));
+    assert_eq!(header("content-disposition"), Some("attachment; filename=\"uploads/report.pdf\""));
+    assert_eq!(header("x-toolsite-blob"), None, "the pointer leaked to the visitor");
+
+    // Pointing at nothing is a 404, not a crash.
+    let (status, ..) = send(&config, get("/p/drive/api/blob-serve?key=uploads/missing.pdf")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_browser_upload_stops_at_the_handlers_limit() {
+    let (dir, config) = server();
+    publish_handler(&config, "drive");
+    let (_, url, _) = send(&config, get("/p/drive/api/blob-upload-url?key=small.bin&max=10")).await;
+    let path = url.strip_prefix("http://localhost:8080").unwrap();
+
+    let (status, ..) = send(&config, put_bytes(path, "application/octet-stream", &[0u8; 11])).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, ..) = send(&config, get("/p/drive/api/blob-stat?key=small.bin")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a refused upload was stored anyway");
+    assert!(
+        std::fs::read_dir(dir.path().join(".tmp")).map(|d| d.count()).unwrap_or(0) == 0,
+        "a spool file was left behind"
+    );
+}
+
+#[tokio::test]
+async fn stored_files_are_not_reachable_as_assets_only_through_the_handler() {
+    let (dir, config) = server();
+    publish_handler(&config, "app");
+    send(&config, put_bytes("/p/app/api/blob-put?key=secret.txt", "text/plain", b"shh")).await;
+    assert!(dir.path().join("app/.blobs/data/secret.txt").exists());
+
+    for path in ["/p/app/.blobs/data/secret.txt", "/p/app/.blobs/meta/secret.txt", "/p/app/.blobs/"] {
+        let (status, ..) = send(&config, get(path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path} was served");
+    }
+}
+
+#[tokio::test]
+async fn an_agent_seeds_a_file_through_its_upload_ticket() {
+    let (_dir, config) = server();
+    publish_handler(&config, "app");
+    let ticket = ticket(&config, "app", Duration::from_secs(60));
+
+    let (status, body, _) = send(
+        &config,
+        put_bytes(&format!("/upload/{ticket}?blob=data/seed.csv"), "text/csv", b"a,b\n1,2\n"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body, headers) = send(&config, get("/p/app/api/blob-get?key=data/seed.csv")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "a,b\n1,2\n");
+    // The type came from the key, since this path carries none.
+    assert!(headers.iter().any(|(k, v)| k == "content-type" && v.starts_with("text/csv")), "{headers:?}");
+
+    // The ticket is for that app alone, and the key rules still hold.
+    let (status, ..) = send(
+        &config,
+        put_bytes(&format!("/upload/{ticket}?blob=../other/x"), "text/plain", b"x"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

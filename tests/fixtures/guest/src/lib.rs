@@ -6,12 +6,32 @@ wit_bindgen::generate!({
     world: "app",
 });
 
+use toolsite::app::blobs;
 use toolsite::app::db;
 use toolsite::app::identity;
 use toolsite::app::fetch;
 use toolsite::app::secrets;
 
 struct Handler;
+
+/// One value out of `a=1&b=2`. Enough for a fixture.
+fn param<'q>(query: &'q str, name: &str) -> &'q str {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+        .unwrap_or("")
+}
+
+fn blob_status(error: &blobs::Error) -> u16 {
+    match error {
+        blobs::Error::NotFound => 404,
+        blobs::Error::InvalidKey(_) => 400,
+        blobs::Error::TooLarge(_) => 413,
+        blobs::Error::Failed(_) => 500,
+    }
+}
 
 fn respond(status: u16, body: String) -> Response {
     Response {
@@ -108,6 +128,73 @@ impl Guest for Handler {
                         format!("{} {}", response.status, String::from_utf8_lossy(&response.body)),
                     ),
                     Err(why) => respond(502, format!("refused: {why}")),
+                }
+            }
+
+            // The app's files, through the host's blobs import.
+            "/blob-put" => {
+                let content_type = req
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "text/plain".to_string());
+                match blobs::put(param(&req.query, "key"), &content_type, &req.body) {
+                    Ok(()) => respond(201, "stored".to_string()),
+                    Err(e) => respond(blob_status(&e), format!("{e:?}")),
+                }
+            }
+
+            "/blob-get" => match blobs::get(param(&req.query, "key")) {
+                Ok(blob) => Response {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), blob.content_type)],
+                    body: blob.body,
+                },
+                Err(e) => respond(blob_status(&e), format!("{e:?}")),
+            },
+
+            "/blob-stat" => match blobs::stat(param(&req.query, "key")) {
+                Ok(Some(entry)) => respond(200, format!("{}:{}", entry.size, entry.content_type)),
+                Ok(None) => respond(404, "absent".to_string()),
+                Err(e) => respond(blob_status(&e), format!("{e:?}")),
+            },
+
+            "/blob-list" => match blobs::list(param(&req.query, "prefix")) {
+                Ok(entries) => respond(
+                    200,
+                    entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>().join(","),
+                ),
+                Err(e) => respond(blob_status(&e), format!("{e:?}")),
+            },
+
+            "/blob-delete" => match blobs::delete(param(&req.query, "key")) {
+                Ok(()) => respond(200, "deleted".to_string()),
+                Err(e) => respond(blob_status(&e), format!("{e:?}")),
+            },
+
+            // A URL for the browser, so the file never comes through here.
+            "/blob-upload-url" => {
+                let max: u64 = param(&req.query, "max").parse().unwrap_or(0);
+                match blobs::upload_url(param(&req.query, "key"), max) {
+                    Ok(url) => respond(200, url),
+                    Err(e) => respond(blob_status(&e), format!("{e:?}")),
+                }
+            }
+
+            // Sends a file by pointing at it: the host streams the bytes.
+            "/blob-serve" => {
+                let key = param(&req.query, "key").to_string();
+                Response {
+                    status: 200,
+                    headers: vec![
+                        ("x-toolsite-blob".to_string(), key.clone()),
+                        (
+                            "content-disposition".to_string(),
+                            format!("attachment; filename=\"{key}\""),
+                        ),
+                    ],
+                    body: Vec::new(),
                 }
             }
 

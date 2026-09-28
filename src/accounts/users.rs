@@ -67,7 +67,7 @@ fn site_db_path(config: &Config) -> PathBuf {
 fn open(config: &Config) -> Result<Connection, String> {
     // Migrations read `pragma user_version`, which the authorizer refuses, so
     // the schema is brought up to date before the door is closed.
-    let mut conn = db::open_unguarded(&site_db_path(config))?;
+    let mut conn = db::open_unguarded(&site_db_path(config), config.max_db_bytes)?;
     crate::accounts::schema::migrate(&mut conn)?;
     db::lock_down(&conn)?;
     Ok(conn)
@@ -261,6 +261,25 @@ pub fn log_out(config: &Config, token: &str) -> Result<(), String> {
     conn.execute("delete from sessions where token_hash = ?", [&hash])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The account behind an id, if it is still active. What anything holding a
+/// user id across a boundary asks before acting on it, so a disabled account
+/// is refused wherever its id has been remembered.
+pub fn user_by_id(config: &Config, id: &str) -> Option<User> {
+    let conn = open(config).ok()?;
+    conn.query_row(
+        "select id, email, is_admin from users where id = ? and disabled_at is null",
+        [id],
+        |row| {
+            Ok(User {
+                id: row.get(0)?,
+                email: row.get(1)?,
+                is_admin: row.get::<_, i64>(2)? != 0,
+            })
+        },
+    )
+    .ok()
 }
 
 /// Who a *site* session token belongs to. A token scoped to an app is not

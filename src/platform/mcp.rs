@@ -410,9 +410,16 @@ impl PageHost {
              \nThe app's settings — its gate, route rules, jobs, icon and allow_http — come \
              from toolsite.toml:\n\
              \n  curl -f -T toolsite.toml '{upload}?manifest'\n\
+             \nFiles the app keeps — images, datasets, anything too big or too opaque for \
+             a row — are blobs, one namespace per app. Seed one from here (64 MB per PUT; \
+             the type comes from the key's extension):\n\
+             \n  curl -f -T photo.jpg '{upload}?blob=photos/cover.jpg'\n\
+             \nA handler reads and lists them through the blobs import, takes bigger ones \
+             from a browser with blobs.upload-url, and sends one by answering with the \
+             header x-toolsite-blob: <key> — see {site}/guide.\n\
              \nEvery flag this URL takes: ?bundle, ?spa, ?handler, ?migrations, ?manifest, \
-             ?icon, ?source. No flag at all publishes the body as a page. Anything else is \
-             refused rather than guessed at.\n\
+             ?icon, ?source, ?blob=<key>. No flag at all publishes the body as a page. \
+             Anything else is refused rather than guessed at.\n\
              \nKeep the project with the app, since a bundle cannot be turned back into the \
              sources that built it. Visitors only ever see what the bundle contained:\n\
              \n  tar -czf - --exclude node_modules --exclude target . | curl -f -T - '{upload}?source'\n\

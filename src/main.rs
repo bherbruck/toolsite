@@ -8,7 +8,7 @@ use rmcp::ServiceExt;
 use toolsite::{
     build_router,
     config::Config,
-    platform::{client_oauth::OAuth, mcp::PageHost},
+    platform::mcp::PageHost,
     runtime::wasm::Runtime,
 };
 
@@ -98,43 +98,28 @@ async fn main() -> anyhow::Result<()> {
         return run_user_command(command, data_dir, read(&["TOOLSITE_BASE_URL", "PUBLIC_BASE_URL"]));
     }
 
-    // These three authenticate MCP *clients* — who may publish — and nothing
-    // else. Signing a visitor in through a provider will need its own
-    // credentials, and an unqualified OAUTH_CLIENT_ID would then be ambiguous
-    // about which of the two it meant.
+    // Authenticates MCP *clients* — who may publish — and nothing else. An
+    // OAuth client signs in with an admin account instead, which needs no
+    // variable beyond the base URL.
     let bearer_token = read(&[
         "TOOLSITE_MCP_TOKEN",
         "TOOLSITE_TOKEN",
         "BEARER_TOKEN",
         "MCP_TOKEN",
     ]);
-    let oauth_client_id = read(&[
-        "TOOLSITE_MCP_OAUTH_CLIENT_ID",
-        "TOOLSITE_OAUTH_CLIENT_ID",
-        "OAUTH_CLIENT_ID",
-    ]);
-    let oauth_client_secret = read(&[
+    // The client-id/secret shim these used to configure is gone: clients sign
+    // in now. The secret was also the access token it handed out, so it stays
+    // valid as a plain bearer until every connector has reconnected.
+    let legacy_oauth_secret = read(&[
         "TOOLSITE_MCP_OAUTH_CLIENT_SECRET",
         "TOOLSITE_OAUTH_CLIENT_SECRET",
         "OAUTH_CLIENT_SECRET",
     ]);
-
-    let oauth = match (oauth_client_id, oauth_client_secret) {
-        (Some(client_id), Some(client_secret)) => Some(OAuth {
-            client_id,
-            client_secret,
-            auth_codes: Mutex::new(HashMap::new()),
-        }),
-        (None, None) => None,
-        _ => panic!("set both OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET together, or neither"),
-    };
-
-    // Over stdio the client already owns the process, so there is nothing for
-    // a token to protect; HTTP still refuses everything without one.
-    if !stdio && bearer_token.is_none() && oauth.is_none() {
-        panic!(
-            "set TOOLSITE_MCP_TOKEN, or TOOLSITE_MCP_OAUTH_CLIENT_ID + \
-             TOOLSITE_MCP_OAUTH_CLIENT_SECRET (or both)"
+    if legacy_oauth_secret.is_some() {
+        tracing::warn!(
+            "TOOLSITE_MCP_OAUTH_CLIENT_SECRET is no longer an OAuth setting: clients now \
+             sign in with an admin account. The secret still works as a bearer token; \
+             reconnect your clients and then drop it, along with the client id"
         );
     }
 
@@ -153,10 +138,13 @@ async fn main() -> anyhow::Result<()> {
                 format!("https://{s}")
             }
         });
-    if oauth.is_some() && base_url.is_none() {
+    // Over stdio the client already owns the process, so there is nothing for
+    // a token to protect; HTTP still refuses everything without one, and the
+    // OAuth server cannot issue any until it knows its own address.
+    if !stdio && bearer_token.is_none() && base_url.is_none() {
         panic!(
-            "TOOLSITE_BASE_URL is required alongside the OAuth variables \
-             (discovery metadata needs absolute URLs)"
+            "set TOOLSITE_MCP_TOKEN for static-token clients, or TOOLSITE_BASE_URL so \
+             clients can sign in with an admin account (or both)"
         );
     }
 
@@ -164,9 +152,52 @@ async fn main() -> anyhow::Result<()> {
     if let Some(t) = &bearer_token {
         valid_tokens.push(t.clone());
     }
-    if let Some(o) = &oauth {
-        valid_tokens.push(o.client_secret.clone());
+    if let Some(secret) = &legacy_oauth_secret {
+        valid_tokens.push(secret.clone());
     }
+
+    // Ceilings, in megabytes. Zero lifts one entirely.
+    let megabytes = |names: &[&str], default: u64| -> u64 {
+        match read(names) {
+            Some(value) => value
+                .trim()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{} must be a whole number of MB (0 for no limit), not {value:?}", names[0]))
+                * 1024
+                * 1024,
+            None => default,
+        }
+    };
+    let max_db_bytes = megabytes(&["TOOLSITE_MAX_DB_MB"], toolsite::config::DEFAULT_MAX_DB_BYTES);
+    let max_blob_bytes = megabytes(&["TOOLSITE_MAX_BLOB_MB"], toolsite::config::DEFAULT_MAX_BLOB_BYTES);
+
+    // Files go to a bucket when one is configured, else beside the app on
+    // disk. The unprefixed names are what a Railway bucket injects by
+    // reference, so pointing at one is five variable references and nothing
+    // else.
+    let blobs = match (
+        read(&["TOOLSITE_BLOB_S3_ENDPOINT", "ENDPOINT"]),
+        read(&["TOOLSITE_BLOB_S3_BUCKET", "BUCKET"]),
+    ) {
+        (Some(endpoint), Some(bucket)) => {
+            let access_key_id = read(&["TOOLSITE_BLOB_S3_ACCESS_KEY_ID", "ACCESS_KEY_ID"])
+                .expect("a blob bucket needs TOOLSITE_BLOB_S3_ACCESS_KEY_ID");
+            let secret = read(&["TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY", "SECRET_ACCESS_KEY"])
+                .expect("a blob bucket needs TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY");
+            let region = read(&["TOOLSITE_BLOB_S3_REGION", "REGION"]).unwrap_or_else(|| "auto".into());
+            let path_style = read(&["TOOLSITE_BLOB_S3_PATH_STYLE"]).is_some_and(|v| v != "0");
+            let s3 = toolsite::runtime::blobs::S3::new(
+                &endpoint, &bucket, &region, &access_key_id, &secret, path_style,
+            )
+            .unwrap_or_else(|why| panic!("{why}"));
+            toolsite::runtime::blobs::Blobs {
+                backend: toolsite::runtime::blobs::Backend::S3(s3),
+                max_bytes: max_blob_bytes,
+            }
+        }
+        (None, None) => toolsite::runtime::blobs::Blobs::local(max_blob_bytes),
+        _ => panic!("set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET together, or neither"),
+    };
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
@@ -175,9 +206,15 @@ async fn main() -> anyhow::Result<()> {
     // rather than only from a client's opaque "can't connect".
     tracing::info!(
         bearer_auth = bearer_token.is_some(),
-        oauth_auth = oauth.is_some(),
+        oauth_auth = base_url.is_some(),
         base_url = base_url.as_deref().unwrap_or("<unset>"),
         "auth configuration"
+    );
+    tracing::info!(
+        blobs = blobs.describe(),
+        max_db_mb = max_db_bytes / 1024 / 1024,
+        max_blob_mb = max_blob_bytes / 1024 / 1024,
+        "storage configuration (0 MB means no ceiling)"
     );
 
     let config = Arc::new(Config {
@@ -185,8 +222,10 @@ async fn main() -> anyhow::Result<()> {
         base_url,
         local_base: format!("http://localhost:{port}"),
         valid_tokens,
-        oauth,
         uploads: Mutex::new(HashMap::new()),
+        max_db_bytes,
+        blobs,
+        blob_uploads: Mutex::new(HashMap::new()),
     });
 
     let runtime = Runtime::new()?;
@@ -238,8 +277,10 @@ fn run_user_command(
         }),
         local_base: "http://localhost:8080".to_string(),
         valid_tokens: Vec::new(),
-        oauth: None,
         uploads: Mutex::new(HashMap::new()),
+        max_db_bytes: toolsite::config::DEFAULT_MAX_DB_BYTES,
+        blobs: toolsite::runtime::blobs::Blobs::local(toolsite::config::DEFAULT_MAX_BLOB_BYTES),
+        blob_uploads: Mutex::new(HashMap::new()),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {
