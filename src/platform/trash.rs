@@ -14,8 +14,8 @@ use crate::{config::Config, content::slug::valid_slug};
 use std::path::PathBuf;
 
 /// Everything that can belong to one slug, beyond its own directory.
-const SIDECARS: [&str; 8] = [
-    "html", "meta", "icon", "notes", "source", "secrets", "jobs", "migrations",
+const SIDECARS: [&str; 9] = [
+    "html", "meta", "icon", "notes", "source", "secrets", "jobs", "migrations", "exports",
 ];
 
 fn trash_dir(config: &Config) -> PathBuf {

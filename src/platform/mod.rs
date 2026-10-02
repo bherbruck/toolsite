@@ -8,6 +8,7 @@ pub mod admin;
 pub mod bearer;
 pub mod blob_upload;
 pub mod client_oauth;
+pub mod export;
 pub mod oauth_store;
 pub mod manifest;
 pub mod mcp;

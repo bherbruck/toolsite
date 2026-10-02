@@ -71,6 +71,20 @@ pub(crate) struct SetIconRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ExportRequest {
+    #[schemars(description = "App whose database the token reads.")]
+    pub(crate) app: String,
+    #[schemars(
+        description = "'create' mints a token and returns it once; 'list' shows the tokens that exist (never their values); 'revoke' ends the one named by id."
+    )]
+    pub(crate) action: String,
+    #[schemars(description = "For create: what will hold the token, e.g. 'answerdb'. Required.")]
+    pub(crate) label: Option<String>,
+    #[schemars(description = "For revoke: the token's id, as list shows it.")]
+    pub(crate) id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct RemoveRequest {
     #[schemars(description = "Slug to take down.")]
     pub(crate) slug: String,
@@ -247,6 +261,64 @@ impl PageHost {
             runtime,
             tool_router: Self::tool_router(),
         }
+    }
+
+    #[tool(
+        description = "Read-only access to one app's database from outside: a token for GET <site>/export/<app>.sqlite, which answers with a consistent snapshot of the whole SQLite file. For reporting tools that pull SQLite over HTTP (AnswerDB and the like). Each token opens one app only and is revocable on its own; the publish token is never accepted there. The token is returned once, by this call, and stored only as a hash."
+    )]
+    pub(crate) async fn app_exports(
+        &self,
+        Parameters(ExportRequest { app, action, label, id }): Parameters<ExportRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !crate::platform::export::valid_app(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be one path segment of letters, numbers, '-' or '_'",
+            )]));
+        }
+        let config = self.config.clone();
+        let url = crate::platform::export::export_url(&config, &app);
+        let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
+            "create" => crate::platform::export::create(&config, &app, &label.unwrap_or_default()).map(
+                |(entry, token)| {
+                    format!(
+                        "Token {} for {app} ({}). Shown once:\n\n{token}\n\nUse it as\n\n  curl -H 'Authorization: Bearer {token}' -o {app}.sqlite {url}\n\nIn AnswerDB: a sqlite connection with URL {url} and that bearer token.",
+                        entry.id, entry.label
+                    )
+                },
+            ),
+            "list" => {
+                let tokens = crate::platform::export::list(&config, &app);
+                if tokens.is_empty() {
+                    return Ok(format!("no export tokens for {app}"));
+                }
+                Ok(tokens
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{}  {}  created {} days ago, last used {}",
+                            t.id,
+                            t.label,
+                            crate::platform::export::seconds_since(t.created_at) / 86_400,
+                            match t.last_used {
+                                Some(at) => format!("{} h ago", crate::platform::export::seconds_since(at) / 3600),
+                                None => "never".to_string(),
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "revoke" => crate::platform::export::revoke(&config, &app, &id.unwrap_or_default())
+                .map(|()| format!("revoked; the tool holding it will get 401 from now on")),
+            other => Err(format!("action must be create, list or revoke, not '{other}'")),
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(match outcome {
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
     }
 
     #[tool(
