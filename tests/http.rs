@@ -2554,3 +2554,161 @@ async fn an_agent_seeds_a_file_through_its_upload_ticket() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// --- exporting a database -------------------------------------------------
+//
+// A reporting tool pulls one app's SQLite file with a token that opens that
+// app and nothing else. The publish token is never good here, and the file
+// is a snapshot, never the live WAL set.
+
+fn bearer_get(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn seed_db(config: &Config, app: &str) {
+    toolsite::runtime::db::run(config, app, "create table orders (id integer, total real)", &[]).unwrap();
+    toolsite::runtime::db::run(config, app, "insert into orders values (1, 9.5), (2, 20)", &[]).unwrap();
+}
+
+#[tokio::test]
+async fn an_export_token_downloads_a_working_copy_of_that_apps_database() {
+    let (dir, config) = server();
+    seed_db(&config, "sales");
+    let (_, token) = toolsite::platform::export::create(&config, "sales", "reporting").unwrap();
+
+    let (status, body, headers) = send_bytes_with_headers(&config, bearer_get("/export/sales.sqlite", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    assert_eq!(header("content-type"), Some("application/vnd.sqlite3"));
+    assert_eq!(header("content-length"), Some(body.len().to_string().as_str()));
+
+    // What came down opens as a database and holds the rows.
+    let copy = dir.path().join("downloaded.sqlite");
+    std::fs::write(&copy, &body).unwrap();
+    let conn = rusqlite::Connection::open(&copy).unwrap();
+    let n: i64 = conn.query_row("select count(*) from orders", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2);
+
+    // The snapshot did not linger.
+    let leftovers = std::fs::read_dir(dir.path().join(".tmp")).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(leftovers, 0, "a snapshot file was left behind");
+}
+
+/// `send_bytes` plus the headers, which the export test needs both of.
+async fn send_bytes_with_headers(config: &Arc<Config>, request: Request<Body>) -> (StatusCode, Vec<u8>, Vec<(String, String)>) {
+    let response = build_router(config.clone(), Runtime::new().unwrap())
+        .oneshot(request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await.unwrap();
+    (status, bytes.to_vec(), headers)
+}
+
+#[tokio::test]
+async fn an_export_token_opens_one_app_and_the_publish_token_opens_none() {
+    let (_dir, config) = server();
+    seed_db(&config, "sales");
+    seed_db(&config, "hr");
+    let (_, token) = toolsite::platform::export::create(&config, "sales", "x").unwrap();
+
+    let (status, ..) = send(&config, bearer_get("/export/hr.sqlite", &token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "sales's token read hr");
+    let (status, ..) = send(&config, bearer_get("/export/sales.sqlite", TOKEN)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the publish token exported a database");
+    let (status, ..) = send(&config, get("/export/sales.sqlite")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Unknown app and wrong token read the same, so a token cannot probe
+    // for which apps exist.
+    let (status, body, _) = send(&config, bearer_get("/export/nothing.sqlite", &token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("no export token"));
+}
+
+#[tokio::test]
+async fn a_revoked_export_token_stops_working_at_once() {
+    let (_dir, config) = server();
+    seed_db(&config, "sales");
+    let (entry, token) = toolsite::platform::export::create(&config, "sales", "x").unwrap();
+    let (status, ..) = send(&config, bearer_get("/export/sales.sqlite", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    toolsite::platform::export::revoke(&config, "sales", &entry.id).unwrap();
+    let (status, ..) = send(&config, bearer_get("/export/sales.sqlite", &token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_token_file_is_never_served_and_the_platform_db_is_never_exported() {
+    let (_dir, config) = server();
+    account(&config, "someone@example.com", "correct horse");
+    let (_, token) = toolsite::platform::export::create(&config, "sales", "x").unwrap();
+
+    let (status, ..) = send(&config, get("/p/sales.exports")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    for app in [".site", "..", ".site%2Fauth", "sales%2F..%2F.site"] {
+        let (status, ..) = send(&config, bearer_get(&format!("/export/{app}.sqlite"), &token)).await;
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED || status == StatusCode::BAD_REQUEST,
+            "{app}: {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_admin_mints_a_token_on_the_exports_page_and_sees_it_once() {
+    let (_dir, config) = server();
+    seed_db(&config, "sales");
+    write_page(&config, "sales/index", "<h1>sales</h1>");
+    toolsite::accounts::users::sign_up_as(&config, "owner@example.com", "correct horse", true).unwrap();
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+
+    let (status, page, _) = send(&config, get_as("/admin/exports", &session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("No export tokens"));
+    let form_token = page
+        .split("name=\"token\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_string();
+
+    let body = format!("token={form_token}&action=create&app=sales&label=reporting");
+    let (status, page, _) = send(&config, form_post("/admin/exports", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let token = page
+        .split("<code>tse_")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .map(|rest| format!("tse_{rest}"))
+        .expect("the new token is shown");
+    assert!(page.contains("/export/sales.sqlite"), "the URL to paste is not shown");
+
+    let (status, ..) = send(&config, bearer_get("/export/sales.sqlite", &token)).await;
+    assert_eq!(status, StatusCode::OK, "the token from the page does not work");
+
+    // Listed by label, never by value; revocable from the same page.
+    let (_, page, _) = send(&config, get_as("/admin/exports", &session)).await;
+    assert!(page.contains("reporting"));
+    assert!(!page.contains(&token), "the token is shown again on a later visit");
+    let id = toolsite::platform::export::list(&config, "sales")[0].id.clone();
+    let body = format!("token={form_token}&action=revoke&app=sales&id={id}");
+    let (status, ..) = send(&config, form_post("/admin/exports", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, ..) = send(&config, bearer_get("/export/sales.sqlite", &token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A visitor account gets nowhere near it.
+    account(&config, "reader@example.com", "correct horse");
+    let reader = sign_in(&config, "reader@example.com", "correct horse");
+    let (status, ..) = send(&config, get_as("/admin/exports", &reader)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

@@ -13,6 +13,7 @@ use crate::{
     platform::{
         admin, blob_upload,
         bearer::require_bearer,
+        export,
         client_oauth::{
             authorize_decide, authorize_form, oauth_authorization_server_metadata,
             oauth_protected_resource_metadata, register, token_endpoint,
@@ -109,6 +110,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/access", get(admin::access_page).post(admin::change_access))
         .route("/admin/active", post(admin::change_active))
         .route("/admin/gate", post(admin::change_gate))
+        .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
+        // One app's database, whole, for a token minted for that app alone.
+        .route("/export/{file}", get(export::download))
         // Trades the site session for one scoped to a single app; the only
         // way an app ever sees a visitor.
         .route("/auth/handoff", get(users::handoff))

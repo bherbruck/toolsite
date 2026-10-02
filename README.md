@@ -240,6 +240,27 @@ Where the bytes live is the deployment's choice, not the app's:
   five variable references. Set `TOOLSITE_BLOB_S3_PATH_STYLE=1` for a bucket
   whose credentials tab says path-style.
 
+## Exporting a database
+
+A reporting tool that pulls SQLite over HTTP (a reporting tool, for one) can read an
+app's database with a token minted for that app alone:
+
+```
+GET https://yourdomain.com/export/<app>.sqlite
+Authorization: Bearer tse_…
+```
+
+The answer is a consistent snapshot of the whole file, taken with
+`VACUUM INTO`, never the live WAL set. Mint one with `app_exports(app,
+"create", label)` from an MCP client, or on `/admin/exports`, which shows the
+token once and lists tokens by label afterwards. Each token opens one app and
+nothing else; the publish token is refused there. Revoke from either place
+and the tool gets 401 on its next pull. Tokens live hashed in
+`<app>.exports`, so removing the app takes them with it.
+
+In a reporting tool: a connection of type `sqlite` with that URL and the token as its
+bearer token. It downloads the file on each sync.
+
 ## Accounts
 
 Visitors are separate from publishing: a token, or an admin signing a client
@@ -544,6 +565,8 @@ the index shows. There's a client-side filter over slugs and titles.
 | `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed, `?handler` installs a wasm component. 64 MB. |
 | `ANY /p/<slug>` | public | The page, a bundle asset, or the app's handler. An app root redirects to `/p/<slug>/` so relative links resolve. |
 | `GET /icon/<slug>` | public | A page's icon, if set. |
+| `GET /export/<app>.sqlite` | export token | A snapshot of that app's database, for a reporting tool. |
+| `PUT /blob/<ticket>` | ticket | A visitor's file, streamed to the app's storage. Minted by the app's handler. |
 | `GET /wit/toolsite.wit` | public | The contract a handler compiles against. |
 | `GET /scaffold/<app>` | public | A gzipped tar of a handler crate ready to build. |
 | `GET /` | public | The index. |

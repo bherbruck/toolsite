@@ -55,6 +55,7 @@ fn sidebar(active: &str) -> Markup {
         a."active"[active == "accounts"] href="/admin" { "Accounts" }
         a."active"[active == "apps"] href="/admin/apps" { "Apps" }
         a."active"[active == "access"] href="/admin/access" { "Access" }
+        a."active"[active == "exports"] href="/admin/exports" { "Exports" }
         div."spacer" {
             a href="/" { "Pages" }
             a href="/auth/logout" { "Sign out" }
@@ -247,6 +248,192 @@ fn render_access(grants: &[(String, String)], token: &str) -> Markup {
             input name="email" type="email" placeholder="Account email" required;
             button type="submit" { "Grant" }
         }
+    }
+}
+
+/// The apps that exist, by their top-level directory.
+async fn app_names(config: &Config) -> Vec<String> {
+    let mut slugs = Vec::new();
+    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
+    let mut apps: Vec<String> = slugs
+        .into_iter()
+        .map(|slug| slug.split('/').next().unwrap_or(&slug).to_string())
+        .collect();
+    apps.sort();
+    apps.dedup();
+    apps
+}
+
+pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let apps = app_names(&config).await;
+    let tokens = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || crate::platform::export::list_all(&config))
+            .await
+            .unwrap_or_default()
+    };
+    let token = form_token(&config, &admin);
+    admin_page("exports", "Exports", &admin, render_exports(&config, &apps, &tokens, &token, None))
+}
+
+fn ago(seconds: u64) -> String {
+    let elapsed = crate::platform::export::seconds_since(seconds);
+    match elapsed {
+        s if s < 90 => "just now".to_string(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 172_800 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
+    }
+}
+
+/// `fresh` is a token minted by the request that rendered this page: the one
+/// time it is ever shown.
+fn render_exports(
+    config: &Config,
+    apps: &[String],
+    tokens: &[(String, crate::platform::export::ExportToken)],
+    form_token: &str,
+    fresh: Option<(&str, &str)>,
+) -> Markup {
+    html! {
+        p."muted" {
+            "A read-only copy of one app's database, for a reporting tool that pulls SQLite over HTTP. "
+            "Each token opens one app and nothing else; revoke it here when the tool goes."
+        }
+        @if let Some((app, token)) = fresh {
+            section {
+                h2 { "New token for " (app) }
+                p { "Copy it now. It is not stored and will not be shown again." }
+                pre { code { (token) } }
+                p."muted" {
+                    "Point the tool at " code { (crate::platform::export::export_url(config, app)) }
+                    " with " code { "Authorization: Bearer " } "that token."
+                }
+            }
+        }
+        @if tokens.is_empty() {
+            p."muted" { "No export tokens." }
+        } @else {
+            table {
+                thead { tr { th { "App" } th { "Label" } th { "Created" } th { "Last used" } th {} } }
+                tbody {
+                    @for (app, entry) in tokens {
+                        tr {
+                            td { (app) }
+                            td { (entry.label) " " span."muted" { "(" (entry.id) ")" } }
+                            td."muted" { (ago(entry.created_at)) }
+                            td."muted" {
+                                @match entry.last_used {
+                                    Some(at) => (ago(at)),
+                                    None => "never",
+                                }
+                            }
+                            td {
+                                form."row" method="post" action="/admin/exports" {
+                                    input type="hidden" name="token" value=(form_token);
+                                    input type="hidden" name="action" value="revoke";
+                                    input type="hidden" name="app" value=(app);
+                                    input type="hidden" name="id" value=(entry.id);
+                                    button."danger" type="submit" { "Revoke" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        form."row" method="post" action="/admin/exports" {
+            input type="hidden" name="token" value=(form_token);
+            input type="hidden" name="action" value="create";
+            @if apps.is_empty() {
+                input name="app" placeholder="App" required;
+            } @else {
+                select name="app" required {
+                    @for app in apps { option value=(app) { (app) } }
+                }
+            }
+            input name="label" placeholder="What will hold it, e.g. reporting" required;
+            button type="submit" { "Create token" }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ExportChange {
+    token: String,
+    action: String,
+    app: String,
+    label: Option<String>,
+    id: Option<String>,
+}
+
+pub async fn change_export(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<ExportChange>,
+) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    if !check_form_token(&config, &admin, &form.token) {
+        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
+    }
+
+    match form.action.as_str() {
+        "create" => {
+            let label = form.label.unwrap_or_default();
+            let (config2, app) = (config.clone(), form.app.clone());
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::platform::export::create(&config2, &app, &label)
+            })
+            .await;
+            match outcome {
+                Ok(Ok((_, token))) => {
+                    tracing::info!(admin = %admin.email, app = %form.app, "export token created");
+                    // Rendered, not redirected: the token exists in this
+                    // response and nowhere else.
+                    let apps = app_names(&config).await;
+                    let tokens = {
+                        let config = config.clone();
+                        tokio::task::spawn_blocking(move || crate::platform::export::list_all(&config))
+                            .await
+                            .unwrap_or_default()
+                    };
+                    let form_token = form_token(&config, &admin);
+                    admin_page(
+                        "exports",
+                        "Exports",
+                        &admin,
+                        render_exports(&config, &apps, &tokens, &form_token, Some((&form.app, &token))),
+                    )
+                }
+                Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not create the token").into_response(),
+            }
+        }
+        "revoke" => {
+            let id = form.id.unwrap_or_default();
+            let (config2, app) = (config.clone(), form.app.clone());
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::platform::export::revoke(&config2, &app, &id)
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    tracing::info!(admin = %admin.email, app = %form.app, "export token revoked");
+                    Redirect::to("/admin/exports").into_response()
+                }
+                Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not revoke the token").into_response(),
+            }
+        }
+        _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     }
 }
 
