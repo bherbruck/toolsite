@@ -96,7 +96,7 @@ pub(crate) struct RepoRequest {
     #[schemars(description = "The app. For import, the slug the repository will be served at; it need not exist yet.")]
     pub(crate) app: String,
     #[schemars(
-        description = "'status' says what the app deploys from. 'discover' lists repositories tagged toolsite that no app deploys from yet, each with the import call to make (the app argument is ignored; pass any name). 'create' makes a new repository from the app's stored source (publish it with ?source first). 'import' connects a repository you already have, adds the deploy workflow and secrets, and runs it. 'sync' runs the workflow now. 'disconnect' revokes the deploy token and forgets the link; the repository stays. 'installations' lists the accounts the GitHub App is installed on."
+        description = "'status' says where the app's source is mirrored, the last push, which commit the live app came from, whether the repository is ahead of it, and the newest commits. 'discover' lists repositories tagged toolsite that no app is linked to yet, each with the import call to make (the app argument is ignored; pass any name). 'create' makes a new repository from the app's stored source (publish it with ?source first). 'import' links a repository you already have and pulls its branch into the app's source archive. 'pull' pulls the branch again. 'disconnect' forgets the link; the repository stays. 'installations' lists the accounts the GitHub App is installed on."
     )]
     pub(crate) action: String,
     #[schemars(description = "For create: the repository name, default the app's slug. For import: owner/name of the existing repository.")]
@@ -295,6 +295,10 @@ pub(crate) struct RunSqlRequest {
         description = "Values bound to '?' placeholders, in order. Always bind values rather than building SQL by concatenation."
     )]
     pub(crate) params: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "An account email. When set, the statement runs as that person inside the app's declared access, exactly as /me/mcp would run it: only the declared views, current_user() and current_role() bound from the account and its grant, writes only through a policy with write = true. Use it to prove a policy holds before saying so: run the same query as two accounts."
+    )]
+    pub(crate) as_user: Option<String>,
 }
 
 #[derive(Clone)]
@@ -450,7 +454,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Keep an app in a GitHub repository and deploy it from there. GitHub Actions does the building and sends the result to PUT <site>/deploy/<app> with a token that publishes this one app only; toolsite never clones or builds. 'create' needs the app's source to have been published with ?source, names the repository toolsite-<app> unless repo says otherwise, and tags it with the toolsite topic. After a connection, every push to the branch deploys; 'sync' deploys now. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts."
+        description = "Keep an app's source in a GitHub repository, with history. The repository is a mirror: publishing the source of a linked app pushes a commit (say why with ?source&message=...), and a push to the repository is pulled into the app's source archive. Nothing is built or run in GitHub; you build and publish from wherever you run, as always. 'create' needs the app's source to have been published with ?source, names the repository toolsite-<app> unless repo says otherwise, and tags it with the toolsite topic. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts."
     )]
     pub(crate) async fn app_repo(
         &self,
@@ -482,7 +486,7 @@ impl PageHost {
             }
         };
         let outcome: Result<String, String> = match action.as_str() {
-            "status" => Ok(github::describe(config, &app)),
+            "status" => Ok(github::status_text(config, &app).await),
             "installations" => match github::refresh_installations(config).await {
                 Ok(list) if list.is_empty() => Ok("the App is installed nowhere yet".to_string()),
                 Ok(list) => Ok(list.iter().map(|i| format!("{}  {} ({})", i.id, i.account, i.kind)).collect::<Vec<_>>().join("\n")),
@@ -491,13 +495,13 @@ impl PageHost {
             "create" => match pick_installation(installation) {
                 Ok(inst) => github::create(config, &app, inst, repo.as_deref(), !public.unwrap_or(false))
                     .await
-                    .map(|link| format!("created {} on branch {}; pushes to it deploy {app}", link.url(), link.branch)),
+                    .map(|link| format!("created {} on branch {} with the source of {app}. Publishing the source again pushes a commit; a push there is pulled into the source archive. Building and publishing stay with you.", link.url(), link.branch)),
                 Err(why) => Err(why),
             },
             "import" => match (pick_installation(installation), repo.as_deref()) {
                 (Ok(inst), Some(repo)) => github::import(config, &app, inst, repo, branch.as_deref(), directory.as_deref())
                     .await
-                    .map(|link| format!("connected {} ({}) to {app}; the first deploy is running", link.url(), link.branch)),
+                    .map(|link| format!("connected {} ({}) to {app}; its branch is now the source archive. Fetch it with curl '<upload-url>?source' | tar xz, build, and publish; nothing is built here.", link.url(), link.branch)),
                 (Err(why), _) => Err(why),
                 (_, None) => Err("import needs repo: owner/name".into()),
             },
@@ -522,16 +526,18 @@ impl PageHost {
                         .join("\n")
                 }
             }),
-            "sync" => github::sync(config, &app).await.map(|()| format!("workflow started for {app}")),
+            "sync" | "pull" => github::pull(config, &app)
+                .await
+                .map(|p| format!("pulled commit {} into the source archive of {app} ({} bytes)", &p.sha[..p.sha.len().min(7)], p.bytes)),
             "disconnect" => {
                 let (config2, app2) = (config.clone(), app.clone());
                 tokio::task::spawn_blocking(move || github::disconnect(&config2, &app2))
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|r| r)
-                    .map(|link| format!("{app} no longer deploys from {}; the repository is untouched", link.full_name()))
+                    .map(|link| format!("{app} is no longer mirrored at {}; the repository is untouched", link.full_name()))
             }
-            other => Err(format!("action must be status, installations, discover, create, import, sync or disconnect, not '{other}'")),
+            other => Err(format!("action must be status, installations, discover, create, import, pull or disconnect, not '{other}'")),
         };
         Ok(match outcome {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
@@ -540,7 +546,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "A token that may publish one app and nothing else, for CI: PUT <site>/deploy/<app> takes the same flags as an upload ticket (?bundle&spa, ?handler, ?migrations, ?manifest, ?source, ?blob=<key>, or a page) with Authorization: Bearer <token>. app_repo mints one itself for a connected repository; use this for any other pipeline. Returned once, stored only as a hash."
+        description = "A token that may publish one app and nothing else, for a CI system of your own: PUT <site>/deploy/<app> takes the same flags as an upload ticket (?bundle&spa, ?handler, ?migrations, ?manifest, ?source, ?blob=<key>, or a page) with Authorization: Bearer <token>; add &commit=<sha> to say which commit was published. Returned once, stored only as a hash."
     )]
     pub(crate) async fn app_deploy_tokens(
         &self,
@@ -851,6 +857,10 @@ impl PageHost {
              \nKeep the project with the app, since a bundle cannot be turned back into the \
              sources that built it. Visitors only ever see what the bundle contained:\n\
              \n  tar -czf - --exclude node_modules --exclude target . | curl -f -T - '{upload}?source'\n\
+             \nIf the app is linked to a GitHub repository, that upload is also pushed as a commit; \
+             say why with '{upload}?source&message=<url-encoded text>', and name the commit the \
+             build came from with &commit=<sha> so the Repo tab can tell whether the live app \
+             is the repository's head.\n\
              \nAnd to pick up where a previous session left off:\n\
              \n  curl -s '{upload}?source' | tar xz\n\
              \nIt then answers every request under {page}/api/, and any route with no file              behind it. It is rejected at upload if it is not a valid component.\n\
@@ -872,17 +882,39 @@ impl PageHost {
     pub(crate) async fn run_sql(
         &self,
         ctx: RequestContext<RoleServer>,
-        Parameters(RunSqlRequest { app, sql, params }): Parameters<RunSqlRequest>,
+        Parameters(RunSqlRequest { app, sql, params, as_user }): Parameters<RunSqlRequest>,
     ) -> Result<CallToolResult, McpError> {
         if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
             return Ok(refused);
         }
         let config = self.config.clone();
         let params = params.unwrap_or_default();
-        let outcome =
-            tokio::task::spawn_blocking(move || db::run(&config, &app, &sql, &params))
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let as_user = as_user.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        let outcome = tokio::task::spawn_blocking(move || match as_user {
+            None => db::run(&config, &app, &sql, &params),
+            Some(email) => {
+                let user = match crate::accounts::users::account_at_email(&config, &email)? {
+                    crate::accounts::users::AtEmail::Active(user) => user,
+                    crate::accounts::users::AtEmail::Disabled => {
+                        return Err(format!("{email} is disabled; enable the account to run as it"))
+                    }
+                    crate::accounts::users::AtEmail::Nobody => {
+                        return Err(format!("there is no account for {email}"))
+                    }
+                };
+                let identity = db::Identity {
+                    role: crate::accounts::users::role_for(&config, &user.id, &app),
+                    user_id: user.id,
+                    email: user.email.clone(),
+                };
+                let meta = crate::content::store::read_meta_blocking(&config, &app);
+                let scope = db::Scope::of(&meta);
+                tracing::info!(app = %app, as_user = %user.email, "admin ran scoped SQL as an account");
+                db::run_scoped(&config, &app, Some(&identity), &scope, &sql, &params)
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         match outcome {
             Ok(outcome) => {
@@ -975,10 +1007,15 @@ impl PageHost {
                 let files: Vec<(String, String)> = files.into_iter().collect();
                 let count = files.len();
                 crate::runtime::migrate::store(&config, &app, files)?;
-                let (version, ran) = crate::runtime::migrate::apply(&config, &app)?;
-                Ok::<_, String>(format!(
+                let (version, ran, notes) = crate::runtime::migrate::apply(&config, &app)?;
+                let mut text = format!(
                     "{count} migration(s) stored, {ran} applied, now at version {version}"
-                ))
+                );
+                for note in notes {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
+                Ok::<_, String>(text)
             }
             None => {
                 let stored = crate::runtime::migrate::stored(&config, &app);
@@ -993,7 +1030,7 @@ impl PageHost {
                             .collect::<Vec<_>>()
                             .join("\n"),
                         crate::runtime::migrate::apply(&config, &app)
-                            .map(|(version, _)| version)
+                            .map(|(version, ..)| version)
                             .unwrap_or(0)
                     )
                 })

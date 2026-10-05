@@ -198,18 +198,78 @@ can pick the right word; it is a hint, and any role can still be granted.
 There is no public signup. Accounts are created by the owner, and a person
 sets their own password through a one-time link.
 
+## Row-level access
+
+Who may see which rows is declared, not written. Three functions are bound
+on every connection by the host: `current_user()` (the account id),
+`current_email()` and `current_role()` (the grant's role on this app). A
+policy in `toolsite.toml` names a table and a `where` over them; the
+platform generates a view and, with `write = true`, the triggers that carry
+inserts, updates and deletes through to the table and abort when the result
+would be a row the person cannot see.
+
+```toml
+[[access.table]]
+table = "orders"
+where = "owner_id = current_user()"
+owner = "owner_id"      # filled with current_user() on insert when NULL
+write = true            # default false: read only
+```
+
+The person's own rows are the simplest case. Scoping by site, team or
+department reads the attribute from another table in the same database:
+
+```toml
+[[access.table]]
+table = "records"
+where = "location = (select location from members where user_id = current_user())"
+write = true
+```
+
+The `where` may use any table or view in the app's database. It must prepare
+as `select 1 from <table> where (<where>)` and may not contain `;`. The view
+is `my_<table>` unless `view = "..."` says otherwise. A table declared
+`without rowid` cannot take `write = true`. Hand-written views go under
+`[access] views = ["my_summary"]` and are read only.
+
+What this buys: a regular account connects Claude to `<site>/me/mcp`, calls
+`my_apps`, and queries the declared views as themselves. A handler can offer
+the same inside the app with `db::query-scoped(sql, params)`, which runs the
+visitor's SQL inside the declared views and nothing else. The handler's own
+`db::query` is unrestricted and can still read `current_user()`.
+
+Prove a policy before saying it holds: `run_sql(app, sql, as_user: "a@x")`
+runs the statement exactly as that account would through `/me/mcp`. Run the
+same query as two accounts and compare.
+
+The generated objects are rebuilt when the manifest or the schema changes
+and dropped when the policy goes. Do not edit them; edit the policy.
+
 ## A repository
 
-An app can live in GitHub and deploy from there: `app_repo(app, "create")`
-makes a repository out of the source you published with `?source`, named
-`toolsite-<app>` unless you say otherwise and tagged with the `toolsite`
-topic, with a workflow that builds in GitHub Actions and deploys back here
-on every push;
-`app_repo(app, "import", repo: "owner/name")` connects a repository that
-already exists, and `app_repo(any, "discover")` lists the repositories
-tagged `toolsite` that nobody has imported yet, each with its import call. The site has to be configured with a GitHub App for either;
-`app_repo(app, "status")` says. Nothing is built on this server: keep
-publishing the source, and the repository carries it from there.
+An app's source can live in a GitHub repository, with its history. The
+repository is a mirror: toolsite pushes when the source is published and
+pulls when someone pushes. Nothing is built there; you build and publish from
+where you run, as always.
+
+- `app_repo(app, "create")` makes a repository out of the source you
+  published with `?source`, named `toolsite-<app>` unless you say otherwise,
+  tagged with the `toolsite` topic.
+- `app_repo(app, "import", repo: "owner/name")` links a repository that
+  already exists and pulls its branch into the app's source archive; fetch it
+  with `curl '<upload-url>?source' | tar xz`, build, publish.
+- Publishing the source of a linked app pushes a commit. Say why with
+  `'<upload-url>?source&message=<url-encoded text>'`, and name the commit the
+  build came from with `&commit=<sha>` so the Repo tab can tell whether the
+  live app is the repository's head.
+- `app_repo(app, "status")` says where the source is mirrored, the last
+  push, whether the repository is ahead of the live app, and the newest
+  commits. `app_repo(app, "pull")` pulls the branch again;
+  `app_repo(any, "discover")` lists the repositories tagged `toolsite` that
+  nobody has imported yet, each with its import call.
+
+The site has to be configured with a GitHub App for any of this;
+`app_repo(app, "installations")` says whether it is and on which accounts.
 
 ## Settings
 

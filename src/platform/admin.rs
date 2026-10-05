@@ -1147,6 +1147,33 @@ async fn render_access_tab(
             }
         }))
 
+        (ui::panel("Shared data", Some("What a person may query from outside the app, as this account, through /me/mcp. Declared in toolsite.toml under [access]."), html! {
+            @if meta.queryable.is_empty() && meta.policies.is_empty() {
+                p."muted" { "This app shares no data. Add [access] to toolsite.toml to share views." }
+            } @else {
+                table {
+                    thead { tr { th { "View" } th { "Mode" } th { "Source" } } }
+                    tbody {
+                        @for view in &meta.queryable {
+                            tr { td { code { (view) } } td { "read" } td."muted small" { "hand-written view" } }
+                        }
+                        @for policy in &meta.policies {
+                            tr {
+                                td { code { (policy.view) } }
+                                td { @if policy.write { "read, write" } @else { "read" } }
+                                td."muted small" {
+                                    "rows of " code { (policy.table) } " where " code { (policy.where_) }
+                                    @if !meta.generated.iter().any(|g| g.eq_ignore_ascii_case(&policy.view)) {
+                                        " " span."badge warn" { "not generated yet" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+
         (ui::panel("Granted accounts", Some("A grant applies only when access is granted. The app reads the role."), html! {
             form."row" method="post" action="/admin/access" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))

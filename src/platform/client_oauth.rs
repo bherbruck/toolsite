@@ -65,6 +65,18 @@ pub(crate) async fn oauth_protected_resource_metadata(
     }))
 }
 
+/// The same for `/me/mcp`, so a person's client discovers the same server.
+pub(crate) async fn me_protected_resource_metadata(
+    State(config): State<Arc<Config>>,
+) -> impl IntoResponse {
+    let base = issuer(&config);
+    Json(serde_json::json!({
+        "resource": format!("{base}/me/mcp"),
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+    }))
+}
+
 pub(crate) async fn oauth_authorization_server_metadata(
     State(config): State<Arc<Config>>,
 ) -> impl IntoResponse {
@@ -302,30 +314,17 @@ fn validate_request(config: &Config, params: &AuthorizeParams) -> Result<(), Res
     Ok(())
 }
 
-/// Who is at the consent screen, and whether they may say yes.
-async fn consenting_admin(
+/// Who is at the consent screen. Any active account may connect a client:
+/// an admin's client publishes through `/mcp`, anyone else's reads what the
+/// account may open through `/me/mcp`. Which one is decided where the token
+/// is presented, not here.
+async fn consenting_user(
     config: &Arc<Config>,
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<User, Response> {
     match users::current_site_user(config, headers).await {
-        Some(user) if may_publish(config, &user).await => Ok(user),
-        Some(user) => {
-            tracing::warn!(email = %user.email, "authorize refused: no editor or admin scope");
-            Err(plain_page(
-                StatusCode::FORBIDDEN,
-                "This account cannot publish",
-                html! {
-                    p."muted" {
-                        "You are signed in as " (user.email) ". This account can open apps but cannot publish. "
-                        "Ask an admin for editor access to a project, then try again."
-                    }
-                    form method="post" action="/auth/logout" {
-                        button type="submit" { "Sign out" }
-                    }
-                },
-            ))
-        }
+        Some(user) => Ok(user),
         None => {
             let here = match query {
                 Some(query) => format!("/authorize?{query}"),
@@ -349,7 +348,7 @@ pub(crate) async fn authorize_form(
     if let Err(response) = validate_request(&config, &params) {
         return response;
     }
-    let admin = match consenting_admin(&config, &headers, query.as_deref()).await {
+    let admin = match consenting_user(&config, &headers, query.as_deref()).await {
         Ok(admin) => admin,
         Err(response) => return response,
     };
@@ -386,9 +385,18 @@ fn consent(client: &Client, params: &AuthorizeParams, admin: &User, token: &str)
             @if local {
                 p."muted" { "Warning: Any program on this computer can make this request. Continue only if you started this connection." }
             }
-            p."muted" {
-                "The client acts as " (admin.email) " with all permissions of this account. "
-                "The client can publish and remove apps, run SQL on each app, and manage accounts and access."
+            @if admin.is_admin {
+                p."muted" {
+                    "The client acts as " (admin.email) " with all permissions of this account. "
+                    "The client can publish and remove apps, run SQL on each app, and manage accounts and access."
+                }
+            } @else {
+                p."muted" {
+                    "The client acts as " (admin.email) ". "
+                    "The client can list the apps this account may open and read the data those apps "
+                    "share with you. It can change data only where an app permits that. It cannot publish "
+                    "or manage anything."
+                }
             }
             input type="hidden" name="token" value=(token);
             input type="hidden" name="response_type" value=(params.response_type);
@@ -427,7 +435,7 @@ pub(crate) async fn authorize_decide(
     if let Err(response) = validate_request(&config, &params) {
         return response;
     }
-    let admin = match consenting_admin(&config, &headers, None).await {
+    let admin = match consenting_user(&config, &headers, None).await {
         Ok(admin) => admin,
         Err(response) => return response,
     };
@@ -499,27 +507,16 @@ fn pkce_matches(verifier: &str, challenge: &str) -> bool {
     computed.len() == challenge.len() && computed == challenge
 }
 
-/// The account a token is about to be issued to, if it may still publish. A
+/// The account a token is about to be issued to, if it is still active. A
 /// code or refresh token outlives nothing: an account disabled in between is
 /// refused here, and every request after is refused by the bearer check.
+/// Whether the account may publish is `/mcp`'s question, asked there.
 async fn publishing_user(config: &Arc<Config>, user_id: &str) -> Option<User> {
     let (config, id) = (config.clone(), user_id.to_string());
-    tokio::task::spawn_blocking(move || {
-        users::user_by_id(&config, &id)
-            .filter(|user| users::holds_anywhere(&config, user, users::Scope::Editor))
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Whether the account may connect a publishing client: a site admin, or
-/// an editor or admin somewhere in the project tree.
-async fn may_publish(config: &Arc<Config>, user: &User) -> bool {
-    let (config, user) = (config.clone(), user.clone());
-    tokio::task::spawn_blocking(move || users::holds_anywhere(&config, &user, users::Scope::Editor))
+    tokio::task::spawn_blocking(move || users::user_by_id(&config, &id))
         .await
-        .unwrap_or(false)
+        .ok()
+        .flatten()
 }
 
 fn token_response(issued: store::Issued) -> Response {
@@ -629,8 +626,8 @@ pub(crate) async fn token_endpoint(
 // --- bearer ---------------------------------------------------------------
 
 /// The account behind an access token, if the token is live and the account
-/// may still publish. What the bearer middleware asks for anything that is
-/// not a static token.
+/// is still active. What the bearer middleware asks for anything that is not
+/// a static token; `/mcp` then insists on an admin, `/me/mcp` does not.
 pub(crate) async fn token_user(config: &Arc<Config>, token: &str) -> Option<User> {
     let (lookup, presented) = (config.clone(), token.to_string());
     let (user_id, _client) = tokio::task::spawn_blocking(move || {

@@ -50,11 +50,12 @@ pub fn stored(config: &Config, app: &str) -> Vec<(String, String)> {
 }
 
 /// Brings an app's database up to its latest migration, returning the version
-/// it reached and how many steps ran.
-pub fn apply(config: &Config, app: &str) -> Result<(usize, usize), String> {
+/// it reached, how many steps ran, and anything worth saying about the
+/// access policies that were rebuilt on the new schema.
+pub fn apply(config: &Config, app: &str) -> Result<(usize, usize, Vec<String>), String> {
     let files = stored(config, app);
     if files.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, Vec::new()));
     }
     let path = db::db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
 
@@ -78,7 +79,21 @@ pub fn apply(config: &Config, app: &str) -> Result<(usize, usize), String> {
         .map(|version| version as usize)
         .unwrap_or(0);
     db::lock_down(&conn)?;
-    Ok((after, after.saturating_sub(before)))
+    drop(conn);
+
+    // The schema moved, so the generated views are rebuilt on it: a column
+    // added here reaches `select *` only through a fresh `create view`.
+    let mut meta = crate::content::store::read_meta_blocking(config, app);
+    let mut notes = Vec::new();
+    if !meta.policies.is_empty() || !meta.generated.is_empty() {
+        let (generated, access_notes) = crate::runtime::access::regenerate(config, app, &meta)?;
+        notes = access_notes;
+        if meta.generated != generated {
+            meta.generated = generated;
+            crate::content::store::write_meta_blocking(config, app, &meta)?;
+        }
+    }
+    Ok((after, after.saturating_sub(before), notes))
 }
 
 #[cfg(test)]
@@ -115,11 +130,11 @@ mod tests {
         )
         .unwrap();
 
-        let (version, ran) = apply(&config, "app").unwrap();
+        let (version, ran, _) = apply(&config, "app").unwrap();
         assert_eq!((version, ran), (2, 2));
         // Running again is a no-op rather than an error, which is what makes
         // a redeploy safe.
-        assert_eq!(apply(&config, "app").unwrap(), (2, 0));
+        assert_eq!(apply(&config, "app").map(|(v, r, _)| (v, r)).unwrap(), (2, 0));
 
         db::run(&config, "app", "insert into todos (body) values (?)", &[serde_json::json!("x")])
             .unwrap();
@@ -148,7 +163,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let (version, ran) = apply(&config, "app").unwrap();
+        let (version, ran, _) = apply(&config, "app").unwrap();
         assert_eq!((version, ran), (2, 1), "the new step did not run");
 
         let rows = db::run(&config, "app", "select body from todos", &[]).unwrap();
@@ -181,6 +196,6 @@ mod tests {
         store(&config, "mine", vec![("001.sql".into(), "create table mine (a)".into())]).unwrap();
         apply(&config, "mine").unwrap();
         assert!(stored(&config, "theirs").is_empty());
-        assert_eq!(apply(&config, "theirs").unwrap(), (0, 0));
+        assert_eq!(apply(&config, "theirs").map(|(v, r, _)| (v, r)).unwrap(), (0, 0));
     }
 }

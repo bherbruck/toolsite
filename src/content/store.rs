@@ -79,6 +79,36 @@ pub struct PageMeta {
     /// editor may remove what it created and nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Hand-written views a person may query from outside the app, read
+    /// only. Declared as `[access] views = [...]` in toolsite.toml.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queryable: Vec<String>,
+    /// Row-level access policies, declared as `[[access.table]]`. The
+    /// platform generates a view per policy, and triggers when it may write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<Policy>,
+    /// Names of the views and triggers the platform generated from the
+    /// policies, so a policy that is removed takes its objects with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated: Vec<String>,
+}
+
+/// One row-level access policy: who may see, and perhaps change, which rows
+/// of one table. `where_` is SQL written against the app's own tables and the
+/// identity functions `current_user()`, `current_email()`, `current_role()`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
+pub struct Policy {
+    pub table: String,
+    /// The view people query. Defaults to `my_<table>`.
+    pub view: String,
+    #[serde(rename = "where")]
+    pub where_: String,
+    /// A column filled with `current_user()` on insert when left NULL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Whether inserts, updates and deletes go through the view too.
+    #[serde(default)]
+    pub write: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -126,6 +156,9 @@ impl Default for PageMeta {
             project: None,
             created_by: None,
             roles: Vec::new(),
+            queryable: Vec::new(),
+            policies: Vec::new(),
+            generated: Vec::new(),
         }
     }
 }
@@ -181,6 +214,19 @@ pub async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io
     }
     let json = serde_json::to_string(meta).map_err(std::io::Error::other)?;
     fs::write(&path, json).await
+}
+
+/// `write_meta` for a blocking task, which is where migrations run. Writes
+/// to the same file `read_meta_blocking` reads.
+pub fn write_meta_blocking(config: &Config, slug: &str, meta: &PageMeta) -> Result<(), String> {
+    let direct = config.data_dir.join(format!("{slug}.meta"));
+    let inner = config.data_dir.join(format!("{slug}/index.meta"));
+    let path = if direct.is_file() || !inner.is_file() { direct } else { inner };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string(meta).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
 /// Coarse "when did this change" for the index; exact timestamps aren't worth

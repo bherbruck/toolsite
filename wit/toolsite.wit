@@ -31,8 +31,16 @@ interface db {
     }
 
     /// Runs one statement. Values are bound, never interpolated — there is no
-    /// string-building entry point on purpose.
+    /// string-building entry point on purpose. Inside the SQL,
+    /// `current_user()`, `current_email()` and `current_role()` answer for
+    /// the signed-in visitor, or NULL when there is none.
     query: func(sql: string, params: list<value>) -> result<rows, error>;
+
+    /// Runs one statement as the visitor, inside the app's declared access:
+    /// the views named in toolsite.toml, read, and written only where a
+    /// policy says `write = true`. Nothing else in the database is reachable,
+    /// whatever the SQL says. For an app that lets its own users type SQL.
+    query-scoped: func(sql: string, params: list<value>) -> result<rows, error>;
 }
 
 /// Values the site's owner set for this app: API keys, endpoints, anything

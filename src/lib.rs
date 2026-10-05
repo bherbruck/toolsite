@@ -12,13 +12,15 @@ use crate::{
     content::serve::{index, serve_icon, serve_page},
     platform::{
         admin, blob_upload,
-        bearer::require_bearer,
+        bearer::{require_bearer, require_person},
         deploy, export, github,
         client_oauth::{
             authorize_decide, authorize_form, oauth_authorization_server_metadata,
-            oauth_protected_resource_metadata, register, token_endpoint,
+            me_protected_resource_metadata, oauth_protected_resource_metadata, register,
+            token_endpoint,
         },
         mcp::PageHost,
+        mcp_me::MeHost,
         scaffold, secrets,
         upload::{self, upload_root, upload_sub, MAX_UPLOAD_BYTES},
     },
@@ -73,6 +75,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         None => StreamableHttpServerConfig::default().disable_allowed_hosts(),
     };
 
+    let me_host_config = host_config.clone();
     let mcp_config = config.clone();
     let mcp_runtime = runtime.clone();
     let mcp_service = StreamableHttpService::new(
@@ -84,6 +87,18 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     let mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn_with_state(config.clone(), require_bearer));
+
+    // The same transport for a regular account, with two tools and the
+    // account itself carried on the request by the middleware.
+    let me_config = config.clone();
+    let me_service = StreamableHttpService::new(
+        move || Ok(MeHost::new(me_config.clone())),
+        LocalSessionManager::default().into(),
+        me_host_config,
+    );
+    let me_router = Router::new()
+        .nest_service("/me/mcp", me_service)
+        .layer(middleware::from_fn_with_state(config.clone(), require_person));
 
     let mut public_router = Router::new()
         .route("/", get(index))
@@ -135,7 +150,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/folder", post(admin::new_folder))
         .route("/admin/move", post(admin::move_app))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
-        // An app's repository: GitHub Actions builds, a per-app token deploys.
+        // An app's repository: a source mirror, pushed on publish and pulled on push.
         .route("/admin/github", get(github::github_page))
         .route("/admin/github/repos/search", get(github::repos_search))
         .route("/admin/repo", post(github::repo_action))
@@ -176,6 +191,10 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
                 get(oauth_protected_resource_metadata),
             )
             .route(
+                "/.well-known/oauth-protected-resource/me/mcp",
+                get(me_protected_resource_metadata),
+            )
+            .route(
                 "/.well-known/oauth-authorization-server",
                 get(oauth_authorization_server_metadata),
             )
@@ -193,5 +212,5 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     crate::platform::schedule::spawn(state.clone());
     let public_router = public_router.with_state(state);
 
-    Router::new().merge(mcp_router).merge(public_router)
+    Router::new().merge(mcp_router).merge(me_router).merge(public_router)
 }

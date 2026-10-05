@@ -40,6 +40,7 @@ ui.rs              the theme for pages toolsite serves itself
 platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
   mcp.rs           MCP tool definitions and the ServerHandler
+  mcp_me.rs        /me/mcp: a regular account's two tools over the data apps share
   bearer.rs        bearer/x-api-key middleware for /mcp
   client_oauth.rs  the OAuth server MCP clients sign in through — who may PUBLISH
   oauth_store.rs   its clients, codes and tokens, in .site/oauth.db
@@ -47,7 +48,7 @@ platform/          the site as its owner uses it
   blob_upload.rs   PUT /blob/<ticket>: a browser's file, streamed to storage
   export.rs        GET /export/<app>.sqlite: one app's database for a per-app token
   deploy.rs        PUT /deploy/<app>: what an upload ticket takes, for a per-app token
-  github.rs        the GitHub App: repositories created or imported, their workflow, webhook
+  github.rs        the GitHub App: a repository per app as a source mirror, push on publish, pull on push
   scaffold.rs      the WIT and a buildable crate, served to agents
   secrets.rs       per-app settings, sealed at rest, entered by a person
   schedule.rs      cron jobs, run through the same handler a request uses
@@ -60,7 +61,8 @@ content/           what gets published, and how it is served
 
 runtime/           executing an app's own code and data
   wasm.rs          engine, guards, host imports
-  db.rs            per-app SQLite and the authorizer keeping apps apart
+  db.rs            per-app SQLite, the identity functions, the authorizers (apps apart; a person inside the views)
+  access.rs        row-level policies from toolsite.toml, realised as views and triggers
   blobs.rs         per-app files, on the volume or in a bucket, keyed like paths
 
 accounts/          people who USE published apps

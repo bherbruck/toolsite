@@ -53,9 +53,25 @@ pub(crate) async fn require_bearer(
     if let Some(token) = presented.filter(|_| config.oauth_enabled())
         && let Some(user) = client_oauth::token_user(&config, token).await
     {
-        tracing::debug!(email = %user.email, "mcp request as a signed-in account");
-        request.extensions_mut().insert(Caller { user: Some(user) });
-        return next.run(request).await;
+        let (may_publish_config, may_publish_user) = (config.clone(), user.clone());
+        let may_publish = tokio::task::spawn_blocking(move || {
+            crate::accounts::users::holds_anywhere(&may_publish_config, &may_publish_user, crate::accounts::users::Scope::Editor)
+        })
+        .await
+        .unwrap_or(false);
+        if may_publish {
+            tracing::debug!(email = %user.email, "mcp request as a signed-in account");
+            request.extensions_mut().insert(Caller { user: Some(user) });
+            return next.run(request).await;
+        }
+        // A real account, but one that may publish nowhere. Its client
+        // belongs on /me/mcp; say so rather than a bare 401.
+        tracing::warn!(email = %user.email, path = %request.uri().path(), "401: the account holds no editor or admin scope; use /me/mcp");
+        return (
+            StatusCode::UNAUTHORIZED,
+            "this account cannot publish; connect to /me/mcp to read what it may open\n",
+        )
+            .into_response();
     }
 
     // A rejected client usually reports nothing more than "can't connect", so
@@ -87,6 +103,40 @@ pub(crate) async fn require_bearer(
     if let Some(base) = config.base_url.as_deref()
         && let Ok(value) =
             format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource""#)
+                .parse()
+    {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+/// `/me/mcp`: any active account's OAuth token, and the account travels with
+/// the request so the tools know who is asking. A static token is refused
+/// here: it names nobody, and everything on this endpoint is about who.
+pub(crate) async fn require_person(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    mut request: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    let presented = presented_token(&headers);
+    if let Some(token) = presented.filter(|_| config.oauth_enabled())
+        && let Some(user) = client_oauth::token_user(&config, token).await
+    {
+        tracing::debug!(email = %user.email, "me/mcp request");
+        request.extensions_mut().insert(user);
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        method = %request.method(),
+        path = %request.uri().path(),
+        token_presented = presented.is_some(),
+        "401: no account token for /me/mcp"
+    );
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    if let Some(base) = config.base_url.as_deref()
+        && let Ok(value) =
+            format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/me/mcp""#)
                 .parse()
     {
         response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
