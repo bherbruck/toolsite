@@ -1285,17 +1285,34 @@ pub async fn new_account_page(State(config): State<Arc<Config>>, headers: Header
             subtitle: None,
             actions: None,
             script: None,
-            body: ui::panel("New account", Some("If you set a password here, you must send it to the account owner. The safer option is a setup link from toolsite user add."), html! {
+            body: ui::panel("New account", Some("By default the account owner gets a setup link and chooses the password. Set a password here only for a shared login."), html! {
                 form method="post" action="/admin/users" {
                     (hidden("token", &token)) (hidden("back", "/admin/accounts"))
                     div."field" {
                         label for="email" { "Email" }
                         input id="email" name="email" type="email" required autofocus;
                     }
+                    div."choices" {
+                        label."choice" {
+                            input type="radio" name="mode" value="invite" checked;
+                            strong { "Send a setup link" }
+                            span { "You get a link to send. The owner opens it and chooses a password. The link works one time and for 48 hours." }
+                        }
+                        label."choice" {
+                            input type="radio" name="mode" value="generate";
+                            strong { "Generate a strong password" }
+                            span { "For a login that a group shares. Toolsite makes a 20-character password and shows it one time." }
+                        }
+                        label."choice" {
+                            input type="radio" name="mode" value="password";
+                            strong { "Set a password now" }
+                            span { "Enter the password yourself. You must give it to the people who use it." }
+                        }
+                    }
                     div."field" {
                         label for="password" { "Password" }
-                        input id="password" name="password" type="password" minlength="8" required;
-                        p."help" { "Enter at least 8 characters. The owner can change the password later." }
+                        input id="password" name="password" type="password" minlength="8" autocomplete="new-password";
+                        p."help" { "Only used with \"Set a password now\". Enter at least 8 characters." }
                     }
                     label."choice" {
                         input type="checkbox" name="admin" value="1";
@@ -1384,9 +1401,23 @@ pub(crate) async fn checked(config: &Arc<Config>, headers: &HeaderMap, token: &s
 pub struct NewAccount {
     token: String,
     email: String,
-    password: String,
+    /// "invite" (the default) or "password". A password with no mode means
+    /// "password", which is what the older form sent.
+    mode: Option<String>,
+    password: Option<String>,
     admin: Option<String>,
     back: Option<String>,
+}
+
+/// Twenty characters from letters and digits, which every password field
+/// and every chat window accepts without mangling. About 119 bits.
+fn strong_password() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    (0..20)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 pub async fn add_account(
@@ -1394,19 +1425,101 @@ pub async fn add_account(
     headers: HeaderMap,
     Form(form): Form<NewAccount>,
 ) -> Response {
-    if let Err(response) = checked(&config, &headers, &form.token).await {
-        return response;
-    }
+    let admin = match checked(&config, &headers, &form.token).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
     let back = back_or(form.back.as_deref(), "/admin/accounts");
     let is_admin = form.admin.is_some();
+    let email = form.email.trim().to_lowercase();
+    let password = form.password.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let mode = match form.mode.as_deref() {
+        Some(mode) => mode.to_string(),
+        None if password.is_some() => "password".to_string(),
+        None => "invite".to_string(),
+    };
+
+    if mode == "password" || mode == "generate" {
+        let generated = mode == "generate";
+        let password = if generated {
+            strong_password()
+        } else {
+            match password {
+                Some(password) => password.to_string(),
+                None => return redirect_flash("/admin/accounts/new", false, "Enter a password, or choose the setup link."),
+            }
+        };
+        let config2 = config.clone();
+        let (for_login, to_hash) = (email.clone(), password.clone());
+        let outcome = tokio::task::spawn_blocking(move || {
+            users::sign_up_as(&config2, &for_login, &to_hash, is_admin)
+        })
+        .await;
+        return match outcome {
+            Ok(Ok(_)) if generated => {
+                tracing::info!(admin = %admin.email, account = %email, "account created with a generated password");
+                admin_page(
+                    &headers,
+                    &admin,
+                    Page {
+                        active: "accounts",
+                        title: "Account created",
+                        crumbs: vec![("Accounts", "/admin/accounts")],
+                        subtitle: Some(html! { (email) }),
+                        actions: None,
+                        script: None,
+                        body: html! {
+                            (ui::panel("Password", Some("Give this password to the people who use the login. It is shown one time only."), html! {
+                                (ui::secret("generated-password", &password))
+                                p."muted small" { "If the password is lost, open the account and create a new setup link." }
+                            }))
+                            div."actions" {
+                                a."btn" href={ "/admin/accounts/" (email) } { "Open account" }
+                                a."btn quiet" href="/admin/accounts" { "Back to accounts" }
+                            }
+                        },
+                    },
+                )
+            }
+            Ok(Ok(_)) => redirect_flash(&back, true, format!("Account {email} is created.")),
+            Ok(Err(message)) => redirect_flash("/admin/accounts/new", false, message),
+            Err(_) => redirect_flash(&back, false, "The account was not created."),
+        };
+    }
+
     let config2 = config.clone();
-    let email = form.email.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        users::sign_up_as(&config2, &form.email, &form.password, is_admin)
-    })
-    .await;
+    let for_invite = email.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || users::invite(&config2, &for_invite, is_admin)).await;
     match outcome {
-        Ok(Ok(_)) => redirect_flash(&back, true, format!("Account {email} is created.")),
+        // Rendered, not redirected: the link is in this response and nowhere
+        // else, like a token.
+        Ok(Ok((_, setup_token))) => {
+            let link = users::invite_url(&config, &setup_token);
+            tracing::info!(admin = %admin.email, account = %email, "account created with a setup link");
+            admin_page(
+                &headers,
+                &admin,
+                Page {
+                    active: "accounts",
+                    title: "Account created",
+                    crumbs: vec![("Accounts", "/admin/accounts")],
+                    subtitle: Some(html! { (email) }),
+                    actions: None,
+                    script: None,
+                    body: html! {
+                        (ui::panel("Setup link", Some("Send this link to the account owner. The link works one time and for 48 hours. It is shown one time only."), html! {
+                            (ui::secret("setup-link", &link))
+                            p."muted small" { "If the link is lost, open the account and create a new setup link." }
+                        }))
+                        div."actions" {
+                            a."btn" href={ "/admin/accounts/" (email) } { "Open account" }
+                            a."btn quiet" href="/admin/accounts" { "Back to accounts" }
+                        }
+                    },
+                },
+            )
+        }
         Ok(Err(message)) => redirect_flash("/admin/accounts/new", false, message),
         Err(_) => redirect_flash(&back, false, "The account was not created."),
     }

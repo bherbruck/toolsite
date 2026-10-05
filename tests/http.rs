@@ -3690,3 +3690,61 @@ async fn a_new_export_token_comes_with_the_pull_ready_to_paste() {
     assert!(line.ends_with("-o sales.sqlite http://localhost:8080/export/sales.sqlite"), "{line}");
     assert!(page.contains(r#"data-copy="fresh-token-curl""#), "the pull has no copy button");
 }
+
+#[tokio::test]
+async fn an_admin_creates_an_account_with_a_setup_link_the_owner_uses_once() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/admin/accounts/new", &boss)).await;
+    let token = form_token_from(&page);
+    assert!(page.contains(r#"value="invite" checked"#), "the setup link is not the default");
+
+    let (status, page, _) = send(
+        &config,
+        post_form("/admin/users", &boss, format!("token={token}&email=new@example.com&mode=invite")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let link = page
+        .split("/auth/setup?token=")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("no setup link on the page");
+    let setup = link.trim().to_string();
+    assert!(toolsite::accounts::users::invited_account(&config, &setup).is_some(), "the link does not open the account");
+    // No password yet: nobody can sign in as them until they choose one.
+    assert!(toolsite::accounts::users::log_in(&config, "new@example.com", "anything-at-all").is_err());
+
+    // The shared-login path still sets a password directly.
+    let (status, ..) = send(
+        &config,
+        post_form("/admin/users", &boss, format!("token={token}&email=shared@example.com&mode=password&password=correct+horse+battery")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(toolsite::accounts::users::log_in(&config, "shared@example.com", "correct horse battery").is_ok());
+    // A generated password is shown one time and works.
+    let (status, page, _) = send(
+        &config,
+        post_form("/admin/users", &boss, format!("token={token}&email=kiosk@example.com&mode=generate")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let generated = page
+        .split(r#"id="generated-password">"#)
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("no generated password shown")
+        .to_string();
+    assert_eq!(generated.len(), 20);
+    assert!(generated.chars().all(|c| c.is_ascii_alphanumeric()));
+    assert!(toolsite::accounts::users::log_in(&config, "kiosk@example.com", &generated).is_ok());
+    // Asking for a password without giving one is refused, not silently invited.
+    let (_, _, headers) = send(
+        &config,
+        post_form("/admin/users", &boss, format!("token={token}&email=third@example.com&mode=password")),
+    )
+    .await;
+    assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")));
+}
