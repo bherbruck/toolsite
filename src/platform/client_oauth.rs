@@ -406,9 +406,9 @@ fn consent(client: &Client, params: &AuthorizeParams, admin: &User, token: &str)
             @if let Some(resource) = &params.resource {
                 input type="hidden" name="resource" value=(resource);
             }
-            div."row" {
+            div."actions consent" {
                 button type="submit" name="decision" value="allow" { "Allow access" }
-                button."danger" type="submit" name="decision" value="deny" { "Deny access" }
+                button."quiet" type="submit" name="decision" value="deny" { "Deny access" }
             }
         }
     }

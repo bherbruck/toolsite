@@ -177,6 +177,9 @@ form.column { display: flex; flex-direction: column; gap: var(--gap); }
 .choice span { grid-column: 2; color: var(--muted); font-size: .85rem; }
 .actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
 .actions.end { justify-content: flex-end; }
+/* The one question a consent page asks: two buttons, room between them. */
+.actions.consent { gap: .75rem; margin-top: .75rem; }
+.actions.consent button { flex: 1; justify-content: center; }
 
 /* Tables: a list of things, each row a place to go. */
 table { width: 100%; border-collapse: collapse; font-size: .9rem; }
@@ -498,7 +501,8 @@ pub const SHELL_SCRIPT: &str = r#"
         none.textContent = 'No matches for ' + q;
         menu.appendChild(none);
       }
-      found.forEach((item, i) => {
+      found.forEach((raw, i) => {
+        const item = typeof raw === 'string' ? { value: raw } : raw;
         const li = document.createElement('li');
         li.id = menu.id + '-' + i;
         li.setAttribute('role', 'option');
@@ -530,7 +534,14 @@ pub const SHELL_SCRIPT: &str = r#"
         if (controller) controller.abort();
         controller = new AbortController();
         try {
-          const res = await fetch(input.dataset.search + '?q=' + encodeURIComponent(q), {
+          // A search that depends on another field of the same form
+          // sends that field's value along, named by data-search-with.
+          let url = input.dataset.search + '?q=' + encodeURIComponent(q);
+          const withField = input.dataset.searchWith;
+          if (withField && input.form && input.form.elements[withField]) {
+            url += '&' + encodeURIComponent(withField) + '=' + encodeURIComponent(input.form.elements[withField].value);
+          }
+          const res = await fetch(url, {
             credentials: 'same-origin', signal: controller.signal,
           });
           if (!res.ok) return;
@@ -746,10 +757,37 @@ pub fn tabs(items: &[(&str, &str, &str)], active: &str) -> Markup {
 /// width of the input, picked with the keyboard or the mouse. Without
 /// script it is a text input that submits whatever was typed.
 pub fn combobox(name: &str, search_url: &str, placeholder: &str) -> Markup {
-    let menu_id = format!("{name}-matches");
+    combobox_prefilled(name, search_url, placeholder, "", None)
+}
+
+/// The same control with a starting value, and optionally the name of
+/// another field in the same form whose value is sent along with every
+/// search (`with`), for a search that depends on a choice made above it.
+pub fn combobox_prefilled(
+    name: &str,
+    search_url: &str,
+    placeholder: &str,
+    value: &str,
+    with: Option<&str>,
+) -> Markup {
+    combobox_full(name, search_url, placeholder, value, with, "")
+}
+
+/// Several comboboxes of one name on a page need an `id_suffix` each, so
+/// their menus do not share an id.
+pub fn combobox_full(
+    name: &str,
+    search_url: &str,
+    placeholder: &str,
+    value: &str,
+    with: Option<&str>,
+    id_suffix: &str,
+) -> Markup {
+    let menu_id = format!("{name}{id_suffix}-matches");
     html! {
         div."combo" {
             input name=(name) placeholder=(placeholder) data-search=(search_url)
+                  data-search-with=[with] value=(value)
                   autocomplete="off" required
                   role="combobox" aria-autocomplete="list" aria-expanded="false"
                   aria-controls=(menu_id) aria-haspopup="listbox";
