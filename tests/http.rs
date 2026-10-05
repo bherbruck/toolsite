@@ -3787,7 +3787,7 @@ async fn an_admin_creates_an_account_with_a_setup_link_the_owner_uses_once() {
 struct Mcp {
     router: axum::Router,
     token: String,
-    session: String,
+    session: Option<String>,
     next_id: u64,
 }
 
@@ -3821,34 +3821,32 @@ impl Mcp {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "initialize refused");
+        // Stateless transport: no session id is issued, and none is needed.
         let session = response
             .headers()
             .get("mcp-session-id")
-            .expect("no session id")
-            .to_str()
-            .unwrap()
-            .to_string();
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let mut mcp = Mcp { router, token: token.to_string(), session, next_id: 1 };
         mcp.post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
         mcp
     }
 
     async fn post(&mut self, body: &str) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(session) = &self.session {
+            builder = builder.header("mcp-session-id", session);
+        }
         let response = self
             .router
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("host", "localhost")
-                    .header("authorization", format!("Bearer {}", self.token))
-                    .header("mcp-session-id", &self.session)
-                    .header("content-type", "application/json")
-                    .header("accept", "application/json, text/event-stream")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -4217,7 +4215,9 @@ async fn mcp_post(router: &axum::Router, path: &str, token: &str, session: Optio
     (status, session, json)
 }
 
-/// Initialises a session and returns its id.
+/// Initialises a session and returns its id, when the transport issues one.
+/// toolsite's transport is stateless, so this is usually empty and the later
+/// calls stand on their own.
 async fn mcp_session(router: &axum::Router, path: &str, token: &str) -> String {
     let (status, session, json) = mcp_post(
         router,
@@ -4228,12 +4228,12 @@ async fn mcp_session(router: &axum::Router, path: &str, token: &str) -> String {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
-    let session = session.expect("no session id");
+    let session = session.unwrap_or_default();
     let (status, ..) = mcp_post(
         router,
         path,
         token,
-        Some(&session),
+        (!session.is_empty()).then_some(session.as_str()),
         serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
     )
     .await;
@@ -4247,7 +4247,7 @@ async fn mcp_tool(router: &axum::Router, path: &str, token: &str, session: &str,
         router,
         path,
         token,
-        Some(session),
+        (!session.is_empty()).then_some(session),
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
     )
     .await;

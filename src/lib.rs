@@ -60,19 +60,27 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     // (DNS-rebinding protection) against an allowlist that defaults to
     // localhost only. Deployed behind a real domain, that must include the
     // public host or every request 403s before auth even runs.
+    //
+    // Stateless, because not every client keeps a session: ChatGPT's connector
+    // sends its first request with no session id and it is not `initialize`,
+    // and a stateful transport answers 422 and the connector gives up. The
+    // spec allows a server to hold no session, every request here stands on
+    // its own (a fresh PageHost is cheap), and a client that does initialize
+    // first loses nothing.
+    let transport = StreamableHttpServerConfig::default().with_stateful_mode(false);
     let host_config = match config
         .base_url
         .as_deref()
         .and_then(|b| b.parse::<Uri>().ok())
         .and_then(|u| u.authority().map(|a| a.as_str().to_string()))
     {
-        Some(authority) => StreamableHttpServerConfig::default().with_allowed_hosts([
+        Some(authority) => transport.with_allowed_hosts([
             authority,
             "localhost".to_string(),
             "127.0.0.1".to_string(),
             "::1".to_string(),
         ]),
-        None => StreamableHttpServerConfig::default().disable_allowed_hosts(),
+        None => transport.disable_allowed_hosts(),
     };
 
     let me_host_config = host_config.clone();

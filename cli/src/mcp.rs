@@ -12,7 +12,9 @@ pub struct Mcp {
     client: Client,
     url: String,
     token: String,
-    session: String,
+    /// Present when the server is stateful. toolsite itself is stateless
+    /// and issues none; the header is sent only when there is one.
+    session: Option<String>,
 }
 
 impl Mcp {
@@ -51,8 +53,7 @@ impl Mcp {
             .headers()
             .get("mcp-session-id")
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| anyhow!("server did not issue a session id"))?
-            .to_string();
+            .map(str::to_string);
 
         let mcp = Self {
             client,
@@ -67,7 +68,7 @@ impl Mcp {
             .bearer_auth(&mcp.token)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .header("mcp-session-id", &mcp.session)
+            .headers(session_header(&mcp.session))
             .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
             .send()?;
 
@@ -83,7 +84,7 @@ impl Mcp {
             .bearer_auth(&self.token)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .header("mcp-session-id", &self.session)
+            .headers(session_header(&self.session))
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -116,6 +117,17 @@ impl Mcp {
         }
         Ok(text)
     }
+}
+
+/// The session header when the server issued one, else nothing.
+fn session_header(session: &Option<String>) -> reqwest::header::HeaderMap {
+    let mut map = reqwest::header::HeaderMap::new();
+    if let Some(session) = session
+        && let Ok(value) = session.parse()
+    {
+        map.insert("mcp-session-id", value);
+    }
+    map
 }
 
 /// Pulls the first JSON object out of an SSE stream.
