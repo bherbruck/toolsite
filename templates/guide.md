@@ -194,8 +194,10 @@ sets their own password through a one-time link.
 ## A repository
 
 An app can live in GitHub and deploy from there: `app_repo(app, "create")`
-makes a repository out of the source you published with `?source`, with a
-workflow that builds in GitHub Actions and deploys back here on every push;
+makes a repository out of the source you published with `?source`, named
+`toolsite-<app>` unless you say otherwise and tagged with the `toolsite`
+topic, with a workflow that builds in GitHub Actions and deploys back here
+on every push;
 `app_repo(app, "import", repo: "owner/name")` connects a repository that
 already exists. The site has to be configured with a GitHub App for either;
 `app_repo(app, "status")` says. Nothing is built on this server: keep

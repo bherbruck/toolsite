@@ -453,6 +453,10 @@ pub fn workflow_for(app: &str, branch: &str, directory: &str) -> String {
 
 // --- talking to a repository ---------------------------------------------------
 
+/// Every repository this site creates or imports carries this topic, so
+/// they are one search away on GitHub.
+const TOPIC: &str = "toolsite";
+
 struct Repo<'a> {
     app: &'a App,
     token: String,
@@ -487,6 +491,33 @@ impl Repo<'_> {
         } else {
             Err(format!("{what} failed ({status}): {}", api_message(&json)))
         }
+    }
+
+    /// Adds the `toolsite` topic, keeping whatever topics the repository
+    /// already has. Best effort: a repository that cannot be tagged is still
+    /// a repository, so the caller logs and carries on.
+    async fn tag_toolsite(&self) -> Result<(), String> {
+        let (status, current) = self.call(reqwest::Method::GET, "/topics", None).await?;
+        let mut names: Vec<String> = if status.is_success() {
+            current["names"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if names.iter().any(|n| n == TOPIC) {
+            return Ok(());
+        }
+        names.push(TOPIC.to_string());
+        self.expect(
+            "tagging the repository",
+            reqwest::Method::PUT,
+            "/topics",
+            Some(serde_json::json!({ "names": names })),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// The repository's record, or the reason it cannot be reached.
@@ -707,7 +738,10 @@ pub async fn create(
     if let Some(existing) = link(config, app_name) {
         return Err(format!("{app_name} is already connected to {}; disconnect it first", existing.full_name()));
     }
-    let repo_name = repo_name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(app_name);
+    // toolsite-<app> by default, so the repositories this site made are
+    // recognisable in a long list and sort together.
+    let default_name = format!("toolsite-{app_name}");
+    let repo_name = repo_name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&default_name);
     if !valid_repo_name(repo_name) {
         return Err(format!("{repo_name} is not a repository name: letters, digits, '-', '_' and '.'"));
     }
@@ -750,6 +784,9 @@ pub async fn create(
     let branch = created["default_branch"].as_str().unwrap_or("main").to_string();
     let repo = open_repo(app, installation_id, &owner, &name).await?;
     let full_name = repo.owner.clone() + "/" + &repo.name;
+    if let Err(why) = repo.tag_toolsite().await {
+        tracing::warn!(repo = %full_name, %why, "could not add the toolsite topic");
+    }
 
     let (token_id, deploy_token) = mint_deploy_token(config, app_name, &full_name)?;
     repo.put_secret(SECRET_URL, &site).await?;
@@ -805,6 +842,9 @@ pub async fn import(
     let directory = clean_directory(directory)?;
     installation(config, installation_id).await?;
     let repo = open_repo(app, installation_id, owner, name).await?;
+    if let Err(why) = repo.tag_toolsite().await {
+        tracing::warn!(repo = %format!("{owner}/{name}"), %why, "could not add the toolsite topic");
+    }
     let record = repo.get().await?;
     let branch = match branch.map(str::trim).filter(|b| !b.is_empty()) {
         Some(branch) if valid_branch(branch) => branch.to_string(),
@@ -1361,7 +1401,7 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
                             }
                             div."field" {
                                 label for="create-name" { "Repository name" }
-                                input id="create-name" name="repo" value=(app) required pattern="[A-Za-z0-9._-]+";
+                                input id="create-name" name="repo" value={ "toolsite-" (app) } required pattern="[A-Za-z0-9._-]+";
                             }
                             label."choice" {
                                 input type="checkbox" name="private" value="1" checked;

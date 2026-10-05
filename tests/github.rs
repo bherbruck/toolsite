@@ -202,6 +202,7 @@ mod fake_github {
         pub dispatches: Vec<String>,
         pub head: String,
         pub commits_made: usize,
+        pub topics: Vec<String>,
     }
 
     pub struct Fake {
@@ -244,6 +245,7 @@ mod fake_github {
                     dispatches: Vec::new(),
                     head: commit,
                     commits_made: 0,
+                    topics: Vec::new(),
                 },
             );
         }
@@ -272,6 +274,7 @@ mod fake_github {
             .route("/orgs/{org}/repos", post(create_org_repo))
             .route("/user/repos", post(create_user_repo))
             .route("/repos/{owner}/{repo}", get(get_repo))
+            .route("/repos/{owner}/{repo}/topics", get(get_topics).put(put_topics))
             .route("/repos/{owner}/{repo}/git/ref/heads/{branch}", get(get_ref))
             .route("/repos/{owner}/{repo}/git/commits/{sha}", get(get_commit))
             .route("/repos/{owner}/{repo}/git/blobs", post(create_blob))
@@ -403,6 +406,29 @@ mod fake_github {
             Some(r) => Json(repo_json(r)).into_response(),
             None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "message": "Not Found" }))).into_response(),
         }
+    }
+
+    async fn get_topics(State(fake): State<Shared>, Path((owner, repo)): Path<(String, String)>, headers: HeaderMap) -> Response {
+        if let Err(r) = installed(&headers) {
+            return r;
+        }
+        let fake = fake.lock().unwrap();
+        match fake.repos.get(&format!("{owner}/{repo}").to_lowercase()) {
+            Some(r) => Json(serde_json::json!({ "names": r.topics })).into_response(),
+            None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "message": "Not Found" }))).into_response(),
+        }
+    }
+
+    async fn put_topics(State(fake): State<Shared>, Path((owner, repo)): Path<(String, String)>, headers: HeaderMap, Json(body): Json<serde_json::Value>) -> Response {
+        if let Err(r) = installed(&headers) {
+            return r;
+        }
+        let mut fake = fake.lock().unwrap();
+        let Some(r) = fake.repos.get_mut(&format!("{owner}/{repo}").to_lowercase()) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "message": "Not Found" }))).into_response();
+        };
+        r.topics = body["names"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        Json(serde_json::json!({ "names": r.topics })).into_response()
     }
 
     async fn get_ref(State(fake): State<Shared>, Path((owner, repo, branch)): Path<(String, String, String)>, headers: HeaderMap) -> Response {
@@ -609,6 +635,7 @@ async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secret
     install(&config, &session).await;
 
     let (status, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    assert!(page.contains(r#"value="toolsite-shop""#), "the form does not propose toolsite-<app>");
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(page.contains("Create a repository"));
     let token = form_token_from(&page);
@@ -627,6 +654,7 @@ async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secret
         assert_eq!(claims["iss"], "12345");
         let repo = fake.repo("acme/shop");
         assert!(repo.private);
+        assert_eq!(repo.topics, ["toolsite"], "the repository was not tagged");
         assert_eq!(repo.commits_made, 1, "the project should land in one commit");
         assert_eq!(repo.files.get("src/main.js").map(|b| b.as_slice()), Some(&b"console.log('hi')"[..]));
         assert!(repo.files.contains_key("package.json"));
@@ -716,6 +744,7 @@ async fn importing_a_repository_adds_the_workflow_sets_secrets_and_runs_it() {
         let deploy_token = repo.secrets.get("TOOLSITE_DEPLOY_TOKEN").unwrap();
         assert!(toolsite::platform::deploy::authorize(&config, "dash", deploy_token));
         assert_eq!(repo.dispatches, vec!["main".to_string()], "the first deploy was not started");
+        assert!(repo.topics.iter().any(|t| t == "toolsite"), "an imported repository was not tagged");
     }
     let link = toolsite::platform::github::link(&config, "dash").unwrap();
     assert_eq!(link.directory, "web/");

@@ -296,7 +296,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Keep an app in a GitHub repository and deploy it from there. GitHub Actions does the building and sends the result to PUT <site>/deploy/<app> with a token that publishes this one app only; toolsite never clones or builds. 'create' needs the app's source to have been published with ?source. After a connection, every push to the branch deploys; 'sync' deploys now. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts."
+        description = "Keep an app in a GitHub repository and deploy it from there. GitHub Actions does the building and sends the result to PUT <site>/deploy/<app> with a token that publishes this one app only; toolsite never clones or builds. 'create' needs the app's source to have been published with ?source, names the repository toolsite-<app> unless repo says otherwise, and tags it with the toolsite topic. After a connection, every push to the branch deploys; 'sync' deploys now. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts."
     )]
     pub(crate) async fn app_repo(
         &self,
