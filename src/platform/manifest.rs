@@ -12,7 +12,7 @@
 
 use crate::{
     config::Config,
-    content::store::{read_meta, write_meta, PathRule},
+    content::store::{read_meta, write_meta, PageMeta, PathRule, Policy},
     platform::schedule,
 };
 use serde::Deserialize;
@@ -49,6 +49,38 @@ pub struct Manifest {
     pub routes: Vec<Route>,
     #[serde(default, rename = "job")]
     pub jobs: Vec<Job>,
+    /// What a person may query from outside the app, and the row-level
+    /// policies the platform turns into views. Present means declared
+    /// wholesale: what the block does not name is withdrawn.
+    #[serde(default)]
+    pub access: Option<Access>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Access {
+    /// Hand-written views a person may read. Read only.
+    #[serde(default)]
+    pub views: Vec<String>,
+    /// One policy per table: a view the platform generates, with triggers
+    /// when it may write.
+    #[serde(default, rename = "table")]
+    pub tables: Vec<TablePolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TablePolicy {
+    pub table: String,
+    /// Defaults to `my_<table>`.
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(rename = "where")]
+    pub where_: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub write: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +100,12 @@ pub struct Job {
 
 use crate::content::store::GATES;
 
+/// A copy of the meta for a blocking task. PageMeta is not Clone on purpose
+/// (it is read from and written to one file), so this goes through serde.
+fn meta_snapshot(meta: &PageMeta) -> PageMeta {
+    serde_json::from_value(serde_json::to_value(meta).expect("meta serialises")).expect("meta round-trips")
+}
+
 /// Applies a manifest to one app, reporting what changed so a deploy says
 /// what it did rather than only that it finished.
 pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<String>, String> {
@@ -76,7 +114,8 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         // difference between [[job]] and [[jobs]] is invisible otherwise.
         format!(
             "could not read toolsite.toml: {e}\nKeys it takes: slug, spa, gate, icon, \
-             allow_http, roles, [[route]] (path, gate), [[job]] (name, schedule, path)."
+             allow_http, roles, [[route]] (path, gate), [[job]] (name, schedule, path), \
+             [access] views, [[access.table]] (table, view, where, owner, write)."
         )
     })?;
 
@@ -161,6 +200,68 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
     if !same {
         changed.push(format!("{} route rule(s)", declared.len()));
         meta.rules = declared;
+    }
+
+    // Access is declared wholesale too. Policies are checked against the
+    // app's own database and realised as views and triggers right away;
+    // one whose table does not exist yet waits for the migrations.
+    if let Some(access) = manifest.access {
+        let views: Vec<String> = access.views.iter().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+        for view in &views {
+            if !crate::runtime::access::valid_identifier(view) {
+                return Err(format!("access: {view:?} is not a view name"));
+            }
+        }
+        let mut policies = Vec::new();
+        for declared in access.tables {
+            let table = declared.table.trim().to_string();
+            policies.push(Policy {
+                view: declared
+                    .view
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| format!("my_{table}")),
+                table,
+                where_: declared.where_.trim().to_string(),
+                owner: declared.owner.map(|o| o.trim().to_string()).filter(|o| !o.is_empty()),
+                write: declared.write,
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        for policy in &policies {
+            if !seen.insert(policy.view.to_lowercase()) || views.iter().any(|v| v.eq_ignore_ascii_case(&policy.view)) {
+                return Err(format!("access: the view name {} is used twice", policy.view));
+            }
+        }
+        if meta.queryable != views {
+            changed.push(if views.is_empty() {
+                "access views cleared".to_string()
+            } else {
+                format!("access views = [{}]", views.join(", "))
+            });
+            meta.queryable = views;
+        }
+        if meta.policies != policies {
+            changed.push(if policies.is_empty() {
+                "access policies cleared".to_string()
+            } else {
+                format!(
+                    "access policies for {}",
+                    policies.iter().map(|p| p.table.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            });
+            meta.policies = policies;
+        }
+        let (generated, notes) = {
+            let (config, app, meta_copy) = (config.clone_for_task(), app.to_string(), meta_snapshot(&meta));
+            tokio::task::spawn_blocking(move || crate::runtime::access::regenerate(&config, &app, &meta_copy))
+                .await
+                .map_err(|e| e.to_string())??
+        };
+        if meta.generated != generated {
+            meta.generated = generated;
+        }
+        changed.extend(notes);
     }
 
     write_meta(config, app, &meta)

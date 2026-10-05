@@ -177,13 +177,14 @@ pub(crate) async fn store_for_slug(
         .await;
 
         return match outcome {
-            Ok(Ok((version, ran))) => {
+            Ok(Ok((version, ran, notes))) => {
                 tracing::info!(app = %app, version, ran, "schema migrated");
-                (
-                    StatusCode::OK,
-                    format!("{app}: {count} migration(s) stored, {ran} applied, now at version {version}\n"),
-                )
-                    .into_response()
+                let mut text = format!("{app}: {count} migration(s) stored, {ran} applied, now at version {version}\n");
+                for note in notes {
+                    text.push_str(&note);
+                    text.push('\n');
+                }
+                (StatusCode::OK, text).into_response()
             }
             Ok(Err(message)) => (StatusCode::BAD_REQUEST, format!("{message}\n")).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "migration failed\n").into_response(),

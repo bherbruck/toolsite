@@ -2170,23 +2170,49 @@ async fn someone_not_signed_in_is_sent_to_sign_in_and_comes_back() {
 }
 
 #[tokio::test]
-async fn a_visitor_account_cannot_connect_a_publishing_client() {
+async fn a_visitor_account_connects_a_reading_client_but_not_a_publishing_one() {
     let (_dir, config) = public_server();
     account(&config, "reader@example.com", "correct horse");
     let session = sign_in(&config, "reader@example.com", "correct horse");
     let client_id = register(&config, CALLBACK).await;
 
+    // The consent page says what a reader's client may do.
     let (status, page, _) = send(&config, get_as(&authorize_url(&client_id, CALLBACK), &session)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(page.contains("not an admin"), "{page}");
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.contains("cannot publish"), "{page}");
 
-    // Nor by posting the decision straight in, skipping the screen.
+    let code = consent(&config, &session, &client_id, CALLBACK).await;
+    let (status, tokens) = exchange(&config, &exchange_body(&client_id, &code, CALLBACK, VERIFIER)).await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    let access = tokens["access_token"].as_str().unwrap();
+
+    // Publishing: no. Reading as themselves: yes.
+    let (status, body, _) = send(&config, mcp_initialize(access)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a visitor's token published");
+    assert!(body.contains("/me/mcp"), "{body}");
+    let (status, body, _) = send(&config, me_initialize(access)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The form token still guards the decision.
     let body = format!(
         "token=whatever&response_type=code&client_id={client_id}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256&decision=allow",
         urlencoding::encode(CALLBACK)
     );
     let (status, ..) = send(&config, form_post("/authorize", &body, Some(&session))).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+fn me_initialize(token: &str) -> Request<Body> {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    Request::builder()
+        .method("POST")
+        .uri("/me/mcp")
+        .header("host", "localhost")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(initialize))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -3747,4 +3773,356 @@ async fn an_admin_creates_an_account_with_a_setup_link_the_owner_uses_once() {
     )
     .await;
     assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")));
+}
+
+
+// --- row-level access ----------------------------------------------------------
+//
+// An app declares who may see which rows; the platform generates the views
+// and triggers and holds the line for a handler, for a regular account over
+// /me/mcp, and for an admin proving the policy as someone else.
+
+/// One router for a whole MCP conversation: the session lives in it, so the
+/// per-request router `send` builds would forget it between calls.
+fn mcp_router(config: &Arc<Config>) -> axum::Router {
+    build_router(config.clone(), Runtime::new().unwrap())
+}
+
+/// One JSON-RPC exchange with an MCP endpoint, through the router. Handles
+/// rmcp's SSE framing for responses and the session header after initialize.
+async fn mcp_post(router: &axum::Router, path: &str, token: &str, session: Option<&str>, body: serde_json::Value) -> (StatusCode, Option<String>, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", "localhost")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(session) = session {
+        builder = builder.header("mcp-session-id", session);
+    }
+    let request = builder.body(Body::from(body.to_string())).unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let json = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
+        .last()
+        .or_else(|| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, session, json)
+}
+
+/// Initialises a session and returns its id.
+async fn mcp_session(router: &axum::Router, path: &str, token: &str) -> String {
+    let (status, session, json) = mcp_post(
+        router,
+        path,
+        token,
+        None,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let session = session.expect("no session id");
+    let (status, ..) = mcp_post(
+        router,
+        path,
+        token,
+        Some(&session),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await;
+    assert!(status.is_success(), "initialized notification: {status}");
+    session
+}
+
+/// Calls a tool and returns its text content, plus whether it was an error.
+async fn mcp_tool(router: &axum::Router, path: &str, token: &str, session: &str, name: &str, arguments: serde_json::Value) -> (bool, String) {
+    let (status, _, json) = mcp_post(
+        router,
+        path,
+        token,
+        Some(session),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let result = &json["result"];
+    let is_error = result["isError"].as_bool().unwrap_or(false);
+    let text = result["content"][0]["text"].as_str().unwrap_or("").to_string();
+    (is_error, text)
+}
+
+fn rows_of(text: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(text).map(|v| v["rows"].clone()).unwrap_or(serde_json::Value::Null)
+}
+
+/// An app with an orders table, a membership table, and two policies: own
+/// rows of `orders`, and `records` by the person's location.
+fn ledger(config: &Config) {
+    write_page(config, "ledger/index", "<title>Ledger</title>");
+    toolsite::runtime::migrate::store(
+        config,
+        "ledger",
+        vec![(
+            "001_initial.sql".to_string(),
+            "create table orders (id integer primary key, owner_id text, total real);\n\
+             create table members (user_id text, location text);\n\
+             create table records (id integer primary key, location text, note text);"
+                .to_string(),
+        )],
+    )
+    .unwrap();
+    toolsite::runtime::migrate::apply(config, "ledger").unwrap();
+}
+
+const LEDGER_MANIFEST: &str = r#"
+[[access.table]]
+table = "orders"
+where = "owner_id = current_user()"
+owner = "owner_id"
+write = true
+
+[[access.table]]
+table = "records"
+where = "location = (select location from members where user_id = current_user())"
+write = true
+"#;
+
+fn person(config: &Config, email: &str) -> toolsite::accounts::users::User {
+    toolsite::accounts::users::sign_up(config, email, "correct horse battery").unwrap()
+}
+
+fn bearer_for(config: &Config, user: &toolsite::accounts::users::User) -> String {
+    let client = toolsite::platform::oauth_store::register_client(config, Some("t"), &["https://c.test/cb".into()]).unwrap();
+    toolsite::platform::oauth_store::issue_tokens(config, &client.id, &user.id).unwrap().access_token
+}
+
+#[tokio::test]
+async fn a_policy_in_the_manifest_becomes_a_view_and_triggers_and_leaves_with_it() {
+    let (_dir, config) = server();
+    ledger(&config);
+    let changed = toolsite::platform::manifest::apply(&config, "ledger", LEDGER_MANIFEST).await.unwrap();
+    assert!(changed.iter().any(|c| c.contains("access policies")), "{changed:?}");
+
+    let objects = toolsite::runtime::db::run(
+        &config,
+        "ledger",
+        "select type, name from sqlite_master where name like 'my_%' or name like 'ts_access_%' order by name",
+        &[],
+    )
+    .unwrap();
+    let names: Vec<String> = objects.rows.iter().map(|r| r[1].as_str().unwrap().to_string()).collect();
+    assert_eq!(
+        names,
+        [
+            "my_orders", "my_records",
+            "ts_access_my_orders_delete", "ts_access_my_orders_insert", "ts_access_my_orders_update",
+            "ts_access_my_records_delete", "ts_access_my_records_insert", "ts_access_my_records_update",
+        ]
+    );
+    let meta = toolsite::content::store::read_meta(&config, "ledger").await;
+    assert_eq!(meta.generated.len(), 8);
+
+    // A column added later reaches the view after the migrations apply.
+    toolsite::runtime::migrate::store(
+        &config,
+        "ledger",
+        vec![
+            ("001_initial.sql".to_string(), "create table orders (id integer primary key, owner_id text, total real);\ncreate table members (user_id text, location text);\ncreate table records (id integer primary key, location text, note text);".to_string()),
+            ("002_note.sql".to_string(), "alter table orders add column note text;".to_string()),
+        ],
+    )
+    .unwrap();
+    toolsite::runtime::migrate::apply(&config, "ledger").unwrap();
+    let columns = toolsite::runtime::db::describe_views(&config, "ledger", &["my_orders".to_string()]);
+    assert!(columns[0].1.contains(&"note".to_string()), "{columns:?}");
+
+    // Dropping a policy drops its objects and nothing else.
+    toolsite::platform::manifest::apply(&config, "ledger", "[access]\nviews = []\n").await.unwrap();
+    let left = toolsite::runtime::db::run(
+        &config,
+        "ledger",
+        "select count(*) from sqlite_master where name like 'my_%' or name like 'ts_access_%'",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(left.rows[0][0], serde_json::json!(0));
+    let tables = toolsite::runtime::db::run(&config, "ledger", "select count(*) from sqlite_master where type = 'table'", &[]).unwrap();
+    assert_eq!(tables.rows[0][0], serde_json::json!(3), "a base table went with the policy");
+}
+
+#[tokio::test]
+async fn a_policy_that_cannot_hold_is_refused_at_apply() {
+    let (_dir, config) = server();
+    ledger(&config);
+    toolsite::runtime::db::run(&config, "ledger", "create table pinned (k text primary key, v text) without rowid", &[]).unwrap();
+
+    let no_rowid = "[[access.table]]\ntable = \"pinned\"\nwhere = \"1\"\nwrite = true\n";
+    let error = toolsite::platform::manifest::apply(&config, "ledger", no_rowid).await.unwrap_err();
+    assert!(error.contains("WITHOUT ROWID"), "{error}");
+
+    let smuggled = "[[access.table]]\ntable = \"orders\"\nwhere = \"1 = 1; drop table orders\"\n";
+    let error = toolsite::platform::manifest::apply(&config, "ledger", smuggled).await.unwrap_err();
+    assert!(error.contains("';'"), "{error}");
+
+    let broken = "[[access.table]]\ntable = \"orders\"\nwhere = \"nonsense_column = 1\"\n";
+    let error = toolsite::platform::manifest::apply(&config, "ledger", broken).await.unwrap_err();
+    assert!(error.contains("does not parse"), "{error}");
+
+    // Nothing of the above landed.
+    let meta = toolsite::content::store::read_meta(&config, "ledger").await;
+    assert!(meta.policies.is_empty() && meta.generated.is_empty());
+    let tables = toolsite::runtime::db::run(&config, "ledger", "select count(*) from sqlite_master where name = 'orders'", &[]).unwrap();
+    assert_eq!(tables.rows[0][0], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn two_people_over_me_mcp_each_see_and_change_only_their_own_rows() {
+    let (_dir, config) = public_server();
+    ledger(&config);
+    toolsite::platform::manifest::apply(&config, "ledger", LEDGER_MANIFEST).await.unwrap();
+    let alice = person(&config, "alice@example.com");
+    let bob = person(&config, "bob@example.com");
+    toolsite::runtime::db::run(
+        &config,
+        "ledger",
+        &format!("insert into members values ('{}', 'north'), ('{}', 'south')", alice.id, bob.id),
+        &[],
+    )
+    .unwrap();
+    let alice_token = bearer_for(&config, &alice);
+    let bob_token = bearer_for(&config, &bob);
+    let router = mcp_router(&config);
+    let a = mcp_session(&router, "/me/mcp", &alice_token).await;
+    let b = mcp_session(&router, "/me/mcp", &bob_token).await;
+
+    // Each sees the app and its views, with the writable ones marked.
+    let (err, apps) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "my_apps", serde_json::json!({})).await;
+    assert!(!err, "{apps}");
+    assert!(apps.contains("ledger") && apps.contains("my_orders (read, write)"), "{apps}");
+
+    // Each inserts; the owner is filled in from the account.
+    let (err, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"insert into my_orders (total) values (?)","params":[10]})).await;
+    assert!(!err, "{out}");
+    assert!(out.contains("\"rows_affected\":1"), "{out}");
+    let (err, out) = mcp_tool(&router, "/me/mcp", &bob_token, &b, "query", serde_json::json!({"app":"ledger","sql":"insert into my_orders (total) values (20)"})).await;
+    assert!(!err, "{out}");
+
+    // Each reads only their own.
+    let (_, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"select total from my_orders"})).await;
+    assert_eq!(rows_of(&out), serde_json::json!([[10.0]]), "{out}");
+    let (_, out) = mcp_tool(&router, "/me/mcp", &bob_token, &b, "query", serde_json::json!({"app":"ledger","sql":"select total from my_orders"})).await;
+    assert_eq!(rows_of(&out), serde_json::json!([[20.0]]), "{out}");
+
+    // Reaching past the view is refused, and says so.
+    let (err, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"select * from orders"})).await;
+    assert!(err && out.contains("refused"), "{out}");
+
+    // An insert for someone else is aborted; a change to someone else's row
+    // changes nothing.
+    let (err, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"insert into my_orders (owner_id, total) values (?, 1)","params":[bob.id]})).await;
+    assert!(err && out.contains("not visible"), "{out}");
+    let (err, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"update my_orders set total = 0 where total = 20"})).await;
+    assert!(!err && out.contains("\"rows_affected\":0"), "{out}");
+    let (_, out) = mcp_tool(&router, "/me/mcp", &bob_token, &b, "query", serde_json::json!({"app":"ledger","sql":"select total from my_orders"})).await;
+    assert_eq!(rows_of(&out), serde_json::json!([[20.0]]));
+
+    // Location scoping through the membership table: each writes and reads
+    // their own location's records, and an insert for the other is aborted.
+    let (err, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"insert into my_records (location, note) values ('north', 'hello')"})).await;
+    assert!(!err, "{out}");
+    let (err, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"insert into my_records (location, note) values ('south', 'sneaky')"})).await;
+    assert!(err && out.contains("not visible"), "{out}");
+    let (_, out) = mcp_tool(&router, "/me/mcp", &bob_token, &b, "query", serde_json::json!({"app":"ledger","sql":"select note from my_records"})).await;
+    assert_eq!(rows_of(&out), serde_json::json!([]), "{out}");
+    let (_, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"ledger","sql":"select note from my_records"})).await;
+    assert_eq!(rows_of(&out), serde_json::json!([["hello"]]), "{out}");
+
+    // An app the account may not open is refused before any SQL runs.
+    write_page(&config, "secret/index", "<h1>s</h1>");
+    toolsite::platform::manifest::apply(&config, "secret", "gate = \"granted\"\n").await.unwrap();
+    let (err, out) = mcp_tool(&router, "/me/mcp", &alice_token, &a, "query", serde_json::json!({"app":"secret","sql":"select 1"})).await;
+    assert!(err && out.contains("may not open"), "{out}");
+    assert!(!apps.contains("secret"));
+}
+
+#[tokio::test]
+async fn an_admin_proves_a_policy_by_running_sql_as_each_account() {
+    let (_dir, config) = server();
+    ledger(&config);
+    toolsite::platform::manifest::apply(&config, "ledger", LEDGER_MANIFEST).await.unwrap();
+    let alice = person(&config, "alice@example.com");
+    let bob = person(&config, "bob@example.com");
+    toolsite::runtime::db::run(
+        &config,
+        "ledger",
+        &format!("insert into orders (owner_id, total) values ('{}', 1), ('{}', 2), ('{}', 3)", alice.id, bob.id, alice.id),
+        &[],
+    )
+    .unwrap();
+    let router = mcp_router(&config);
+    let session = mcp_session(&router, "/mcp", TOKEN).await;
+
+    let (err, out) = mcp_tool(&router, "/mcp", TOKEN, &session, "run_sql", serde_json::json!({"app":"ledger","sql":"select total from my_orders order by total","as_user":"alice@example.com"})).await;
+    assert!(!err, "{out}");
+    assert_eq!(rows_of(&out), serde_json::json!([[1.0],[3.0]]));
+    let (_, out) = mcp_tool(&router, "/mcp", TOKEN, &session, "run_sql", serde_json::json!({"app":"ledger","sql":"select total from my_orders","as_user":"bob@example.com"})).await;
+    assert_eq!(rows_of(&out), serde_json::json!([[2.0]]));
+    // As an account, the base table is out of reach.
+    let (err, out) = mcp_tool(&router, "/mcp", TOKEN, &session, "run_sql", serde_json::json!({"app":"ledger","sql":"select count(*) from orders","as_user":"alice@example.com"})).await;
+    assert!(err && out.contains("not authorized"), "{out}");
+    // Without as_user: the admin path, everything.
+    let (err, out) = mcp_tool(&router, "/mcp", TOKEN, &session, "run_sql", serde_json::json!({"app":"ledger","sql":"select count(*) from orders"})).await;
+    assert!(!err, "{out}");
+    assert_eq!(rows_of(&out), serde_json::json!([[3]]));
+    // An account that does not exist is named, not guessed at.
+    let (err, out) = mcp_tool(&router, "/mcp", TOKEN, &session, "run_sql", serde_json::json!({"app":"ledger","sql":"select 1","as_user":"nobody@example.com"})).await;
+    assert!(err && out.contains("no account"), "{out}");
+}
+
+#[tokio::test]
+async fn a_handler_sees_the_visitor_in_sql_and_can_query_inside_the_policy() {
+    let (_dir, config) = server();
+    ledger(&config);
+    publish_handler(&config, "ledger");
+    toolsite::platform::manifest::apply(&config, "ledger", LEDGER_MANIFEST).await.unwrap();
+    let alice = person(&config, "alice@example.com");
+    let bob = person(&config, "bob@example.com");
+    toolsite::runtime::db::run(
+        &config,
+        "ledger",
+        &format!("insert into orders (owner_id, total) values ('{}', 1), ('{}', 2)", alice.id, bob.id),
+        &[],
+    )
+    .unwrap();
+    let site = sign_in(&config, "alice@example.com", "correct horse battery");
+    let (app_token, _) = hand_off(&config, &site, "ledger").await;
+
+    // The handler's own SQL sees who is calling, and the whole table.
+    let (status, body, _) = send(&config, get_as_app("/p/ledger/api/sql?q=select+current_user(),+count(*)+from+orders", "ledger", &app_token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, format!("0:{}|2", alice.id));
+    // Scoped: the visitor's rows, and nothing past the view.
+    let (status, body, _) = send(&config, get_as_app("/p/ledger/api/scoped?q=select+total+from+my_orders", "ledger", &app_token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "0:1");
+    let (status, body, _) = send(&config, get_as_app("/p/ledger/api/scoped?q=select+total+from+orders", "ledger", &app_token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // Nobody signed in: the identity functions are NULL and the scoped view
+    // is empty rather than everyone's.
+    let (status, body, _) = send(&config, get("/p/ledger/api/sql?q=select+current_user()+is+null")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "0:1");
+    let (_, body, _) = send(&config, get("/p/ledger/api/scoped?q=select+count(*)+from+my_orders")).await;
+    assert_eq!(body, "0:0");
 }

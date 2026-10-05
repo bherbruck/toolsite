@@ -255,6 +255,25 @@ role. Declare the roles your handler checks in `toolsite.toml`
 (`roles = ["viewer", "editor"]`) so whoever grants access can pick the right
 word; it is a hint, and any role can still be granted.
 
+**Row-level access.** Declare it in `toolsite.toml`, do not write it:
+
+```toml
+[[access.table]]
+table = "orders"
+where = "owner_id = current_user()"   # any table in the app's db may appear here
+owner = "owner_id"
+write = true
+```
+
+The platform generates the view `my_orders` and the triggers that keep writes
+inside it. `current_user()`, `current_email()` and `current_role()` are bound
+on every connection. A regular account then queries the view as themselves
+through `<site>/me/mcp` (`my_apps`, `query`); a handler can offer the same
+with `db::query-scoped`. For site or team scoping, read the attribute from a
+membership table in the `where`. Prove it before claiming it:
+`run_sql(app, sql, as_user: "someone@x")` runs as that account, so run the
+same query as two accounts.
+
 **Reaching other services.** `fetch::send` works only for hosts the app
 declared in `toolsite.toml` as `allow_http = ["api.example.com"]`. Off by
 default. Addresses inside the server's own network are refused whatever the

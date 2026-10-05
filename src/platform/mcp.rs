@@ -274,6 +274,10 @@ pub(crate) struct RunSqlRequest {
         description = "Values bound to '?' placeholders, in order. Always bind values rather than building SQL by concatenation."
     )]
     pub(crate) params: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "An account email. When set, the statement runs as that person inside the app's declared access, exactly as /me/mcp would run it: only the declared views, current_user() and current_role() bound from the account and its grant, writes only through a policy with write = true. Use it to prove a policy holds before saying so: run the same query as two accounts."
+    )]
+    pub(crate) as_user: Option<String>,
 }
 
 #[derive(Clone)]
@@ -681,14 +685,36 @@ impl PageHost {
     )]
     pub(crate) async fn run_sql(
         &self,
-        Parameters(RunSqlRequest { app, sql, params }): Parameters<RunSqlRequest>,
+        Parameters(RunSqlRequest { app, sql, params, as_user }): Parameters<RunSqlRequest>,
     ) -> Result<CallToolResult, McpError> {
         let config = self.config.clone();
         let params = params.unwrap_or_default();
-        let outcome =
-            tokio::task::spawn_blocking(move || db::run(&config, &app, &sql, &params))
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let as_user = as_user.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        let outcome = tokio::task::spawn_blocking(move || match as_user {
+            None => db::run(&config, &app, &sql, &params),
+            Some(email) => {
+                let user = match crate::accounts::users::account_at_email(&config, &email)? {
+                    crate::accounts::users::AtEmail::Active(user) => user,
+                    crate::accounts::users::AtEmail::Disabled => {
+                        return Err(format!("{email} is disabled; enable the account to run as it"))
+                    }
+                    crate::accounts::users::AtEmail::Nobody => {
+                        return Err(format!("there is no account for {email}"))
+                    }
+                };
+                let identity = db::Identity {
+                    role: crate::accounts::users::role_for(&config, &user.id, &app),
+                    user_id: user.id,
+                    email: user.email.clone(),
+                };
+                let meta = crate::content::store::read_meta_blocking(&config, &app);
+                let scope = db::Scope::of(&meta);
+                tracing::info!(app = %app, as_user = %user.email, "admin ran scoped SQL as an account");
+                db::run_scoped(&config, &app, Some(&identity), &scope, &sql, &params)
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         match outcome {
             Ok(outcome) => {
@@ -773,10 +799,15 @@ impl PageHost {
                 let files: Vec<(String, String)> = files.into_iter().collect();
                 let count = files.len();
                 crate::runtime::migrate::store(&config, &app, files)?;
-                let (version, ran) = crate::runtime::migrate::apply(&config, &app)?;
-                Ok::<_, String>(format!(
+                let (version, ran, notes) = crate::runtime::migrate::apply(&config, &app)?;
+                let mut text = format!(
                     "{count} migration(s) stored, {ran} applied, now at version {version}"
-                ))
+                );
+                for note in notes {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
+                Ok::<_, String>(text)
             }
             None => {
                 let stored = crate::runtime::migrate::stored(&config, &app);
@@ -791,7 +822,7 @@ impl PageHost {
                             .collect::<Vec<_>>()
                             .join("\n"),
                         crate::runtime::migrate::apply(&config, &app)
-                            .map(|(version, _)| version)
+                            .map(|(version, ..)| version)
                             .unwrap_or(0)
                     )
                 })

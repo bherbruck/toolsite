@@ -191,6 +191,53 @@ can pick the right word; it is a hint, and any role can still be granted.
 There is no public signup. Accounts are created by the owner, and a person
 sets their own password through a one-time link.
 
+## Row-level access
+
+Who may see which rows is declared, not written. Three functions are bound
+on every connection by the host: `current_user()` (the account id),
+`current_email()` and `current_role()` (the grant's role on this app). A
+policy in `toolsite.toml` names a table and a `where` over them; the
+platform generates a view and, with `write = true`, the triggers that carry
+inserts, updates and deletes through to the table and abort when the result
+would be a row the person cannot see.
+
+```toml
+[[access.table]]
+table = "orders"
+where = "owner_id = current_user()"
+owner = "owner_id"      # filled with current_user() on insert when NULL
+write = true            # default false: read only
+```
+
+The person's own rows are the simplest case. Scoping by site, team or
+department reads the attribute from another table in the same database:
+
+```toml
+[[access.table]]
+table = "records"
+where = "location = (select location from members where user_id = current_user())"
+write = true
+```
+
+The `where` may use any table or view in the app's database. It must prepare
+as `select 1 from <table> where (<where>)` and may not contain `;`. The view
+is `my_<table>` unless `view = "..."` says otherwise. A table declared
+`without rowid` cannot take `write = true`. Hand-written views go under
+`[access] views = ["my_summary"]` and are read only.
+
+What this buys: a regular account connects Claude to `<site>/me/mcp`, calls
+`my_apps`, and queries the declared views as themselves. A handler can offer
+the same inside the app with `db::query-scoped(sql, params)`, which runs the
+visitor's SQL inside the declared views and nothing else. The handler's own
+`db::query` is unrestricted and can still read `current_user()`.
+
+Prove a policy before saying it holds: `run_sql(app, sql, as_user: "a@x")`
+runs the statement exactly as that account would through `/me/mcp`. Run the
+same query as two accounts and compare.
+
+The generated objects are rebuilt when the manifest or the schema changes
+and dropped when the policy goes. Do not edit them; edit the policy.
+
 ## A repository
 
 An app can live in GitHub and deploy from there: `app_repo(app, "create")`

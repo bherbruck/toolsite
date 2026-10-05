@@ -1,12 +1,44 @@
 use crate::{config::Config, content::slug::valid_slug};
 use rusqlite::{
+    functions::FunctionFlags,
     hooks::{AuthAction, AuthContext, Authorization},
     limits::Limit,
     types::{ToSqlOutput, Value as SqlValue, ValueRef},
     Connection, OpenFlags,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
+
+/// Who a statement runs as, established by the host from a verified session
+/// or token and never from the SQL. Bound into the connection as the
+/// functions `current_user()`, `current_email()` and `current_role()`, which
+/// is what lets a view say whose rows are whose.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Identity {
+    pub user_id: String,
+    pub email: String,
+    /// The grant's role on this app, if the account has one.
+    pub role: Option<String>,
+}
+
+/// Registers the identity functions on a connection. With no identity they
+/// answer NULL, so a view written against them shows nobody anything, which
+/// is the right answer for a scheduled job or an unscoped admin query.
+pub fn bind_identity(conn: &Connection, identity: Option<&Identity>) -> Result<(), String> {
+    // Deterministic within a connection, which is all SQLite asks: the value
+    // cannot change between two calls in one statement.
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    let user = identity.map(|i| i.user_id.clone());
+    let email = identity.map(|i| i.email.clone());
+    let role = identity.and_then(|i| i.role.clone());
+    conn.create_scalar_function("current_user", 0, flags, move |_| Ok(user.clone()))
+        .map_err(|e| e.to_string())?;
+    conn.create_scalar_function("current_email", 0, flags, move |_| Ok(email.clone()))
+        .map_err(|e| e.to_string())?;
+    conn.create_scalar_function("current_role", 0, flags, move |_| Ok(role.clone()))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 /// SQLite's own page size; the ceiling is expressed to it in pages.
 const PAGE_SIZE: u64 = 4096;
@@ -36,15 +68,11 @@ fn deny_escapes(context: AuthContext<'_>) -> Authorization {
     }
 }
 
-pub(crate) fn open(config: &Config, app: &str) -> Result<Connection, String> {
+/// The app's database with the identity bound and the usual guard in place.
+pub(crate) fn open_as(config: &Config, app: &str, identity: Option<&Identity>) -> Result<Connection, String> {
     let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
-    open_at(&path, config.max_db_bytes)
-}
-
-/// Opens one SQLite file with the same guards everywhere: an authorizer that
-/// refuses anything reaching outside this file, a size ceiling, and WAL.
-pub(crate) fn open_at(path: &std::path::Path, max_bytes: u64) -> Result<Connection, String> {
-    let conn = open_unguarded(path, max_bytes)?;
+    let conn = open_unguarded(&path, config.max_db_bytes)?;
+    bind_identity(&conn, identity)?;
     lock_down(&conn)?;
     Ok(conn)
 }
@@ -136,25 +164,210 @@ pub fn run(
     sql: &str,
     params: &[Value],
 ) -> Result<SqlOutcome, String> {
-    let conn = open(config, app)?;
+    run_as(config, app, None, sql, params)
+}
 
+/// `run`, with `current_user()` and friends answering for `identity`. This is
+/// what a handler's own `db.query` gets: the full database, and a way to ask
+/// who is calling from inside SQL.
+pub fn run_as(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    sql: &str,
+    params: &[Value],
+) -> Result<SqlOutcome, String> {
+    let conn = open_as(config, app, identity)?;
+    execute(&conn, sql, params, true)
+}
+
+/// What a scoped caller may reach, by name. Everything is matched case
+/// insensitively, as SQLite does.
+pub struct Scope {
+    /// Views that may be read.
+    pub readable: HashSet<String>,
+    /// Views that may also be inserted into, updated and deleted through.
+    pub writable: HashSet<String>,
+    /// The platform's own triggers on the writable views, whose base-table
+    /// writes are the only ones allowed.
+    pub triggers: HashSet<String>,
+}
+
+impl Scope {
+    /// Built from the app's meta: hand-written views are read only, policy
+    /// views read and perhaps write, with their generated triggers.
+    pub fn of(meta: &crate::content::store::PageMeta) -> Self {
+        let mut readable: HashSet<String> = meta.queryable.iter().map(|v| v.to_lowercase()).collect();
+        let mut writable = HashSet::new();
+        let mut triggers = HashSet::new();
+        for policy in &meta.policies {
+            if !meta.generated.iter().any(|g| g.eq_ignore_ascii_case(&policy.view)) {
+                // Declared but not generated yet: nothing to reach.
+                continue;
+            }
+            readable.insert(policy.view.to_lowercase());
+            if policy.write {
+                writable.insert(policy.view.to_lowercase());
+                for trigger in crate::runtime::access::trigger_names(&policy.view) {
+                    triggers.insert(trigger.to_lowercase());
+                }
+            }
+        }
+        Self {
+            readable,
+            writable,
+            triggers,
+        }
+    }
+
+    fn reads(&self, name: &str) -> bool {
+        let name = name.to_lowercase();
+        self.readable.contains(&name) || self.writable.contains(&name)
+    }
+
+    fn through(&self, accessor: Option<&str>) -> bool {
+        accessor.is_some_and(|a| {
+            let a = a.to_lowercase();
+            self.readable.contains(&a) || self.writable.contains(&a) || self.triggers.contains(&a)
+        })
+    }
+
+    /// The authorizer: the whole boundary, decided per parsed action.
+    fn authorize(&self, context: AuthContext<'_>) -> Authorization {
+        let accessor = context.accessor;
+        match context.action {
+            AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+            // A column read: of a permitted view directly, or of anything the
+            // view or a generated trigger reaches on the person's behalf.
+            AuthAction::Read { table_name, .. } => {
+                if self.reads(table_name) || self.through(accessor) {
+                    Authorization::Allow
+                } else {
+                    Authorization::Deny
+                }
+            }
+            // A write: by the person on a writable view, or by the view's own
+            // trigger on the base table. Nothing else writes.
+            AuthAction::Insert { table_name } | AuthAction::Update { table_name, .. } | AuthAction::Delete { table_name } => {
+                let own = accessor.is_none() && self.writable.contains(&table_name.to_lowercase());
+                let via_trigger = accessor.is_some_and(|a| self.triggers.contains(&a.to_lowercase()));
+                if own || via_trigger {
+                    Authorization::Allow
+                } else {
+                    Authorization::Deny
+                }
+            }
+            AuthAction::Function { function_name, .. } => {
+                if function_name.eq_ignore_ascii_case("load_extension") {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }
+            // A scoped call is one statement with the connection's own
+            // atomicity; the person does not get to hold a transaction open.
+            _ => Authorization::Deny,
+        }
+    }
+}
+
+/// Runs one statement as `identity`, inside `scope`: the declared views, read
+/// or written only as their policies allow, and nothing else in the file. For
+/// a person typing SQL, whether through `/me/mcp` or an app that offers it.
+pub fn run_scoped(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    scope: &Scope,
+    sql: &str,
+    params: &[Value],
+) -> Result<SqlOutcome, String> {
+    if scope.readable.is_empty() && scope.writable.is_empty() {
+        return Err(format!("{app} declares nothing a person may query"));
+    }
+    let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    if !path.is_file() {
+        return Err(format!("{app} has no database yet"));
+    }
+    let conn = open_unguarded(&path, config.max_db_bytes)?;
+    bind_identity(&conn, identity)?;
+    let names = Scope {
+        readable: scope.readable.clone(),
+        writable: scope.writable.clone(),
+        triggers: scope.triggers.clone(),
+    };
+    conn.authorizer(Some(move |context: AuthContext<'_>| names.authorize(context)))
+        .map_err(|e| e.to_string())?;
+    execute(&conn, sql, params, false)
+}
+
+/// The columns of each named view that exists, for a caller deciding what to
+/// ask. Host-run: a person never gets to pragma.
+pub fn describe_views(config: &Config, app: &str, views: &[String]) -> Vec<(String, Vec<String>)> {
+    let Some(path) = db_path(config, app) else {
+        return Vec::new();
+    };
+    let Ok(conn) = open_unguarded(&path, config.max_db_bytes) else {
+        return Vec::new();
+    };
+    // A view's columns come from preparing its select, which needs the
+    // identity functions to exist even though nobody is asking as anyone.
+    if bind_identity(&conn, None).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for view in views {
+        if !crate::runtime::access::valid_identifier(view) {
+            continue;
+        }
+        let Ok(mut statement) = conn.prepare(&format!("pragma table_info(\"{view}\")")) else {
+            continue;
+        };
+        let columns: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        if !columns.is_empty() {
+            out.push((view.clone(), columns));
+        }
+    }
+    out
+}
+
+/// One statement with parameters, or a parameterless script when `scripts`
+/// is allowed. The scoped path never allows a script: one statement, one
+/// decision.
+/// SQLite words a refusal differently per action ("access to t.c is
+/// prohibited", "not authorized"); callers match on one phrase.
+fn describe(error: rusqlite::Error) -> String {
+    match &error {
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::AuthorizationForStatementDenied =>
+        {
+            format!("not authorized: {error}")
+        }
+        _ => error.to_string(),
+    }
+}
+
+fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool) -> Result<SqlOutcome, String> {
     let mut statement = match conn.prepare(sql) {
         Ok(statement) => statement,
-        Err(rusqlite::Error::MultipleStatement) if !params.is_empty() => {
-            return Err("pass one statement at a time when using parameters".to_string())
+        Err(rusqlite::Error::MultipleStatement) if !params.is_empty() || !scripts => {
+            return Err("pass one statement at a time".to_string())
         }
         // Preparing a whole script fails as soon as one statement references
         // something an earlier one creates — the classic `create table` then
         // `create index` migration — so run it statement by statement instead.
         // Nothing has executed at this point, so there is nothing to undo.
-        Err(prepare_error) if params.is_empty() => {
+        Err(prepare_error) if params.is_empty() && scripts => {
             let before = conn.total_changes();
             conn.execute_batch(sql)
                 .map_err(|batch_error| match batch_error {
                     // Genuinely broken SQL: report what the batch said, which
                     // names the offending statement.
-                    rusqlite::Error::SqliteFailure(..) => batch_error.to_string(),
-                    _ => prepare_error.to_string(),
+                    rusqlite::Error::SqliteFailure(..) => describe(batch_error),
+                    _ => describe(prepare_error),
                 })?;
             return Ok(SqlOutcome {
                 columns: Vec::new(),
@@ -163,7 +376,7 @@ pub fn run(
                 rows_affected: (conn.total_changes() - before) as usize,
             });
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(describe(e)),
     };
 
     let bound: Vec<ToSqlOutput<'static>> = params
@@ -179,11 +392,11 @@ pub fn run(
     let before = conn.total_changes();
     let mut cursor = statement
         .query(rusqlite::params_from_iter(bound.iter()))
-        .map_err(|e| e.to_string())?;
+        .map_err(describe)?;
 
     let mut rows = Vec::new();
     let mut truncated = false;
-    while let Some(row) = cursor.next().map_err(|e| e.to_string())? {
+    while let Some(row) = cursor.next().map_err(describe)? {
         if rows.len() >= MAX_ROWS {
             truncated = true;
             break;
@@ -357,7 +570,7 @@ mod tests {
         // The account database has a schema the platform owns and versions.
         // An app's database does not: its shape is the app's business, and
         // run_sql and the guest's db.query are the only things that shape it.
-        let conn = open(&config, "app").unwrap();
+        let conn = open_as(&config, "app", None).unwrap();
         let version: i64 = conn
             .query_row("select 1 from sqlite_master where name = 'users'", [], |row| {
                 row.get(0)
@@ -372,5 +585,185 @@ mod tests {
         run(&config, "app", "create table t (a)", &[]).unwrap();
         let out = run(&config, "app", "insert into t values (1)", &[]).unwrap();
         assert_eq!(out.rows_affected, 1);
+    }
+
+    // --- identity and scope -------------------------------------------------
+
+    fn alice() -> Identity {
+        Identity { user_id: "u-alice".into(), email: "alice@example.com".into(), role: Some("viewer".into()) }
+    }
+
+    fn bob() -> Identity {
+        Identity { user_id: "u-bob".into(), email: "bob@example.com".into(), role: None }
+    }
+
+    fn manager() -> Identity {
+        Identity { user_id: "u-boss".into(), email: "boss@example.com".into(), role: Some("manager".into()) }
+    }
+
+    /// An orders table with a policy view generated the way the platform does
+    /// it, plus a hand-written read-only view.
+    fn shop(config: &Config, write: bool) -> Scope {
+        run(config, "shop", "create table orders (id integer primary key, owner_id text, total real)", &[]).unwrap();
+        run(config, "shop", "insert into orders (owner_id, total) values ('u-alice', 10), ('u-bob', 20), ('u-alice', 30)", &[]).unwrap();
+        run(config, "shop", "create view totals as select owner_id, sum(total) as total from orders group by owner_id", &[]).unwrap();
+        let policy = crate::content::store::Policy {
+            table: "orders".into(),
+            view: "my_orders".into(),
+            where_: "owner_id = current_user() or current_role() = 'manager'".into(),
+            owner: Some("owner_id".into()),
+            write,
+        };
+        let columns = vec!["id".to_string(), "owner_id".to_string(), "total".to_string()];
+        run(config, "shop", &crate::runtime::access::generate(&policy, &columns), &[]).unwrap();
+        // The platform writes these with the authorizer off; the test did the
+        // same through run, whose authorizer allows DDL.
+        let mut generated = vec!["my_orders".to_string()];
+        if write {
+            generated.extend(crate::runtime::access::trigger_names("my_orders"));
+        }
+        let meta = crate::content::store::PageMeta {
+            queryable: vec!["totals".into()],
+            policies: vec![policy],
+            generated,
+            ..Default::default()
+        };
+        Scope::of(&meta)
+    }
+
+    fn scoped(config: &Config, who: &Identity, scope: &Scope, sql: &str) -> Result<SqlOutcome, String> {
+        run_scoped(config, "shop", Some(who), scope, sql, &[])
+    }
+
+    #[test]
+    fn the_identity_functions_answer_for_the_bound_account_and_null_for_nobody() {
+        let (_dir, config) = config();
+        let out = run_as(&config, "app", Some(&alice()), "select current_user(), current_email(), current_role()", &[]).unwrap();
+        assert_eq!(out.rows[0], vec![json!("u-alice"), json!("alice@example.com"), json!("viewer")]);
+        let out = run_as(&config, "app", Some(&bob()), "select current_role()", &[]).unwrap();
+        assert_eq!(out.rows[0], vec![Value::Null]);
+        let out = run(&config, "app", "select current_user(), current_email(), current_role()", &[]).unwrap();
+        assert_eq!(out.rows[0], vec![Value::Null, Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn a_scoped_read_sees_only_the_bound_accounts_rows() {
+        let (_dir, config) = config();
+        let scope = shop(&config, false);
+        let mine = scoped(&config, &alice(), &scope, "select total from my_orders order by total").unwrap();
+        assert_eq!(mine.rows, vec![vec![json!(10.0)], vec![json!(30.0)]]);
+        let his = scoped(&config, &bob(), &scope, "select total from my_orders").unwrap();
+        assert_eq!(his.rows, vec![vec![json!(20.0)]]);
+        // A hand-written view is readable too, and a where on it is fine.
+        let totals = scoped(&config, &alice(), &scope, "select total from totals where owner_id = 'u-bob'").unwrap();
+        assert_eq!(totals.rows, vec![vec![json!(20.0)]]);
+    }
+
+    #[test]
+    fn a_scoped_caller_cannot_reach_the_base_table_or_an_undeclared_view() {
+        let (_dir, config) = config();
+        let scope = shop(&config, true);
+        run(&config, "shop", "create view everything as select * from orders", &[]).unwrap();
+        for sql in [
+            "select * from orders",
+            "select count(*) from orders",
+            "select * from everything",
+            "select name from sqlite_master",
+            "select * from my_orders join orders using (id)",
+        ] {
+            let error = scoped(&config, &alice(), &scope, sql).unwrap_err();
+            assert!(error.contains("not authorized"), "{sql} was allowed: {error}");
+        }
+    }
+
+    #[test]
+    fn a_scoped_caller_cannot_write_without_a_writable_policy_or_hold_a_transaction() {
+        let (_dir, config) = config();
+        let scope = shop(&config, false);
+        for sql in [
+            "insert into my_orders (owner_id, total) values ('u-alice', 1)",
+            "update my_orders set total = 0",
+            "delete from my_orders",
+            "insert into totals values ('x', 1)",
+            "update orders set total = 0",
+            "attach database ':memory:' as other",
+            "pragma table_info(orders)",
+            "begin",
+            "savepoint s",
+            "create table t (x)",
+            "drop view my_orders",
+        ] {
+            let error = scoped(&config, &alice(), &scope, sql).unwrap_err();
+            assert!(
+                error.contains("not authorized") || error.contains("cannot modify"),
+                "{sql} was allowed: {error}"
+            );
+        }
+        let error = scoped(&config, &alice(), &scope, "select 1; select 2").unwrap_err();
+        assert!(error.contains("one statement"), "{error}");
+        // Nothing changed underneath.
+        let all = run(&config, "shop", "select count(*), sum(total) from orders", &[]).unwrap();
+        assert_eq!(all.rows[0], vec![json!(3), json!(60.0)]);
+    }
+
+    #[test]
+    fn writes_through_a_writable_policy_stay_inside_the_accounts_rows() {
+        let (_dir, config) = config();
+        let scope = shop(&config, true);
+
+        // An insert gets the account as owner when it leaves it out.
+        let inserted = scoped(&config, &alice(), &scope, "insert into my_orders (total) values (5)").unwrap();
+        assert_eq!(inserted.rows_affected, 1);
+        let owner = run(&config, "shop", "select owner_id from orders where total = 5", &[]).unwrap();
+        assert_eq!(owner.rows[0], vec![json!("u-alice")]);
+
+        // An insert for someone else is aborted, and leaves nothing.
+        let error = scoped(&config, &alice(), &scope, "insert into my_orders (owner_id, total) values ('u-bob', 99)").unwrap_err();
+        assert!(error.contains("not visible to you"), "{error}");
+        let count = run(&config, "shop", "select count(*) from orders where total = 99", &[]).unwrap();
+        assert_eq!(count.rows[0], vec![json!(0)]);
+
+        // Updating or deleting another account's row changes nothing, and
+        // does not say the row exists.
+        let update = scoped(&config, &alice(), &scope, "update my_orders set total = 0 where owner_id = 'u-bob'").unwrap();
+        assert_eq!(update.rows_affected, 0);
+        let delete = scoped(&config, &alice(), &scope, "delete from my_orders where owner_id = 'u-bob'").unwrap();
+        assert_eq!(delete.rows_affected, 0);
+        let bobs = run(&config, "shop", "select total from orders where owner_id = 'u-bob'", &[]).unwrap();
+        assert_eq!(bobs.rows, vec![vec![json!(20.0)]]);
+
+        // Moving a row to someone else is an update that lands outside the
+        // view, so it is aborted too.
+        let error = scoped(&config, &alice(), &scope, "update my_orders set owner_id = 'u-bob' where total = 10").unwrap_err();
+        assert!(error.contains("not visible to you"), "{error}");
+        let still = run(&config, "shop", "select owner_id from orders where total = 10", &[]).unwrap();
+        assert_eq!(still.rows[0], vec![json!("u-alice")]);
+
+        // Their own rows: fine.
+        let update = scoped(&config, &alice(), &scope, "update my_orders set total = 11 where total = 10").unwrap();
+        assert_eq!(update.rows_affected, 1);
+        let delete = scoped(&config, &alice(), &scope, "delete from my_orders where total = 11").unwrap();
+        assert_eq!(delete.rows_affected, 1);
+    }
+
+    #[test]
+    fn a_role_named_in_the_policy_reaches_everyones_rows() {
+        let (_dir, config) = config();
+        let scope = shop(&config, true);
+        let all = scoped(&config, &manager(), &scope, "select count(*) from my_orders").unwrap();
+        assert_eq!(all.rows[0], vec![json!(3)]);
+        let update = scoped(&config, &manager(), &scope, "update my_orders set total = total + 1").unwrap();
+        assert_eq!(update.rows_affected, 3);
+        let bobs = run(&config, "shop", "select total from orders where owner_id = 'u-bob'", &[]).unwrap();
+        assert_eq!(bobs.rows, vec![vec![json!(21.0)]]);
+    }
+
+    #[test]
+    fn a_scope_with_nothing_declared_refuses_everything() {
+        let (_dir, config) = config();
+        run(&config, "shop", "create table orders (id integer primary key)", &[]).unwrap();
+        let scope = Scope::of(&crate::content::store::PageMeta::default());
+        let error = scoped(&config, &alice(), &scope, "select 1").unwrap_err();
+        assert!(error.contains("declares nothing"), "{error}");
     }
 }

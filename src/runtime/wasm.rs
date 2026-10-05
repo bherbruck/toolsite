@@ -96,6 +96,39 @@ impl WasiView for StoreState {
     }
 }
 
+impl StoreState {
+    /// Who the SQL runs as: the visitor the host established, with their
+    /// grant on this app. Looked up per call so a grant changed mid-session
+    /// is seen by the next statement.
+    fn identity(&self) -> Option<db::Identity> {
+        let user = self.user.as_ref()?;
+        Some(db::Identity {
+            user_id: user.id.clone(),
+            email: user.email.clone(),
+            role: crate::accounts::users::role_for(&self.site, &user.id, &self.app),
+        })
+    }
+}
+
+fn wit_rows(outcome: Result<db::SqlOutcome, String>) -> Result<WitRows, WitDbError> {
+    match outcome {
+        Ok(outcome) => Ok(WitRows {
+            columns: outcome.columns,
+            values: outcome
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().map(wit_of).collect())
+                .collect(),
+            truncated: outcome.truncated,
+            rows_affected: outcome.rows_affected as u64,
+        }),
+        // The authorizer's refusals are reported as their own case so a
+        // guest can tell "you may not" from "that query was wrong".
+        Err(message) if message.contains("not authorized") => Err(WitDbError::Denied(message)),
+        Err(message) => Err(WitDbError::Failed(message)),
+    }
+}
+
 impl self::toolsite::app::db::Host for StoreState {
     fn query(
         &mut self,
@@ -103,24 +136,22 @@ impl self::toolsite::app::db::Host for StoreState {
         params: Vec<WitValue>,
     ) -> Result<WitRows, WitDbError> {
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
-        match db::run(&self.site, &self.app, &sql, &params) {
-            Ok(outcome) => Ok(WitRows {
-                columns: outcome.columns,
-                values: outcome
-                    .rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(wit_of).collect())
-                    .collect(),
-                truncated: outcome.truncated,
-                rows_affected: outcome.rows_affected as u64,
-            }),
-            // The authorizer's refusals are reported as their own case so a
-            // guest can tell "you may not" from "that query was wrong".
-            Err(message) if message.contains("not authorized") => {
-                Err(WitDbError::Denied(message))
-            }
-            Err(message) => Err(WitDbError::Failed(message)),
-        }
+        let identity = self.identity();
+        wit_rows(db::run_as(&self.site, &self.app, identity.as_ref(), &sql, &params))
+    }
+
+    fn query_scoped(
+        &mut self,
+        sql: String,
+        params: Vec<WitValue>,
+    ) -> Result<WitRows, WitDbError> {
+        let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
+        let identity = self.identity();
+        // Read per call rather than cached, like allow_http: a policy added
+        // by a manifest upload applies to the next request.
+        let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
+        let scope = db::Scope::of(&meta);
+        wit_rows(db::run_scoped(&self.site, &self.app, identity.as_ref(), &scope, &sql, &params))
     }
 }
 

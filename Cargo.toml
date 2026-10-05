@@ -19,7 +19,7 @@ rand = "0.10.2"
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io", "schemars"] }
 # rustls plus bundled roots: no OpenSSL in the runtime image.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "charset", "stream", "json"] }
-rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits", "functions"] }
 rusqlite_migration = "2.6.0"
 schemars = "1.2.1"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -40,6 +40,7 @@ ui.rs              the theme for pages toolsite serves itself
 platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
   mcp.rs           MCP tool definitions and the ServerHandler
+  mcp_me.rs        /me/mcp: a regular account's two tools over the data apps share
   bearer.rs        bearer/x-api-key middleware for /mcp
   client_oauth.rs  the OAuth server MCP clients sign in through — who may PUBLISH
   oauth_store.rs   its clients, codes and tokens, in .site/oauth.db
@@ -60,7 +61,8 @@ content/           what gets published, and how it is served
 
 runtime/           executing an app's own code and data
   wasm.rs          engine, guards, host imports
-  db.rs            per-app SQLite and the authorizer keeping apps apart
+  db.rs            per-app SQLite, the identity functions, the authorizers (apps apart; a person inside the views)
+  access.rs        row-level policies from toolsite.toml, realised as views and triggers
   blobs.rs         per-app files, on the volume or in a bucket, keyed like paths
 
 accounts/          people who USE published apps

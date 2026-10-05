@@ -15,6 +15,7 @@ pub mod github;
 pub mod oauth_store;
 pub mod manifest;
 pub mod mcp;
+pub mod mcp_me;
 pub mod scaffold;
 pub mod schedule;
 pub mod secrets;

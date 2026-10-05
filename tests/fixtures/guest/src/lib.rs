@@ -24,6 +24,49 @@ fn param<'q>(query: &'q str, name: &str) -> &'q str {
         .unwrap_or("")
 }
 
+/// Enough of percent-decoding for a fixture: `+` and `%XX`.
+fn decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() + 0 && i + 2 <= bytes.len() - 1 => {
+                let hex = &raw[i + 1..i + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn rows_text(rows: &db::Rows) -> String {
+    rows.values
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    db::Value::Null => "null".to_string(),
+                    db::Value::Integer(i) => i.to_string(),
+                    db::Value::Real(f) => f.to_string(),
+                    db::Value::Text(t) => t.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn blob_status(error: &blobs::Error) -> u16 {
     match error {
         blobs::Error::NotFound => 404,
@@ -88,6 +131,19 @@ impl Guest for Handler {
                     Err(e) => respond(500, format!("{e:?}")),
                 }
             }
+
+            // SQL as the visitor: the full database with the identity bound,
+            // or only the declared views.
+            "/sql" => match db::query(&decode(param(&req.query, "q")), &[]) {
+                Ok(rows) => respond(200, format!("{}:{}", rows.rows_affected, rows_text(&rows))),
+                Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
+                Err(db::Error::Failed(m)) => respond(500, format!("failed: {m}")),
+            },
+            "/scoped" => match db::query_scoped(&decode(param(&req.query, "q")), &[]) {
+                Ok(rows) => respond(200, format!("{}:{}", rows.rows_affected, rows_text(&rows))),
+                Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
+                Err(db::Error::Failed(m)) => respond(500, format!("failed: {m}")),
+            },
 
             // The host must refuse this, not the guest.
             // Can a guest read the platform's own account tables?

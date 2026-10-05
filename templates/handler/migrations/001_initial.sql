@@ -14,3 +14,15 @@
 create table visits (
     at integer not null
 );
+
+-- Row-level access is declared in toolsite.toml, not written here. The
+-- platform makes the view and, when write = true, the triggers:
+--
+--     [[access.table]]
+--     table = "visits"
+--     where = "owner_id = current_user()"
+--     owner = "owner_id"
+--     write = true
+--
+-- current_user(), current_email() and current_role() are bound by the host
+-- on every connection, so a handler's own SQL can use them too.

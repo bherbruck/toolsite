@@ -782,6 +782,63 @@ visitor through the handoff and then use the resulting cookie. This is a fine
 trade when every app is one you deployed, and it is the reason to reach for a
 subdomain per app if that ever stops being true.
 
+## Row-level access
+
+An app decides who may see which rows by declaring it, and the platform
+enforces it. On every connection to an app's database the host binds three
+SQL functions: `current_user()` is the signed-in account's id,
+`current_email()` its email, `current_role()` the role of its grant on this
+app, or NULL when nobody is signed in. A policy in `toolsite.toml` names a
+table and a `where` over them:
+
+```toml
+[[access.table]]
+table = "orders"
+where = "owner_id = current_user()"
+owner = "owner_id"      # optional: filled with current_user() on insert when NULL
+write = true            # optional, default false
+```
+
+From it the platform generates the view `my_orders` (or the `view` you name)
+and, with `write = true`, three `instead of` triggers that carry an insert,
+update or delete through to `orders` and abort when the result would be a row
+the person cannot see. An insert for someone else fails; an update or delete
+of someone else's row changes nothing.
+
+Scoping by site, team or department reads the attribute from another table:
+
+```toml
+[[access.table]]
+table = "records"
+where = "location = (select location from members where user_id = current_user())"
+write = true
+```
+
+The `where` may reference any table or view in the app's own database. It
+must prepare as `select 1 from <table> where (<where>)` and may not contain a
+semicolon. A `without rowid` table cannot take `write = true`. Hand-written
+views are shared read only with `[access] views = ["my_summary"]`.
+
+The generated objects are the platform's: rebuilt whenever the manifest or
+the schema changes, so a new column reaches the view, and dropped when the
+policy goes. The app's Access tab lists them.
+
+Three callers see the boundary:
+
+- **A regular account's Claude**, connected to `https://yourdomain.com/me/mcp`.
+  Any active account can connect; the consent page says what the client may
+  do. Two tools: `my_apps` lists the apps the account may open and the views
+  each shares, `query(app, sql)` runs one statement as the account. Reads
+  work on every shared view, writes only on a writable one, and the SQL
+  cannot reach anything else in the file. An admin's publishing client still
+  uses `/mcp`; a non-admin token there is refused with a pointer to `/me/mcp`.
+- **The app's own handler**, through `db::query-scoped(sql, params)`, for an
+  app that lets its users type SQL. The handler's plain `db::query` stays
+  unrestricted and can read `current_user()` for its own filtering.
+- **An admin proving a policy**: `run_sql(app, sql, as_user: "a@x")` from
+  MCP, or `toolsite sql <app> "<sql>" --as a@x`, runs exactly as that account
+  would through `/me/mcp`.
+
 ## Exporting a database
 
 A reporting tool that pulls SQLite over HTTP can read an
@@ -821,7 +878,8 @@ the index shows. There is a client-side filter over slugs and titles.
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `POST /mcp` | sign-in or token | The MCP server. |
+| `POST /mcp` | admin sign-in or token | The MCP server for publishing. |
+| `POST /me/mcp` | any account's sign-in | A regular account's MCP server: `my_apps` and `query` over the data apps share. |
 | `GET /.well-known/oauth-authorization-server`, `POST /register`, `GET\|POST /authorize`, `POST /token` | public | The OAuth server MCP clients sign in through. Present when `TOOLSITE_BASE_URL` is set. |
 | `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed, `?handler` installs a wasm component, `?migrations`, `?manifest`, `?source`, `?blob=<key>`. 64 MB. |
 | `ANY /p/<slug>` | gate | The page, a bundle asset, or the app's handler. An app root redirects to `/p/<slug>/` so relative links resolve. |

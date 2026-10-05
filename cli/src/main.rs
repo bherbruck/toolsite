@@ -78,6 +78,10 @@ enum Command {
         /// Bound to '?' placeholders, in order. Repeat for several.
         #[arg(long = "param")]
         params: Vec<String>,
+        /// Run as this account, inside the app's declared access, exactly
+        /// as that person would through /me/mcp. For proving a policy.
+        #[arg(long = "as")]
+        as_user: Option<String>,
     },
     /// What is already published.
     List {
@@ -239,9 +243,13 @@ fn run() -> Result<()> {
             no_build,
         ),
         Command::Fetch { slug, dir } => fetch(&mcp, slug, dir.unwrap_or_else(|| PathBuf::from("."))),
-        Command::Sql { app, sql, params } => {
+        Command::Sql { app, sql, params, as_user } => {
             let params: Vec<serde_json::Value> = params.into_iter().map(json_scalar).collect();
-            let text = mcp.call("run_sql", json!({ "app": app, "sql": sql, "params": params }))?;
+            let mut arguments = json!({ "app": app, "sql": sql, "params": params });
+            if let Some(email) = as_user {
+                arguments["as_user"] = json!(email);
+            }
+            let text = mcp.call("run_sql", arguments)?;
             print_rows(&text);
             Ok(())
         }

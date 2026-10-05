@@ -337,6 +337,17 @@ fn app_scoped_next(app: &str, path: &str) -> String {
 }
 
 /// Whether this gate admits this visitor. `None` is an anonymous request.
+/// Whether `user` may open `app` at its root: the gate's answer for a signed
+/// in person, as the index and `/me/mcp` both need it. A hidden app is
+/// closed to everyone.
+pub(crate) async fn may_open(config: &Arc<Config>, app: &str, user: &crate::accounts::users::User) -> bool {
+    let meta = read_meta(config, app).await;
+    if meta.hidden {
+        return false;
+    }
+    admits(config, meta.gate_for("/", &config.default_gate), app, Some(user)).await
+}
+
 async fn admits(
     config: &Arc<Config>,
     gate: &str,
