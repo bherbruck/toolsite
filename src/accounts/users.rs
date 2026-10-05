@@ -105,6 +105,22 @@ fn normalise(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
+/// The one place a password becomes a hash, so the parameters cannot drift
+/// between sign-up, a setup link and a change.
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = new_salt()?;
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| e.to_string())?
+        .to_string())
+}
+
+fn verify_password(stored: &str, password: &str) -> bool {
+    PasswordHash::new(stored)
+        .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+        .unwrap_or(false)
+}
+
 pub fn sign_up(config: &Config, email: &str, password: &str) -> Result<User, String> {
     sign_up_as(config, email, password, false)
 }
@@ -125,11 +141,7 @@ pub fn sign_up_as(
         return Err("password must be at least 8 characters".into());
     }
 
-    let salt = new_salt()?;
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| e.to_string())?
-        .to_string();
+    let hash = hash_password(password)?;
 
     let conn = open(config)?;
     let id = crate::content::slug::random_token(16);
@@ -180,11 +192,7 @@ pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, Str
         return Err("email or password is incorrect".into());
     };
 
-    let parsed = PasswordHash::new(&stored).map_err(|e| e.to_string())?;
-    if Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_err()
-    {
+    if !verify_password(&stored, password) {
         return Err("email or password is incorrect".into());
     }
 
@@ -369,6 +377,78 @@ pub fn create_provider_account(config: &Config, email: &str) -> Result<User, Str
         email,
         is_admin: false,
     })
+}
+
+/// Whether the account has a password at all. One made through a provider
+/// does not, and has nothing to change.
+pub fn has_password(config: &Config, user_id: &str) -> bool {
+    let Ok(conn) = open(config) else {
+        return false;
+    };
+    conn.query_row(
+        "select password_hash is not null from users where id = ?",
+        [user_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+/// The providers an account signs in through, by name, for the account page.
+pub fn identities_for(config: &Config, user_id: &str) -> Vec<String> {
+    let Ok(conn) = open(config) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = conn.prepare(
+        "select provider from identities where user_id = ? order by provider",
+    ) else {
+        return Vec::new();
+    };
+    statement
+        .query_map([user_id], |row| row.get::<_, String>(0))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// A person changes their own password: the current one has to be right,
+/// the new one has to be long enough, and every session but the one they
+/// are using ends, so a password changed because of a leak closes whatever
+/// the leak opened. `current_session` is the raw site token from the cookie.
+pub fn change_password(
+    config: &Config,
+    user_id: &str,
+    current: &str,
+    new: &str,
+    current_session: &str,
+) -> Result<(), String> {
+    if new.chars().count() < 8 {
+        return Err("the new password must be at least 8 characters".into());
+    }
+    let conn = open(config)?;
+    let stored: Option<String> = conn
+        .query_row(
+            "select password_hash from users where id = ? and disabled_at is null",
+            [user_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "no such account".to_string())?;
+    let Some(stored) = stored else {
+        return Err("this account signs in through a provider and has no password".into());
+    };
+    if !verify_password(&stored, current) {
+        return Err("the current password is not right".into());
+    }
+    let hash = hash_password(new)?;
+    conn.execute(
+        "update users set password_hash = ? where id = ?",
+        rusqlite::params![&hash, user_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "delete from sessions where user_id = ? and token_hash != ?",
+        rusqlite::params![user_id, hash_token(current_session)],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// A site session for an account whose identity was proven some other way
@@ -932,6 +1012,11 @@ pub async fn login_form(
                       autocomplete="current-password" required;
                 button type="submit" { "Sign in" }
             }
+            // There is no mailer, so there is no reset email; an admin's
+            // setup link is the way back in, and the page says so.
+            p."muted" style="margin: .75rem 0 0; font-size: .8rem" {
+                "Forgot your password? Ask an admin for a new setup link."
+            }
             // One button per provider the deployment configured. Each goes
             // out through /auth/login/<slug> and comes back to `next`.
             @if !config.providers.is_empty() {
@@ -1298,11 +1383,7 @@ pub fn accept_invite(
         return Err("password must be at least 8 characters".into());
     }
 
-    let salt = new_salt()?;
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| e.to_string())?
-        .to_string();
+    let hash = hash_password(password)?;
 
     let conn = open(config)?;
     conn.execute(

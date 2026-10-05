@@ -101,6 +101,10 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/auth/callback/{provider}", get(providers::callback))
         .route("/auth/logout", post(users::logout).get(users::logout))
         .route("/auth/me", get(users::me))
+        // The signed-in person's own page: how they sign in, and a new
+        // password if they have one.
+        .route("/account", get(platform::account::page))
+        .route("/account/password", post(platform::account::change_password))
         .route("/settings/{token}", get(secrets::entry_form))
         .route("/settings", get(secrets::entry_form_query).post(secrets::entry_submit))
         .route(
