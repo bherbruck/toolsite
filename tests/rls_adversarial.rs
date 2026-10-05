@@ -779,8 +779,9 @@ async fn mcp_session(router: &axum::Router, path: &str, token: &str) -> String {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
-    let session = session.expect("no session id");
-    let (status, ..) = mcp_post(router, path, token, Some(&session), json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
+    // The transport is stateless: no session id is issued, and none is sent.
+    let session = session.unwrap_or_default();
+    let (status, ..) = mcp_post(router, path, token, (!session.is_empty()).then_some(session.as_str()), json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await;
     assert!(status.is_success(), "initialized notification: {status}");
     session
 }
@@ -790,7 +791,7 @@ async fn mcp_tool(router: &axum::Router, path: &str, token: &str, session: &str,
         router,
         path,
         token,
-        Some(session),
+        (!session.is_empty()).then_some(session),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
     )
     .await;
