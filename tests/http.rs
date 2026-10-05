@@ -3243,3 +3243,172 @@ async fn an_admin_can_put_an_app_back_on_the_site_default() {
     let (_, page, _) = send(&config, get_as("/admin/apps", &boss)).await;
     assert!(page.contains("site default"));
 }
+
+// --- the second pass on the admin pages ----------------------------------------
+
+#[tokio::test]
+async fn the_index_is_called_apps_and_offers_cards_or_a_list() {
+    let (_dir, config) = server();
+    write_page(&config, "one", "<title>One</title>");
+    let (status, page, _) = send(&config, get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("<h1>Apps</h1>"), "the index is not titled Apps");
+    assert!(page.contains("1 app"), "{page}");
+    assert!(page.contains(r#"data-view="cards""#) && page.contains(r#"data-view="list""#), "no view control");
+    assert!(!page.contains("Pages"), "the old name is still on the page");
+}
+
+#[tokio::test]
+async fn the_apps_list_pages_and_searches_instead_of_dumping_everything() {
+    let (_dir, config) = server();
+    for n in 0..60 {
+        write_page(&config, &format!("app-{n:02}/index"), &format!("<title>Number {n}</title>"));
+    }
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+
+    let (status, page, _) = send(&config, get_as("/admin/apps", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.matches("data-slug=\"").count(), 50, "the first page is not capped at 50");
+    assert!(page.contains("Showing 1–50 of 60"), "{page}");
+    assert!(page.contains("page=2"), "no way to the second page");
+
+    let (_, page, _) = send(&config, get_as("/admin/apps?page=2", &boss)).await;
+    assert_eq!(page.matches("data-slug=\"").count(), 10);
+    assert!(page.contains("Showing 51–60 of 60"));
+
+    // The server-side search finds by slug and by title, across pages.
+    let (_, page, _) = send(&config, get_as("/admin/apps?q=app-57", &boss)).await;
+    assert_eq!(page.matches("data-slug=\"").count(), 1);
+    let (_, page, _) = send(&config, get_as("/admin/apps?q=number+3", &boss)).await;
+    assert_eq!(page.matches("data-slug=\"").count(), 11, "Number 3 and 30-39");
+    let (_, page, _) = send(&config, get_as("/admin/apps?q=zzz", &boss)).await;
+    assert!(page.contains("Nothing matches"));
+}
+
+#[tokio::test]
+async fn an_account_page_shows_grants_and_lets_an_admin_change_them() {
+    let (_dir, config) = server();
+    write_page(&config, "reports/index", "<title>Reports</title>");
+    write_page(&config, "board/index", "<title>Board</title>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let reader = sign_in(&config, "reader@example.com", "correct horse battery");
+
+    let (status, ..) = send(&config, get_as("/admin/accounts/reader%40example.com", &reader)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, ..) = send(&config, get_as("/admin/accounts/nobody%40example.com", &boss)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, page, _) = send(&config, get_as("/admin/accounts/reader%40example.com", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("No grants"));
+    assert!(page.contains(r#"data-search="/admin/apps/search""#), "the app picker is not a combobox");
+    assert!(!page.contains("<select"), "a select lists every app");
+    let token = form_token_from(&page);
+
+    // Add from the account page, with a role, and come back to it.
+    let back = "/admin/accounts/reader%40example.com";
+    let (status, _, headers) = send(
+        &config,
+        post_form("/admin/access", &boss, format!("token={token}&app=reports&email=reader@example.com&allow=1&role=editor&back={back}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, page) = follow(&config, &boss, &headers).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("reports") && page.contains("editor"), "the grant is not listed with its role: {page}");
+    let who = toolsite::accounts::users::log_in(&config, "reader@example.com", "correct horse battery").unwrap().0;
+    assert_eq!(toolsite::accounts::users::role_for(&config, &who.id, "reports").as_deref(), Some("editor"));
+
+    // A role is one word.
+    let (_, _, headers) = send(
+        &config,
+        post_form("/admin/access", &boss, format!("token={token}&app=board&email=reader@example.com&allow=1&role=drop+table&back={back}")),
+    )
+    .await;
+    assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")));
+    assert!(!toolsite::accounts::users::has_grant(&config, &who, "board"));
+
+    // Revoke from the same page.
+    send(
+        &config,
+        post_form("/admin/access", &boss, format!("token={token}&app=reports&email=reader@example.com&allow=0&back={back}")),
+    )
+    .await;
+    assert!(!toolsite::accounts::users::has_grant(&config, &who, "reports"));
+
+    // A fresh setup link, shown once and usable.
+    let (status, page, _) = send(
+        &config,
+        post_form("/admin/reinvite", &boss, format!("token={token}&email=reader@example.com&back={back}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let link = page
+        .split("id=\"setup-link\">")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("no setup link shown");
+    assert!(link.contains("/auth/setup?token="), "{link}");
+    let (_, page, _) = send(&config, get_as("/admin/accounts/reader%40example.com", &boss)).await;
+    assert!(!page.contains("/auth/setup?token="), "the link is shown again on a later visit");
+}
+
+#[tokio::test]
+async fn the_pickers_search_the_server_and_never_list_everyone() {
+    let (_dir, config) = server();
+    write_page(&config, "reports/index", "<title>Quarterly Numbers</title>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    for n in 0..15 {
+        account(&config, &format!("person{n:02}@example.com"), "correct horse battery");
+    }
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let reader = sign_in(&config, "person00@example.com", "correct horse battery");
+
+    // Admin only.
+    let (status, ..) = send(&config, get("/admin/accounts/search?q=person")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, ..) = send(&config, get_as("/admin/accounts/search?q=person", &reader)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, ..) = send(&config, get_as("/admin/apps/search?q=rep", &reader)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Capped at ten, nothing for nothing.
+    let (status, body, _) = send(&config, get_as("/admin/accounts/search?q=person", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    let found: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(found.len(), 10, "{body}");
+    let (_, body, _) = send(&config, get_as("/admin/accounts/search?q=", &boss)).await;
+    assert_eq!(body, "[]");
+    let (_, body, _) = send(&config, get_as("/admin/accounts/search?q=person1", &boss)).await;
+    let found: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(found.len(), 5);
+
+    // Apps match by slug or title.
+    let (_, body, _) = send(&config, get_as("/admin/apps/search?q=quarterly", &boss)).await;
+    assert!(body.contains(r#""value":"reports""#), "{body}");
+    let (_, body, _) = send(&config, get_as("/admin/apps/search?q=", &boss)).await;
+    assert_eq!(body, "[]");
+
+    // The Access tab carries the picker, not the directory.
+    let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
+    assert!(page.contains("Add a person"));
+    assert!(page.contains(r#"data-search="/admin/accounts/search""#));
+    for n in 0..15 {
+        assert!(!page.contains(&format!("person{n:02}@example.com")), "the page lists every account");
+    }
+    assert!(!page.contains("<select name=\"email\""));
+}
+
+#[tokio::test]
+async fn the_global_access_page_is_gone_but_its_action_remains() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (status, ..) = send(&config, get_as("/admin/access", &boss)).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (_, page, _) = send(&config, get_as("/admin/apps", &boss)).await;
+    assert!(!page.contains(r#"href="/admin/access""#), "the sidebar still links to it");
+}

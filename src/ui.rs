@@ -234,6 +234,36 @@ a.row-link:hover { text-decoration: underline; }
 .title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: .25rem; }
 .title-row .muted { margin: 0; }
 
+/* A segmented control: two or three choices, one active. */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: calc(var(--radius) - .1rem); overflow: hidden; }
+.seg button {
+  border: 0; border-radius: 0; background: var(--card); color: var(--muted);
+  padding: .3rem .7rem; font-size: .85rem; font-weight: 500;
+}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { background: var(--soft); color: var(--fg); }
+.seg button:hover { opacity: 1; background: var(--soft); }
+
+/* The index has two views over one list: the same markup, restyled. Cards
+   is the default; List packs each entry into one bordered row. */
+.stack.view-list { gap: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--card); }
+.stack.view-list .card { border: 0; border-bottom: 1px solid var(--border); border-radius: 0; box-shadow: none; padding: .45rem .75rem; }
+.stack.view-list li:last-child .card { border-bottom: 0; }
+.stack.view-list .card:hover { background: var(--soft); }
+.stack.view-list .icon { flex-basis: 1.6rem; width: 1.6rem; height: 1.6rem; border-radius: .35rem; }
+.stack.view-list .icon-text { font-size: .95rem; }
+.stack.view-list .meta { flex-direction: row; align-items: baseline; gap: .6rem; flex: 1; min-width: 0; }
+.stack.view-list .meta .slug { margin-left: auto; white-space: nowrap; }
+
+/* Search above a list: narrows the page as you type, searches on Enter. */
+form.search { margin: 0 0 1rem; }
+form.search input[type=search] { margin: 0; }
+.pager {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  margin: .75rem 0 0; color: var(--muted); font-size: .85rem;
+}
+.pager .actions a.btn { font-size: .8rem; }
+
 /* One-line result of the last action, set by the server on redirect. */
 .flash {
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
@@ -397,6 +427,31 @@ pub const SHELL_SCRIPT: &str = r#"
   document.querySelectorAll('.flash [data-dismiss]').forEach((button) => {
     button.addEventListener('click', () => button.closest('.flash').remove());
   });
+  // A picker is a plain text input whose <datalist> fills from the server
+  // as the person types. Without script it is still a text input.
+  document.querySelectorAll('input[data-search]').forEach((input) => {
+    const list = document.getElementById(input.getAttribute('list'));
+    if (!list) return;
+    let timer = null;
+    input.addEventListener('input', () => {
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (!q) { list.replaceChildren(); return; }
+      timer = setTimeout(async () => {
+        try {
+          const res = await fetch(input.dataset.search + '?q=' + encodeURIComponent(q), { credentials: 'same-origin' });
+          if (!res.ok) return;
+          const found = await res.json();
+          list.replaceChildren(...found.map((item) => {
+            const option = document.createElement('option');
+            option.value = item.value;
+            if (item.label && item.label !== item.value) option.label = item.label;
+            return option;
+          }));
+        } catch {}
+      }, 150);
+    });
+  });
 })();
 </script>
 "#;
@@ -406,19 +461,40 @@ pub const SHELL_SCRIPT: &str = r#"
 /// appears when nothing is left. Shared by the index and the apps list.
 pub const FILTER_SCRIPT: &str = r#"
 <script>
+(() => {
   const input = document.getElementById('q');
-  const items = Array.from(document.getElementById('list').children);
+  const list = document.getElementById('list');
   const noMatch = document.getElementById('no-match');
-  input.addEventListener('input', () => {
-    const q = input.value.trim().toLowerCase();
-    let visible = 0;
-    items.forEach((li) => {
-      const match = (li.dataset.slug + ' ' + (li.dataset.title || '')).includes(q);
-      li.style.display = match ? '' : 'none';
-      if (match) visible++;
+  if (input && list) {
+    const items = Array.from(list.querySelectorAll('[data-slug]'));
+    input.addEventListener('input', () => {
+      const q = input.value.trim().toLowerCase();
+      let visible = 0;
+      items.forEach((item) => {
+        const match = (item.dataset.slug + ' ' + (item.dataset.title || '')).includes(q);
+        item.style.display = match ? '' : 'none';
+        if (match) visible++;
+      });
+      if (noMatch) noMatch.style.display = (items.length > 0 && visible === 0 && q !== '') ? 'block' : 'none';
     });
-    noMatch.style.display = (items.length > 0 && visible === 0 && q !== '') ? 'block' : 'none';
-  });
+  }
+  // Cards or rows: remembered per browser, never sent anywhere.
+  const buttons = Array.from(document.querySelectorAll('[data-view]'));
+  if (list && buttons.length) {
+    const key = 'toolsite.view';
+    const apply = (view) => {
+      list.classList.toggle('view-list', view === 'list');
+      buttons.forEach((b) => b.setAttribute('aria-pressed', b.dataset.view === view ? 'true' : 'false'));
+    };
+    let saved = 'cards';
+    try { saved = localStorage.getItem(key) || 'cards'; } catch {}
+    apply(saved);
+    buttons.forEach((b) => b.addEventListener('click', () => {
+      apply(b.dataset.view);
+      try { localStorage.setItem(key, b.dataset.view); } catch {}
+    }));
+  }
+})();
 </script>
 "#;
 
@@ -548,6 +624,19 @@ pub fn tabs(items: &[(&str, &str, &str)], active: &str) -> Markup {
                 a."active"[*key == active] href=(href) { (label) }
             }
         }
+    }
+}
+
+/// A text input that suggests matches from `search_url` (`?q=` appended) as
+/// the person types, through the shared shell script. It submits whatever
+/// was typed, so it works with no script, and it never renders the whole
+/// set of apps or accounts into the page the way a `<select>` would.
+pub fn combobox(name: &str, search_url: &str, placeholder: &str) -> Markup {
+    let list_id = format!("{name}-matches");
+    html! {
+        input name=(name) placeholder=(placeholder) list=(list_id) data-search=(search_url)
+              autocomplete="off" required;
+        datalist id=(list_id) {}
     }
 }
 

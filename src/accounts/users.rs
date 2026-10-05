@@ -1171,17 +1171,18 @@ pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-pub fn list_grants(config: &Config) -> Result<Vec<(String, String)>, String> {
+/// Every grant on the site: app, account, role.
+pub fn list_grants(config: &Config) -> Result<Vec<(String, String, String)>, String> {
     let conn = open(config)?;
     let mut statement = conn
         .prepare(
-            "select grants.app, users.email
+            "select grants.app, users.email, grants.role
                from grants join users on users.id = grants.user_id
               order by grants.app, users.email",
         )
         .map_err(|e| e.to_string())?;
     let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(|e| e.to_string())?;
     Ok(rows.filter_map(Result::ok).collect())
 }

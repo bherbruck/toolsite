@@ -99,7 +99,7 @@ currently requires `TOOLSITE_MCP_TOKEN` to be set there.
 
 **Locally, with cargo.** `cp .env.example .env`, set `TOOLSITE_MCP_TOKEN` or
 `TOOLSITE_BASE_URL`, then `cargo run --release`. `.env` is loaded at startup
-and is gitignored. Pages are at `http://localhost:8080`.
+and is gitignored. The site is at `http://localhost:8080`.
 
 **Locally, over stdio.** A client on the same machine can speak MCP to the
 binary directly, with no network and no token:
@@ -627,8 +627,8 @@ breaking it.
 |---|---|
 | `/admin/apps` | Every app, with its gate and whether it ships a handler. Each row opens the app's page. |
 | `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility), then tabs: Access (gate, route rules, granted accounts), Exports, Settings, Jobs, Notes. |
+| `/admin/accounts/<email>` | One account: the apps they may open (add with a searchable picker, revoke), a fresh setup link shown once, disable or enable. |
 | `/admin/accounts` | Accounts with role and status; disable or re-enable; New account is its own page. |
-| `/admin/access` | Every grant on the site, each linking to its app's Access tab. |
 | `/admin/exports` | Every export token, by app and label. |
 
 Anything that removes or disables asks first. Every action comes back to the

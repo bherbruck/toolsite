@@ -580,23 +580,31 @@ pub(crate) async fn index(
     });
 
     let count_label = match cards.len() {
-        0 => "No pages yet".to_string(),
-        1 => "1 page".to_string(),
-        n => format!("{n} pages"),
+        0 => "No apps yet".to_string(),
+        1 => "1 app".to_string(),
+        n => format!("{n} apps"),
     };
 
     let body = html! {
         div."title-row" {
             div {
-                h1 { "Pages" }
+                h1 { "Apps" }
                 p."muted" { (count_label) }
+            }
+            @if !cards.is_empty() {
+                div."actions" {
+                    div."seg" role="group" aria-label="View" {
+                        button type="button" data-view="cards" aria-pressed="true" { "Cards" }
+                        button type="button" data-view="list" aria-pressed="false" { "List" }
+                    }
+                }
             }
         }
 
         @if cards.is_empty() {
-            p."empty" { "No pages yet. Push one to see it here." }
+            p."empty" { "No apps yet. Publish one to see it here." }
         } @else {
-            input type="search" id="q" placeholder="Filter pages…" autocomplete="off";
+            input type="search" id="q" placeholder="Filter apps…" autocomplete="off";
             ul."stack" id="list" {
                 @for card in &cards {
                     li data-slug=(card.slug.to_lowercase())
@@ -618,14 +626,14 @@ pub(crate) async fn index(
                     }
                 }
             }
-            p."no-match" id="no-match" { "No pages match that." }
+            p."no-match" id="no-match" { "No app matches that." }
         }
     };
     // The same shell as the admin pages, so the one person who may go there
-    // sees the door, and everyone else sees Pages and a way to sign in.
+    // sees the door, and everyone else sees the apps and a way to sign in.
     let markup = crate::ui::shell(
-        "Pages",
-        crate::platform::admin::sidebar("pages", viewer.as_ref()),
+        "Apps",
+        crate::platform::admin::sidebar("site", viewer.as_ref()),
         body,
         (!cards.is_empty()).then_some(crate::ui::FILTER_SCRIPT),
     );

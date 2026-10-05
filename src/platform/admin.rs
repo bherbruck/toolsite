@@ -27,9 +27,10 @@ use crate::{
     AppState,
 };
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
+    Json,
 };
 use maud::{html, Markup};
 use serde::Deserialize;
@@ -124,14 +125,13 @@ pub(crate) fn sidebar(active: &str, viewer: Option<&User>) -> Markup {
         a."brand" href="/" { span."mark" { "t" } "toolsite" }
         div."nav-group" {
             div."label" { "Site" }
-            a."active"[active == "pages"] href="/" { "Pages" }
+            a."active"[active == "site"] href="/" { "Apps" }
         }
         @if is_admin {
             div."nav-group" {
                 div."label" { "Admin" }
                 a."active"[active == "apps"] href="/admin/apps" { "Apps" }
                 a."active"[active == "accounts"] href="/admin/accounts" { "Accounts" }
-                a."active"[active == "access"] href="/admin/access" { "Access" }
                 a."active"[active == "exports"] href="/admin/exports" { "Exports" }
             }
         }
@@ -198,6 +198,156 @@ fn hidden(name: &str, value: &str) -> Markup {
     html! { input type="hidden" name=(name) value=(value); }
 }
 
+// --- lists ---------------------------------------------------------------------
+
+/// How many rows a list page shows. Beyond this it pages, so a site with
+/// hundreds of apps or accounts is still a page a person can read.
+const PAGE_SIZE: usize = 50;
+
+#[derive(Deserialize, Default)]
+pub struct ListQuery {
+    q: Option<String>,
+    page: Option<usize>,
+}
+
+struct Listing<T> {
+    rows: Vec<T>,
+    total: usize,
+    page: usize,
+    pages: usize,
+    q: String,
+}
+
+/// Narrows by `q` (case-insensitive, against whatever `text` returns) and
+/// takes one page. One helper for every list, so they all behave the same.
+fn paginate<T>(all: Vec<T>, query: &ListQuery, text: impl Fn(&T) -> String) -> Listing<T> {
+    let q = query.q.as_deref().unwrap_or("").trim().to_lowercase();
+    let matching: Vec<T> = if q.is_empty() {
+        all
+    } else {
+        all.into_iter().filter(|row| text(row).to_lowercase().contains(&q)).collect()
+    };
+    let total = matching.len();
+    let pages = total.div_ceil(PAGE_SIZE).max(1);
+    let page = query.page.unwrap_or(1).clamp(1, pages);
+    let rows = matching.into_iter().skip((page - 1) * PAGE_SIZE).take(PAGE_SIZE).collect();
+    Listing { rows, total, page, pages, q }
+}
+
+/// The search box above a list. Typing narrows the rows already on the
+/// page; Enter asks the server, which is what finds things on other pages.
+fn search_box(listing: &Listing<impl Sized>, path: &str, placeholder: &str) -> Markup {
+    html! {
+        form."search" method="get" action=(path) {
+            input type="search" id="q" name="q" value=(listing.q) placeholder=(placeholder) autocomplete="off";
+        }
+    }
+}
+
+/// "Showing 1–50 of 120" and the way to the rest.
+fn pager(listing: &Listing<impl Sized>, path: &str) -> Markup {
+    let first = if listing.total == 0 { 0 } else { (listing.page - 1) * PAGE_SIZE + 1 };
+    let last = ((listing.page) * PAGE_SIZE).min(listing.total);
+    let link = |page: usize| {
+        let mut href = format!("{path}?page={page}");
+        if !listing.q.is_empty() {
+            href.push_str(&format!("&q={}", urlencoding::encode(&listing.q)));
+        }
+        href
+    };
+    html! {
+        div."pager" {
+            span {
+                @if listing.total == 0 { "Nothing matches" }
+                @else { "Showing " (first) "–" (last) " of " (listing.total) }
+            }
+            @if listing.pages > 1 {
+                div."actions" {
+                    @if listing.page > 1 { a."btn quiet sm" href=(link(listing.page - 1)) { "Previous" } }
+                    span."muted small" { "Page " (listing.page) " of " (listing.pages) }
+                    @if listing.page < listing.pages { a."btn quiet sm" href=(link(listing.page + 1)) { "Next" } }
+                }
+            }
+        }
+    }
+}
+
+/// One match for a picker: what the form submits, and what the person sees.
+#[derive(serde::Serialize)]
+pub struct Match {
+    value: String,
+    label: String,
+}
+
+const MAX_MATCHES: usize = 10;
+
+fn matches<T>(all: Vec<T>, q: &str, to_match: impl Fn(&T) -> Match) -> Vec<Match> {
+    let q = q.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    all.into_iter()
+        .map(|row| to_match(&row))
+        .filter(|m| m.value.to_lowercase().contains(&q) || m.label.to_lowercase().contains(&q))
+        .take(MAX_MATCHES)
+        .collect()
+}
+
+/// `GET /admin/accounts/search?q=`: at most ten emails, for a picker. An
+/// empty query finds nothing, so the page never carries every account.
+pub async fn search_accounts(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    if let Err(response) = require_admin(&config, &headers).await {
+        return response;
+    }
+    let accounts = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || users::list_accounts(&config))
+            .await
+            .unwrap_or_else(|_| Ok(Vec::new()))
+            .unwrap_or_default()
+    };
+    let found = matches(accounts, query.q.as_deref().unwrap_or(""), |account| Match {
+        value: account.email.clone(),
+        label: account.email.clone(),
+    });
+    ([no_store()], Json(found)).into_response()
+}
+
+/// `GET /admin/apps/search?q=`: at most ten apps by slug or title.
+pub async fn search_apps(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    if let Err(response) = require_admin(&config, &headers).await {
+        return response;
+    }
+    let q = query.q.as_deref().unwrap_or("").trim().to_lowercase();
+    if q.is_empty() {
+        return ([no_store()], Json(Vec::<Match>::new())).into_response();
+    }
+    let mut found = Vec::new();
+    for app in app_names(&config).await {
+        let path = crate::content::store::page_path(&config, &app).await;
+        let title = match &path {
+            Some(path) => crate::content::store::page_title(path).await,
+            None => None,
+        };
+        let label = title.clone().unwrap_or_else(|| app.clone());
+        if app.to_lowercase().contains(&q) || label.to_lowercase().contains(&q) {
+            found.push(Match { value: app, label });
+            if found.len() == MAX_MATCHES {
+                break;
+            }
+        }
+    }
+    ([no_store()], Json(found)).into_response()
+}
+
 // --- apps ----------------------------------------------------------------------
 
 /// The apps that exist, by their top-level directory.
@@ -245,7 +395,11 @@ async fn app_row(config: &Config, app: &str) -> AppRow {
     }
 }
 
-pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+pub async fn apps_page(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
     let admin = match require_admin(&config, &headers).await {
         Ok(admin) => admin,
         Err(response) => return response,
@@ -255,6 +409,9 @@ pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) ->
         rows.push(app_row(&config, &app).await);
     }
     let count = rows.len();
+    let listing = paginate(rows, &query, |row| {
+        format!("{} {}", row.app, row.title.as_deref().unwrap_or(""))
+    });
     admin_page(
         &headers,
         &admin,
@@ -264,17 +421,17 @@ pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) ->
             crumbs: vec![],
             subtitle: Some(html! { (count) " published" }),
             actions: None,
-            script: (!rows.is_empty()).then_some(ui::FILTER_SCRIPT),
+            script: (count > 0).then_some(ui::FILTER_SCRIPT),
             body: html! {
-                @if rows.is_empty() {
+                @if count == 0 {
                     (ui::panel("Nothing published yet", Some("An agent publishes with create_upload; apps appear here as they land."), html! {}))
                 } @else {
-                    input type="search" id="q" placeholder="Find an app…" autocomplete="off" autofocus;
+                    (search_box(&listing, "/admin/apps", "Find an app…"))
                     section."panel" {
                         table {
                             thead { tr { th { "App" } th { "Access" } th { "Handler" } th { "Updated" } th {} } }
                             tbody id="list" {
-                                @for row in &rows {
+                                @for row in &listing.rows {
                                     tr data-slug=(row.app.to_lowercase())
                                        data-title=(row.title.as_deref().unwrap_or_default().to_lowercase()) {
                                         td {
@@ -296,7 +453,8 @@ pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) ->
                             }
                         }
                     }
-                    p."no-match" id="no-match" { "No app matches that." }
+                    p."no-match" id="no-match" { "No app on this page matches that. Press Enter to search them all." }
+                    (pager(&listing, "/admin/apps"))
                 }
             },
         },
@@ -524,7 +682,7 @@ async fn render_access_tab(
     token: &str,
     back: &str,
 ) -> Markup {
-    let grants: Vec<String> = {
+    let grants: Vec<(String, String)> = {
         let config = config.clone_for_task();
         let app = app.to_string();
         tokio::task::spawn_blocking(move || users::list_grants(&config))
@@ -532,8 +690,8 @@ async fn render_access_tab(
             .unwrap_or_else(|_| Ok(Vec::new()))
             .unwrap_or_default()
             .into_iter()
-            .filter(|(granted_app, _)| granted_app == &app)
-            .map(|(_, email)| email)
+            .filter(|(granted_app, _, _)| granted_app == &app)
+            .map(|(_, email, role)| (email, role))
             .collect()
     };
     html! {
@@ -590,16 +748,24 @@ async fn render_access_tab(
             }
         }))
 
-        (ui::panel("Granted accounts", Some("Only matters while access, or a rule, says granted."), html! {
+        (ui::panel("Granted accounts", Some("A grant only matters while access, or a rule, says granted. The role is the app's to interpret."), html! {
+            form."row" method="post" action="/admin/access" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))
+                label."small" for="email" { "Add a person" }
+                (ui::combobox("email", "/admin/accounts/search", "Start typing an email…"))
+                input name="role" value="viewer" placeholder="role" size="8" title="A word the app reads with identity::current-role";
+                button type="submit" { "Add" }
+            }
             @if grants.is_empty() {
                 p."muted" { "Nobody has been granted access yet." }
             } @else {
                 table {
-                    thead { tr { th { "Account" } th {} } }
+                    thead { tr { th { "Account" } th { "Role" } th {} } }
                     tbody {
-                        @for email in &grants {
+                        @for (email, role) in &grants {
                             tr {
-                                td { (email) }
+                                td { a."row-link" href={ "/admin/accounts/" (urlencoding::encode(email)) } { (email) } }
+                                td { span."badge" { (role) } }
                                 td."actions-cell" {
                                     form method="post" action="/admin/access"
                                          data-confirm={ "Revoke " (email) "?" }
@@ -614,11 +780,6 @@ async fn render_access_tab(
                         }
                     }
                 }
-            }
-            form."row" method="post" action="/admin/access" {
-                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))
-                input name="email" type="email" placeholder="someone@example.com" required;
-                button."quiet" type="submit" { "Grant access" }
             }
         }))
     }
@@ -766,7 +927,11 @@ fn ago(seconds: u64) -> String {
 
 // --- accounts ---------------------------------------------------------------------
 
-pub async fn accounts_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+pub async fn accounts_page(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
     let admin = match require_admin(&config, &headers).await {
         Ok(admin) => admin,
         Err(response) => return response,
@@ -778,6 +943,8 @@ pub async fn accounts_page(State(config): State<Arc<Config>>, headers: HeaderMap
             .unwrap_or_else(|_| Ok(Vec::new()))
             .unwrap_or_default()
     };
+    let count = accounts.len();
+    let listing = paginate(accounts, &query, |account| account.email.clone());
     let token = form_token(&config, &admin);
     admin_page(
         &headers,
@@ -786,20 +953,21 @@ pub async fn accounts_page(State(config): State<Arc<Config>>, headers: HeaderMap
             active: "accounts",
             title: "Accounts",
             crumbs: vec![],
-            subtitle: Some(html! { (accounts.len()) " accounts" }),
+            subtitle: Some(html! { (count) " accounts" }),
             actions: Some(html! { a."btn" href="/admin/accounts/new" { "New account" } }),
-            script: None,
+            script: (count > 0).then_some(ui::FILTER_SCRIPT),
             body: html! {
-                @if accounts.is_empty() {
+                @if count == 0 {
                     (ui::panel("No accounts yet", Some("Create the first one, or run `toolsite user add` on the machine."), html! {}))
                 } @else {
+                    (search_box(&listing, "/admin/accounts", "Find an account…"))
                     section."panel" {
                         table {
                             thead { tr { th { "Email" } th { "Role" } th { "Status" } th { "Created" } th {} } }
-                            tbody {
-                                @for account in &accounts {
-                                    tr {
-                                        td { span."row-link" { (account.email) } }
+                            tbody id="list" {
+                                @for account in &listing.rows {
+                                    tr data-slug=(account.email.to_lowercase()) {
+                                        td { a."row-link" href={ "/admin/accounts/" (urlencoding::encode(&account.email)) } { (account.email) } }
                                         td { @if account.is_admin { span."badge solid" { "admin" } } @else { span."muted small" { "visitor" } } }
                                         td { @if account.is_active { span."badge ok" { "active" } } @else { span."badge warn" { "disabled" } } }
                                         td."muted small" { (account.created) }
@@ -824,10 +992,171 @@ pub async fn accounts_page(State(config): State<Arc<Config>>, headers: HeaderMap
                             }
                         }
                     }
+                    p."no-match" id="no-match" { "No account on this page matches that. Press Enter to search them all." }
+                    (pager(&listing, "/admin/accounts"))
                 }
             },
         },
     )
+}
+
+/// One account: who they are, what they may open, and the two things an
+/// admin does for them — a fresh setup link, and switching them off.
+pub async fn account_page(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Path(email): Path<String>,
+) -> Response {
+    render_account_page(config, headers, email, None).await
+}
+
+async fn render_account_page(
+    config: Arc<Config>,
+    headers: HeaderMap,
+    email: String,
+    fresh_link: Option<String>,
+) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let wanted = email.trim().to_lowercase();
+    let (account, grants) = {
+        let (config, wanted) = (config.clone(), wanted.clone());
+        tokio::task::spawn_blocking(move || {
+            let account = users::list_accounts(&config)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|account| account.email == wanted);
+            let grants: Vec<(String, String)> = users::list_grants(&config)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, who, _)| who == &wanted)
+                .map(|(app, _, role)| (app, role))
+                .collect();
+            (account, grants)
+        })
+        .await
+        .unwrap_or((None, Vec::new()))
+    };
+    let Some(account) = account else {
+        return (StatusCode::NOT_FOUND, "no such account").into_response();
+    };
+    let token = form_token(&config, &admin);
+    let back = format!("/admin/accounts/{}", urlencoding::encode(&account.email));
+    let is_self = account.email == admin.email;
+    let title = account.email.clone();
+    admin_page(
+        &headers,
+        &admin,
+        Page {
+            active: "accounts",
+            title: &title,
+            crumbs: vec![("Accounts", "/admin/accounts")],
+            subtitle: Some(html! { "Created " (account.created) }),
+            actions: Some(html! {
+                @if account.is_admin { span."badge solid" { "admin" } } @else { span."badge" { "visitor" } }
+                @if account.is_active { span."badge ok" { "active" } } @else { span."badge warn" { "disabled" } }
+            }),
+            script: None,
+            body: html! {
+                @if let Some(link) = &fresh_link {
+                    (ui::panel("Setup link", Some("Send it to them. It lasts 48 hours, works once, and lets them choose a password."), html! {
+                        (ui::secret("setup-link", link))
+                    }))
+                }
+                (ui::panel("Apps they may open", Some("Only matters for apps whose access is granted. The role is a word the app reads; viewer is the usual one."), html! {
+                    form."row" method="post" action="/admin/access" {
+                        (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("allow", "1"))
+                        label."small" for="app" { "Add to an app" }
+                        (ui::combobox("app", "/admin/apps/search", "Start typing an app…"))
+                        input name="role" value="viewer" placeholder="role" size="8";
+                        button type="submit" { "Add" }
+                    }
+                    @if grants.is_empty() {
+                        p."muted" { "No grants." }
+                    } @else {
+                        table {
+                            thead { tr { th { "App" } th { "Role" } th {} } }
+                            tbody {
+                                @for (app, role) in &grants {
+                                    tr {
+                                        td { a."row-link" href={ "/admin/apps/" (app) "/access" } { (app) } }
+                                        td { span."badge" { (role) } }
+                                        td."actions-cell" {
+                                            form method="post" action="/admin/access"
+                                                 data-confirm={ "Revoke " (app) "?" }
+                                                 data-confirm-detail="They keep their account and lose this app."
+                                                 data-confirm-label="Revoke" data-confirm-danger="1" {
+                                                (hidden("token", &token)) (hidden("app", app)) (hidden("email", &account.email))
+                                                (hidden("allow", "0")) (hidden("back", &back))
+                                                button."danger quiet sm" type="submit" { "Revoke" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }))
+                (ui::panel("Account", None, html! {
+                    div."actions" {
+                        form method="post" action="/admin/reinvite" {
+                            (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back))
+                            button."quiet" type="submit" { "New setup link" }
+                        }
+                        @if is_self {
+                            span."muted small" { "You cannot disable your own account." }
+                        } @else if account.is_active {
+                            form method="post" action="/admin/active"
+                                 data-confirm={ "Disable " (account.email) "?" }
+                                 data-confirm-detail="Their sessions end now and any connected MCP client stops on its next call. Re-enable any time."
+                                 data-confirm-label="Disable" data-confirm-danger="1" {
+                                (hidden("token", &token)) (hidden("email", &account.email)) (hidden("active", "0")) (hidden("back", &back))
+                                button."danger quiet" type="submit" { "Disable account" }
+                            }
+                        } @else {
+                            form method="post" action="/admin/active" {
+                                (hidden("token", &token)) (hidden("email", &account.email)) (hidden("active", "1")) (hidden("back", &back))
+                                button."quiet" type="submit" { "Enable account" }
+                            }
+                        }
+                    }
+                }))
+            },
+        },
+    )
+}
+
+#[derive(Deserialize)]
+pub struct Reinvite {
+    token: String,
+    email: String,
+    back: Option<String>,
+}
+
+/// Mints a fresh setup link and shows it on the account page, once.
+pub async fn reinvite(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<Reinvite>,
+) -> Response {
+    let admin = match checked(&config, &headers, &form.token).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), "/admin/accounts");
+    let (config2, email) = (config.clone(), form.email.clone());
+    let outcome = tokio::task::spawn_blocking(move || users::reinvite(&config2, &email)).await;
+    match outcome {
+        Ok(Ok(invite)) => {
+            tracing::info!(admin = %admin.email, email = %form.email, "setup link reissued");
+            let url = users::invite_url(&config, &invite);
+            render_account_page(config, headers, form.email, Some(url)).await
+        }
+        Ok(Err(message)) => redirect_flash(&back, false, message),
+        Err(_) => redirect_flash(&back, false, "Could not make a setup link."),
+    }
 }
 
 pub async fn new_account_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
@@ -875,62 +1204,11 @@ pub async fn new_account_page(State(config): State<Arc<Config>>, headers: Header
 
 // --- cross-cutting lists ---------------------------------------------------------
 
-pub async fn access_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-    let grants = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || users::list_grants(&config))
-            .await
-            .unwrap_or_else(|_| Ok(Vec::new()))
-            .unwrap_or_default()
-    };
-    let token = form_token(&config, &admin);
-    admin_page(
-        &headers,
-        &admin,
-        Page {
-            active: "access",
-            title: "Access",
-            crumbs: vec![],
-            subtitle: Some(html! { "Every grant on the site. Edit them on each app's Access tab." }),
-            actions: None,
-            script: None,
-            body: html! {
-                @if grants.is_empty() {
-                    (ui::panel("No grants", Some("Grants only matter for apps whose access is \"granted\". Set that on an app's Access tab first."), html! {}))
-                } @else {
-                    section."panel" {
-                        table {
-                            thead { tr { th { "App" } th { "Account" } th {} } }
-                            tbody {
-                                @for (app, email) in &grants {
-                                    tr {
-                                        td { a."row-link" href={ "/admin/apps/" (app) "/access" } { (app) } }
-                                        td { (email) }
-                                        td."actions-cell" {
-                                            form method="post" action="/admin/access"
-                                                 data-confirm={ "Revoke " (email) " from " (app) "?" }
-                                                 data-confirm-label="Revoke" data-confirm-danger="1" {
-                                                (hidden("token", &token)) (hidden("app", app)) (hidden("email", email))
-                                                (hidden("allow", "0")) (hidden("back", "/admin/access"))
-                                                button."danger quiet sm" type="submit" { "Revoke" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        },
-    )
-}
-
-pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+pub async fn exports_page(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
     let admin = match require_admin(&config, &headers).await {
         Ok(admin) => admin,
         Err(response) => return response,
@@ -941,6 +1219,8 @@ pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap)
             .await
             .unwrap_or_default()
     };
+    let count = tokens.len();
+    let listing = paginate(tokens, &query, |(app, entry)| format!("{app} {} {}", entry.label, entry.id));
     admin_page(
         &headers,
         &admin,
@@ -950,17 +1230,18 @@ pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap)
             crumbs: vec![],
             subtitle: Some(html! { "Tokens that let a reporting tool pull one app's database. Mint them on the app's Exports tab." }),
             actions: None,
-            script: None,
+            script: (count > 0).then_some(ui::FILTER_SCRIPT),
             body: html! {
-                @if tokens.is_empty() {
+                @if count == 0 {
                     (ui::panel("No export tokens", Some("Open an app and use its Exports tab to create one."), html! {}))
                 } @else {
+                    (search_box(&listing, "/admin/exports", "Find a token by app or label…"))
                     section."panel" {
                         table {
                             thead { tr { th { "App" } th { "Label" } th { "Created" } th { "Last used" } } }
-                            tbody {
-                                @for (app, entry) in &tokens {
-                                    tr {
+                            tbody id="list" {
+                                @for (app, entry) in &listing.rows {
+                                    tr data-slug=(app.to_lowercase()) data-title=(entry.label.to_lowercase()) {
                                         td { a."row-link" href={ "/admin/apps/" (app) "/exports" } { (app) } }
                                         td { (entry.label) " " span."muted small" { (entry.id) } }
                                         td."muted small" { (ago(entry.created_at)) }
@@ -970,6 +1251,8 @@ pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap)
                             }
                         }
                     }
+                    p."no-match" id="no-match" { "No token on this page matches that. Press Enter to search them all." }
+                    (pager(&listing, "/admin/exports"))
                 }
             },
         },
@@ -1063,6 +1346,7 @@ pub struct AccessChange {
     app: String,
     email: String,
     allow: String,
+    role: Option<String>,
     back: Option<String>,
 }
 
@@ -1074,13 +1358,23 @@ pub async fn change_access(
     if let Err(response) = checked(&config, &headers, &form.token).await {
         return response;
     }
-    let back = back_or(form.back.as_deref(), "/admin/access");
+    let back = back_or(form.back.as_deref(), "/admin/accounts");
     let allow = form.allow == "1";
+    let role = form
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .unwrap_or("viewer")
+        .to_string();
+    if role.len() > 40 || !role.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+        return redirect_flash(&back, false, "A role is one word: letters, digits, '-' or '_'.");
+    }
     let config2 = config.clone();
     let (email, app) = (form.email.clone(), form.app.clone());
     let outcome = tokio::task::spawn_blocking(move || {
         if allow {
-            users::grant(&config2, &form.email, &form.app, "viewer")
+            users::grant(&config2, &form.email, &form.app, &role)
         } else {
             users::revoke(&config2, &form.email, &form.app)
         }
