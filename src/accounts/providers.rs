@@ -378,8 +378,8 @@ pub async fn begin(
             tracing::warn!(provider = %slug, %why, "sign-in refused: provider not reachable");
             return refusal(
                 StatusCode::BAD_GATEWAY,
-                "That sign-in is not available right now",
-                "The provider could not be reached. Try again in a moment, or sign in another way.",
+                "Sign-in is not available",
+                "The provider did not respond. Try again later, or sign in with a different method.",
             );
         }
     };
@@ -392,7 +392,7 @@ pub async fn begin(
 
     let Ok(mut url) = url::Url::parse(&endpoints.authorization) else {
         tracing::warn!(provider = %slug, "sign-in refused: provider's authorization endpoint is not a URL");
-        return refusal(StatusCode::BAD_GATEWAY, "That sign-in is not available right now", "The provider's configuration is broken.");
+        return refusal(StatusCode::BAD_GATEWAY, "Sign-in is not available", "The provider configuration is not valid.");
     };
     {
         let mut query = url.query_pairs_mut();
@@ -489,7 +489,7 @@ pub async fn callback(
         tracing::warn!(provider = %slug, state_presented = params.state.is_some(), "sign-in refused: unknown, expired or spent state");
         return refusal(
             StatusCode::BAD_REQUEST,
-            "That sign-in has expired",
+            "Sign-in has expired",
             "Start again from the sign-in page.",
         );
     };
@@ -499,12 +499,12 @@ pub async fn callback(
         return refusal(
             StatusCode::BAD_REQUEST,
             "Sign-in did not complete",
-            "The provider did not sign you in. You can try again.",
+            "The provider did not sign you in. Try again.",
         );
     }
     let Some(code) = params.code.as_deref() else {
         tracing::warn!(provider = %slug, "sign-in refused: callback carried no code");
-        return refusal(StatusCode::BAD_REQUEST, "Sign-in did not complete", "The provider sent nothing back.");
+        return refusal(StatusCode::BAD_REQUEST, "Sign-in did not complete", "The provider sent no answer.");
     };
 
     let proven = match prove(&config, provider, &pending, code).await {
@@ -514,7 +514,7 @@ pub async fn callback(
             return refusal(
                 StatusCode::BAD_GATEWAY,
                 "Sign-in did not complete",
-                "The provider's answer could not be verified. You can try again.",
+                "The answer from the provider was not verified. Try again.",
             );
         }
     };
@@ -555,21 +555,21 @@ pub async fn callback(
         }
         Ok(Ok(Err(Refused::Disabled))) => {
             tracing::warn!(provider = %slug, %email, "sign-in refused: account disabled");
-            refusal(StatusCode::FORBIDDEN, "This account is disabled", "An admin turned it off. Ask them if that was a mistake.")
+            refusal(StatusCode::FORBIDDEN, "This account is disabled", "An admin disabled this account. Ask an admin.")
         }
         Ok(Ok(Err(Refused::NoAccount))) => {
             tracing::warn!(provider = %slug, %email, "sign-in refused: no account for that email");
             refusal(
                 StatusCode::FORBIDDEN,
-                "No account for that email",
-                &format!("{email} signed in fine, but there is no account here for it. Ask an admin to add one, then try again."),
+                "No account for this email",
+                &format!("{email} signed in at the provider. There is no account here for it. Ask an admin to create one, then try again."),
             )
         }
         Ok(Err(message)) => {
             tracing::warn!(provider = %slug, %message, "sign-in failed");
-            refusal(StatusCode::INTERNAL_SERVER_ERROR, "Sign-in did not complete", "Something went wrong on this side. Try again.")
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "Sign-in did not complete", "An error occurred on this server. Try again.")
         }
-        Err(_) => refusal(StatusCode::INTERNAL_SERVER_ERROR, "Sign-in did not complete", "Something went wrong on this side. Try again."),
+        Err(_) => refusal(StatusCode::INTERNAL_SERVER_ERROR, "Sign-in did not complete", "An error occurred on this server. Try again."),
     }
 }
 

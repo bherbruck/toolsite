@@ -317,7 +317,7 @@ async fn gate_check(
         };
         (status, "not permitted").into_response()
     } else if known {
-        (StatusCode::FORBIDDEN, "you do not have access to this app").into_response()
+        (StatusCode::FORBIDDEN, "You do not have access to this app.").into_response()
     } else {
         Redirect::to(&format!("/auth/login?next={}", urlencoding::encode(&next))).into_response()
     })
@@ -587,7 +587,7 @@ pub(crate) async fn index(
     });
 
     let count_label = match cards.len() {
-        0 => "No apps yet".to_string(),
+        0 => "No apps".to_string(),
         1 => "1 app".to_string(),
         n => format!("{n} apps"),
     };
@@ -609,9 +609,9 @@ pub(crate) async fn index(
         }
 
         @if cards.is_empty() {
-            p."empty" { "No apps yet. Publish one to see it here." }
+            p."empty" { "There are no apps. Publish an app to show it here." }
         } @else {
-            input type="search" id="q" placeholder="Filter apps…" autocomplete="off";
+            input type="search" id="q" placeholder="Search apps" autocomplete="off";
             ul."stack" id="list" {
                 @for card in &cards {
                     li data-slug=(card.slug.to_lowercase())
@@ -633,7 +633,7 @@ pub(crate) async fn index(
                     }
                 }
             }
-            p."no-match" id="no-match" { "No app matches that." }
+            p."no-match" id="no-match" { "No app matches." }
         }
     };
     // The same shell as the admin pages, so the one person who may go there

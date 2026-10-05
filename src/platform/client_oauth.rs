@@ -263,7 +263,7 @@ async fn validated_client(
         return Err(plain_page(
             StatusCode::BAD_REQUEST,
             "Unknown client",
-            html! { p."muted" { "This client has not registered with this server. Try connecting again from the start." } },
+            html! { p."muted" { "This client is not registered with this server. Start the connection again." } },
         ));
     };
     if !client_accepts(&client, &params.redirect_uri) {
@@ -275,7 +275,7 @@ async fn validated_client(
         return Err(plain_page(
             StatusCode::BAD_REQUEST,
             "Redirect not allowed",
-            html! { p."muted" { "The client asked for the answer to be sent somewhere it did not register." } },
+            html! { p."muted" { "The client asked for a redirect to an address it did not register." } },
         ));
     }
     Ok(client)
@@ -314,10 +314,10 @@ async fn consenting_admin(
             tracing::warn!(email = %user.email, "authorize refused: not an admin");
             Err(plain_page(
                 StatusCode::FORBIDDEN,
-                "This account can't publish",
+                "This account cannot publish",
                 html! {
                     p."muted" {
-                        "You are signed in as " (user.email) ", which is not an admin account. "
+                        "You are signed in as " (user.email) ". This account is not an admin account. "
                         "Only an admin can connect a client that publishes to this site."
                     }
                     form method="post" action="/auth/logout" {
@@ -372,23 +372,23 @@ fn consent(client: &Client, params: &AuthorizeParams, admin: &User, token: &str)
     let local = is_loopback(&host);
     html! {
         form."column" method="post" action="/authorize" {
-            h1 { "Connect to this site?" }
+            h1 { "Connect this client?" }
             // What is proven comes first: where the code goes. What the
             // client says about itself comes second, as a claim.
             @if local {
-                p { strong { "A program on this computer" } " wants to publish here." }
+                p { strong { "A program on this computer" } " requests access to publish here." }
             } @else {
-                p { strong { (host) } " wants to publish here." }
+                p { strong { (host) } " requests access to publish here." }
             }
             @if let Some(name) = &client.name {
-                p."muted" { "It calls itself " (name) "." }
+                p."muted" { "The client name is " (name) "." }
             }
             @if local {
-                p."muted" { "Any program running on this computer can make this request. Only continue if you just started connecting something yourself." }
+                p."muted" { "Warning: Any program on this computer can make this request. Continue only if you started this connection." }
             }
             p."muted" {
-                "It will act as " (admin.email) ", with everything that account can do: "
-                "publish and remove pages, run SQL against any app, and manage accounts and access."
+                "The client acts as " (admin.email) " with all permissions of this account. "
+                "The client can publish and remove apps, run SQL on each app, and manage accounts and access."
             }
             input type="hidden" name="token" value=(token);
             input type="hidden" name="response_type" value=(params.response_type);
@@ -407,8 +407,8 @@ fn consent(client: &Client, params: &AuthorizeParams, admin: &User, token: &str)
                 input type="hidden" name="resource" value=(resource);
             }
             div."row" {
-                button type="submit" name="decision" value="allow" { "Allow" }
-                button."danger" type="submit" name="decision" value="deny" { "Deny" }
+                button type="submit" name="decision" value="allow" { "Allow access" }
+                button."danger" type="submit" name="decision" value="deny" { "Deny access" }
             }
         }
     }
@@ -434,7 +434,7 @@ pub(crate) async fn authorize_decide(
     let expected = users::derive_form_token(&config, &admin.id);
     if expected.len() != decision.token.len() || expected != decision.token {
         tracing::warn!(email = %admin.email, "authorize refused: form token mismatch");
-        return (StatusCode::FORBIDDEN, "stale form").into_response();
+        return (StatusCode::FORBIDDEN, "The form is out of date. Reload the page and try again.").into_response();
     }
     if decision.decision != "allow" {
         tracing::info!(email = %admin.email, client_id = %client.id, "connection declined");

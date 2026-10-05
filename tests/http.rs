@@ -3120,11 +3120,11 @@ async fn saving_a_gate_returns_to_the_tab_with_the_outcome_shown_once() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (status, page) = follow(&config, &boss, &headers).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("reports is now granted"), "no flash: {page}");
+    assert!(page.contains("Access for reports is granted"), "no flash: {page}");
     assert!(page.contains(r#"value="granted" checked"#), "the radio does not reflect the save");
     // Shown once: the next visit is quiet.
     let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
-    assert!(!page.contains("reports is now granted"));
+    assert!(!page.contains("Access for reports is granted"));
 
     // A `back` that is not one of ours is ignored, not followed.
     let (_, _, headers) = send(
@@ -3283,7 +3283,7 @@ async fn the_apps_list_pages_and_searches_instead_of_dumping_everything() {
     let (_, page, _) = send(&config, get_as("/admin/apps?q=number+3", &boss)).await;
     assert_eq!(page.matches("data-slug=\"").count(), 11, "Number 3 and 30-39");
     let (_, page, _) = send(&config, get_as("/admin/apps?q=zzz", &boss)).await;
-    assert!(page.contains("Nothing matches"));
+    assert!(page.contains("No match"));
 }
 
 #[tokio::test]
@@ -3396,7 +3396,7 @@ async fn the_pickers_search_the_server_and_never_list_everyone() {
 
     // The Access tab carries the picker, not the directory.
     let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
-    assert!(page.contains("Add a person"));
+    assert!(page.contains("Add an account"));
     assert!(page.contains(r#"data-search="/admin/accounts/search""#));
     for n in 0..15 {
         assert!(!page.contains(&format!("person{n:02}@example.com")), "the page lists every account");
@@ -3485,7 +3485,7 @@ async fn a_person_changes_their_own_password_and_the_old_one_stops_working() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (status, page) = follow(&config, &me, &headers).await;
     assert_eq!(status, StatusCode::OK, "the session that changed the password was signed out");
-    assert!(page.contains("Password changed"), "no confirmation shown");
+    assert!(page.contains("The password is changed"), "no confirmation shown");
 
     assert!(
         toolsite::accounts::users::log_in(&config, "me@example.com", "correct horse battery").is_err(),
@@ -3556,7 +3556,7 @@ async fn a_provider_only_account_has_no_password_to_change() {
 async fn the_sign_in_page_says_where_a_forgotten_password_goes() {
     let (_dir, config) = server();
     let (_, page, _) = send(&config, get("/auth/login")).await;
-    assert!(page.contains("Ask an admin for a new setup link"));
+    assert!(page.contains("ask an admin for a setup link"));
 }
 
 
@@ -3598,7 +3598,7 @@ async fn an_admin_downloads_the_stored_source_and_nobody_else_can() {
     let (status, ..) = send(&config, get_as("/admin/apps/bare/source", &boss)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, page, _) = send(&config, get_as("/admin/apps/bare", &boss)).await;
-    assert!(page.contains("No source stored"));
+    assert!(page.contains("no source archive"));
 }
 
 // --- declared roles are a hint ---------------------------------------------------

@@ -135,10 +135,10 @@ pub fn sign_up_as(
 ) -> Result<User, String> {
     let email = normalise(email);
     if !email.contains('@') || email.len() < 3 {
-        return Err("that does not look like an email address".into());
+        return Err("Enter a valid email address.".into());
     }
     if password.chars().count() < 8 {
-        return Err("password must be at least 8 characters".into());
+        return Err("Enter a password of at least 8 characters.".into());
     }
 
     let hash = hash_password(password)?;
@@ -152,7 +152,7 @@ pub fn sign_up_as(
     )
     .map_err(|e| {
         if e.to_string().contains("UNIQUE") {
-            "that email is already registered".to_string()
+            "An account with this email exists.".to_string()
         } else {
             e.to_string()
         }
@@ -189,11 +189,11 @@ pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, Str
         if let Ok(salt) = new_salt() {
             let _ = Argon2::default().hash_password(password.as_bytes(), &salt);
         }
-        return Err("email or password is incorrect".into());
+        return Err("The email or password is not correct.".into());
     };
 
     if !verify_password(&stored, password) {
-        return Err("email or password is incorrect".into());
+        return Err("The email or password is not correct.".into());
     }
 
     let token = crate::content::slug::random_token(48);
@@ -362,7 +362,7 @@ pub fn link_identity(config: &Config, provider: &str, provider_id: &str, user_id
 pub fn create_provider_account(config: &Config, email: &str) -> Result<User, String> {
     let email = normalise(email);
     if !email.contains('@') || email.len() < 3 {
-        return Err("that does not look like an email address".into());
+        return Err("Enter a valid email address.".into());
     }
     let conn = open(config)?;
     let id = crate::content::slug::random_token(16);
@@ -421,7 +421,7 @@ pub fn change_password(
     current_session: &str,
 ) -> Result<(), String> {
     if new.chars().count() < 8 {
-        return Err("the new password must be at least 8 characters".into());
+        return Err("Enter a new password of at least 8 characters.".into());
     }
     let conn = open(config)?;
     let stored: Option<String> = conn
@@ -432,10 +432,10 @@ pub fn change_password(
         )
         .map_err(|_| "no such account".to_string())?;
     let Some(stored) = stored else {
-        return Err("this account signs in through a provider and has no password".into());
+        return Err("This account signs in through a provider. It has no password.".into());
     };
     if !verify_password(&stored, current) {
-        return Err("the current password is not right".into());
+        return Err("The current password is not correct.".into());
     }
     let hash = hash_password(new)?;
     conn.execute(
@@ -463,7 +463,7 @@ pub fn start_session(config: &Config, user_id: &str) -> Result<String, String> {
         )
         .map_err(|_| "no such account".to_string())?;
     if !active {
-        return Err("this account is disabled".into());
+        return Err("This account is disabled.".into());
     }
     let token = crate::content::slug::random_token(48);
     let expires = now() + SESSION_LIFETIME.as_secs();
@@ -1015,7 +1015,7 @@ pub async fn login_form(
             // There is no mailer, so there is no reset email; an admin's
             // setup link is the way back in, and the page says so.
             p."muted" style="margin: .75rem 0 0; font-size: .8rem" {
-                "Forgot your password? Ask an admin for a new setup link."
+                "If you forgot your password, ask an admin for a setup link."
             }
             // One button per provider the deployment configured. Each goes
             // out through /auth/login/<slug> and comes back to `next`.
@@ -1060,7 +1060,7 @@ pub async fn login_submit(
         )
             .into_response(),
         Ok(Err(message)) => (StatusCode::UNAUTHORIZED, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Sign-in failed.").into_response(),
     }
 }
 
@@ -1293,7 +1293,7 @@ const INVITE_LIFETIME: Duration = Duration::from_secs(60 * 60 * 48);
 pub fn invite(config: &Config, email: &str, is_admin: bool) -> Result<(User, String), String> {
     let email = normalise(email);
     if !email.contains('@') || email.len() < 3 {
-        return Err("that does not look like an email address".into());
+        return Err("Enter a valid email address.".into());
     }
 
     let conn = open(config)?;
@@ -1305,7 +1305,7 @@ pub fn invite(config: &Config, email: &str, is_admin: bool) -> Result<(User, Str
     )
     .map_err(|e| {
         if e.to_string().contains("UNIQUE") {
-            "that email is already registered".to_string()
+            "An account with this email exists.".to_string()
         } else {
             e.to_string()
         }
@@ -1379,9 +1379,9 @@ pub fn accept_invite(
     token: &str,
     password: &str,
 ) -> Result<(User, String), String> {
-    let user = invited_account(config, token).ok_or("this link is no longer valid")?;
+    let user = invited_account(config, token).ok_or("This link is not valid.")?;
     if password.chars().count() < 8 {
-        return Err("password must be at least 8 characters".into());
+        return Err("Enter a password of at least 8 characters.".into());
     }
 
     let hash = hash_password(password)?;
@@ -1436,23 +1436,23 @@ pub async fn setup_form(
     let Some(account) = account else {
         return (
             StatusCode::GONE,
-            "this link has expired or has already been used",
+            "This link has expired or was used before.",
         )
             .into_response();
     };
 
     let markup = crate::ui::form_page(
-        "Choose a password",
+        "Set a password",
         maud::html! {
             form."column" method="post" action="/auth/setup" {
-                h1 { "Choose a password" }
+                h1 { "Set a password" }
                 input type="hidden" name="token" value=(params.token);
                 // A password manager needs the account name in the same form
                 // to save the pair; without it, it stores a password with no
                 // username and asks the person to type the email by hand.
                 input type="email" name="email" value=(account.email)
                       autocomplete="username" readonly;
-                input name="password" type="password" placeholder="Password (8+)"
+                input name="password" type="password" placeholder="Password, at least 8 characters"
                       autocomplete="new-password" required autofocus;
                 button type="submit" { "Set password and sign in" }
             }
@@ -1486,6 +1486,6 @@ pub async fn setup_submit(
         )
             .into_response(),
         Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not set the password").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "The password was not set.").into_response(),
     }
 }

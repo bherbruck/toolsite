@@ -65,13 +65,13 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
             }
             (ui::flash(flash.as_ref()))
 
-            (ui::panel("How you sign in", None, html! {
+            (ui::panel("Sign-in methods", None, html! {
                 dl."kv" {
                     dt { "Email" } dd { (user.email) }
-                    dt { "Ways in" }
+                    dt { "Methods" }
                     dd {
                         @if !has_password && providers.is_empty() {
-                            "None set up yet. Ask an admin for a setup link."
+                            "No sign-in method is set. Ask an admin for a setup link."
                         }
                         @if has_password { "A password" }
                         @for (i, provider) in providers.iter().enumerate() {
@@ -85,7 +85,7 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
             @if has_password {
                 (ui::panel(
                     "Change password",
-                    Some("Your other sessions end when you do. The one you are using now stays signed in."),
+                    Some("When you change the password, your other sessions end. This session stays signed in."),
                     html! {
                         form method="post" action="/account/password" {
                             input type="hidden" name="token" value=(token);
@@ -98,10 +98,10 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
                                 label for="new" { "New password" }
                                 input id="new" name="new" type="password"
                                       autocomplete="new-password" minlength="8" required;
-                                p."help" { "At least 8 characters." }
+                                p."help" { "Enter at least 8 characters." }
                             }
                             div."field" {
-                                label for="confirm" { "New password again" }
+                                label for="confirm" { "Confirm new password" }
                                 input id="confirm" name="confirm" type="password"
                                       autocomplete="new-password" minlength="8" required;
                             }
@@ -116,7 +116,7 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
                         @if i > 0 { " and " }
                         (provider)
                     }
-                    ", so there is no password here to change."
+                    ". This account has no password."
                 }
             }
         },
@@ -155,10 +155,10 @@ pub async fn change_password(
     };
     let expected = form_token(&config, &user);
     if expected.len() != form.token.len() || expected != form.token {
-        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
+        return (StatusCode::FORBIDDEN, "The form is out of date. Reload the page and try again.").into_response();
     }
     if form.new != form.confirm {
-        return redirect_flash("/account", false, "The two new passwords do not match.");
+        return redirect_flash("/account", false, "The new passwords do not match.");
     }
     // The session to keep is the one that sent this form.
     let Some(session) = users::token_from_cookies(
@@ -177,12 +177,12 @@ pub async fn change_password(
     match outcome {
         Ok(Ok(())) => {
             tracing::info!(%email, "password changed");
-            redirect_flash("/account", true, "Password changed. Your other sessions have been signed out.")
+            redirect_flash("/account", true, "The password is changed. Your other sessions are signed out.")
         }
         Ok(Err(message)) => {
             tracing::warn!(%email, %message, "password change refused");
             redirect_flash("/account", false, message)
         }
-        Err(_) => redirect_flash("/account", false, "Could not change the password."),
+        Err(_) => redirect_flash("/account", false, "The password was not changed."),
     }
 }

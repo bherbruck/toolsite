@@ -645,7 +645,7 @@ async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secret
     assert_eq!((link.owner.as_str(), link.repo.as_str(), link.branch.as_str()), ("acme", "shop", "main"));
     let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
     assert!(page.contains("acme/shop"));
-    assert!(page.contains("Sync now"));
+    assert!(page.contains("Sync repository"));
     let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
     assert!(page.contains("acme/shop"));
 
@@ -666,7 +666,7 @@ async fn an_app_without_stored_source_cannot_become_a_repository() {
     let session = admin(&config);
     install(&config, &session).await;
     let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
-    assert!(page.contains("no stored source"));
+    assert!(page.contains("no source archive"));
     let token = form_token_from(&page);
     let (_, _, headers) = send(
         &config,

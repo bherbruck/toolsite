@@ -1067,13 +1067,13 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
         None => setup_guide(&base),
         Some(app) if installations(&config).is_empty() => ui::panel(
             "Install the App",
-            Some("The App is configured. Install it on the account or organisation whose repositories it should reach; GitHub sends you back here."),
+            Some("The App is configured. Install the App on the account or organization that owns the repositories. GitHub returns you to this page."),
             html! {
                 div."actions" {
                     @if let Some(url) = app.install_url() {
                         a."btn" href=(url) { "Install on an account" }
                     } @else {
-                        span."muted small" { "Set TOOLSITE_GITHUB_APP_SLUG for an install button, or install from GitHub's developer settings; it sends you back here." }
+                        span."muted small" { "Set TOOLSITE_GITHUB_APP_SLUG to show an Install button. Or install the App from the GitHub developer settings. GitHub returns you to this page." }
                     }
                     form method="post" action="/admin/repo" {
                         (admin::hidden("token", &token)) (admin::hidden("action", "refresh")) (admin::hidden("app", "-"))
@@ -1081,7 +1081,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
                     }
                 }
                 p."muted small" style="margin-top: 1rem" {
-                    "Double-check the App's webhook URL is " code { (base) "/github/webhook" } "."
+                    "Make sure that the webhook URL of the App is " code { (base) "/github/webhook" } "."
                 }
             },
         ),
@@ -1089,9 +1089,9 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
             let installs = installations(&config);
             let linked = linked_apps(&config);
             html! {
-                (ui::panel("Installed on", Some("Accounts the App may create and read repositories in."), html! {
+                (ui::panel("Installations", Some("The App can create and read repositories in these accounts."), html! {
                     @if installs.is_empty() {
-                        p."muted" { "Not installed anywhere yet." }
+                        p."muted" { "The App is not installed. Install the App below." }
                     } @else {
                         table {
                             thead { tr { th { "Account" } th { "Kind" } th { "Installation" } } }
@@ -1106,7 +1106,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
                         @if let Some(url) = app.install_url() {
                             a."btn" href=(url) { "Install on an account" }
                         } @else {
-                            span."muted small" { "Install the App from GitHub's developer settings; it sends you back here." }
+                            span."muted small" { "Install the App from the GitHub developer settings. GitHub returns you to this page." }
                         }
                         form method="post" action="/admin/repo" {
                             (admin::hidden("token", &token)) (admin::hidden("action", "refresh")) (admin::hidden("app", "-"))
@@ -1114,7 +1114,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
                         }
                     }
                 }))
-                (ui::panel("Import a repository", Some("Connect a repository you already have as a new app. Toolsite adds the deploy workflow and secrets and runs it once."), html! {
+                (ui::panel("Import a repository", Some("Connect an existing repository as a new app. Toolsite adds the deploy workflow and the secrets, then runs the workflow one time."), html! {
                     @if installs.is_empty() {
                         p."muted" { "Install the App first." }
                     } @else {
@@ -1123,7 +1123,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
                 }))
                 (ui::panel("Connected apps", None, html! {
                     @if linked.is_empty() {
-                        p."muted" { "No app deploys from a repository yet. Open an app's Repo tab to create or import one." }
+                        p."muted" { "No app is connected to a repository. Open the Repo tab of an app to create or import a repository." }
                     } @else {
                         table {
                             thead { tr { th { "App" } th { "Repository" } th { "Last push" } th { "Last deploy" } } }
@@ -1150,7 +1150,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
             active: "github",
             title: "GitHub",
             crumbs: vec![],
-            subtitle: Some(html! { "Apps that live in a repository and deploy from it." }),
+            subtitle: Some(html! { "Apps that deploy from a repository." }),
             actions: None,
             body,
             script: Some(PICKER_SCRIPT),
@@ -1227,14 +1227,14 @@ fn setup_guide(base: &str) -> Markup {
         "TOOLSITE_GITHUB_APP_ID=\nTOOLSITE_GITHUB_APP_PRIVATE_KEY=\nTOOLSITE_GITHUB_APP_SLUG=\nTOOLSITE_GITHUB_WEBHOOK_SECRET={secret}"
     );
     html! {
-        (ui::panel("1. Create a GitHub App", Some("Open the form below in a new tab and paste these values in. Leave everything else as GitHub sets it."), html! {
+        (ui::panel("1. Create a GitHub App", Some("Open the GitHub form in a new tab. Paste these values. Keep the other default values."), html! {
             p { a."btn" href="https://github.com/settings/apps/new" target="_blank" rel="noopener" { "Open github.com/settings/apps/new" } }
             dl."kv" style="margin-top: .75rem" {
                 dt { "GitHub App name" } dd { (ui::secret("gh-name", &name)) }
                 dt { "Homepage URL" } dd { (ui::secret("gh-home", base)) }
                 dt { "Setup URL" } dd { (ui::secret("gh-setup", &format!("{base}/github/setup"))) p."muted small" { "Tick \"Redirect on update\"." } }
                 dt { "Webhook URL" } dd { (ui::secret("gh-webhook", &format!("{base}/github/webhook"))) }
-                dt { "Webhook secret" } dd { (ui::secret("gh-secret", &secret)) p."muted small" { "Made for you just now. Paste this same value in step 3." } }
+                dt { "Webhook secret" } dd { (ui::secret("gh-secret", &secret)) p."muted small" { "This secret is new. Paste the same value in step 3." } }
             }
             p."small" style="margin-top: .75rem" { "Repository permissions:" }
             ul."small" {
@@ -1245,17 +1245,17 @@ fn setup_guide(base: &str) -> Markup {
                 li { "Workflows: read and write" }
                 li { "Metadata: read" }
             }
-            p."small" { "Subscribe to events: " code { "push" } ", " code { "workflow_run" } ". Where it can be installed: your account, or any." }
+            p."small" { "Subscribe to these events: " code { "push" } ", " code { "workflow_run" } ". Set where the App can be installed to your account or to any account." }
         }))
-        (ui::panel("2. Generate a private key", Some("On the App's page after it is created: Private keys, Generate a private key. A .pem file downloads. Note the App ID at the top of that page and the slug in its URL."), html! {}))
-        (ui::panel("3. Set these variables on the service", Some("Then restart. This page shows an Install button once the App is configured."), html! {
+        (ui::panel("2. Generate a private key", Some("After GitHub creates the App, open the App page. Under Private keys, click Generate a private key. A .pem file downloads. Note the App ID at the top of the page and the slug in the page URL."), html! {}))
+        (ui::panel("3. Set the variables", Some("Set these variables on the service and restart it. This page then shows an Install button."), html! {
             div."secret" {
                 pre id="gh-env" style="flex: 1; margin: 0; background: none; border: 0; padding: 0" { (env_block) }
                 button."quiet sm" type="button" data-copy="gh-env" { "Copy" }
             }
             p."muted small" {
-                "APP_ID is the number on the App's page. PRIVATE_KEY is the .pem's contents, or base64 of it, on one line. "
-                "SLUG is the name in the App's URL. The secret is the one from step 1."
+                "APP_ID is the number on the App page. PRIVATE_KEY is the content of the .pem file, or its base64, on one line. "
+                "SLUG is the name in the App URL. WEBHOOK_SECRET is the secret from step 1."
             }
         }))
     }
@@ -1271,7 +1271,7 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
                 div."field" {
                     label for="import-app" { "App name" }
                     input id="import-app" name="app" placeholder="my-app" required pattern="[A-Za-z0-9_-]+";
-                    p."help" { "The slug it will be served at: /p/<name>/." }
+                    p."help" { "The app is served at /p/<name>/." }
                 }
             }
             div."field" {
@@ -1284,7 +1284,7 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
                 label for="import-repo" { "Repository" }
                 input id="import-repo" name="repo" list="repo-options" placeholder="owner/name" required autocomplete="off" data-repo-picker;
                 datalist id="repo-options" {}
-                p."help" { "Type to search the account's repositories." }
+                p."help" { "Type to search the repositories of the account." }
             }
             div."grid-2" {
                 div."field" {
@@ -1294,7 +1294,7 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
                 div."field" {
                     label for="import-dir" { "Directory" }
                     input id="import-dir" name="directory" placeholder="root of the repository";
-                    p."help" { "If the project is in a subfolder." }
+                    p."help" { "Enter a directory if the project is not at the repository root." }
                 }
             }
             div."actions end" { button type="submit" { "Import and deploy" } }
@@ -1310,7 +1310,7 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
     let tokens = deploy::list(config, app);
     html! {
         @if config.github.is_none() {
-            (ui::panel("GitHub is not configured", Some("Set the TOOLSITE_GITHUB_* variables to connect repositories. Deploy tokens below work regardless, for any CI you already run."), html! {}))
+            (ui::panel("GitHub is not configured", Some("Set the TOOLSITE_GITHUB_* variables to connect repositories. Deploy tokens below work without GitHub, for other CI systems."), html! {}))
         } @else if let Some(link) = &link {
             (ui::panel("Repository", None, html! {
                 dl."kv" {
@@ -1318,38 +1318,38 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
                     dt { "Branch" } dd { code { (link.branch) } @if !link.directory.is_empty() { " in " code { (link.directory) } } }
                     dt { "Connected" } dd { (ago(link.connected_at)) }
                     dt { "Last push" }
-                    dd { @match &link.last_push { Some(p) => { code { (&p.sha[..p.sha.len().min(7)]) } " " span."muted small" { (ago(p.at)) } }, None => "none seen yet" } }
+                    dd { @match &link.last_push { Some(p) => { code { (&p.sha[..p.sha.len().min(7)]) } " " span."muted small" { (ago(p.at)) } }, None => "none" } }
                     dt { "Last deploy" }
                     dd { (deploy_badge(link.last_deploy.as_ref())) @if let Some(d) = &link.last_deploy { " " span."muted small" { (ago(d.at)) } } }
                 }
                 div."actions" style="margin-top:1rem" {
                     form method="post" action="/admin/repo" {
                         (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "sync"))
-                        button type="submit" { "Sync now" }
+                        button type="submit" { "Sync repository" }
                     }
                     form method="post" action="/admin/repo"
                          data-confirm="Rotate the deploy token?"
-                         data-confirm-detail="The repository's secret is replaced and the old token stops working at once."
-                         data-confirm-label="Rotate" {
+                         data-confirm-detail="Toolsite replaces the secret in the repository. The old token stops immediately."
+                         data-confirm-label="Rotate token" {
                         (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "rotate"))
                         button."quiet" type="submit" { "Rotate deploy token" }
                     }
                     form method="post" action="/admin/repo"
                          data-confirm={ "Disconnect " (link.full_name()) "?" }
-                         data-confirm-detail="The deploy token is revoked and pushes stop deploying. The repository itself is left alone."
-                         data-confirm-label="Disconnect" data-confirm-danger="1" {
+                         data-confirm-detail="Toolsite revokes the deploy token. Pushes do not deploy. The repository is not changed."
+                         data-confirm-label="Disconnect repository" data-confirm-danger="1" {
                         (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "disconnect"))
-                        button."danger quiet" type="submit" { "Disconnect" }
+                        button."danger quiet" type="submit" { "Disconnect repository" }
                     }
                 }
             }))
         } @else {
             div."grid-2" {
-                (ui::panel("Create a repository", Some("A new repository holding this app's stored source and a deploy workflow. Pushes to it deploy here."), html! {
+                (ui::panel("Create a repository", Some("Toolsite creates a repository with the source archive of this app and a deploy workflow. A push to the repository deploys the app here."), html! {
                     @if installs.is_empty() {
                         p."muted" { "Install the App on an account first, from the " a href="/admin/github" { "GitHub page" } "." }
                     } @else if !has_source {
-                        p."muted" { "This app has no stored source. Publish the project first with " code { "?source" } ", then come back." }
+                        p."muted" { "This app has no source archive. Publish the source with " code { "?source" } " first." }
                     } @else {
                         form method="post" action="/admin/repo" {
                             (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "create"))
@@ -1366,13 +1366,13 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
                             label."choice" {
                                 input type="checkbox" name="private" value="1" checked;
                                 strong { "Private" }
-                                span { "Only the account's members see it." }
+                                span { "Only members of the account can see the repository." }
                             }
                             div."actions end" { button type="submit" { "Create repository" } }
                         }
                     }
                 }))
-                (ui::panel("Import a repository", Some("Connect a repository you already have. Toolsite adds the workflow and secrets, then runs it."), html! {
+                (ui::panel("Import a repository", Some("Connect an existing repository. Toolsite adds the workflow and the secrets, then runs the workflow."), html! {
                     @if installs.is_empty() {
                         p."muted" { "Install the App first." }
                     } @else {
@@ -1383,14 +1383,14 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
         }
 
         @if let Some(fresh) = fresh_token {
-            (ui::panel("New deploy token", Some("Copy it now; it is not stored and will not be shown again."), html! {
+            (ui::panel("New deploy token", Some("Copy the token now. The token is shown one time only."), html! {
                 (ui::secret("fresh-deploy-token", fresh))
-                p."muted small" { "Use it as " code { "Authorization: Bearer <token>" } " on " code { "PUT " (deploy::deploy_url(config, app)) } "." }
+                p."muted small" { "Send it as " code { "Authorization: Bearer <token>" } " with " code { "PUT " (deploy::deploy_url(config, app)) } "." }
             }))
         }
-        (ui::panel("Deploy tokens", Some("Each one may publish this app and nothing else: the same flags as an upload ticket, on PUT /deploy/<app>. The workflow holds one; mint another for any other CI."), html! {
+        (ui::panel("Deploy tokens", Some("A deploy token can publish this app only. Use it with PUT /deploy/<app> and the same flags as an upload ticket. The workflow holds one token. Create another token for a different CI system."), html! {
             @if tokens.is_empty() {
-                p."muted" { "No deploy tokens." }
+                p."muted" { "No deploy tokens. Create one below." }
             } @else {
                 table {
                     thead { tr { th { "Label" } th { "Created" } th { "Last used" } th {} } }
@@ -1403,11 +1403,11 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
                                 td."actions-cell" {
                                     form method="post" action="/admin/repo"
                                          data-confirm={ "Revoke " (entry.label) "?" }
-                                         data-confirm-detail="Whatever holds it gets 401 on its next push."
-                                         data-confirm-label="Revoke" data-confirm-danger="1" {
+                                         data-confirm-detail="The system that holds this token gets 401 on the next push."
+                                         data-confirm-label="Revoke token" data-confirm-danger="1" {
                                         (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back))
                                         (admin::hidden("action", "token-revoke")) (admin::hidden("id", &entry.id))
-                                        button."danger quiet sm" type="submit" { "Revoke" }
+                                        button."danger quiet sm" type="submit" { "Revoke token" }
                                     }
                                 }
                             }
@@ -1417,7 +1417,7 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
             }
             form."row" method="post" action="/admin/repo" {
                 (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "token-create"))
-                input name="label" placeholder="What will hold it, e.g. ci" required;
+                input name="label" placeholder="Label, for example ci" required;
                 button."quiet" type="submit" { "Create token" }
             }
         }))
@@ -1453,20 +1453,20 @@ pub(crate) async fn repo_action(
     let tab = format!("/admin/apps/{app}/repo");
     let back = admin::back_or(form.back.as_deref(), &tab);
     let outcome: Result<Option<String>, String> = match form.action.as_str() {
-        "refresh" => refresh_installations(&config).await.map(|list| Some(format!("{} installation(s).", list.len()))),
+        "refresh" => refresh_installations(&config).await.map(|list| Some(format!("GitHub lists {} installations.", list.len()))),
         "create" => match form.installation {
             Some(inst) => create(&config, &app, inst, form.repo.as_deref(), form.private.is_some())
                 .await
-                .map(|link| Some(format!("Created {} and pushed the project.", link.full_name()))),
-            None => Err("choose an account".into()),
+                .map(|link| Some(format!("Repository {} is created. The project is pushed.", link.full_name()))),
+            None => Err("Choose an account.".into()),
         },
         "import" => match (form.installation, form.repo.as_deref()) {
             (Some(inst), Some(repo)) => import(&config, &app, inst, repo, form.branch.as_deref(), form.directory.as_deref())
                 .await
-                .map(|link| Some(format!("Connected {}; the first deploy is running.", link.full_name()))),
-            _ => Err("choose an account and a repository".into()),
+                .map(|link| Some(format!("Repository {} is connected. The first deploy is running.", link.full_name()))),
+            _ => Err("Choose an account and a repository.".into()),
         },
-        "sync" => sync(&config, &app).await.map(|()| Some("Workflow started.".to_string())),
+        "sync" => sync(&config, &app).await.map(|()| Some("The workflow is started.".to_string())),
         "rotate" => match rotate(&config, &app).await {
             Ok(token) => {
                 tracing::info!(admin = %admin.email, app = %app, "deploy token rotated");
@@ -1477,8 +1477,8 @@ pub(crate) async fn repo_action(
         "disconnect" => {
             let (config2, app2) = (config.clone(), app.clone());
             match tokio::task::spawn_blocking(move || disconnect(&config2, &app2)).await {
-                Ok(result) => result.map(|link| Some(format!("Disconnected from {}.", link.full_name()))),
-                Err(_) => Err("could not disconnect".into()),
+                Ok(result) => result.map(|link| Some(format!("Repository {} is disconnected.", link.full_name()))),
+                Err(_) => Err("The repository was not disconnected.".into()),
             }
         }
         "token-create" => {
@@ -1490,15 +1490,15 @@ pub(crate) async fn repo_action(
                     return admin::app_tab(config, headers, app, "repo".into(), Some(admin::Fresh::DeployToken(token))).await;
                 }
                 Ok(Err(why)) => Err(why),
-                Err(_) => Err("could not create the token".into()),
+                Err(_) => Err("The token was not created.".into()),
             }
         }
         "token-revoke" => {
             let id = form.id.unwrap_or_default();
             let (config2, app2) = (config.clone(), app.clone());
             match tokio::task::spawn_blocking(move || deploy::revoke(&config2, &app2, &id)).await {
-                Ok(result) => result.map(|()| Some("Token revoked.".to_string())),
-                Err(_) => Err("could not revoke the token".into()),
+                Ok(result) => result.map(|()| Some("The token is revoked.".to_string())),
+                Err(_) => Err("The token was not revoked.".into()),
             }
         }
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),

@@ -277,7 +277,7 @@ pub async fn entry_form(
     let Some(app) = entry_app(&state.config, &token) else {
         return (
             StatusCode::GONE,
-            "this link has expired; ask for a new one",
+            "This link has expired. Ask for a new link.",
         )
             .into_response();
     };
@@ -289,11 +289,11 @@ pub async fn entry_form(
             form."column" method="post" action="/settings" {
                 h1 { "Settings for " (app) }
                 p."muted" {
-                    "One per line, as NAME=value. These are readable only by "
-                    (app) "'s own code."
+                    "Enter one setting per line as NAME=value. Only the code of "
+                    (app) " can read these values."
                 }
                 @if !existing.is_empty() {
-                    p."muted" { "Already set: " (existing.join(", ")) }
+                    p."muted" { "Set: " (existing.join(", ")) }
                 }
                 input type="hidden" name="token" value=(token);
                 textarea name="pasted" rows="8" placeholder="API_KEY=…\nENDPOINT=https://…"
@@ -320,7 +320,7 @@ pub async fn entry_submit(
     Form(form): Form<PastedSettings>,
 ) -> Response {
     let Some(app) = entry_app(&state.config, &form.token) else {
-        return (StatusCode::GONE, "this link has expired; ask for a new one").into_response();
+        return (StatusCode::GONE, "This link has expired. Ask for a new link.").into_response();
     };
 
     let config = state.config.clone();
@@ -337,13 +337,13 @@ pub async fn entry_submit(
     match outcome {
         Ok(Ok(0)) => (
             StatusCode::BAD_REQUEST,
-            "nothing looked like NAME=value; check the format",
+            "No line has the format NAME=value. Check the format.",
         )
             .into_response(),
         // Back to the form, which now lists the names — and never the values.
         Ok(Ok(_)) => Redirect::to(&format!("/settings/{}", form.token)).into_response(),
         Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not save").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "The settings were not saved.").into_response(),
     }
 }
 

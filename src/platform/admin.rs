@@ -38,9 +38,9 @@ use std::sync::Arc;
 
 const FLASH_COOKIE: &str = "ts_flash";
 const GATES: [(&str, &str, &str); 3] = [
-    ("public", "Public", "Anyone with the link."),
-    ("authenticated", "Signed in", "Any account on this site."),
-    ("granted", "Granted", "Only accounts given access on the Access tab."),
+    ("public", "Public", "Anyone can open the app."),
+    ("authenticated", "Signed in", "Each signed-in account can open the app."),
+    ("granted", "Granted", "Only accounts with a grant can open the app."),
 ];
 
 /// Resolves an admin from the request, or the response to send instead.
@@ -261,7 +261,7 @@ fn pager(listing: &Listing<impl Sized>, path: &str) -> Markup {
     html! {
         div."pager" {
             span {
-                @if listing.total == 0 { "Nothing matches" }
+                @if listing.total == 0 { "No match" }
                 @else { "Showing " (first) "–" (last) " of " (listing.total) }
             }
             @if listing.pages > 1 {
@@ -427,9 +427,9 @@ pub async fn apps_page(
             script: (count > 0).then_some(ui::FILTER_SCRIPT),
             body: html! {
                 @if count == 0 {
-                    (ui::panel("Nothing published yet", Some("An agent publishes with create_upload; apps appear here as they land."), html! {}))
+                    (ui::panel("No apps", Some("There are no apps. An agent publishes an app with create_upload."), html! {}))
                 } @else {
-                    (search_box(&listing, "/admin/apps", "Find an app…"))
+                    (search_box(&listing, "/admin/apps", "Search apps"))
                     section."panel" {
                         table {
                             thead { tr { th { "App" } th { "Access" } th { "Handler" } th { "Updated" } th {} } }
@@ -456,7 +456,7 @@ pub async fn apps_page(
                             }
                         }
                     }
-                    p."no-match" id="no-match" { "No app on this page matches that. Press Enter to search them all." }
+                    p."no-match" id="no-match" { "No app on this page matches. Press Enter to search all apps." }
                     (pager(&listing, "/admin/apps"))
                 }
             },
@@ -647,34 +647,34 @@ async fn render_overview(
                 dl."kv" {
                     dt { "Title" } dd { (title.as_deref().unwrap_or("—")) }
                     dt { "Updated" } dd { @match modified { Some(m) => (crate::content::store::relative_time(m)), None => "—" } }
-                    dt { "Handler" } dd { @if has_handler { "wasm component" } @else { "none, static files only" } }
-                    dt { "Database" } dd { @match db_bytes { Some(b) => (human_bytes(b)), None => "not created yet" } }
-                    dt { "Routing" } dd { @if meta.spa { "client-side (spa)" } @else { "files and handler" } }
+                    dt { "Handler" } dd { @if has_handler { "wasm component" } @else { "none" } }
+                    dt { "Database" } dd { @match db_bytes { Some(b) => (human_bytes(b)), None => "none" } }
+                    dt { "Routing" } dd { @if meta.spa { "client-side" } @else { "files and handler" } }
                     dt { "Outbound" }
                     dd {
-                        @if meta.allow_http.is_empty() { "no hosts allowed" }
+                        @if meta.allow_http.is_empty() { "none" }
                         @else { @for (i, host) in meta.allow_http.iter().enumerate() { @if i > 0 { ", " } code { (host) } } }
                     }
                 }
             }))
-            (ui::panel("Visibility", Some("Nothing here deletes anything. Both are reversible from this page."), html! {
+            (ui::panel("Visibility", Some("These settings do not delete files. You can change them again on this page."), html! {
                 form."column" method="post" action="/admin/visibility" {
                     (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                     label."choice" {
                         input type="checkbox" name="listed" value="1" checked[meta.listed];
-                        strong { "Listed on the index" }
-                        span { "Off keeps the URL working but drops it from the front page." }
+                        strong { "Show on the index" }
+                        span { "If off, the URL continues to work. The app does not show on the index." }
                     }
                     label."choice" {
                         input type="checkbox" name="hidden" value="1" checked[meta.hidden];
-                        strong { "Taken down" }
-                        span { "The URL answers 404 and the app leaves the index. Files stay where they are." }
+                        strong { "Take down" }
+                        span { "The URL returns 404. The app does not show on the index. The files stay." }
                     }
-                    div."actions end" { button type="submit" { "Save" } }
+                    div."actions end" { button type="submit" { "Save visibility" } }
                 }
             }))
         }
-        (ui::panel("Source", Some("The project the app was built from, as the agent stored it. A bundle cannot be turned back into its source, so this is the copy."), html! {
+        (ui::panel("Source archive", Some("The agent stored this source archive. The bundle cannot give back the source. Keep this copy."), html! {
             @match source {
                 Some((bytes, modified)) => {
                     dl."kv" {
@@ -688,9 +688,9 @@ async fn render_overview(
                 }
                 None => {
                     p."muted" {
-                        "No source stored. Ask the agent to publish it with " code { "?source" }
-                        " on its upload URL; the " a href="/guide" { "guide" } " says how. "
-                        "Until then the page as served is all there is: "
+                        "There is no source archive. Ask the agent to publish the source with " code { "?source" }
+                        " on the upload URL. The " a href="/guide" { "guide" } " gives the steps. "
+                        "The app as served is at "
                         a href=(page_url) target="_blank" { (page_url) } "."
                     }
                 }
@@ -740,7 +740,7 @@ fn role_input(declared: &[String]) -> Markup {
     html! {
         input name="role" value=(first) placeholder="role" size="8"
               list=[(!declared.is_empty()).then_some("role-hints")]
-              title="A word the app reads with identity::current-role";
+              title="The app reads this word with identity::current-role.";
         @if !declared.is_empty() {
             datalist id="role-hints" {
                 @for role in declared { option value=(role) {} }
@@ -798,7 +798,7 @@ async fn render_access_tab(
             .collect()
     };
     html! {
-        (ui::panel("Who may open it", Some("Access for the whole app. Route rules below make exceptions by path."), html! {
+        (ui::panel("Access", Some("This setting applies to the whole app. Route rules below set exceptions for a path."), html! {
             form method="post" action="/admin/gate" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                 div."choices" {
@@ -806,8 +806,8 @@ async fn render_access_tab(
                         input type="radio" name="gate" value="default" checked[meta.gate.is_none()];
                         strong { "Site default" }
                         span {
-                            "Currently " (config.default_gate) ". Set once for the whole site with "
-                            code { "TOOLSITE_DEFAULT_ACCESS" } "; apps that have not chosen follow it."
+                            "The site default is " (config.default_gate) ". Set it for the whole site with "
+                            code { "TOOLSITE_DEFAULT_ACCESS" } ". An app without its own setting uses it."
                         }
                     }
                     @for (value, label, help) in GATES {
@@ -822,7 +822,7 @@ async fn render_access_tab(
             }
         }))
 
-        (ui::panel("Route rules", Some("A path prefix with its own access rule. Longest match wins, so a public app can have a private corner."), html! {
+        (ui::panel("Route rules", Some("A rule sets access for one path prefix. The longest matching prefix applies."), html! {
             @if !meta.rules.is_empty() {
                 table {
                     thead { tr { th { "Prefix" } th { "Access" } th {} } }
@@ -835,7 +835,7 @@ async fn render_access_tab(
                                     form method="post" action="/admin/rule" {
                                         (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                                         (hidden("prefix", &rule.prefix)) (hidden("action", "remove"))
-                                        button."danger quiet sm" type="submit" { "Remove" }
+                                        button."danger quiet sm" type="submit" { "Remove rule" }
                                     }
                                 }
                             }
@@ -851,16 +851,16 @@ async fn render_access_tab(
             }
         }))
 
-        (ui::panel("Granted accounts", Some("A grant only matters while access, or a rule, says granted. The role is the app's to interpret."), html! {
+        (ui::panel("Granted accounts", Some("A grant applies only when access is granted. The app reads the role."), html! {
             form."row" method="post" action="/admin/access" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))
-                label."small" for="email" { "Add a person" }
-                (ui::combobox("email", "/admin/accounts/search", "Start typing an email…"))
+                label."small" for="email" { "Add an account" }
+                (ui::combobox("email", "/admin/accounts/search", "Type an email"))
                 (role_input(&meta.roles))
                 button type="submit" { "Add" }
             }
             @if grants.is_empty() {
-                p."muted" { "Nobody has been granted access yet." }
+                p."muted" { "No account has a grant. Add an account above." }
             } @else {
                 table {
                     thead { tr { th { "Account" } th { "Role" } th {} } }
@@ -872,11 +872,11 @@ async fn render_access_tab(
                                 td."actions-cell" {
                                     form method="post" action="/admin/access"
                                          data-confirm={ "Revoke " (email) "?" }
-                                         data-confirm-detail="They keep their account and lose this app."
-                                         data-confirm-label="Revoke" data-confirm-danger="1" {
+                                         data-confirm-detail="The account stays. The account cannot open this app."
+                                         data-confirm-label="Revoke grant" data-confirm-danger="1" {
                                         (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                                         (hidden("email", email)) (hidden("allow", "0"))
-                                        button."danger quiet sm" type="submit" { "Revoke" }
+                                        button."danger quiet sm" type="submit" { "Revoke grant" }
                                     }
                                 }
                             }
@@ -899,22 +899,22 @@ fn render_exports_tab(
     let url = export::export_url(config, app);
     html! {
         @if let Some(fresh) = fresh {
-            (ui::panel("Your new token", Some("Copy it now. It is not stored and will not be shown again."), html! {
-                p."small" { "The token:" }
+            (ui::panel("New export token", Some("Copy the token now. The token is shown one time only."), html! {
+                p."small" { "Token:" }
                 (ui::secret("fresh-token", fresh))
-                p."small" { "Or the whole pull, ready to paste:" }
+                p."small" { "Command:" }
                 (ui::secret(
                     "fresh-token-curl",
                     &format!("curl -H 'Authorization: Bearer {fresh}' -o {app}.sqlite {url}"),
                 ))
                 p."muted small" {
-                    "In a reporting tool: a sqlite connection with URL " code { (url) } " and the token as its bearer token."
+                    "In a reporting tool, use a sqlite connection with the URL " code { (url) } " and this token as the bearer token."
                 }
             }))
         }
-        (ui::panel("Export tokens", Some("A read-only snapshot of this app's database for a reporting tool. Each token opens this app and nothing else."), html! {
+        (ui::panel("Export tokens", Some("An export token lets a reporting tool read a copy of the database of this app. One token opens one app."), html! {
             @if tokens.is_empty() {
-                p."muted" { "No tokens yet." }
+                p."muted" { "No export tokens. Create one below." }
             } @else {
                 table {
                     thead { tr { th { "Label" } th { "Created" } th { "Last used" } th {} } }
@@ -927,11 +927,11 @@ fn render_exports_tab(
                                 td."actions-cell" {
                                     form method="post" action="/admin/exports"
                                          data-confirm={ "Revoke " (entry.label) "?" }
-                                         data-confirm-detail="Whatever holds it gets 401 on its next pull."
-                                         data-confirm-label="Revoke" data-confirm-danger="1" {
+                                         data-confirm-detail="The tool that holds this token gets 401 on the next request."
+                                         data-confirm-label="Revoke token" data-confirm-danger="1" {
                                         (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                                         (hidden("action", "revoke")) (hidden("id", &entry.id))
-                                        button."danger quiet sm" type="submit" { "Revoke" }
+                                        button."danger quiet sm" type="submit" { "Revoke token" }
                                     }
                                 }
                             }
@@ -941,7 +941,7 @@ fn render_exports_tab(
             }
             form."row" method="post" action="/admin/exports" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("action", "create"))
-                input name="label" placeholder="What will hold it, e.g. reporting" required;
+                input name="label" placeholder="Label, for example reporting" required;
                 button."quiet" type="submit" { "Create token" }
             }
             p."muted small" { "URL: " code { (url) } }
@@ -952,19 +952,19 @@ fn render_exports_tab(
 fn render_settings_tab(app: &str, names: &[String], token: &str, back: &str, link: Option<&str>) -> Markup {
     html! {
         @if let Some(link) = link {
-            (ui::panel("Entry link", Some("Send this to whoever holds the values. It lasts an hour and takes one NAME=value per line."), html! {
+            (ui::panel("Entry link", Some("Send this link to the person who has the values. The link is valid for one hour. Enter one NAME=value per line."), html! {
                 (ui::secret("settings-link", link))
             }))
         }
-        (ui::panel("Settings", Some("Values the handler reads with secrets.get. Sealed at rest; names only here, never values."), html! {
+        (ui::panel("Settings", Some("The handler reads these values with secrets.get. This page shows the names only."), html! {
             @if names.is_empty() {
-                p."muted" { "Nothing set." }
+                p."muted" { "No settings. Get an entry link below." }
             } @else {
                 ul."stack" { @for name in names { li { code { (name) } } } }
             }
             form."row" method="post" action="/admin/settings-link" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
-                button."quiet" type="submit" { "Get a link to enter values" }
+                button."quiet" type="submit" { "Get entry link" }
             }
         }))
     }
@@ -977,9 +977,9 @@ fn render_jobs_tab(
     back: &str,
 ) -> Markup {
     html! {
-        (ui::panel("Scheduled jobs", Some("Declared in the app's toolsite.toml. Each run goes through the handler like a request."), html! {
+        (ui::panel("Scheduled jobs", Some("The app declares jobs in toolsite.toml. Each run sends a request to the handler."), html! {
             @if jobs.is_empty() {
-                p."muted" { "No jobs." }
+                p."muted" { "No jobs. The app declares jobs in toolsite.toml." }
             } @else {
                 table {
                     thead { tr { th { "Name" } th { "Schedule" } th { "Path" } th { "Last run" } th { "Status" } th {} } }
@@ -1000,7 +1000,7 @@ fn render_jobs_tab(
                                 td."actions-cell" {
                                     form method="post" action="/admin/job-run" {
                                         (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("name", name))
-                                        button."quiet sm" type="submit" { "Run now" }
+                                        button."quiet sm" type="submit" { "Run job" }
                                     }
                                 }
                             }
@@ -1014,10 +1014,10 @@ fn render_jobs_tab(
 
 fn render_notes_tab(app: &str, notes: Option<&str>, token: &str, back: &str) -> Markup {
     html! {
-        (ui::panel("Notes", Some("What the last session left for the next one. A bundle cannot be turned back into its source, so this may be the only record."), html! {
+        (ui::panel("Notes", Some("Notes from the last session for the next session. The bundle cannot give back the source. Keep the notes."), html! {
             form."column" method="post" action="/admin/notes" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
-                textarea name="notes" rows="14" placeholder="Nothing written yet." { (notes.unwrap_or("")) }
+                textarea name="notes" rows="14" placeholder="No notes." { (notes.unwrap_or("")) }
                 div."actions end" { button type="submit" { "Save notes" } }
             }
         }))
@@ -1067,9 +1067,9 @@ pub async fn accounts_page(
             script: (count > 0).then_some(ui::FILTER_SCRIPT),
             body: html! {
                 @if count == 0 {
-                    (ui::panel("No accounts yet", Some("Create the first one, or run `toolsite user add` on the machine."), html! {}))
+                    (ui::panel("No accounts", Some("There are no accounts. Click New account, or run toolsite user add on the server."), html! {}))
                 } @else {
-                    (search_box(&listing, "/admin/accounts", "Find an account…"))
+                    (search_box(&listing, "/admin/accounts", "Search accounts"))
                     section."panel" {
                         table {
                             thead { tr { th { "Email" } th { "Role" } th { "Status" } th { "Created" } th {} } }
@@ -1084,15 +1084,15 @@ pub async fn accounts_page(
                                             @if account.is_active {
                                                 form method="post" action="/admin/active"
                                                      data-confirm={ "Disable " (account.email) "?" }
-                                                     data-confirm-detail="Their sessions end now and any connected MCP client stops on its next call. Re-enable any time."
-                                                     data-confirm-label="Disable" data-confirm-danger="1" {
+                                                     data-confirm-detail="The sessions of this account end now. A connected MCP client stops on the next call. You can enable the account again."
+                                                     data-confirm-label="Disable account" data-confirm-danger="1" {
                                                     (hidden("token", &token)) (hidden("email", &account.email)) (hidden("active", "0")) (hidden("back", "/admin/accounts"))
-                                                    button."danger quiet sm" type="submit" { "Disable" }
+                                                    button."danger quiet sm" type="submit" { "Disable account" }
                                                 }
                                             } @else {
                                                 form method="post" action="/admin/active" {
                                                     (hidden("token", &token)) (hidden("email", &account.email)) (hidden("active", "1")) (hidden("back", "/admin/accounts"))
-                                                    button."quiet sm" type="submit" { "Enable" }
+                                                    button."quiet sm" type="submit" { "Enable account" }
                                                 }
                                             }
                                         }
@@ -1101,7 +1101,7 @@ pub async fn accounts_page(
                             }
                         }
                     }
-                    p."no-match" id="no-match" { "No account on this page matches that. Press Enter to search them all." }
+                    p."no-match" id="no-match" { "No account on this page matches. Press Enter to search all accounts." }
                     (pager(&listing, "/admin/accounts"))
                 }
             },
@@ -1171,20 +1171,20 @@ async fn render_account_page(
             script: None,
             body: html! {
                 @if let Some(link) = &fresh_link {
-                    (ui::panel("Setup link", Some("Send it to them. It lasts 48 hours, works once, and lets them choose a password."), html! {
+                    (ui::panel("Setup link", Some("Send this link to the account owner. The link is valid for 48 hours and works one time. The owner sets a password with it."), html! {
                         (ui::secret("setup-link", link))
                     }))
                 }
-                (ui::panel("Apps they may open", Some("Only matters for apps whose access is granted. The role is a word the app reads; viewer is the usual one."), html! {
+                (ui::panel("Grants", Some("A grant applies only to an app with access set to granted. The app reads the role. The usual role is viewer."), html! {
                     form."row" method="post" action="/admin/access" {
                         (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("allow", "1"))
-                        label."small" for="app" { "Add to an app" }
-                        (ui::combobox("app", "/admin/apps/search", "Start typing an app…"))
+                        label."small" for="app" { "Add a grant" }
+                        (ui::combobox("app", "/admin/apps/search", "Type an app name"))
                         (role_input(&declared_roles))
                         button type="submit" { "Add" }
                     }
                     @if grants.is_empty() {
-                        p."muted" { "No grants." }
+                        p."muted" { "No grants. Add a grant above." }
                     } @else {
                         table {
                             thead { tr { th { "App" } th { "Role" } th {} } }
@@ -1196,11 +1196,11 @@ async fn render_account_page(
                                         td."actions-cell" {
                                             form method="post" action="/admin/access"
                                                  data-confirm={ "Revoke " (app) "?" }
-                                                 data-confirm-detail="They keep their account and lose this app."
-                                                 data-confirm-label="Revoke" data-confirm-danger="1" {
+                                                 data-confirm-detail="The account stays. The account cannot open this app."
+                                                 data-confirm-label="Revoke grant" data-confirm-danger="1" {
                                                 (hidden("token", &token)) (hidden("app", app)) (hidden("email", &account.email))
                                                 (hidden("allow", "0")) (hidden("back", &back))
-                                                button."danger quiet sm" type="submit" { "Revoke" }
+                                                button."danger quiet sm" type="submit" { "Revoke grant" }
                                             }
                                         }
                                     }
@@ -1213,15 +1213,15 @@ async fn render_account_page(
                     div."actions" {
                         form method="post" action="/admin/reinvite" {
                             (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back))
-                            button."quiet" type="submit" { "New setup link" }
+                            button."quiet" type="submit" { "Create setup link" }
                         }
                         @if is_self {
                             span."muted small" { "You cannot disable your own account." }
                         } @else if account.is_active {
                             form method="post" action="/admin/active"
                                  data-confirm={ "Disable " (account.email) "?" }
-                                 data-confirm-detail="Their sessions end now and any connected MCP client stops on its next call. Re-enable any time."
-                                 data-confirm-label="Disable" data-confirm-danger="1" {
+                                 data-confirm-detail="The sessions of this account end now. A connected MCP client stops on the next call. You can enable the account again."
+                                 data-confirm-label="Disable account" data-confirm-danger="1" {
                                 (hidden("token", &token)) (hidden("email", &account.email)) (hidden("active", "0")) (hidden("back", &back))
                                 button."danger quiet" type="submit" { "Disable account" }
                             }
@@ -1265,7 +1265,7 @@ pub async fn reinvite(
             render_account_page(config, headers, form.email, Some(url)).await
         }
         Ok(Err(message)) => redirect_flash(&back, false, message),
-        Err(_) => redirect_flash(&back, false, "Could not make a setup link."),
+        Err(_) => redirect_flash(&back, false, "The setup link was not created."),
     }
 }
 
@@ -1285,7 +1285,7 @@ pub async fn new_account_page(State(config): State<Arc<Config>>, headers: Header
             subtitle: None,
             actions: None,
             script: None,
-            body: ui::panel("Account", Some("A password set here is one you have to pass on. Prefer an invite: `toolsite user add` prints a one-time link."), html! {
+            body: ui::panel("New account", Some("If you set a password here, you must send it to the account owner. The safer option is a setup link from toolsite user add."), html! {
                 form method="post" action="/admin/users" {
                     (hidden("token", &token)) (hidden("back", "/admin/accounts"))
                     div."field" {
@@ -1295,12 +1295,12 @@ pub async fn new_account_page(State(config): State<Arc<Config>>, headers: Header
                     div."field" {
                         label for="password" { "Password" }
                         input id="password" name="password" type="password" minlength="8" required;
-                        p."help" { "At least 8 characters. They can change it from a setup link later." }
+                        p."help" { "Enter at least 8 characters. The owner can change the password later." }
                     }
                     label."choice" {
                         input type="checkbox" name="admin" value="1";
                         strong { "Admin" }
-                        span { "Sees this page, manages every app, and may connect an MCP client that publishes." }
+                        span { "An admin can open this page, manage all apps, and connect an MCP client that publishes." }
                     }
                     div."actions end" {
                         a."btn quiet" href="/admin/accounts" { "Cancel" }
@@ -1338,14 +1338,14 @@ pub async fn exports_page(
             active: "exports",
             title: "Exports",
             crumbs: vec![],
-            subtitle: Some(html! { "Tokens that let a reporting tool pull one app's database. Mint them on the app's Exports tab." }),
+            subtitle: Some(html! { "An export token lets a reporting tool read the database of one app. Create tokens on the Exports tab of the app." }),
             actions: None,
             script: (count > 0).then_some(ui::FILTER_SCRIPT),
             body: html! {
                 @if count == 0 {
-                    (ui::panel("No export tokens", Some("Open an app and use its Exports tab to create one."), html! {}))
+                    (ui::panel("No export tokens", Some("There are no export tokens. Open an app and create one on the Exports tab."), html! {}))
                 } @else {
-                    (search_box(&listing, "/admin/exports", "Find a token by app or label…"))
+                    (search_box(&listing, "/admin/exports", "Search tokens"))
                     section."panel" {
                         table {
                             thead { tr { th { "App" } th { "Label" } th { "Created" } th { "Last used" } } }
@@ -1361,7 +1361,7 @@ pub async fn exports_page(
                             }
                         }
                     }
-                    p."no-match" id="no-match" { "No token on this page matches that. Press Enter to search them all." }
+                    p."no-match" id="no-match" { "No token on this page matches. Press Enter to search all tokens." }
                     (pager(&listing, "/admin/exports"))
                 }
             },
@@ -1375,7 +1375,7 @@ pub async fn exports_page(
 pub(crate) async fn checked(config: &Arc<Config>, headers: &HeaderMap, token: &str) -> Result<User, Response> {
     let admin = require_admin(config, headers).await?;
     if !check_form_token(config, &admin, token) {
-        return Err((StatusCode::FORBIDDEN, "stale form; reload and try again").into_response());
+        return Err((StatusCode::FORBIDDEN, "The form is out of date. Reload the page and try again.").into_response());
     }
     Ok(admin)
 }
@@ -1406,9 +1406,9 @@ pub async fn add_account(
     })
     .await;
     match outcome {
-        Ok(Ok(_)) => redirect_flash(&back, true, format!("Created {email}.")),
+        Ok(Ok(_)) => redirect_flash(&back, true, format!("Account {email} is created.")),
         Ok(Err(message)) => redirect_flash("/admin/accounts/new", false, message),
-        Err(_) => redirect_flash(&back, false, "Could not add the account."),
+        Err(_) => redirect_flash(&back, false, "The account was not created."),
     }
 }
 
@@ -1443,10 +1443,10 @@ pub async fn change_active(
         Ok(Ok(())) => redirect_flash(
             &back,
             true,
-            if active { format!("{email} can sign in again.") } else { format!("{email} is disabled.") },
+            if active { format!("Account {email} is enabled.") } else { format!("Account {email} is disabled.") },
         ),
         Ok(Err(message)) => redirect_flash(&back, false, message),
-        Err(_) => redirect_flash(&back, false, "Could not change the account."),
+        Err(_) => redirect_flash(&back, false, "The account was not changed."),
     }
 }
 
@@ -1478,7 +1478,7 @@ pub async fn change_access(
         .unwrap_or("viewer")
         .to_string();
     if role.len() > 40 || !role.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
-        return redirect_flash(&back, false, "A role is one word: letters, digits, '-' or '_'.");
+        return redirect_flash(&back, false, "Enter the role as one word. Use letters, digits, - or _.");
     }
     let config2 = config.clone();
     let (email, app) = (form.email.clone(), form.app.clone());
@@ -1494,10 +1494,10 @@ pub async fn change_access(
         Ok(Ok(())) => redirect_flash(
             &back,
             true,
-            if allow { format!("{email} may open {app}.") } else { format!("{email} no longer has {app}.") },
+            if allow { format!("Account {email} has a grant on {app}.") } else { format!("The grant of {email} on {app} is revoked.") },
         ),
         Ok(Err(message)) => redirect_flash(&back, false, message),
-        Err(_) => redirect_flash(&back, false, "Could not change access."),
+        Err(_) => redirect_flash(&back, false, "Access was not changed."),
     }
 }
 
@@ -1527,12 +1527,12 @@ pub async fn change_gate(
     let mut meta = read_meta(&config, &form.app).await;
     meta.gate = (form.gate != "default").then(|| form.gate.clone());
     let said = match meta.gate.as_deref() {
-        Some(gate) => format!("{} is now {gate}.", form.app),
-        None => format!("{} follows the site default, {}.", form.app, config.default_gate),
+        Some(gate) => format!("Access for {} is {gate}.", form.app),
+        None => format!("Access for {} is the site default, {}.", form.app, config.default_gate),
     };
     match write_meta(&config, &form.app, &meta).await {
         Ok(()) => redirect_flash(&back, true, said),
-        Err(_) => redirect_flash(&back, false, "Could not save access."),
+        Err(_) => redirect_flash(&back, false, "Access was not saved."),
     }
 }
 
@@ -1560,7 +1560,7 @@ pub async fn change_rule(
     }
     let prefix = form.prefix.trim().to_string();
     if !prefix.starts_with('/') || prefix.contains("..") {
-        return redirect_flash(&back, false, "A rule's prefix is a path within the app, like /admin.");
+        return redirect_flash(&back, false, "Enter the prefix as a path in the app, for example /admin.");
     }
     let mut meta = read_meta(&config, &form.app).await;
     meta.rules.retain(|rule| rule.prefix != prefix);
@@ -1574,14 +1574,14 @@ pub async fn change_rule(
                 prefix: prefix.clone(),
                 gate: gate.clone(),
             });
-            format!("{prefix} is {gate}.")
+            format!("Access for {prefix} is {gate}.")
         }
-        "remove" => format!("Removed the rule for {prefix}."),
+        "remove" => format!("The rule for {prefix} is removed."),
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     };
     match write_meta(&config, &form.app, &meta).await {
         Ok(()) => redirect_flash(&back, true, text),
-        Err(_) => redirect_flash(&back, false, "Could not save the rule."),
+        Err(_) => redirect_flash(&back, false, "The rule was not saved."),
     }
 }
 
@@ -1610,8 +1610,8 @@ pub async fn change_visibility(
     meta.listed = form.listed.is_some();
     meta.hidden = form.hidden.is_some();
     match write_meta(&config, &form.app, &meta).await {
-        Ok(()) => redirect_flash(&back, true, "Visibility saved."),
-        Err(_) => redirect_flash(&back, false, "Could not save visibility."),
+        Ok(()) => redirect_flash(&back, true, "Visibility is saved."),
+        Err(_) => redirect_flash(&back, false, "Visibility was not saved."),
     }
 }
 
@@ -1636,8 +1636,8 @@ pub async fn change_notes(
         return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
     }
     match crate::content::store::write_notes(&config, &form.app, &form.notes).await {
-        Ok(()) => redirect_flash(&back, true, "Notes saved."),
-        Err(_) => redirect_flash(&back, false, "Could not save the notes."),
+        Ok(()) => redirect_flash(&back, true, "Notes are saved."),
+        Err(_) => redirect_flash(&back, false, "Notes were not saved."),
     }
 }
 
@@ -1681,8 +1681,8 @@ pub async fn run_job(
     }
     let back = back_or(form.back.as_deref(), "/admin/apps");
     match crate::platform::schedule::run_job(&state, &form.app, &form.name).await {
-        Ok(status) => redirect_flash(&back, true, format!("{} ran: {status}", form.name)),
-        Err(message) => redirect_flash(&back, false, format!("{} failed: {message}", form.name)),
+        Ok(status) => redirect_flash(&back, true, format!("Job {} ran. Status: {status}", form.name)),
+        Err(message) => redirect_flash(&back, false, format!("Job {} failed. {message}", form.name)),
     }
 }
 
@@ -1719,7 +1719,7 @@ pub async fn change_export(
                     app_tab(config, headers, form.app, "exports".into(), Some(Fresh::ExportToken(token))).await
                 }
                 Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "Could not create the token."),
+                Err(_) => redirect_flash(&back, false, "The token was not created."),
             }
         }
         "revoke" => {
@@ -1729,10 +1729,10 @@ pub async fn change_export(
             match outcome {
                 Ok(Ok(())) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "export token revoked");
-                    redirect_flash(&back, true, "Token revoked.")
+                    redirect_flash(&back, true, "The token is revoked.")
                 }
                 Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "Could not revoke the token."),
+                Err(_) => redirect_flash(&back, false, "The token was not revoked."),
             }
         }
         _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
