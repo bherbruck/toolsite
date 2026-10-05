@@ -188,6 +188,16 @@ platform never interprets a role.
 There is no public signup. Accounts are created by the owner, and a person
 sets their own password through a one-time link.
 
+## A repository
+
+An app can live in GitHub and deploy from there: `app_repo(app, "create")`
+makes a repository out of the source you published with `?source`, with a
+workflow that builds in GitHub Actions and deploys back here on every push;
+`app_repo(app, "import", repo: "owner/name")` connects a repository that
+already exists. The site has to be configured with a GitHub App for either;
+`app_repo(app, "status")` says. Nothing is built on this server: keep
+publishing the source, and the repository carries it from there.
+
 ## Settings
 
 `app_settings(app, name, value)` writes one; `link: true` returns a URL the

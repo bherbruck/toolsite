@@ -44,7 +44,7 @@ const GATES: [(&str, &str, &str); 3] = [
 ];
 
 /// Resolves an admin from the request, or the response to send instead.
-async fn require_admin(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
+pub(crate) async fn require_admin(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
     match users::current_site_user(config, headers).await {
         Some(user) if user.is_admin => Ok(user),
         // Someone signed in but not an admin is told no, not sent to sign in
@@ -56,7 +56,7 @@ async fn require_admin(config: &Arc<Config>, headers: &HeaderMap) -> Result<User
 
 /// Ties a form to the session that rendered it. Not the session token itself,
 /// so a leaked page cannot be replayed as a credential.
-fn form_token(config: &Config, user: &User) -> String {
+pub(crate) fn form_token(config: &Config, user: &User) -> String {
     users::derive_form_token(config, &user.id)
 }
 
@@ -76,7 +76,7 @@ pub fn no_store() -> (header::HeaderName, &'static str) {
 // --- flash -------------------------------------------------------------------
 
 /// Where a form sends the person back to, if it is one of ours.
-fn back_or(back: Option<&str>, default: &str) -> String {
+pub(crate) fn back_or(back: Option<&str>, default: &str) -> String {
     match back {
         Some(path) if path.starts_with("/admin") && !path.contains("//") => path.to_string(),
         _ => default.to_string(),
@@ -84,7 +84,7 @@ fn back_or(back: Option<&str>, default: &str) -> String {
 }
 
 /// Redirects with the outcome in a cookie the next admin page shows once.
-fn redirect_flash(to: &str, ok: bool, text: impl Into<String>) -> Response {
+pub(crate) fn redirect_flash(to: &str, ok: bool, text: impl Into<String>) -> Response {
     let text: String = text.into();
     let value = format!(
         "{FLASH_COOKIE}={}:{}; Path=/; HttpOnly; SameSite=Lax; Max-Age=60",
@@ -133,6 +133,7 @@ pub(crate) fn sidebar(active: &str, viewer: Option<&User>) -> Markup {
                 a."active"[active == "apps"] href="/admin/apps" { "Apps" }
                 a."active"[active == "accounts"] href="/admin/accounts" { "Accounts" }
                 a."active"[active == "exports"] href="/admin/exports" { "Exports" }
+                a."active"[active == "github"] href="/admin/github" { "GitHub" }
             }
         }
         div."spacer" {
@@ -149,18 +150,20 @@ pub(crate) fn sidebar(active: &str, viewer: Option<&User>) -> Markup {
     }
 }
 
-struct Page<'a> {
-    active: &'a str,
-    title: &'a str,
-    crumbs: Vec<(&'a str, &'a str)>,
-    subtitle: Option<Markup>,
-    actions: Option<Markup>,
-    body: Markup,
-    script: Option<&'static str>,
+pub(crate) struct Page<'a> {
+    pub(crate) active: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) crumbs: Vec<(&'a str, &'a str)>,
+    pub(crate) subtitle: Option<Markup>,
+    pub(crate) actions: Option<Markup>,
+    pub(crate) body: Markup,
+    /// Emitted at the end of the body, for a page that needs behaviour the
+    /// shell's own script does not give it.
+    pub(crate) script: Option<&'static str>,
 }
 
 /// Wraps a section's content, so each page differs only in what it renders.
-fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> Response {
+pub(crate) fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> Response {
     let flash = take_flash(headers);
     let markup = ui::shell(
         page.title,
@@ -194,7 +197,7 @@ fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> Response {
     response
 }
 
-fn hidden(name: &str, value: &str) -> Markup {
+pub(crate) fn hidden(name: &str, value: &str) -> Markup {
     html! { input type="hidden" name=(name) value=(value); }
 }
 
@@ -471,9 +474,10 @@ fn gate_badge(gate: &str) -> Markup {
     }
 }
 
-const TABS: [(&str, &str); 6] = [
+const TABS: [(&str, &str); 7] = [
     ("overview", "Overview"),
     ("access", "Access"),
+    ("repo", "Repo"),
     ("exports", "Exports"),
     ("settings", "Settings"),
     ("jobs", "Jobs"),
@@ -505,12 +509,13 @@ pub async fn app_tab_page(
 }
 
 /// Something minted by the request that rendered this page, shown this once.
-enum Fresh {
+pub(crate) enum Fresh {
     ExportToken(String),
     SettingsLink(String),
+    DeployToken(String),
 }
 
-async fn app_tab(
+pub(crate) async fn app_tab(
     config: Arc<Config>,
     headers: HeaderMap,
     app: String,
@@ -545,6 +550,13 @@ async fn app_tab(
     let body = match tab.as_str() {
         "overview" => render_overview(&config, &app, &meta, &token, &back).await,
         "access" => render_access_tab(&config, &app, &meta, &token, &back).await,
+        "repo" => {
+            let fresh_token = match &fresh {
+                Some(Fresh::DeployToken(value)) => Some(value.as_str()),
+                _ => None,
+            };
+            crate::platform::github::render_repo_tab(&config, &app, &token, &back, fresh_token).await
+        }
         "exports" => {
             let tokens = {
                 let (config, app) = (config.clone(), app.clone());
@@ -1262,7 +1274,7 @@ pub async fn exports_page(
 // --- actions ----------------------------------------------------------------------
 
 /// Everything a POST needs before it may do anything.
-async fn checked(config: &Arc<Config>, headers: &HeaderMap, token: &str) -> Result<User, Response> {
+pub(crate) async fn checked(config: &Arc<Config>, headers: &HeaderMap, token: &str) -> Result<User, Response> {
     let admin = require_admin(config, headers).await?;
     if !check_form_token(config, &admin, token) {
         return Err((StatusCode::FORBIDDEN, "stale form; reload and try again").into_response());

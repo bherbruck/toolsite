@@ -1,6 +1,6 @@
 use crate::{
     accounts::providers::{PendingLogin, Provider},
-    platform::upload::UploadTicket,
+    platform::{github, upload::UploadTicket},
     runtime::blobs::{self, Blobs},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
@@ -33,6 +33,9 @@ pub struct Config {
     /// The gate an app has until it says otherwise. "public" for a site on
     /// the open internet; "granted" or "authenticated" for an internal one.
     pub default_gate: String,
+    /// The GitHub App this site speaks as, when one is configured. Lets an
+    /// app live in a repository and deploy from it.
+    pub github: Option<github::App>,
 }
 
 impl Config {
@@ -59,6 +62,7 @@ impl Config {
             default_gate: self.default_gate.clone(),
             providers: Vec::new(),
             logins: Mutex::new(HashMap::new()),
+            github: None,
         }
     }
 
@@ -78,6 +82,7 @@ impl Config {
             providers: Vec::new(),
             logins: Mutex::new(HashMap::new()),
             default_gate: "public".to_string(),
+            github: None,
         }
     }
 }

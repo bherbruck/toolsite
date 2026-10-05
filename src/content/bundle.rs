@@ -112,6 +112,45 @@ pub(crate) fn read_sql_files(body: &[u8]) -> Result<Vec<(String, String)>, Strin
     Ok(files)
 }
 
+/// Every regular file in a gzipped tar, in memory, under the same traversal
+/// rules a bundle gets. For handing a stored source archive on somewhere
+/// else, file by file. Capped, because an archive is attacker-shaped input;
+/// what a build or a version control tool leaves behind is not the project.
+pub(crate) fn read_all_files(
+    body: &[u8],
+    max_files: usize,
+    max_bytes: usize,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let decoder = flate2::read::GzDecoder::new(body);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let rel = match classify_entry(&entry) {
+            EntryVerdict::Take(rel) => rel,
+            EntryVerdict::Ignore | EntryVerdict::Skip(_) => continue,
+            EntryVerdict::Reject(message) => return Err(message),
+        };
+        let first = rel.split('/').next().unwrap_or("");
+        if matches!(first, "node_modules" | "target" | "dist") || rel.contains("/node_modules/") {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| e.to_string())?;
+        total += bytes.len();
+        if files.len() >= max_files || total > max_bytes {
+            return Err(format!(
+                "archive is larger than {max_files} files or {} MB",
+                max_bytes / 1024 / 1024
+            ));
+        }
+        files.push((rel, bytes));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
 #[derive(Debug)]
 pub(crate) struct Unpacked {
     pub(crate) files: Vec<String>,

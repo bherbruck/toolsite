@@ -227,6 +227,32 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // A GitHub App, when there is one, so apps can live in repositories and
+    // deploy from them. The id and key are the App; the rest is optional.
+    let github = match (
+        read(&["TOOLSITE_GITHUB_APP_ID"]),
+        read(&["TOOLSITE_GITHUB_APP_PRIVATE_KEY"]),
+    ) {
+        (Some(id), Some(key)) => Some(
+            toolsite::platform::github::App::new(
+                &id,
+                &key,
+                read(&["TOOLSITE_GITHUB_APP_SLUG"]),
+                read(&["TOOLSITE_GITHUB_WEBHOOK_SECRET"]),
+                read(&["TOOLSITE_GITHUB_API"]),
+            )
+            .unwrap_or_else(|why| panic!("{why}")),
+        ),
+        (None, None) => None,
+        _ => panic!("set TOOLSITE_GITHUB_APP_ID and TOOLSITE_GITHUB_APP_PRIVATE_KEY together, or neither"),
+    };
+    if let Some(app) = &github {
+        if base_url.is_none() {
+            panic!("TOOLSITE_BASE_URL is required with TOOLSITE_GITHUB_*: the workflow deploys back to it");
+        }
+        tracing::info!(app_id = %app.app_id, webhook = app.install_url().is_some(), "github app configured");
+    }
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
 
@@ -258,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
         providers,
         logins: Mutex::new(HashMap::new()),
         default_gate,
+        github,
     });
 
     let runtime = Runtime::new()?;
@@ -316,6 +343,7 @@ fn run_user_command(
         providers: Vec::new(),
         logins: Mutex::new(HashMap::new()),
         default_gate: "public".to_string(),
+        github: None,
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {
