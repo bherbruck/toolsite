@@ -65,10 +65,10 @@ schema and the metadata all live beside the app and are served by nothing.
 
 Requests resolve in a fixed order:
 
-1. `/p/<app>/api/...` — the app's handler, always. The prefix is reserved.
-2. an exact file from the bundle — static, no wasm runs.
-3. no file but a handler exists — the handler, so it can render its own routes.
-4. no file, no handler, `spa` set — the app's `index.html`.
+1. `/p/<app>/api/...`: the app's handler, always. The prefix is reserved.
+2. an exact file from the bundle: static, no wasm runs.
+3. no file but a handler exists: the handler, so it can render its own routes.
+4. no file, no handler, `spa` set: the app's `index.html`.
 5. otherwise 404.
 
 A handler sees the path relative to its app **with `/api` still attached**, so
@@ -81,13 +81,13 @@ Start from `<server>/scaffold/<app>`, which is a crate that builds unmodified.
 
 It gets five capabilities and nothing else:
 
-- `db.query` — this app's own SQLite. Parameters are bound; there is no
+- `db.query`: this app's own SQLite. Parameters are bound; there is no
   string-building entry point.
-- `blobs` — this app's own files. See Files, below.
-- `identity.current-user` / `current-role` — established by the host from a
+- `blobs`: this app's own files. See Files, below.
+- `identity.current-user` / `current-role`: established by the host from a
   verified session. A guest cannot forge either.
-- `secrets.get` — settings the owner entered. Never in the bundle.
-- `fetch.send` — only hosts the app declared in `allow_http`.
+- `secrets.get`: settings the owner entered. Never in the bundle.
+- `fetch.send`: only hosts the app declared in `allow_http`.
 
 No filesystem. No environment. No sockets beyond that allowlist. **And no
 clock**: `std::time` will not link. Take timestamps from SQLite instead:
@@ -95,7 +95,7 @@ clock**: `std::time` will not link. Take timestamps from SQLite instead:
     select cast(strftime('%s','now') as integer)
 
 Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
-wall-clock deadline. State must live in the database — a global does not
+wall-clock deadline. State must live in the database. A global does not
 survive the request that set it.
 
 The host sets `x-toolsite-scheduled` on a job run. Client copies of any
@@ -105,7 +105,7 @@ The host sets `x-toolsite-scheduled` on a job run. Client copies of any
 
 Uploads, images, exports, datasets: anything too large or too opaque for a
 row is a blob. One namespace per app, keyed like a path (`photos/cat.jpg`),
-with the same rules as a bundle path — no segment may start with `.`, so
+with the same rules as a bundle path: no segment may start with `.`, so
 `..` is refused before anything touches storage.
 
 The handler decides; the platform moves the bytes. A request body into a
@@ -115,10 +115,10 @@ goes through guest memory:
 - **Taking a file from a browser.** Call `blobs::upload_url(key, max_bytes)`
   and hand the URL to the page. The browser `PUT`s the file there with its
   content type; the URL works once and expires in fifteen minutes. Decide who
-  gets a URL the way you decide anything else — it is the credential.
+  gets a URL the way you decide anything else. The URL is the credential.
 - **Sending one.** Answer with the header `x-toolsite-blob: <key>` and an
   empty body. The platform streams the file in its place, with the stored
-  content type unless you set one, and keeps your other headers — so
+  content type unless you set one, and keeps your other headers, so
   `content-disposition` and `cache-control` are yours to add. Gate it however
   the route is gated: answering is the permission.
 - **Small things from inside.** `put`, `get`, `stat`, `list(prefix)` and
@@ -129,7 +129,7 @@ Seeding from a shell: `curl -f -T file '<upload-url>?blob=<key>'`, up to 64 MB
 per PUT, typed by the key's extension.
 
 The ceiling per file is the deployment's, a few GB by default. Where the
-bytes live — the volume, or a bucket — is not the app's concern.
+bytes live, the volume or a bucket, is not the app's concern.
 
 ## Schema
 
@@ -207,14 +207,14 @@ publishing the source, and the repository carries it from there.
 ## Settings
 
 `app_settings(app, name, value)` writes one; `link: true` returns a URL the
-owner opens to paste values in themselves. Prefer the link — a secret that
+owner opens to paste values in themselves. Prefer the link: a secret that
 never enters a conversation cannot leak from one. Values are encrypted at
 rest and never come back out: listings give names only.
 
 ## Before saying it works
 
 Fetch the thing. A page that returns 200 with its assets 404ing renders blank
-and looks like a success — the usual cause is a build whose base path is not
+and looks like a success. The usual cause is a build whose base path is not
 `/p/<slug>/`.
 
     curl -I <page-url>/assets/<a-built-file>
