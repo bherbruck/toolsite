@@ -3439,3 +3439,122 @@ async fn an_admin_opens_a_granted_app_without_a_grant_and_a_visitor_does_not() {
     let (status, ..) = send(&config, get_as("/p/internal/", &reader)).await;
     assert_ne!(status, StatusCode::OK, "a visitor without a grant got in");
 }
+
+// --- a person's own account ----------------------------------------------
+//
+// Any signed-in account can see how it signs in and, if it has a password,
+// change it. The reset path for a forgotten one is an admin's setup link.
+
+fn account_form(token: &str, current: &str, new: &str, confirm: &str) -> String {
+    format!(
+        "token={token}&current={}&new={}&confirm={}",
+        urlencoding::encode(current),
+        urlencoding::encode(new),
+        urlencoding::encode(confirm),
+    )
+}
+
+#[tokio::test]
+async fn the_account_page_is_for_the_signed_in_person_only() {
+    let (_dir, config) = server();
+    let (status, _, headers) = send(&config, get("/account")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location(&headers).starts_with("/auth/login?next="));
+
+    account(&config, "me@example.com", "correct horse battery");
+    let me = sign_in(&config, "me@example.com", "correct horse battery");
+    let (status, page, _) = send(&config, get_as("/account", &me)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("me@example.com"));
+    assert!(page.contains("Change password"), "a password account got no form");
+    assert!(page.contains("A password"), "the page does not say how they sign in");
+}
+
+#[tokio::test]
+async fn a_person_changes_their_own_password_and_the_old_one_stops_working() {
+    let (_dir, config) = server();
+    account(&config, "me@example.com", "correct horse battery");
+    let me = sign_in(&config, "me@example.com", "correct horse battery");
+    // A second session: a phone, say. It should not survive the change.
+    let phone = sign_in(&config, "me@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/account", &me)).await;
+    let token = form_token_from(&page);
+
+    let body = account_form(&token, "correct horse battery", "a brand new secret", "a brand new secret");
+    let (status, _, headers) = send(&config, post_form("/account/password", &me, body)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, page) = follow(&config, &me, &headers).await;
+    assert_eq!(status, StatusCode::OK, "the session that changed the password was signed out");
+    assert!(page.contains("Password changed"), "no confirmation shown");
+
+    assert!(
+        toolsite::accounts::users::log_in(&config, "me@example.com", "correct horse battery").is_err(),
+        "the old password still works"
+    );
+    assert!(toolsite::accounts::users::log_in(&config, "me@example.com", "a brand new secret").is_ok());
+    let (status, ..) = send(&config, get_as("/account", &phone)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "another session survived the change");
+}
+
+#[tokio::test]
+async fn a_wrong_current_password_or_a_mismatched_confirmation_changes_nothing() {
+    let (_dir, config) = server();
+    account(&config, "me@example.com", "correct horse battery");
+    let me = sign_in(&config, "me@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/account", &me)).await;
+    let token = form_token_from(&page);
+
+    for (body, why) in [
+        (account_form(&token, "not it", "a brand new secret", "a brand new secret"), "wrong current"),
+        (account_form(&token, "correct horse battery", "a brand new secret", "a different secret"), "mismatch"),
+        (account_form(&token, "correct horse battery", "short", "short"), "too short"),
+    ] {
+        let (status, _, headers) = send(&config, post_form("/account/password", &me, body)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{why}");
+        assert!(
+            headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")),
+            "{why}: no error was reported"
+        );
+        assert!(
+            toolsite::accounts::users::log_in(&config, "me@example.com", "correct horse battery").is_ok(),
+            "{why}: the password changed anyway"
+        );
+    }
+
+    // Without the form token, nothing happens at all.
+    let (status, ..) = send(
+        &config,
+        post_form("/account/password", &me, account_form("guess", "correct horse battery", "a brand new secret", "a brand new secret")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_provider_only_account_has_no_password_to_change() {
+    let (_dir, config) = server();
+    let user = toolsite::accounts::users::create_provider_account(&config, "sso@example.com").unwrap();
+    toolsite::accounts::users::link_identity(&config, "google", "sub-123", &user.id).unwrap();
+    let session = toolsite::accounts::users::start_session(&config, &user.id).unwrap();
+
+    let (status, page, _) = send(&config, get_as("/account", &session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("Change password"), "a provider account was offered a password form");
+    assert!(page.contains("google"), "the provider is not named");
+
+    let token = toolsite::accounts::users::derive_form_token(&config, &user.id);
+    let (status, _, headers) = send(
+        &config,
+        post_form("/account/password", &session, account_form(&token, "anything", "a brand new secret", "a brand new secret")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")));
+}
+
+#[tokio::test]
+async fn the_sign_in_page_says_where_a_forgotten_password_goes() {
+    let (_dir, config) = server();
+    let (_, page, _) = send(&config, get("/auth/login")).await;
+    assert!(page.contains("Ask an admin for a new setup link"));
+}

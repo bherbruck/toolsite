@@ -369,6 +369,7 @@ dialog .actions { justify-content: flex-end; margin-top: 1rem; }
 .sidebar .count { color: var(--muted); font-size: .75rem; }
 .sidebar .spacer { margin-top: auto; padding-top: .75rem; border-top: 1px solid var(--border); }
 .sidebar .who { padding: .25rem .6rem; color: var(--muted); font-size: .8rem; overflow: hidden; text-overflow: ellipsis; }
+.sidebar a.who { display: block; color: var(--muted); white-space: nowrap; }
 .shell { margin-left: 15rem; }
 .main { max-width: 52rem; margin: 0 auto; min-width: 0; }
 .main > h1 { margin-bottom: .25rem; }

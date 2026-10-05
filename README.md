@@ -709,6 +709,15 @@ page it was made on with one line saying what happened. Disabling ends the
 account's live sessions immediately rather than waiting for them to expire,
 and destroys nothing; enabling restores the same password.
 
+### Your own account
+
+Everyone signed in has `/account`, reached from their email in the sidebar:
+how they sign in (a password, a provider, or both) and, for an account with
+a password, a form to change it. Changing it signs out every other session
+of that account. There is no mailer, so there is no reset email: someone who
+has forgotten their password asks an admin, who issues a new setup link from
+the account's page in the admin.
+
 ### Gates
 
 An app's gate is one of:

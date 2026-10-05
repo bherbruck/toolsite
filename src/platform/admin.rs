@@ -94,7 +94,7 @@ pub(crate) fn redirect_flash(to: &str, ok: bool, text: impl Into<String>) -> Res
     ([(header::SET_COOKIE, value)], Redirect::to(to)).into_response()
 }
 
-fn take_flash(headers: &HeaderMap) -> Option<Flash> {
+pub(crate) fn take_flash(headers: &HeaderMap) -> Option<Flash> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
     let raw = cookie
         .split(';')
@@ -108,7 +108,7 @@ fn take_flash(headers: &HeaderMap) -> Option<Flash> {
     })
 }
 
-fn clear_flash() -> (header::HeaderName, String) {
+pub(crate) fn clear_flash() -> (header::HeaderName, String) {
     (
         header::SET_COOKIE,
         format!("{FLASH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
@@ -139,7 +139,7 @@ pub(crate) fn sidebar(active: &str, viewer: Option<&User>) -> Markup {
         div."spacer" {
             @match viewer {
                 Some(user) => {
-                    div."who" { (user.email) }
+                    a."who"."active"[active == "account"] href="/account" title="Your account" { (user.email) }
                     a href="/auth/logout" { "Sign out" }
                 }
                 None => {

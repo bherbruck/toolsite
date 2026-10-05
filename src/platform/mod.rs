@@ -4,6 +4,7 @@
 //! by letting an admin sign one in. Visitor sign-in lives in `accounts`, and
 //! the two must never be conflated.
 
+pub mod account;
 pub mod admin;
 pub mod bearer;
 pub mod blob_upload;
