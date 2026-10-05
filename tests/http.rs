@@ -1239,7 +1239,7 @@ async fn an_admin_cannot_disable_itself_and_lock_everyone_out() {
     let (_, page, _) = send(&config, get_as("/admin", &boss)).await;
     let token = form_token_from(&page);
 
-    let (status, ..) = send(
+    let (status, _, headers) = send(
         &config,
         post_form(
             "/admin/active",
@@ -1248,8 +1248,11 @@ async fn an_admin_cannot_disable_itself_and_lock_everyone_out() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(send(&config, get_as("/admin", &boss)).await.0, StatusCode::OK);
+    // Refused with a message on the page they came from, not a bare 400.
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, page) = follow(&config, &boss, &headers).await;
+    assert_eq!(status, StatusCode::OK, "the admin locked themselves out");
+    assert!(page.contains("cannot disable your own account"), "no explanation shown");
 }
 
 // --- invitations --------------------------------------------------------
@@ -2674,6 +2677,9 @@ async fn an_admin_mints_a_token_on_the_exports_page_and_sees_it_once() {
     let (status, page, _) = send(&config, get_as("/admin/exports", &session)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("No export tokens"));
+    // Minting happens on the app's own Exports tab.
+    let (status, page, _) = send(&config, get_as("/admin/apps/sales/exports", &session)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
     let form_token = page
         .split("name=\"token\" value=\"")
         .nth(1)
@@ -2685,7 +2691,7 @@ async fn an_admin_mints_a_token_on_the_exports_page_and_sees_it_once() {
     let (status, page, _) = send(&config, form_post("/admin/exports", &body, Some(&session))).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     let token = page
-        .split("<code>tse_")
+        .split("id=\"fresh-token\">tse_")
         .nth(1)
         .and_then(|rest| rest.split('<').next())
         .map(|rest| format!("tse_{rest}"))
@@ -3044,4 +3050,130 @@ async fn an_email_missing_from_the_token_is_fetched_from_userinfo() {
     let (status, _, headers) = sign_in_through(&config, "/").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(session_cookie(&headers).is_some());
+}
+
+// --- the app page -----------------------------------------------------------
+
+/// Follows one redirect the way a browser would: carries the Set-Cookie it
+/// came with (the flash) into the next request alongside the session.
+async fn follow(config: &Arc<Config>, session: &str, headers: &[(String, String)]) -> (StatusCode, String) {
+    let location = headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.clone()).expect("no redirect");
+    let flash = headers
+        .iter()
+        .filter(|(k, _)| k == "set-cookie")
+        .map(|(_, v)| v.split(';').next().unwrap_or("").to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let request = Request::builder()
+        .uri(&location)
+        .header("cookie", format!("ts_session={session}; {flash}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(config, request).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn an_apps_page_is_for_admins_and_only_for_apps_that_exist() {
+    let (_dir, config) = server();
+    write_page(&config, "reports/index", "<title>Reports</title>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let reader = sign_in(&config, "reader@example.com", "correct horse battery");
+
+    let (status, page, _) = send(&config, get_as("/admin/apps/reports", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Reports"), "the title is not shown");
+    for tab in ["access", "exports", "settings", "jobs", "notes"] {
+        let (status, ..) = send(&config, get_as(&format!("/admin/apps/reports/{tab}"), &boss)).await;
+        assert_eq!(status, StatusCode::OK, "{tab}");
+    }
+    let (status, ..) = send(&config, get_as("/admin/apps/reports/bogus", &boss)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, get_as("/admin/apps/nothing", &boss)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, get_as("/admin/apps/..%2F.site", &boss)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, get_as("/admin/apps/reports", &reader)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn saving_a_gate_returns_to_the_tab_with_the_outcome_shown_once() {
+    let (_dir, config) = server();
+    write_page(&config, "reports/index", "<h1>r</h1>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
+    let token = form_token_from(&page);
+
+    let (status, _, headers) = send(
+        &config,
+        post_form(
+            "/admin/gate",
+            &boss,
+            format!("token={token}&app=reports&gate=granted&back=/admin/apps/reports/access"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, page) = follow(&config, &boss, &headers).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("reports is now granted"), "no flash: {page}");
+    assert!(page.contains(r#"value="granted" checked"#), "the radio does not reflect the save");
+    // Shown once: the next visit is quiet.
+    let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
+    assert!(!page.contains("reports is now granted"));
+
+    // A `back` that is not one of ours is ignored, not followed.
+    let (_, _, headers) = send(
+        &config,
+        post_form("/admin/gate", &boss, format!("token={token}&app=reports&gate=public&back=https://evil.test/")),
+    )
+    .await;
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap().1.clone();
+    assert!(location.starts_with("/admin"), "{location}");
+}
+
+#[tokio::test]
+async fn route_rules_are_added_and_removed_from_the_access_tab() {
+    let (_dir, config) = server();
+    write_page(&config, "reports/index", "<h1>r</h1>");
+    write_page(&config, "reports/admin/index", "<h1>secret</h1>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
+    let token = form_token_from(&page);
+
+    let (status, ..) = send(
+        &config,
+        post_form("/admin/rule", &boss, format!("token={token}&app=reports&action=add&prefix=/admin&gate=authenticated")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    // The rule does what the page says it does.
+    let (status, ..) = send(&config, get("/p/reports/")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, ..) = send(&config, get("/p/reports/admin/")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "the rule did not gate the corner");
+
+    let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
+    assert!(page.contains("/admin</code>"), "the rule is not listed");
+    let (status, ..) = send(
+        &config,
+        post_form("/admin/rule", &boss, format!("token={token}&app=reports&action=remove&prefix=/admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, ..) = send(&config, get("/p/reports/admin/")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A prefix that is not a path within the app is refused.
+    let (_, _, headers) = send(
+        &config,
+        post_form("/admin/rule", &boss, format!("token={token}&app=reports&action=add&prefix=../x&gate=public")),
+    )
+    .await;
+    assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")));
 }

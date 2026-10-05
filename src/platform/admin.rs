@@ -1,10 +1,16 @@
-//! Accounts and access, for whoever runs the site.
+//! The site as its owner runs it: apps, accounts, access, exports.
 //!
 //! This is a platform route rather than a published app on purpose: an app
 //! cannot read the account database — that isolation is the thing every other
 //! guarantee rests on — so an "admin app" could only exist by breaking it.
 //!
-//! Every action here is a POST carrying a token derived from the caller's own
+//! The shape is lists that show and pages that edit. A list row is a link;
+//! the page it leads to has real forms, grouped by concern, each with its own
+//! save. Anything that removes or disables asks first, through the shell's
+//! dialog. The result of an action comes back as a one-line flash on the page
+//! the person was on, carried across the redirect in a short-lived cookie.
+//!
+//! Every action is a POST carrying a token derived from the caller's own
 //! session. Cookies are `SameSite=Lax`, which already refuses a cross-site
 //! POST; the token is what stops a page on *this* origin from acting as the
 //! admin who happens to be visiting it.
@@ -12,16 +18,29 @@
 use crate::{
     accounts::users::{self, User},
     config::Config,
-    content::{slug::valid_slug, store::collect_slugs, store::read_meta},
+    content::{
+        slug::valid_slug,
+        store::{collect_slugs, read_meta, write_meta, PathRule},
+    },
+    platform::export,
+    ui::{self, Flash},
+    AppState,
 };
 use axum::{
-    extract::{Form, State},
+    extract::{Form, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
 use maud::{html, Markup};
 use serde::Deserialize;
 use std::sync::Arc;
+
+const FLASH_COOKIE: &str = "ts_flash";
+const GATES: [(&str, &str, &str); 3] = [
+    ("public", "Public", "Anyone with the link."),
+    ("authenticated", "Signed in", "Any account on this site."),
+    ("granted", "Granted", "Only accounts given access on the Access tab."),
+];
 
 /// Resolves an admin from the request, or the response to send instead.
 async fn require_admin(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
@@ -47,209 +66,138 @@ fn check_form_token(config: &Config, user: &User, presented: &str) -> bool {
     expected.len() == presented.len() && expected == presented
 }
 
-/// The rail every admin page shares. `active` names the current page so the
-/// link to it can be marked rather than followed.
-fn sidebar(active: &str) -> Markup {
+/// Sent on every admin response so the browser will not cache a page listing
+/// accounts.
+pub fn no_store() -> (header::HeaderName, &'static str) {
+    (header::CACHE_CONTROL, "no-store")
+}
+
+// --- flash -------------------------------------------------------------------
+
+/// Where a form sends the person back to, if it is one of ours.
+fn back_or(back: Option<&str>, default: &str) -> String {
+    match back {
+        Some(path) if path.starts_with("/admin") && !path.contains("//") => path.to_string(),
+        _ => default.to_string(),
+    }
+}
+
+/// Redirects with the outcome in a cookie the next admin page shows once.
+fn redirect_flash(to: &str, ok: bool, text: impl Into<String>) -> Response {
+    let text: String = text.into();
+    let value = format!(
+        "{FLASH_COOKIE}={}:{}; Path=/; HttpOnly; SameSite=Lax; Max-Age=60",
+        if ok { "ok" } else { "error" },
+        urlencoding::encode(&text)
+    );
+    ([(header::SET_COOKIE, value)], Redirect::to(to)).into_response()
+}
+
+fn take_flash(headers: &HeaderMap) -> Option<Flash> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    let raw = cookie
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find(|(name, _)| *name == FLASH_COOKIE)
+        .map(|(_, value)| value)?;
+    let (kind, text) = raw.split_once(':')?;
+    Some(Flash {
+        ok: kind == "ok",
+        text: urlencoding::decode(text).ok()?.into_owned(),
+    })
+}
+
+fn clear_flash() -> (header::HeaderName, String) {
+    (
+        header::SET_COOKIE,
+        format!("{FLASH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    )
+}
+
+// --- the shell ----------------------------------------------------------------
+
+/// The rail every signed-in page shares, including the index. `active` names
+/// the current section so its link is marked rather than followed.
+pub(crate) fn sidebar(active: &str, viewer: Option<&User>) -> Markup {
+    let is_admin = viewer.is_some_and(|user| user.is_admin);
     html! {
-        div."brand" { "Admin" }
-        a."active"[active == "accounts"] href="/admin" { "Accounts" }
-        a."active"[active == "apps"] href="/admin/apps" { "Apps" }
-        a."active"[active == "access"] href="/admin/access" { "Access" }
-        a."active"[active == "exports"] href="/admin/exports" { "Exports" }
+        a."brand" href="/" { span."mark" { "t" } "toolsite" }
+        div."nav-group" {
+            div."label" { "Site" }
+            a."active"[active == "pages"] href="/" { "Pages" }
+        }
+        @if is_admin {
+            div."nav-group" {
+                div."label" { "Admin" }
+                a."active"[active == "apps"] href="/admin/apps" { "Apps" }
+                a."active"[active == "accounts"] href="/admin/accounts" { "Accounts" }
+                a."active"[active == "access"] href="/admin/access" { "Access" }
+                a."active"[active == "exports"] href="/admin/exports" { "Exports" }
+            }
+        }
         div."spacer" {
-            a href="/" { "Pages" }
-            a href="/auth/logout" { "Sign out" }
+            @match viewer {
+                Some(user) => {
+                    div."who" { (user.email) }
+                    a href="/auth/logout" { "Sign out" }
+                }
+                None => {
+                    a href="/auth/login?next=/" { "Sign in" }
+                }
+            }
         }
     }
+}
+
+struct Page<'a> {
+    active: &'a str,
+    title: &'a str,
+    crumbs: Vec<(&'a str, &'a str)>,
+    subtitle: Option<Markup>,
+    actions: Option<Markup>,
+    body: Markup,
 }
 
 /// Wraps a section's content, so each page differs only in what it renders.
-fn admin_page(active: &str, heading: &str, admin: &User, body: Markup) -> Response {
-    let markup = crate::ui::shell(
-        heading,
-        sidebar(active),
+fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> Response {
+    let flash = take_flash(headers);
+    let markup = ui::shell(
+        page.title,
+        sidebar(page.active, Some(admin)),
         html! {
-            h1 { (heading) }
-            p."muted" { "Signed in as " (admin.email) }
-            (body)
+            @if !page.crumbs.is_empty() {
+                nav."crumbs" {
+                    @for (label, href) in &page.crumbs { span { a href=(href) { (label) } } }
+                    span { (page.title) }
+                }
+            }
+            div."title-row" {
+                div {
+                    h1 { (page.title) }
+                    @if let Some(subtitle) = page.subtitle { p."muted" { (subtitle) } }
+                }
+                @if let Some(actions) = page.actions { div."actions" { (actions) } }
+            }
+            (ui::flash(flash.as_ref()))
+            (page.body)
         },
         None,
     );
-    ([no_store()], Html(markup.into_string())).into_response()
-}
-
-pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-
-    let accounts = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || users::list_accounts(&config))
-            .await
-            .unwrap_or_else(|_| Ok(Vec::new()))
-            .unwrap_or_default()
-    };
-
-    let token = form_token(&config, &admin);
-    admin_page("accounts", "Accounts", &admin, render_accounts(&accounts, &token))
-}
-
-pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-
-    // Apps, with the gate each one is behind.
-    let mut apps = Vec::new();
-    let mut slugs = Vec::new();
-    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
-    for slug in slugs {
-        let app = slug.split('/').next().unwrap_or(&slug).to_string();
-        if apps.iter().any(|(name, _)| name == &app) {
-            continue;
-        }
-        let gate = read_meta(&config, &app).await.gate;
-        apps.push((app, gate));
-    }
-    apps.sort();
-
-    let token = form_token(&config, &admin);
-    admin_page("apps", "Apps", &admin, render_apps(&apps, &token))
-}
-
-pub async fn access_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-
-    let grants = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || users::list_grants(&config))
-            .await
-            .unwrap_or_else(|_| Ok(Vec::new()))
-            .unwrap_or_default()
-    };
-
-    let token = form_token(&config, &admin);
-    admin_page("access", "Access", &admin, render_access(&grants, &token))
-}
-
-fn render_accounts(accounts: &[users::Account], token: &str) -> Markup {
-    html! {
-        @if accounts.is_empty() {
-            p."muted" { "No accounts yet." }
-        } @else {
-            table {
-                thead { tr { th { "Email" } th { "Created" } th { "Admin" } th { "Status" } th {} } }
-                tbody {
-                    @for account in accounts {
-                        tr {
-                            td { (account.email) }
-                            td."muted" { (account.created) }
-                            td { @if account.is_admin { "yes" } @else { "" } }
-                            td { @if account.is_active { "active" } @else { "disabled" } }
-                            td {
-                                form."row" method="post" action="/admin/active" {
-                                    input type="hidden" name="token" value=(token);
-                                    input type="hidden" name="email" value=(account.email);
-                                    input type="hidden" name="active"
-                                          value=(if account.is_active { "0" } else { "1" });
-                                    @if account.is_active {
-                                        button."danger" type="submit" { "Disable" }
-                                    } @else {
-                                        button type="submit" { "Enable" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        form."row" method="post" action="/admin/users" {
-            input type="hidden" name="token" value=(token);
-            input name="email" type="email" placeholder="Email" required;
-            input name="password" type="password" placeholder="Password (8+)" required;
-            label { input type="checkbox" name="admin" value="1"; " admin" }
-            button type="submit" { "Add account" }
+    let mut response = ([no_store()], Html(markup.into_string())).into_response();
+    if flash.is_some() {
+        let (name, value) = clear_flash();
+        if let Ok(value) = value.parse() {
+            response.headers_mut().append(name, value);
         }
     }
+    response
 }
 
-fn render_apps(apps: &[(String, String)], token: &str) -> Markup {
-    html! {
-        @if apps.is_empty() {
-            p."muted" { "Nothing published yet." }
-        } @else {
-            table {
-                thead { tr { th { "App" } th { "Gate" } th {} } }
-                tbody {
-                    @for (app, gate) in apps {
-                        tr {
-                            td { a href={ "/p/" (app) "/" } { (app) } }
-                            td { code { (gate) } }
-                            td {
-                                form."row" method="post" action="/admin/gate" {
-                                    input type="hidden" name="token" value=(token);
-                                    input type="hidden" name="app" value=(app);
-                                    select name="gate" {
-                                        @for option in ["public", "authenticated", "granted"] {
-                                            option value=(option) selected[option == gate] { (option) }
-                                        }
-                                    }
-                                    button type="submit" { "Set" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+fn hidden(name: &str, value: &str) -> Markup {
+    html! { input type="hidden" name=(name) value=(value); }
 }
 
-fn render_access(grants: &[(String, String)], token: &str) -> Markup {
-    html! {
-        p."muted" { "Only matters for apps gated " code { "granted" } "." }
-        @if grants.is_empty() {
-            p."muted" { "No grants." }
-        } @else {
-            table {
-                thead { tr { th { "App" } th { "Account" } th {} } }
-                tbody {
-                    @for (app, email) in grants {
-                        tr {
-                            td { (app) }
-                            td { (email) }
-                            td {
-                                form."row" method="post" action="/admin/access" {
-                                    input type="hidden" name="token" value=(token);
-                                    input type="hidden" name="app" value=(app);
-                                    input type="hidden" name="email" value=(email);
-                                    input type="hidden" name="allow" value="0";
-                                    button."danger" type="submit" { "Revoke" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        form."row" method="post" action="/admin/access" {
-            input type="hidden" name="token" value=(token);
-            input type="hidden" name="allow" value="1";
-            input name="app" placeholder="App" required;
-            input name="email" type="email" placeholder="Account email" required;
-            button type="submit" { "Grant" }
-        }
-    }
-}
+// --- apps ----------------------------------------------------------------------
 
 /// The apps that exist, by their top-level directory.
 async fn app_names(config: &Config) -> Vec<String> {
@@ -264,24 +212,530 @@ async fn app_names(config: &Config) -> Vec<String> {
     apps
 }
 
-pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+struct AppRow {
+    app: String,
+    title: Option<String>,
+    gate: String,
+    hidden: bool,
+    has_handler: bool,
+    modified: Option<std::time::SystemTime>,
+}
+
+async fn app_row(config: &Config, app: &str) -> AppRow {
+    let meta = read_meta(config, app).await;
+    let path = crate::content::store::page_path(config, app).await;
+    let title = match &path {
+        Some(path) => crate::content::store::page_title(path).await,
+        None => None,
+    };
+    let modified = match &path {
+        Some(path) => tokio::fs::metadata(path).await.ok().and_then(|m| m.modified().ok()),
+        None => None,
+    };
+    AppRow {
+        app: app.to_string(),
+        title,
+        gate: meta.gate,
+        hidden: meta.hidden,
+        has_handler: config.data_dir.join(app).join("handler.wasm").is_file(),
+        modified,
+    }
+}
+
+pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
     let admin = match require_admin(&config, &headers).await {
         Ok(admin) => admin,
         Err(response) => return response,
     };
-    let apps = app_names(&config).await;
-    let tokens = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || crate::platform::export::list_all(&config))
-            .await
-            .unwrap_or_default()
+    let mut rows = Vec::new();
+    for app in app_names(&config).await {
+        rows.push(app_row(&config, &app).await);
+    }
+    let count = rows.len();
+    admin_page(
+        &headers,
+        &admin,
+        Page {
+            active: "apps",
+            title: "Apps",
+            crumbs: vec![],
+            subtitle: Some(html! { (count) " published" }),
+            actions: None,
+            body: html! {
+                @if rows.is_empty() {
+                    (ui::panel("Nothing published yet", Some("An agent publishes with create_upload; apps appear here as they land."), html! {}))
+                } @else {
+                    section."panel" {
+                        table {
+                            thead { tr { th { "App" } th { "Gate" } th { "Handler" } th { "Updated" } th {} } }
+                            tbody {
+                                @for row in &rows {
+                                    tr {
+                                        td {
+                                            a."row-link" href={ "/admin/apps/" (row.app) } { (row.title.as_deref().unwrap_or(&row.app)) }
+                                            @if row.title.is_some() { " " span."muted small" { (row.app) } }
+                                        }
+                                        td { (gate_badge(&row.gate)) @if row.hidden { " " span."badge warn" { "hidden" } } }
+                                        td { @if row.has_handler { span."badge" { "wasm" } } @else { span."muted small" { "static" } } }
+                                        td."muted small" {
+                                            @if let Some(modified) = row.modified { (crate::content::store::relative_time(modified)) }
+                                        }
+                                        td."actions-cell" { a."btn quiet sm" href={ "/p/" (row.app) "/" } target="_blank" { "Open" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        },
+    )
+}
+
+fn gate_badge(gate: &str) -> Markup {
+    html! {
+        @match gate {
+            "public" => span."badge" { "public" },
+            "authenticated" => span."badge solid" { "signed in" },
+            _ => span."badge solid" { "granted" },
+        }
+    }
+}
+
+const TABS: [(&str, &str); 6] = [
+    ("overview", "Overview"),
+    ("access", "Access"),
+    ("exports", "Exports"),
+    ("settings", "Settings"),
+    ("jobs", "Jobs"),
+    ("notes", "Notes"),
+];
+
+fn tab_href(app: &str, tab: &str) -> String {
+    if tab == "overview" {
+        format!("/admin/apps/{app}")
+    } else {
+        format!("/admin/apps/{app}/{tab}")
+    }
+}
+
+pub async fn app_overview(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Path(app): Path<String>,
+) -> Response {
+    app_tab(config, headers, app, "overview".to_string(), None).await
+}
+
+pub async fn app_tab_page(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Path((app, tab)): Path<(String, String)>,
+) -> Response {
+    app_tab(config, headers, app, tab, None).await
+}
+
+/// Something minted by the request that rendered this page, shown this once.
+enum Fresh {
+    ExportToken(String),
+    SettingsLink(String),
+}
+
+async fn app_tab(
+    config: Arc<Config>,
+    headers: HeaderMap,
+    app: String,
+    tab: String,
+    fresh: Option<Fresh>,
+) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
     };
+    if !export::valid_app(&app) || !TABS.iter().any(|(key, _)| *key == tab) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let exists = app_names(&config).await.iter().any(|name| name == &app);
+    if !exists {
+        return (StatusCode::NOT_FOUND, "no such app").into_response();
+    }
+
     let token = form_token(&config, &admin);
-    admin_page("exports", "Exports", &admin, render_exports(&config, &apps, &tokens, &token, None))
+    let meta = read_meta(&config, &app).await;
+    let hrefs: Vec<(String, String)> = TABS
+        .iter()
+        .map(|(key, _)| (key.to_string(), tab_href(&app, key)))
+        .collect();
+    let tab_items: Vec<(&str, &str, &str)> = TABS
+        .iter()
+        .zip(hrefs.iter())
+        .map(|((key, label), (_, href))| (*key, *label, href.as_str()))
+        .collect();
+    let back = tab_href(&app, &tab);
+
+    let body = match tab.as_str() {
+        "overview" => render_overview(&config, &app, &meta, &token, &back).await,
+        "access" => render_access_tab(&config, &app, &meta, &token, &back).await,
+        "exports" => {
+            let tokens = {
+                let (config, app) = (config.clone(), app.clone());
+                tokio::task::spawn_blocking(move || export::list(&config, &app))
+                    .await
+                    .unwrap_or_default()
+            };
+            let fresh_token = match &fresh {
+                Some(Fresh::ExportToken(value)) => Some(value.as_str()),
+                _ => None,
+            };
+            render_exports_tab(&config, &app, &tokens, &token, &back, fresh_token)
+        }
+        "settings" => {
+            let names = crate::platform::secrets::names(&config, &app);
+            let link = match &fresh {
+                Some(Fresh::SettingsLink(url)) => Some(url.as_str()),
+                _ => None,
+            };
+            render_settings_tab(&app, &names, &token, &back, link)
+        }
+        "jobs" => {
+            let jobs = {
+                let (config, app) = (config.clone(), app.clone());
+                tokio::task::spawn_blocking(move || crate::platform::schedule::read_jobs(&config, &app))
+                    .await
+                    .unwrap_or_default()
+            };
+            render_jobs_tab(&app, &jobs, &token, &back)
+        }
+        _ => {
+            let notes = crate::content::store::read_notes(&config, &app).await;
+            render_notes_tab(&app, notes.as_deref(), &token, &back)
+        }
+    };
+
+    let title = app.clone();
+    let url = crate::content::store::page_url(&config, &app);
+    admin_page(
+        &headers,
+        &admin,
+        Page {
+            active: "apps",
+            title: &title,
+            crumbs: vec![("Apps", "/admin/apps")],
+            subtitle: Some(html! { a href=(url) target="_blank" { (url) } }),
+            actions: Some(html! {
+                (gate_badge(&meta.gate))
+                @if meta.hidden { span."badge warn" { "hidden" } }
+                @if !meta.listed { span."badge" { "unlisted" } }
+            }),
+            body: html! {
+                (ui::tabs(&tab_items, &tab))
+                (body)
+            },
+        },
+    )
+}
+
+async fn render_overview(
+    config: &Config,
+    app: &str,
+    meta: &crate::content::store::PageMeta,
+    token: &str,
+    back: &str,
+) -> Markup {
+    let dir = config.data_dir.join(app);
+    let has_handler = dir.join("handler.wasm").is_file();
+    let db_bytes = tokio::fs::metadata(dir.join("data.db")).await.ok().map(|m| m.len());
+    let page = crate::content::store::page_path(config, app).await;
+    let title = match &page {
+        Some(path) => crate::content::store::page_title(path).await,
+        None => None,
+    };
+    let modified = match &page {
+        Some(path) => tokio::fs::metadata(path).await.ok().and_then(|m| m.modified().ok()),
+        None => None,
+    };
+    html! {
+        div."grid-2" {
+            (ui::panel("About", None, html! {
+                dl."kv" {
+                    dt { "Title" } dd { (title.as_deref().unwrap_or("—")) }
+                    dt { "Updated" } dd { @match modified { Some(m) => (crate::content::store::relative_time(m)), None => "—" } }
+                    dt { "Handler" } dd { @if has_handler { "wasm component" } @else { "none, static files only" } }
+                    dt { "Database" } dd { @match db_bytes { Some(b) => (human_bytes(b)), None => "not created yet" } }
+                    dt { "Routing" } dd { @if meta.spa { "client-side (spa)" } @else { "files and handler" } }
+                    dt { "Outbound" }
+                    dd {
+                        @if meta.allow_http.is_empty() { "no hosts allowed" }
+                        @else { @for (i, host) in meta.allow_http.iter().enumerate() { @if i > 0 { ", " } code { (host) } } }
+                    }
+                }
+            }))
+            (ui::panel("Visibility", Some("Nothing here deletes anything. Both are reversible from this page."), html! {
+                form."column" method="post" action="/admin/visibility" {
+                    (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                    label."choice" {
+                        input type="checkbox" name="listed" value="1" checked[meta.listed];
+                        strong { "Listed on the index" }
+                        span { "Off keeps the URL working but drops it from the front page." }
+                    }
+                    label."choice" {
+                        input type="checkbox" name="hidden" value="1" checked[meta.hidden];
+                        strong { "Taken down" }
+                        span { "The URL answers 404 and the app leaves the index. Files stay where they are." }
+                    }
+                    div."actions end" { button type="submit" { "Save" } }
+                }
+            }))
+        }
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+async fn render_access_tab(
+    config: &Config,
+    app: &str,
+    meta: &crate::content::store::PageMeta,
+    token: &str,
+    back: &str,
+) -> Markup {
+    let grants: Vec<String> = {
+        let config = config.clone_for_task();
+        let app = app.to_string();
+        tokio::task::spawn_blocking(move || users::list_grants(&config))
+            .await
+            .unwrap_or_else(|_| Ok(Vec::new()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(granted_app, _)| granted_app == &app)
+            .map(|(_, email)| email)
+            .collect()
+    };
+    html! {
+        (ui::panel("Who may reach it", Some("The gate for the whole app. Route rules below make exceptions by path."), html! {
+            form method="post" action="/admin/gate" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                div."choices" {
+                    @for (value, label, help) in GATES {
+                        label."choice" {
+                            input type="radio" name="gate" value=(value) checked[meta.gate == value];
+                            strong { (label) }
+                            span { (help) }
+                        }
+                    }
+                }
+                div."actions end" { button type="submit" { "Save gate" } }
+            }
+        }))
+
+        (ui::panel("Route rules", Some("A path prefix with its own gate. Longest match wins, so a public app can have a private corner."), html! {
+            @if !meta.rules.is_empty() {
+                table {
+                    thead { tr { th { "Prefix" } th { "Gate" } th {} } }
+                    tbody {
+                        @for rule in &meta.rules {
+                            tr {
+                                td { code { (rule.prefix) } }
+                                td { (gate_badge(&rule.gate)) }
+                                td."actions-cell" {
+                                    form method="post" action="/admin/rule" {
+                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                                        (hidden("prefix", &rule.prefix)) (hidden("action", "remove"))
+                                        button."danger quiet sm" type="submit" { "Remove" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            form."row" method="post" action="/admin/rule" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("action", "add"))
+                input name="prefix" placeholder="/admin" required pattern="/.*";
+                select name="gate" { @for (value, label, _) in GATES { option value=(value) { (label) } } }
+                button."quiet" type="submit" { "Add rule" }
+            }
+        }))
+
+        (ui::panel("Granted accounts", Some("Only matters while the gate, or a rule, says granted."), html! {
+            @if grants.is_empty() {
+                p."muted" { "Nobody has been granted access yet." }
+            } @else {
+                table {
+                    thead { tr { th { "Account" } th {} } }
+                    tbody {
+                        @for email in &grants {
+                            tr {
+                                td { (email) }
+                                td."actions-cell" {
+                                    form method="post" action="/admin/access"
+                                         data-confirm={ "Revoke " (email) "?" }
+                                         data-confirm-detail="They keep their account and lose this app."
+                                         data-confirm-label="Revoke" data-confirm-danger="1" {
+                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                                        (hidden("email", email)) (hidden("allow", "0"))
+                                        button."danger quiet sm" type="submit" { "Revoke" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            form."row" method="post" action="/admin/access" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))
+                input name="email" type="email" placeholder="someone@example.com" required;
+                button."quiet" type="submit" { "Grant access" }
+            }
+        }))
+    }
+}
+
+fn render_exports_tab(
+    config: &Config,
+    app: &str,
+    tokens: &[export::ExportToken],
+    token: &str,
+    back: &str,
+    fresh: Option<&str>,
+) -> Markup {
+    let url = export::export_url(config, app);
+    html! {
+        @if let Some(fresh) = fresh {
+            (ui::panel("Your new token", Some("Copy it now. It is not stored and will not be shown again."), html! {
+                (ui::secret("fresh-token", fresh))
+                p."muted small" {
+                    "Point the tool at " code { (url) } " with " code { "Authorization: Bearer <token>" } "."
+                }
+            }))
+        }
+        (ui::panel("Export tokens", Some("A read-only snapshot of this app's database for a reporting tool. Each token opens this app and nothing else."), html! {
+            @if tokens.is_empty() {
+                p."muted" { "No tokens yet." }
+            } @else {
+                table {
+                    thead { tr { th { "Label" } th { "Created" } th { "Last used" } th {} } }
+                    tbody {
+                        @for entry in tokens {
+                            tr {
+                                td { (entry.label) " " span."muted small" { (entry.id) } }
+                                td."muted small" { (ago(entry.created_at)) }
+                                td."muted small" { @match entry.last_used { Some(at) => (ago(at)), None => "never" } }
+                                td."actions-cell" {
+                                    form method="post" action="/admin/exports"
+                                         data-confirm={ "Revoke " (entry.label) "?" }
+                                         data-confirm-detail="Whatever holds it gets 401 on its next pull."
+                                         data-confirm-label="Revoke" data-confirm-danger="1" {
+                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                                        (hidden("action", "revoke")) (hidden("id", &entry.id))
+                                        button."danger quiet sm" type="submit" { "Revoke" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            form."row" method="post" action="/admin/exports" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("action", "create"))
+                input name="label" placeholder="What will hold it, e.g. reporting" required;
+                button."quiet" type="submit" { "Create token" }
+            }
+            p."muted small" { "URL: " code { (url) } }
+        }))
+    }
+}
+
+fn render_settings_tab(app: &str, names: &[String], token: &str, back: &str, link: Option<&str>) -> Markup {
+    html! {
+        @if let Some(link) = link {
+            (ui::panel("Entry link", Some("Send this to whoever holds the values. It lasts an hour and takes one NAME=value per line."), html! {
+                (ui::secret("settings-link", link))
+            }))
+        }
+        (ui::panel("Settings", Some("Values the handler reads with secrets.get. Sealed at rest; names only here, never values."), html! {
+            @if names.is_empty() {
+                p."muted" { "Nothing set." }
+            } @else {
+                ul."stack" { @for name in names { li { code { (name) } } } }
+            }
+            form."row" method="post" action="/admin/settings-link" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                button."quiet" type="submit" { "Get a link to enter values" }
+            }
+        }))
+    }
+}
+
+fn render_jobs_tab(
+    app: &str,
+    jobs: &std::collections::BTreeMap<String, crate::platform::schedule::Job>,
+    token: &str,
+    back: &str,
+) -> Markup {
+    html! {
+        (ui::panel("Scheduled jobs", Some("Declared in the app's toolsite.toml. Each run goes through the handler like a request."), html! {
+            @if jobs.is_empty() {
+                p."muted" { "No jobs." }
+            } @else {
+                table {
+                    thead { tr { th { "Name" } th { "Schedule" } th { "Path" } th { "Last run" } th { "Status" } th {} } }
+                    tbody {
+                        @for (name, job) in jobs {
+                            tr {
+                                td { (name) }
+                                td { code { (job.schedule) } }
+                                td { code { (job.path) } }
+                                td."muted small" { @match job.last_run { Some(at) => (ago(at)), None => "never" } }
+                                td {
+                                    @match job.last_status.as_deref() {
+                                        Some(status) if status.starts_with("ok") || status.starts_with("200") => span."badge ok" { (status) },
+                                        Some(status) => span."badge warn" { (status) },
+                                        None => span."muted small" { "—" },
+                                    }
+                                }
+                                td."actions-cell" {
+                                    form method="post" action="/admin/job-run" {
+                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("name", name))
+                                        button."quiet sm" type="submit" { "Run now" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    }
+}
+
+fn render_notes_tab(app: &str, notes: Option<&str>, token: &str, back: &str) -> Markup {
+    html! {
+        (ui::panel("Notes", Some("What the last session left for the next one. A bundle cannot be turned back into its source, so this may be the only record."), html! {
+            form."column" method="post" action="/admin/notes" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                textarea name="notes" rows="14" placeholder="Nothing written yet." { (notes.unwrap_or("")) }
+                div."actions end" { button type="submit" { "Save notes" } }
+            }
+        }))
+    }
 }
 
 fn ago(seconds: u64) -> String {
-    let elapsed = crate::platform::export::seconds_since(seconds);
+    let elapsed = export::seconds_since(seconds);
     match elapsed {
         s if s < 90 => "just now".to_string(),
         s if s < 3600 => format!("{} min ago", s / 60),
@@ -290,76 +744,513 @@ fn ago(seconds: u64) -> String {
     }
 }
 
-/// `fresh` is a token minted by the request that rendered this page: the one
-/// time it is ever shown.
-fn render_exports(
-    config: &Config,
-    apps: &[String],
-    tokens: &[(String, crate::platform::export::ExportToken)],
-    form_token: &str,
-    fresh: Option<(&str, &str)>,
-) -> Markup {
-    html! {
-        p."muted" {
-            "A read-only copy of one app's database, for a reporting tool that pulls SQLite over HTTP. "
-            "Each token opens one app and nothing else; revoke it here when the tool goes."
-        }
-        @if let Some((app, token)) = fresh {
-            section {
-                h2 { "New token for " (app) }
-                p { "Copy it now. It is not stored and will not be shown again." }
-                pre { code { (token) } }
-                p."muted" {
-                    "Point the tool at " code { (crate::platform::export::export_url(config, app)) }
-                    " with " code { "Authorization: Bearer " } "that token."
-                }
-            }
-        }
-        @if tokens.is_empty() {
-            p."muted" { "No export tokens." }
-        } @else {
-            table {
-                thead { tr { th { "App" } th { "Label" } th { "Created" } th { "Last used" } th {} } }
-                tbody {
-                    @for (app, entry) in tokens {
-                        tr {
-                            td { (app) }
-                            td { (entry.label) " " span."muted" { "(" (entry.id) ")" } }
-                            td."muted" { (ago(entry.created_at)) }
-                            td."muted" {
-                                @match entry.last_used {
-                                    Some(at) => (ago(at)),
-                                    None => "never",
-                                }
-                            }
-                            td {
-                                form."row" method="post" action="/admin/exports" {
-                                    input type="hidden" name="token" value=(form_token);
-                                    input type="hidden" name="action" value="revoke";
-                                    input type="hidden" name="app" value=(app);
-                                    input type="hidden" name="id" value=(entry.id);
-                                    button."danger" type="submit" { "Revoke" }
+// --- accounts ---------------------------------------------------------------------
+
+pub async fn accounts_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let accounts = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || users::list_accounts(&config))
+            .await
+            .unwrap_or_else(|_| Ok(Vec::new()))
+            .unwrap_or_default()
+    };
+    let token = form_token(&config, &admin);
+    admin_page(
+        &headers,
+        &admin,
+        Page {
+            active: "accounts",
+            title: "Accounts",
+            crumbs: vec![],
+            subtitle: Some(html! { (accounts.len()) " accounts" }),
+            actions: Some(html! { a."btn" href="/admin/accounts/new" { "New account" } }),
+            body: html! {
+                @if accounts.is_empty() {
+                    (ui::panel("No accounts yet", Some("Create the first one, or run `toolsite user add` on the machine."), html! {}))
+                } @else {
+                    section."panel" {
+                        table {
+                            thead { tr { th { "Email" } th { "Role" } th { "Status" } th { "Created" } th {} } }
+                            tbody {
+                                @for account in &accounts {
+                                    tr {
+                                        td { span."row-link" { (account.email) } }
+                                        td { @if account.is_admin { span."badge solid" { "admin" } } @else { span."muted small" { "visitor" } } }
+                                        td { @if account.is_active { span."badge ok" { "active" } } @else { span."badge warn" { "disabled" } } }
+                                        td."muted small" { (account.created) }
+                                        td."actions-cell" {
+                                            @if account.is_active {
+                                                form method="post" action="/admin/active"
+                                                     data-confirm={ "Disable " (account.email) "?" }
+                                                     data-confirm-detail="Their sessions end now and any connected MCP client stops on its next call. Re-enable any time."
+                                                     data-confirm-label="Disable" data-confirm-danger="1" {
+                                                    (hidden("token", &token)) (hidden("email", &account.email)) (hidden("active", "0")) (hidden("back", "/admin/accounts"))
+                                                    button."danger quiet sm" type="submit" { "Disable" }
+                                                }
+                                            } @else {
+                                                form method="post" action="/admin/active" {
+                                                    (hidden("token", &token)) (hidden("email", &account.email)) (hidden("active", "1")) (hidden("back", "/admin/accounts"))
+                                                    button."quiet sm" type="submit" { "Enable" }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        }
+            },
+        },
+    )
+}
 
-        form."row" method="post" action="/admin/exports" {
-            input type="hidden" name="token" value=(form_token);
-            input type="hidden" name="action" value="create";
-            @if apps.is_empty() {
-                input name="app" placeholder="App" required;
-            } @else {
-                select name="app" required {
-                    @for app in apps { option value=(app) { (app) } }
+pub async fn new_account_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let token = form_token(&config, &admin);
+    admin_page(
+        &headers,
+        &admin,
+        Page {
+            active: "accounts",
+            title: "New account",
+            crumbs: vec![("Accounts", "/admin/accounts")],
+            subtitle: None,
+            actions: None,
+            body: ui::panel("Account", Some("A password set here is one you have to pass on. Prefer an invite: `toolsite user add` prints a one-time link."), html! {
+                form method="post" action="/admin/users" {
+                    (hidden("token", &token)) (hidden("back", "/admin/accounts"))
+                    div."field" {
+                        label for="email" { "Email" }
+                        input id="email" name="email" type="email" required autofocus;
+                    }
+                    div."field" {
+                        label for="password" { "Password" }
+                        input id="password" name="password" type="password" minlength="8" required;
+                        p."help" { "At least 8 characters. They can change it from a setup link later." }
+                    }
+                    label."choice" {
+                        input type="checkbox" name="admin" value="1";
+                        strong { "Admin" }
+                        span { "Sees this page, manages every app, and may connect an MCP client that publishes." }
+                    }
+                    div."actions end" {
+                        a."btn quiet" href="/admin/accounts" { "Cancel" }
+                        button type="submit" { "Create account" }
+                    }
                 }
-            }
-            input name="label" placeholder="What will hold it, e.g. reporting" required;
-            button type="submit" { "Create token" }
+            }),
+        },
+    )
+}
+
+// --- cross-cutting lists ---------------------------------------------------------
+
+pub async fn access_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let grants = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || users::list_grants(&config))
+            .await
+            .unwrap_or_else(|_| Ok(Vec::new()))
+            .unwrap_or_default()
+    };
+    let token = form_token(&config, &admin);
+    admin_page(
+        &headers,
+        &admin,
+        Page {
+            active: "access",
+            title: "Access",
+            crumbs: vec![],
+            subtitle: Some(html! { "Every grant on the site. Edit them on each app's Access tab." }),
+            actions: None,
+            body: html! {
+                @if grants.is_empty() {
+                    (ui::panel("No grants", Some("Grants only matter for apps gated \"granted\". Set a gate on an app's Access tab first."), html! {}))
+                } @else {
+                    section."panel" {
+                        table {
+                            thead { tr { th { "App" } th { "Account" } th {} } }
+                            tbody {
+                                @for (app, email) in &grants {
+                                    tr {
+                                        td { a."row-link" href={ "/admin/apps/" (app) "/access" } { (app) } }
+                                        td { (email) }
+                                        td."actions-cell" {
+                                            form method="post" action="/admin/access"
+                                                 data-confirm={ "Revoke " (email) " from " (app) "?" }
+                                                 data-confirm-label="Revoke" data-confirm-danger="1" {
+                                                (hidden("token", &token)) (hidden("app", app)) (hidden("email", email))
+                                                (hidden("allow", "0")) (hidden("back", "/admin/access"))
+                                                button."danger quiet sm" type="submit" { "Revoke" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        },
+    )
+}
+
+pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&config, &headers).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let tokens = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || export::list_all(&config))
+            .await
+            .unwrap_or_default()
+    };
+    admin_page(
+        &headers,
+        &admin,
+        Page {
+            active: "exports",
+            title: "Exports",
+            crumbs: vec![],
+            subtitle: Some(html! { "Tokens that let a reporting tool pull one app's database. Mint them on the app's Exports tab." }),
+            actions: None,
+            body: html! {
+                @if tokens.is_empty() {
+                    (ui::panel("No export tokens", Some("Open an app and use its Exports tab to create one."), html! {}))
+                } @else {
+                    section."panel" {
+                        table {
+                            thead { tr { th { "App" } th { "Label" } th { "Created" } th { "Last used" } } }
+                            tbody {
+                                @for (app, entry) in &tokens {
+                                    tr {
+                                        td { a."row-link" href={ "/admin/apps/" (app) "/exports" } { (app) } }
+                                        td { (entry.label) " " span."muted small" { (entry.id) } }
+                                        td."muted small" { (ago(entry.created_at)) }
+                                        td."muted small" { @match entry.last_used { Some(at) => (ago(at)), None => "never" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        },
+    )
+}
+
+// --- actions ----------------------------------------------------------------------
+
+/// Everything a POST needs before it may do anything.
+async fn checked(config: &Arc<Config>, headers: &HeaderMap, token: &str) -> Result<User, Response> {
+    let admin = require_admin(config, headers).await?;
+    if !check_form_token(config, &admin, token) {
+        return Err((StatusCode::FORBIDDEN, "stale form; reload and try again").into_response());
+    }
+    Ok(admin)
+}
+
+#[derive(Deserialize)]
+pub struct NewAccount {
+    token: String,
+    email: String,
+    password: String,
+    admin: Option<String>,
+    back: Option<String>,
+}
+
+pub async fn add_account(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<NewAccount>,
+) -> Response {
+    if let Err(response) = checked(&config, &headers, &form.token).await {
+        return response;
+    }
+    let back = back_or(form.back.as_deref(), "/admin/accounts");
+    let is_admin = form.admin.is_some();
+    let config2 = config.clone();
+    let email = form.email.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        users::sign_up_as(&config2, &form.email, &form.password, is_admin)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(_)) => redirect_flash(&back, true, format!("Created {email}.")),
+        Ok(Err(message)) => redirect_flash("/admin/accounts/new", false, message),
+        Err(_) => redirect_flash(&back, false, "Could not add the account."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ActiveChange {
+    token: String,
+    email: String,
+    active: String,
+    back: Option<String>,
+}
+
+pub async fn change_active(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<ActiveChange>,
+) -> Response {
+    let admin = match checked(&config, &headers, &form.token).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), "/admin/accounts");
+    // Disabling yourself would lock the last admin out of this page.
+    if form.email.trim().eq_ignore_ascii_case(&admin.email) && form.active != "1" {
+        return redirect_flash(&back, false, "You cannot disable your own account.");
+    }
+    let active = form.active == "1";
+    let config2 = config.clone();
+    let email = form.email.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || users::set_active(&config2, &form.email, active)).await;
+    match outcome {
+        Ok(Ok(())) => redirect_flash(
+            &back,
+            true,
+            if active { format!("{email} can sign in again.") } else { format!("{email} is disabled.") },
+        ),
+        Ok(Err(message)) => redirect_flash(&back, false, message),
+        Err(_) => redirect_flash(&back, false, "Could not change the account."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AccessChange {
+    token: String,
+    app: String,
+    email: String,
+    allow: String,
+    back: Option<String>,
+}
+
+pub async fn change_access(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<AccessChange>,
+) -> Response {
+    if let Err(response) = checked(&config, &headers, &form.token).await {
+        return response;
+    }
+    let back = back_or(form.back.as_deref(), "/admin/access");
+    let allow = form.allow == "1";
+    let config2 = config.clone();
+    let (email, app) = (form.email.clone(), form.app.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        if allow {
+            users::grant(&config2, &form.email, &form.app, "viewer")
+        } else {
+            users::revoke(&config2, &form.email, &form.app)
         }
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => redirect_flash(
+            &back,
+            true,
+            if allow { format!("{email} may open {app}.") } else { format!("{email} no longer has {app}.") },
+        ),
+        Ok(Err(message)) => redirect_flash(&back, false, message),
+        Err(_) => redirect_flash(&back, false, "Could not change access."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GateChange {
+    token: String,
+    app: String,
+    gate: String,
+    back: Option<String>,
+}
+
+pub async fn change_gate(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<GateChange>,
+) -> Response {
+    if let Err(response) = checked(&config, &headers, &form.token).await {
+        return response;
+    }
+    let back = back_or(form.back.as_deref(), "/admin/apps");
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if !GATES.iter().any(|(value, ..)| *value == form.gate) {
+        return (StatusCode::BAD_REQUEST, "unknown gate").into_response();
+    }
+    let mut meta = read_meta(&config, &form.app).await;
+    meta.gate = form.gate.clone();
+    match write_meta(&config, &form.app, &meta).await {
+        Ok(()) => redirect_flash(&back, true, format!("{} is now {}.", form.app, form.gate)),
+        Err(_) => redirect_flash(&back, false, "Could not save the gate."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RuleChange {
+    token: String,
+    app: String,
+    action: String,
+    prefix: String,
+    gate: Option<String>,
+    back: Option<String>,
+}
+
+pub async fn change_rule(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<RuleChange>,
+) -> Response {
+    if let Err(response) = checked(&config, &headers, &form.token).await {
+        return response;
+    }
+    let back = back_or(form.back.as_deref(), "/admin/apps");
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    let prefix = form.prefix.trim().to_string();
+    if !prefix.starts_with('/') || prefix.contains("..") {
+        return redirect_flash(&back, false, "A rule's prefix is a path within the app, like /admin.");
+    }
+    let mut meta = read_meta(&config, &form.app).await;
+    meta.rules.retain(|rule| rule.prefix != prefix);
+    let text = match form.action.as_str() {
+        "add" => {
+            let gate = form.gate.unwrap_or_default();
+            if !GATES.iter().any(|(value, ..)| *value == gate) {
+                return (StatusCode::BAD_REQUEST, "unknown gate").into_response();
+            }
+            meta.rules.push(PathRule {
+                prefix: prefix.clone(),
+                gate: gate.clone(),
+            });
+            format!("{prefix} is {gate}.")
+        }
+        "remove" => format!("Removed the rule for {prefix}."),
+        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    };
+    match write_meta(&config, &form.app, &meta).await {
+        Ok(()) => redirect_flash(&back, true, text),
+        Err(_) => redirect_flash(&back, false, "Could not save the rule."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct VisibilityChange {
+    token: String,
+    app: String,
+    listed: Option<String>,
+    hidden: Option<String>,
+    back: Option<String>,
+}
+
+pub async fn change_visibility(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<VisibilityChange>,
+) -> Response {
+    if let Err(response) = checked(&config, &headers, &form.token).await {
+        return response;
+    }
+    let back = back_or(form.back.as_deref(), "/admin/apps");
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    let mut meta = read_meta(&config, &form.app).await;
+    meta.listed = form.listed.is_some();
+    meta.hidden = form.hidden.is_some();
+    match write_meta(&config, &form.app, &meta).await {
+        Ok(()) => redirect_flash(&back, true, "Visibility saved."),
+        Err(_) => redirect_flash(&back, false, "Could not save visibility."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct NotesChange {
+    token: String,
+    app: String,
+    notes: String,
+    back: Option<String>,
+}
+
+pub async fn change_notes(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<NotesChange>,
+) -> Response {
+    if let Err(response) = checked(&config, &headers, &form.token).await {
+        return response;
+    }
+    let back = back_or(form.back.as_deref(), "/admin/apps");
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    match crate::content::store::write_notes(&config, &form.app, &form.notes).await {
+        Ok(()) => redirect_flash(&back, true, "Notes saved."),
+        Err(_) => redirect_flash(&back, false, "Could not save the notes."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AppOnly {
+    token: String,
+    app: String,
+    back: Option<String>,
+}
+
+/// Mints an entry link and shows it on the Settings tab, once.
+pub async fn settings_link(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<AppOnly>,
+) -> Response {
+    if let Err(response) = checked(&config, &headers, &form.token).await {
+        return response;
+    }
+    match crate::platform::secrets::create_entry(&config, &form.app) {
+        Ok(url) => app_tab(config, headers, form.app, "settings".into(), Some(Fresh::SettingsLink(url))).await,
+        Err(message) => redirect_flash(&back_or(form.back.as_deref(), "/admin/apps"), false, message),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct JobRun {
+    token: String,
+    app: String,
+    name: String,
+    back: Option<String>,
+}
+
+pub async fn run_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<JobRun>,
+) -> Response {
+    if let Err(response) = checked(&state.config, &headers, &form.token).await {
+        return response;
+    }
+    let back = back_or(form.back.as_deref(), "/admin/apps");
+    match crate::platform::schedule::run_job(&state, &form.app, &form.name).await {
+        Ok(status) => redirect_flash(&back, true, format!("{} ran: {status}", form.name)),
+        Err(message) => redirect_flash(&back, false, format!("{} failed: {message}", form.name)),
     }
 }
 
@@ -370,6 +1261,7 @@ pub struct ExportChange {
     app: String,
     label: Option<String>,
     id: Option<String>,
+    back: Option<String>,
 }
 
 pub async fn change_export(
@@ -377,216 +1269,40 @@ pub async fn change_export(
     headers: HeaderMap,
     Form(form): Form<ExportChange>,
 ) -> Response {
-    let admin = match require_admin(&config, &headers).await {
+    let admin = match checked(&config, &headers, &form.token).await {
         Ok(admin) => admin,
         Err(response) => return response,
     };
-    if !check_form_token(&config, &admin, &form.token) {
-        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
-    }
-
+    let back = back_or(form.back.as_deref(), &format!("/admin/apps/{}/exports", form.app));
     match form.action.as_str() {
         "create" => {
             let label = form.label.unwrap_or_default();
             let (config2, app) = (config.clone(), form.app.clone());
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::platform::export::create(&config2, &app, &label)
-            })
-            .await;
+            let outcome = tokio::task::spawn_blocking(move || export::create(&config2, &app, &label)).await;
             match outcome {
                 Ok(Ok((_, token))) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "export token created");
                     // Rendered, not redirected: the token exists in this
                     // response and nowhere else.
-                    let apps = app_names(&config).await;
-                    let tokens = {
-                        let config = config.clone();
-                        tokio::task::spawn_blocking(move || crate::platform::export::list_all(&config))
-                            .await
-                            .unwrap_or_default()
-                    };
-                    let form_token = form_token(&config, &admin);
-                    admin_page(
-                        "exports",
-                        "Exports",
-                        &admin,
-                        render_exports(&config, &apps, &tokens, &form_token, Some((&form.app, &token))),
-                    )
+                    app_tab(config, headers, form.app, "exports".into(), Some(Fresh::ExportToken(token))).await
                 }
-                Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not create the token").into_response(),
+                Ok(Err(message)) => redirect_flash(&back, false, message),
+                Err(_) => redirect_flash(&back, false, "Could not create the token."),
             }
         }
         "revoke" => {
             let id = form.id.unwrap_or_default();
             let (config2, app) = (config.clone(), form.app.clone());
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::platform::export::revoke(&config2, &app, &id)
-            })
-            .await;
+            let outcome = tokio::task::spawn_blocking(move || export::revoke(&config2, &app, &id)).await;
             match outcome {
                 Ok(Ok(())) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "export token revoked");
-                    Redirect::to("/admin/exports").into_response()
+                    redirect_flash(&back, true, "Token revoked.")
                 }
-                Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not revoke the token").into_response(),
+                Ok(Err(message)) => redirect_flash(&back, false, message),
+                Err(_) => redirect_flash(&back, false, "Could not revoke the token."),
             }
         }
         _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     }
 }
-
-#[derive(Deserialize)]
-pub struct NewAccount {
-    token: String,
-    email: String,
-    password: String,
-    admin: Option<String>,
-}
-
-pub async fn add_account(
-    State(config): State<Arc<Config>>,
-    headers: HeaderMap,
-    Form(form): Form<NewAccount>,
-) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-    if !check_form_token(&config, &admin, &form.token) {
-        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
-    }
-
-    let is_admin = form.admin.is_some();
-    let config2 = config.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        users::sign_up_as(&config2, &form.email, &form.password, is_admin)
-    })
-    .await;
-
-    match outcome {
-        Ok(Ok(_)) => Redirect::to("/admin").into_response(),
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not add account").into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ActiveChange {
-    token: String,
-    email: String,
-    active: String,
-}
-
-pub async fn change_active(
-    State(config): State<Arc<Config>>,
-    headers: HeaderMap,
-    Form(form): Form<ActiveChange>,
-) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-    if !check_form_token(&config, &admin, &form.token) {
-        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
-    }
-    // Disabling yourself would lock the last admin out of this page.
-    if form.email.trim().eq_ignore_ascii_case(&admin.email) && form.active != "1" {
-        return (StatusCode::BAD_REQUEST, "you cannot disable your own account").into_response();
-    }
-
-    let active = form.active == "1";
-    let config2 = config.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || users::set_active(&config2, &form.email, active)).await;
-
-    match outcome {
-        Ok(Ok(())) => Redirect::to("/admin").into_response(),
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not change the account").into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct AccessChange {
-    token: String,
-    app: String,
-    email: String,
-    allow: String,
-}
-
-pub async fn change_access(
-    State(config): State<Arc<Config>>,
-    headers: HeaderMap,
-    Form(form): Form<AccessChange>,
-) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-    if !check_form_token(&config, &admin, &form.token) {
-        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
-    }
-
-    let allow = form.allow == "1";
-    let config2 = config.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        if allow {
-            users::grant(&config2, &form.email, &form.app, "viewer")
-        } else {
-            users::revoke(&config2, &form.email, &form.app)
-        }
-    })
-    .await;
-
-    match outcome {
-        Ok(Ok(())) => Redirect::to("/admin/access").into_response(),
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not change access").into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct GateChange {
-    token: String,
-    app: String,
-    gate: String,
-}
-
-pub async fn change_gate(
-    State(config): State<Arc<Config>>,
-    headers: HeaderMap,
-    Form(form): Form<GateChange>,
-) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
-    if !check_form_token(&config, &admin, &form.token) {
-        return (StatusCode::FORBIDDEN, "stale form; reload and try again").into_response();
-    }
-    if !valid_slug(&form.app) {
-        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
-    }
-    if !matches!(
-        form.gate.as_str(),
-        "public" | "authenticated" | "granted"
-    ) {
-        return (StatusCode::BAD_REQUEST, "unknown gate").into_response();
-    }
-
-    let mut meta = read_meta(&config, &form.app).await;
-    meta.gate = form.gate;
-    match crate::content::store::write_meta(&config, &form.app, &meta).await {
-        Ok(()) => Redirect::to("/admin/apps").into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not set gate").into_response(),
-    }
-}
-
-/// Sent on every admin response so the browser will not cache a page listing
-/// accounts.
-pub fn no_store() -> (header::HeaderName, &'static str) {
-    (header::CACHE_CONTROL, "no-store")
-}
-

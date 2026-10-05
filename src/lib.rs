@@ -107,12 +107,21 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
             "/auth/setup",
             get(users::setup_form).post(users::setup_submit),
         )
-        .route("/admin", get(admin::page))
+        .route("/admin", get(admin::accounts_page))
         .route("/admin/apps", get(admin::apps_page))
+        .route("/admin/apps/{app}", get(admin::app_overview))
+        .route("/admin/apps/{app}/{tab}", get(admin::app_tab_page))
+        .route("/admin/accounts", get(admin::accounts_page))
+        .route("/admin/accounts/new", get(admin::new_account_page))
         .route("/admin/users", post(admin::add_account))
         .route("/admin/access", get(admin::access_page).post(admin::change_access))
         .route("/admin/active", post(admin::change_active))
         .route("/admin/gate", post(admin::change_gate))
+        .route("/admin/rule", post(admin::change_rule))
+        .route("/admin/visibility", post(admin::change_visibility))
+        .route("/admin/notes", post(admin::change_notes))
+        .route("/admin/settings-link", post(admin::settings_link))
+        .route("/admin/job-run", post(admin::run_job))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
         // One app's database, whole, for a token minted for that app alone.
         .route("/export/{file}", get(export::download))
