@@ -1,116 +1,203 @@
 # toolsite
 
-A single container that is both an MCP server and a web host. An agent
-publishes a page — a hand-written HTML file, a multi-page app, or a compiled
-front-end bundle — and gets back a URL that just works.
+A place for the things an AI assistant builds for you, running on a server you
+own. Ask Claude for a dashboard, a sign-up form, a small internal tool, and
+instead of a file you have to find somewhere to host, you get a link. The link
+is on your domain, behind your sign-in if you want it, with its own database,
+its own files, and a page where you decide who may open it.
 
-The point of the design: **page contents never pass through the model.** The
-agent asks for an upload URL, writes the file to disk, and `curl`s it up.
+It is one container: an MCP server that agents publish through, and the web
+host that serves what they published. Nothing an agent builds passes through
+the conversation. It asks for an upload URL, writes the file, and sends it.
 
-## Run it
+## What you get
 
-Locally: `cp .env.example .env`, set a `BEARER_TOKEN`, then
-`cargo run --release`. `.env` is loaded at startup and is gitignored.
+- **A URL for everything.** A single page, a multi-page site, or a built
+  React app, served at `https://yourdomain.com/p/<name>/`.
+- **Apps that do things.** An app can ship server-side code (a wasm
+  component) with its own SQLite database, files, settings, outbound HTTP to
+  hosts you allow, and scheduled jobs.
+- **Your sign-in, your rules.** Accounts you create, or Google, Microsoft,
+  GitHub, an Entra tenant, or any OpenID Connect provider. Each app is public,
+  for anyone signed in, or for the people you name. No public signup, ever.
+- **One admin page.** Apps, accounts, access, and export tokens, with a page
+  per app for its gate, route rules, grants, settings, jobs and notes.
+- **Reporting on your data.** A tool like a reporting tool pulls an app's database
+  with a token that opens that app and nothing else.
+- **Nothing destroys data.** Taking a page down is a flag. Removing an app
+  moves its files to `.trash/`. Disabling an account keeps it.
+
+## How it is used
+
+**Publishing.** You connect Claude (claude.ai, Claude Code, ChatGPT) to
+`https://yourdomain.com/mcp`. It sends you to sign in with your admin account
+and asks to be allowed; no token to paste. From then on you ask for things.
+The agent calls `create_upload`, gets a short-lived URL, writes the page or
+the built bundle to disk and `curl`s it up. It hands you back the link.
+
+**Building something real.** For anything with state, the agent scaffolds a
+project (`toolsite init <name> --react --handler`), writes migrations for the
+schema, a Rust handler compiled to wasm for the API, and a `toolsite.toml`
+that says who may reach which paths. `toolsite deploy` sends all of it, keeps
+the source with the app, and fetches the page back to check it works.
+
+**People using it.** Visitors sign in at `/auth/login` with a password you
+invited them to set, or with a provider button. A gated app sends them there
+and back. The handler knows who they are and what role you granted; the
+platform never interprets the role.
+
+**Running it.** `/admin` lists apps, accounts, grants and export tokens. Each
+app has its own page: Overview, Access, Exports, Settings, Jobs, Notes.
+Anything that removes or disables asks first; every action reports back on
+the page you were on.
+
+**Reading the data elsewhere.** On an app's Exports tab you mint a token. A
+reporting tool pulls `GET /export/<app>.sqlite` with it and gets a consistent
+snapshot of the database.
+
+## Deploy it
+
+You need a domain pointing at the container and a persistent directory at
+`/data`. Everything lives there as plain files; losing it loses every app.
+
+**Railway.** Deploy the repository as a service, attach a Volume at `/data`
+(the Dockerfile has no `VOLUME` line on purpose; Railway's builder rejects
+it), and set:
+
+```
+TOOLSITE_BASE_URL=https://your-service.up.railway.app
+```
+
+That is enough for clients to sign in. Add `TOOLSITE_MCP_TOKEN` if you also
+want a static token for scripts, and a Railway Bucket if you want apps' files
+in object storage instead of on the volume (see Files). Then create your
+first admin from the service's shell:
+
+```
+toolsite user add you@example.com --admin
+```
+
+It prints a one-time link to choose a password. Open it, then connect Claude.
+
+**Docker.**
 
 ```
 docker build -t toolsite .
 
 docker run -d -p 8080:8080 -v ./data:/data \
-  -e BEARER_TOKEN=<random-secret> \
-  -e PUBLIC_BASE_URL=https://yourdomain.com \
+  -e TOOLSITE_BASE_URL=https://yourdomain.com \
   toolsite
+
+docker exec -it <container> toolsite user add you@example.com --admin
 ```
 
-Set `TOOLSITE_BASE_URL` to where the outside world reaches it. Without it the
-upload URLs handed to an agent point at the container's own port, which
-nothing outside can use; compose defaults it to `http://localhost:$PORT` for
-that reason.
+`compose.yml` does the same with a named volume; it reads `.env` and
+currently requires `TOOLSITE_MCP_TOKEN` to be set there.
 
-On Railway: attach a Volume at `/data` (the Dockerfile deliberately has no
-`VOLUME` line — Railway's builder rejects it) and set the variables below.
+**Locally, with cargo.** `cp .env.example .env`, set `TOOLSITE_MCP_TOKEN` or
+`TOOLSITE_BASE_URL`, then `cargo run --release`. `.env` is loaded at startup
+and is gitignored. Pages are at `http://localhost:8080`.
 
-## The CLI
+**Locally, over stdio.** A client on the same machine can speak MCP to the
+binary directly, with no network and no token:
+
+```json
+{ "mcpServers": { "toolsite": {
+    "command": "/path/to/toolsite",
+    "args": ["--stdio"],
+    "env": { "TOOLSITE_DATA_DIR": "/path/to/data" }
+} } }
+```
+
+The web server keeps running alongside, so uploads still have somewhere to go
+and pages are viewable. HTTP `/mcp` still refuses everything without a token
+or a sign-in. Logs go to stderr, since stdout is the protocol.
+
+Set `TOOLSITE_BASE_URL` to where the outside world reaches the server.
+Without it, the upload URLs handed to an agent point at the container's own
+port, which nothing outside can use, and clients cannot sign in. Boot logs the
+effective configuration, so a misconfigured deploy is visible without a client
+to test against:
 
 ```
-cargo install --path cli
-export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<BEARER_TOKEN>
+INFO toolsite: auth configuration bearer_auth=true oauth_auth=true base_url="https://host.com"
+INFO toolsite: storage configuration blobs="local" max_db_mb=4096 max_blob_mb=4096
 ```
 
-| Command | What it does |
-|---|---|
-| `toolsite init <name> [--react] [--spa] [--handler]` | Scaffolds an app with its base path already right. `--react` writes a Vite + React + Tailwind project that builds unmodified; `--handler` adds a wasm handler with its own database. |
-| `toolsite deploy [dir] [--slug s]` | Runs the project's build, applies migrations and `toolsite.toml`, uploads the bundle, handler, notes and source, then fetches the page to check it. |
-| `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
-| `toolsite list [--all]` | What is published, newest first. |
-| `toolsite hide <slug>` / `unhide` | Reversible takedown. |
-| `toolsite remove <slug> [--page-only]` | Takes it down for good; files move to `.trash/`. |
-| `toolsite notes <slug> [--file notes.md]` | Read or write the notes kept with an app. |
-| `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
-| `toolsite gate <app> <public\|authenticated\|granted>` | Decide who may reach an app. |
-| `toolsite grant <app> <email>` / `revoke` | Access for a `granted` app. |
-| `toolsite user disable <email>` / `enable` | Stop an account signing in and end its live sessions. Reversible. |
+---
 
-`deploy` warns when `index.html` references `/assets/…` from the domain root,
-which is the mistake that ships a blank page while looking like a success.
+# Reference
 
 ## Connecting a client
 
-The MCP endpoint is `POST /mcp` — Streamable HTTP transport, so **no `/sse`
+The MCP endpoint is `POST /mcp`. Streamable HTTP transport, so **no `/sse`
 suffix.** Responses are SSE-framed, but the path is still `/mcp`.
 
-- **claude.ai** — Settings → Connectors → Add custom connector. URL
+- **claude.ai**: Settings, Connectors, Add custom connector. URL
   `https://yourdomain.com/mcp`, nothing else. Claude registers itself, sends
-  you to sign in with your admin account, and asks you to allow it. No token
-  or client ID to paste. (A "Request headers" field still takes
-  `Authorization: Bearer <TOOLSITE_MCP_TOKEN>` if you would rather.)
-- **Claude Code** — `claude mcp add --transport http toolsite
+  you to sign in with your admin account, and asks you to allow it. (A
+  "Request headers" field still takes `Authorization: Bearer
+  <TOOLSITE_MCP_TOKEN>` if you would rather.)
+- **Claude Code**: `claude mcp add --transport http toolsite
   https://yourdomain.com/mcp`, then `/mcp` to sign in; the browser opens the
   same consent screen. Or add it with a bearer token header.
-- **ChatGPT** — enable Developer Mode and add a connector with the same URL;
+- **ChatGPT**: enable Developer Mode and add a connector with the same URL;
   sign in the same way, or use token auth.
 
 Signing in needs `TOOLSITE_BASE_URL` set, and an admin account to sign in
 with (see Accounts). A visitor account is told no: a connected client
 publishes with the account's full standing, which is an admin's.
 
-### Locally, over stdio
+`GET /mcp` on its own returns `400 Session ID is required`. That is normal
+for Streamable HTTP; the session is issued by `initialize`.
 
-`toolsite --stdio` (or `MCP_STDIO=1`) speaks MCP on stdin/stdout instead of
-requiring a network round trip, which is how a local client like Claude Code
-can use it with no token and no OAuth:
+`GET /guide` is a short, current description of the platform written for an
+agent about to build a handler, a schema or a gate.
 
-```json
-{ "mcpServers": { "toolsite": {
-    "command": "/path/to/toolsite",
-    "args": ["--stdio"],
-    "env": { "DATA_DIR": "/path/to/data", "DATABASES": "on" }
-} } }
+## The CLI
+
+```
+cargo install --path cli
+export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<TOOLSITE_MCP_TOKEN>
 ```
 
-The web server keeps running alongside, so uploads still have somewhere to go
-and pages are viewable at `http://localhost:8080`. No token is needed in this
-mode — the client already owns the process — but HTTP `/mcp` still refuses
-everything without one. Logs go to stderr, since stdout is the protocol.
+| Command | What it does |
+|---|---|
+| `toolsite init <name> [--react] [--spa] [--handler]` | Scaffolds an app with its base path already right. `--react` writes a Vite + React + Tailwind project that builds unmodified; `--handler` adds a wasm handler with its own database. |
+| `toolsite deploy [dir] [--slug s]` | Runs the project's build, applies migrations and `toolsite.toml`, uploads the bundle, handler, notes and source, then fetches the page to check it. |
+| `toolsite fetch` | Unpacks the project a previous deploy kept with the app, so a later session carries on. |
+| `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
+| `toolsite list [--all]` | What is published, newest first. |
+| `toolsite hide <slug>` / `unhide` | Reversible takedown. |
+| `toolsite remove <slug> [--page-only]` | Takes it down for good; files move to `.trash/`. |
+| `toolsite notes <slug> [--file notes.md]` | Read or write the notes kept with an app. |
+| `toolsite secret <app> [NAME --value v] [--link]` | List setting names, set one, or print a link for someone to paste values into. |
+| `toolsite job <app> [name] [--schedule c --path p] [--now] [--remove]` | List, set, run or remove a scheduled job. |
+| `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
+| `toolsite gate <app> <public\|authenticated\|granted> [--path /prefix]` | Decide who may reach an app, or one path within it. |
+| `toolsite grant <app> <email> [--role r]` / `revoke` | Access for a `granted` app. |
+| `toolsite user disable <email>` / `enable` | Stop an account signing in and end its live sessions. Reversible. |
 
-`GET /mcp` on its own returns `400 Session ID is required`. That's normal for
-Streamable HTTP — the session is issued by `initialize`.
+`deploy` warns when `index.html` references `/assets/…` from the domain root,
+which is the mistake that ships a blank page while looking like a success.
 
 ## Publishing
 
 | Tool | Use |
 |---|---|
-| `create_upload(slug?)` | **The default.** Returns a short-lived upload URL to `curl` files to. Handles single pages, multi-page apps, bundles, and handlers. |
-| `run_sql(app, sql, params?)` | Schema and seed work against an app's own database. MCP only — never reachable from a published page. |
+| `create_upload(slug?)` | **The default.** Returns a short-lived upload URL to `curl` files to. Handles single pages, multi-page apps, bundles, handlers, migrations, manifests, source, files. |
+| `run_sql(app, sql, params?)` | Schema and seed work against an app's own database. MCP only; never reachable from a published page. |
 | `list_pages(include_all?)` | What already exists: slug, title, URL, last modified, visibility. Newest first. |
-| `set_visibility(slug, hidden?, listed?)` | Take a page down or hide it from the index. Reversible; nothing is deleted. |
+| `set_visibility(slug, hidden?, listed?, gate?, path?)` | Take a page down, hide it from the index, or set its gate. Reversible; nothing is deleted. |
 | `set_icon(slug, icon)` | An emoji, inline `<svg>`, or `data:` URI. Optional. |
-| `push_page(html, slug?)` | Fallback for clients with no shell — HTML inline. |
+| `app_migrations`, `app_jobs`, `app_settings`, `app_notes`, `app_exports` | An app's schema, schedule, settings, notes and export tokens, each described below. |
+| `create_user`, `set_user_active`, `set_access` | Accounts and grants, as on the admin page. |
+| `push_page(html, slug?)` | Fallback for clients with no shell; HTML inline. |
 | `push_app(app, pages)` | Fallback, multi-page. A page named `index` also serves at the app root. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
-
 | `remove_page(slug, confirm)` | Takes a slug down for good. Files move to `.trash/` on the server rather than being deleted. |
 
-Prefer `set_visibility` — it retracts without removing anything. `remove_page`
+Prefer `set_visibility`; it retracts without removing anything. `remove_page`
 is for junk: a probe published as a page, an app nobody wants. Pass
 `page_only` to clear a single page that is shadowing an app of the same name,
 which is what an accidental upload leaves behind.
@@ -128,6 +215,10 @@ curl -fT about.html <upload-url>/about
 curl -fT logo.png   '<upload-url>?icon'     # this page's index icon
 ```
 
+Every flag the URL takes: `?bundle`, `?spa`, `?handler`, `?migrations`,
+`?manifest`, `?icon`, `?source`, `?blob=<key>`. No flag publishes the body as
+a page. Anything else is refused rather than guessed at.
+
 ### Bundles
 
 A built front-end goes up whole, as a gzipped tar of the `dist` folder:
@@ -137,14 +228,14 @@ tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle'        # static
 tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle&spa'    # client router
 ```
 
-Both `tar -czf - -C dist .` and `tar -czf - dist` work — a single shared top
+Both `tar -czf - -C dist .` and `tar -czf - dist` work; a single shared top
 level directory is stripped. Files serve from `/p/<app>/…` with a content type
 derived from the extension (JS, CSS, JSON, wasm, fonts, images). With `&spa`,
 paths matching no file fall back to the app's `index.html`; without it, they
 404.
 
 **Set the base path before building.** Apps are served from `/p/<slug>/`,
-never the domain root, so a default config emits `/assets/…` URLs that 404 —
+never the domain root, so a default config emits `/assets/…` URLs that 404:
 the page loads and renders blank. `create_upload` prints these with the real
 slug filled in:
 
@@ -185,28 +276,65 @@ The contract on its own is at `GET /wit/toolsite.wit`, and mirrors
 
 Requests are then resolved in a fixed order:
 
-1. `/p/<app>/api/...` → the handler, always. The prefix is reserved so a file
-   can't shadow it.
-2. an exact file on disk → served statically, no wasm involved.
-3. no file, but a handler exists → the handler, so it can render its own
+1. `/p/<app>/api/...`: the handler, always. The prefix is reserved so a file
+   cannot shadow it.
+2. an exact file on disk: served statically, no wasm involved.
+3. no file, but a handler exists: the handler, so it can render its own
    routes server-side.
-4. no file, no handler, `spa` set → the app's `index.html`.
+4. no file, no handler, `spa` set: the app's `index.html`.
 5. otherwise 404.
 
 The guest sees the path relative to its app (`/api/echo`, not
 `/p/myapp/api/echo`), so a handler never needs to know where it is mounted.
 
-**What a handler can and cannot do.** It gets two imports: `db.query`, bound
-to its own app's database with parameters bound rather than interpolated, and
-`identity.current-user`, which it cannot forge. It gets no filesystem, no
-environment, no sockets, and no clock beyond what the world imports. wasi is
-linked because a `wasm32-wasip2` guest imports it through std, so the sandbox
-is the context — which grants nothing, and the test suite proves each denial.
+**What a handler can and cannot do.** It gets five imports and nothing else:
+`db.query`, bound to its own app's database with parameters bound rather than
+interpolated; `blobs`, its own files; `identity.current-user` and
+`current-role`, which it cannot forge; `secrets.get`, settings the owner
+entered; and `fetch.send`, only to hosts the app declared. It gets no
+filesystem, no environment, no sockets, and no clock beyond what the world
+imports. wasi is linked because a `wasm32-wasip2` guest imports it through
+std, so the sandbox is the context, which grants nothing, and the test suite
+proves each denial.
 
 Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
 wall-clock deadline. A handler that loops forever is killed and returns 500;
 the server keeps serving. Because instances are never reused, state must live
 in the database.
+
+## An app's schema
+
+Put numbered `.sql` files in `migrations/` beside the source. `toolsite
+deploy` sends them and applies them before the app is reachable:
+
+```
+migrations/001_initial.sql
+migrations/002_add_note.sql
+```
+
+```
+notes: 2 migration(s) stored, 1 applied, now at version 2
+```
+
+Each runs once, in order, in a transaction, tracked by SQLite's own
+`user_version` on that app's database. **Add a file for the next change
+rather than editing an old one**; a database that already ran it will never
+run it again.
+
+This is what `create table if not exists` in a handler cannot do: the table
+already exists, so adding a column silently does nothing and the failure
+arrives later as "no such column" against real rows. A broken migration is
+rolled back whole, so a failed deploy leaves the database as it was.
+
+Without the CLI: `curl -f -T migrations.tar.gz '<upload-url>?migrations'`, or
+`app_migrations(app, files)` over MCP. `toolsite sql` remains for looking
+around and one-off fixes.
+
+The platform never reads what migrations create. Tables, columns and their
+meaning are entirely the app's business; only the ladder is shared. Any one
+database may grow to `TOOLSITE_MAX_DB_MB` (4 GB by default, `0` for no
+ceiling); past that a write fails its own statement instead of filling the
+volume.
 
 ## Files
 
@@ -240,35 +368,186 @@ Where the bytes live is the deployment's choice, not the app's:
   five variable references. Set `TOOLSITE_BLOB_S3_PATH_STYLE=1` for a bucket
   whose credentials tab says path-style.
 
-## Exporting a database
+One file may be up to `TOOLSITE_MAX_BLOB_MB` (4 GB by default, `0` for no
+ceiling).
 
-A reporting tool that pulls SQLite over HTTP (a reporting tool, for one) can read an
-app's database with a token minted for that app alone:
+## Reaching other services
+
+A handler can make HTTP requests, but only to hosts its app named:
+
+```toml
+allow_http = ["api.github.com", "*.example.com"]
+```
+
+```rust
+let response = fetch::send(&fetch::Request {
+    method: "GET".into(),
+    url: format!("https://api.github.com/repos/{repo}"),
+    headers: vec![("authorization".into(), format!("Bearer {token}"))],
+    body: vec![],
+})?;
+```
+
+Off by default; an empty list is no capability at all. `*.example.com`
+covers subdomains but not the bare name.
+
+**Naming a host is not enough.** Every address is resolved and checked first,
+and anything inside this server's own network is refused whatever the
+allowlist says: loopback, private ranges, link-local, including
+`169.254.169.254`, which on most clouds hands out credentials. IPv4 addresses
+written as IPv6 are unwrapped and checked the same way, redirects are followed
+by hand so each hop is checked rather than trusted, and only `http` and
+`https` are fetched at all.
+
+A `user-agent` is sent unless the handler sets its own, since several APIs,
+GitHub among them, answer 403 without one. Responses are capped at 8 MB with
+a 10 second timeout. Pair it with a setting for the key: `secrets::get("API_KEY")`
+and `allow_http` are the two halves of calling somebody's API.
+
+## Scheduled work
+
+An app can do things nobody asked for: refresh a cache, pull from an API,
+tidy a table. A job is a cron expression and a path, and when it fires the
+host calls the app's own handler exactly as a request would: same sandbox,
+same limits, same database, no signed-in user.
 
 ```
-GET https://yourdomain.com/export/<app>.sqlite
-Authorization: Bearer tse_…
+toolsite job myapp refresh --schedule '0 */5 * * * *' --path /api/refresh
+toolsite job myapp refresh --now      # run it immediately
+toolsite job myapp                    # what is scheduled, and how each went
+toolsite job myapp refresh --remove
 ```
 
-The answer is a consistent snapshot of the whole file, taken with
-`VACUUM INTO`, never the live WAL set. Mint one with `app_exports(app,
-"create", label)` from an MCP client, or on `/admin/exports`, which shows the
-token once and lists tokens by label afterwards. Each token opens one app and
-nothing else; the publish token is refused there. Revoke from either place
-and the tool gets 401 on its next pull. Tokens live hashed in
-`<app>.exports`, so removing the app takes them with it.
+Six cron fields, seconds first: `0 */5 * * * *` is every five minutes,
+`0 0 3 * * *` is 03:00 daily. A bad expression is refused when you set it
+rather than silently never firing. The app's Jobs tab on `/admin` shows the
+same list with the last run and its status, and a Run now button.
 
-In a reporting tool: a connection of type `sqlite` with that URL and the token as its
-bearer token. It downloads the file on each sync.
+The handler sees an `x-toolsite-scheduled` header naming the job, so a route
+can behave differently when nobody is waiting on the other end. A job that
+missed its turn while the server was down fires once when it comes back, not
+once per missed interval, and a job still running when its next turn arrives
+is skipped rather than stacked.
+
+## Settings
+
+An app's handler can read values its bundle must not contain: API keys,
+endpoints. They are stored encrypted, beside the app, and nothing the platform
+serves ever returns one: listings give names, the source archive omits them,
+and no URL exposes them.
+
+The good way to set them is a link, so a secret never enters a conversation
+with an agent:
+
+```
+toolsite secret myapp --link     # prints a URL to hand over
+```
+
+Whoever holds the credentials opens it and pastes them, one `NAME=value` per
+line; a `.env` file works as-is, `export` prefixes, quotes and `#` comments
+included. For scripting there is still `toolsite secret myapp API_KEY --value
+…`, and `toolsite secret myapp` lists the names. The app's Settings tab on
+`/admin` lists the names and mints the same link.
+
+A handler reads them through the `secrets` import:
+
+```rust
+let key = secrets::get("API_KEY").ok_or("API_KEY is not set")?;
+```
+
+**Encryption at rest.** Values are sealed with XChaCha20-Poly1305. The key
+comes from `TOOLSITE_SECRET_KEY` (base64, 32 bytes) when set, which is worth
+doing, since then a copy of the data volume is not a copy of the secrets.
+Without it one is generated at `.site/secret.key` beside them, which protects
+a stray backup of the database file and no more; the log says so at startup.
+
+## toolsite.toml
+
+An app says what it needs in one file that travels with its source, so
+`toolsite fetch` brings back the intent along with the code and a redeploy
+reproduces it:
+
+```toml
+slug = "board"
+spa  = false
+gate = "public"
+icon = "📋"
+
+# Anyone can submit; only signed-in people read the pile.
+[[route]]
+path = "/triage"
+gate = "authenticated"
+
+[[job]]
+name = "rollup"
+schedule = "0 0 3 * * *"
+path = "/api/rollup"
+```
+
+`toolsite deploy` sends it first, before the bundle or handler, so a private
+app is never briefly public. One deploy does the lot: build, schema, config,
+bundle, handler, notes, source. Without the CLI it is
+`curl -f -T toolsite.toml '<upload-url>?manifest'`.
+
+**What it declares, it owns.** Routes and jobs are replaced wholesale, so
+deleting a line removes the thing; no drift between the file and the server.
+What it does not mention is left alone, so hiding an app by hand survives the
+next deploy. A job whose schedule did not change keeps its history. A manifest
+with a mistake anywhere is rejected whole rather than half-applied.
+
+Commands still work and are right for a one-off (`toolsite gate`,
+`toolsite job`). The manifest is for anything meant to outlive the session
+that set it.
+
+## Notes for the next session
+
+A published app is a rendered page; its source does not come back out of it.
+So each app can carry markdown written for whoever works on it next: the
+schema, why something is the way it is, what is half-finished.
+
+`NOTES.md` (or `AGENTS.md`) in the project is sent on every deploy, so notes
+travel with the source instead of being a command someone remembers. The
+commands still work for reading or setting them directly:
+
+```
+toolsite notes myapp                    # read
+toolsite notes myapp --file NOTES.md    # write
+```
+
+Over MCP that is `app_notes(slug, notes?)`, reading when `notes` is omitted,
+and the app's Notes tab on `/admin` edits the same text. They are stored
+beside the app rather than inside the bundle, so they are never served to a
+visitor and need no place in the build. The same applies to the `.meta` and
+`.icon` sidecars: none of the three is reachable under `/p/`.
+
+## Source, and what a visitor can see
+
+A visitor only ever sees what the bundle contained: the built output. The
+project that produced it is stored separately and is never served:
+
+```
+toolsite deploy            # uploads the bundle, and keeps the project with it
+toolsite fetch             # a later session unpacks the project and carries on
+```
+
+Over HTTP that is `PUT <upload-url>?source` and `GET <upload-url>?source`: the
+same ticket, both directions, scoped to the same slug. `node_modules`,
+`target` and `.git` are left out; build output is kept, because a project with
+no build step has nothing else.
+
+Nothing stored beside an app is reachable under `/p/`: not `.source`, not
+`.notes`, not `.meta`, not `.exports`, not `.blobs/`. If a visitor should be
+able to read a file, put it in the bundle; that is the whole rule.
 
 ## Accounts
 
 Visitors are separate from publishing: a token, or an admin signing a client
-in, says who may deploy; an account says who may look. There is no public signup — every account is
-created by the owner, so there is nothing to abuse.
+in, says who may deploy; an account says who may look. There is no public
+signup. Every account is created by the owner or arrives through a provider
+you configured, so there is nothing to abuse.
 
-From a shell on the machine itself — no token, no network, which is how the
-first account gets created:
+From a shell on the machine itself, with no token and no network, which is
+how the first account gets created:
 
 ```
 toolsite user add you@example.com --admin
@@ -334,13 +613,27 @@ against the provider's published keys (asymmetric algorithms only). An email
 the provider marks unverified is refused. GitHub has no id token, so its
 primary verified email is read from the API.
 
-An admin account can do all of that from `/admin` instead: list accounts, add
-one, disable or re-enable it, set any app's gate, and grant or revoke access.
-Disabling ends the account's live sessions immediately rather than waiting for
-them to expire, and destroys nothing — enabling restores the same password. It is a platform route
-rather than a published app because an app cannot read the account database —
-that isolation is what the rest of the security rests on, so an admin app
-could only exist by breaking it.
+### The admin pages
+
+An admin account sees `/admin`. It is a platform route rather than a
+published app because an app cannot read the account database; that isolation
+is what the rest of the security rests on, so an admin app could only exist by
+breaking it.
+
+| Page | What is there |
+|---|---|
+| `/admin/apps` | Every app, with its gate and whether it ships a handler. Each row opens the app's page. |
+| `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility), then tabs: Access (gate, route rules, granted accounts), Exports, Settings, Jobs, Notes. |
+| `/admin/accounts` | Accounts with role and status; disable or re-enable; New account is its own page. |
+| `/admin/access` | Every grant on the site, each linking to its app's Access tab. |
+| `/admin/exports` | Every export token, by app and label. |
+
+Anything that removes or disables asks first. Every action comes back to the
+page it was made on with one line saying what happened. Disabling ends the
+account's live sessions immediately rather than waiting for them to expire,
+and destroys nothing; enabling restores the same password.
+
+### Gates
 
 An app's gate is one of:
 
@@ -364,14 +657,14 @@ stays open. The arrangement works in reverse too: a `granted` app with
 `--path / --gate public` has a front page anyone can read.
 
 Beyond that, what a signed-in caller may *do* is the app's decision. A grant
-carries a role — `toolsite grant board someone@example.com --role editor` —
+carries a role (`toolsite grant board someone@example.com --role editor`)
 and the handler reads it with `identity::current-role()`. The platform never
 interprets it.
 
 Gates are per app, so public and gated apps sit side by side on one instance;
 each is decided on its own. A gate covers the app's handler and its assets,
-not just its pages, and keeps it off the index of anyone who cannot open it. Signing in
-happens at `/auth/login`; a handler sees the visitor through
+not just its pages, and keeps it off the index of anyone who cannot open it.
+Signing in happens at `/auth/login`; a handler sees the visitor through
 `identity.current-user` and cannot forge it.
 
 Sessions come in two tiers. The site session proves who someone is; an app
@@ -386,236 +679,66 @@ visitor through the handoff and then use the resulting cookie. This is a fine
 trade when every app is one you deployed, and it is the reason to reach for a
 subdomain per app if that ever stops being true.
 
-## Source, and what a visitor can see
+## Exporting a database
 
-A visitor only ever sees what the bundle contained — the built output. The
-project that produced it is stored separately and is never served:
-
-```
-toolsite deploy            # uploads the bundle, and keeps the project with it
-toolsite fetch             # a later session unpacks the project and carries on
-```
-
-Over HTTP that is `PUT <upload-url>?source` and `GET <upload-url>?source`: the
-same ticket, both directions, scoped to the same slug. `node_modules`,
-`target` and `.git` are left out; build output is kept, because a project with
-no build step has nothing else.
-
-Nothing stored beside an app is reachable under `/p/` — not `.source`, not
-`.notes`, not `.meta`. If a visitor should be able to read a file, put it in
-the bundle; that is the whole rule.
-
-## An app's schema
-
-Put numbered `.sql` files in `migrations/` beside the source. `toolsite
-deploy` sends them and applies them before the app is reachable:
+A reporting tool that pulls SQLite over HTTP (a reporting tool, for one) can read an
+app's database with a token minted for that app alone:
 
 ```
-migrations/001_initial.sql
-migrations/002_add_note.sql
+GET https://yourdomain.com/export/<app>.sqlite
+Authorization: Bearer tse_…
 ```
 
-```
-notes: 2 migration(s) stored, 1 applied, now at version 2
-```
+The answer is a consistent snapshot of the whole file, taken with
+`VACUUM INTO`, never the live WAL set. Mint one with `app_exports(app,
+"create", label)` from an MCP client, or on the app's Exports tab, which shows
+the token once and lists tokens by label afterwards. Each token opens one app
+and nothing else; the publish token is refused there. Revoke from either place
+and the tool gets 401 on its next pull. Tokens live hashed in
+`<app>.exports`, so removing the app takes them with it.
 
-Each runs once, in order, in a transaction, tracked by SQLite's own
-`user_version` on that app's database. **Add a file for the next change
-rather than editing an old one** — a database that already ran it will never
-run it again.
-
-This is what `create table if not exists` in a handler cannot do: the table
-already exists, so adding a column silently does nothing and the failure
-arrives later as "no such column" against real rows. A broken migration is
-rolled back whole, so a failed deploy leaves the database as it was.
-
-Without the CLI: `curl -f -T migrations.tar.gz '<upload-url>?migrations'`, or
-`app_migrations(app, files)` over MCP. `toolsite sql` remains for looking
-around and one-off fixes.
-
-The platform never reads what migrations create. Tables, columns and their
-meaning are entirely the app's business; only the ladder is shared.
-
-## toolsite.toml
-
-An app says what it needs in one file that travels with its source, so
-`toolsite fetch` brings back the intent along with the code and a redeploy
-reproduces it:
-
-```toml
-slug = "board"
-spa  = false
-gate = "public"
-icon = "📋"
-
-# Anyone can submit; only signed-in people read the pile.
-[[route]]
-path = "/triage"
-gate = "authenticated"
-
-[[job]]
-name = "rollup"
-schedule = "0 0 3 * * *"
-path = "/api/rollup"
-```
-
-`toolsite deploy` sends it first, before the bundle or handler, so a private
-app is never briefly public. One deploy does the lot: build, schema, config,
-bundle, handler, notes, source. Without the CLI it is
-`curl -f -T toolsite.toml '<upload-url>?manifest'`.
-
-**What it declares, it owns.** Routes and jobs are replaced wholesale, so
-deleting a line removes the thing — no drift between the file and the server.
-What it does not mention is left alone, so hiding an app by hand survives the
-next deploy. A job whose schedule did not change keeps its history. A manifest
-with a mistake anywhere is rejected whole rather than half-applied.
-
-Commands still work and are right for a one-off (`toolsite gate`,
-`toolsite job`). The manifest is for anything meant to outlive the session
-that set it.
-
-## Reaching other services
-
-A handler can make HTTP requests, but only to hosts its app named:
-
-```toml
-allow_http = ["api.github.com", "*.example.com"]
-```
-
-```rust
-let response = fetch::send(&fetch::Request {
-    method: "GET".into(),
-    url: format!("https://api.github.com/repos/{repo}"),
-    headers: vec![("authorization".into(), format!("Bearer {token}"))],
-    body: vec![],
-})?;
-```
-
-Off by default — an empty list is no capability at all. `*.example.com`
-covers subdomains but not the bare name.
-
-**Naming a host is not enough.** Every address is resolved and checked first,
-and anything inside this server's own network is refused whatever the
-allowlist says: loopback, private ranges, link-local — including
-`169.254.169.254`, which on most clouds hands out credentials. IPv4 addresses
-written as IPv6 are unwrapped and checked the same way, redirects are followed
-by hand so each hop is checked rather than trusted, and only `http` and
-`https` are fetched at all.
-
-A `user-agent` is sent unless the handler sets its own, since several APIs —
-GitHub among them — answer 403 without one. Responses are capped at 8 MB with
-a 10 second timeout. Pair it with a setting
-for the key: `secrets::get("API_KEY")` and `allow_http` are the two halves of
-calling somebody's API.
-
-## Scheduled work
-
-An app can do things nobody asked for — refresh a cache, pull from an API,
-tidy a table. A job is a cron expression and a path, and when it fires the
-host calls the app's own handler exactly as a request would: same sandbox,
-same limits, same database, no signed-in user.
-
-```
-toolsite job myapp refresh --schedule '0 */5 * * * *' --path /api/refresh
-toolsite job myapp refresh --now      # run it immediately
-toolsite job myapp                    # what is scheduled, and how each went
-toolsite job myapp refresh --remove
-```
-
-Six cron fields, seconds first: `0 */5 * * * *` is every five minutes,
-`0 0 3 * * *` is 03:00 daily. A bad expression is refused when you set it
-rather than silently never firing.
-
-The handler sees an `x-toolsite-scheduled` header naming the job, so a route
-can behave differently when nobody is waiting on the other end. A job that
-missed its turn while the server was down fires once when it comes back, not
-once per missed interval, and a job still running when its next turn arrives
-is skipped rather than stacked.
-
-## Settings
-
-An app's handler can read values its bundle must not contain — API keys,
-endpoints. They are stored encrypted, beside the app, and nothing the platform
-serves ever returns one: listings give names, the source archive omits them,
-and no URL exposes them.
-
-The good way to set them is a link, so a secret never enters a conversation
-with an agent:
-
-```
-toolsite secret myapp --link     # prints a URL to hand over
-```
-
-Whoever holds the credentials opens it and pastes them, one `NAME=value` per
-line — a `.env` file works as-is, `export` prefixes, quotes and `#` comments
-included. For scripting there is still `toolsite secret myapp API_KEY --value
-…`, and `toolsite secret myapp` lists the names.
-
-A handler reads them through the `secrets` import:
-
-```rust
-let key = secrets::get("API_KEY").ok_or("API_KEY is not set")?;
-```
-
-**Encryption at rest.** Values are sealed with XChaCha20-Poly1305. The key
-comes from `TOOLSITE_SECRET_KEY` (base64, 32 bytes) when set — worth doing,
-since then a copy of the data volume is not a copy of the secrets. Without it
-one is generated at `.site/secret.key` beside them, which protects a stray
-backup of the database file and no more; the log says so at startup.
-
-## Notes for the next session
-
-A published app is a rendered page; its source does not come back out of it.
-So each app can carry markdown written for whoever works on it next — the
-schema, why something is the way it is, what is half-finished:
-
-`NOTES.md` (or `AGENTS.md`) in the project is sent on every deploy, so notes
-travel with the source instead of being a command someone remembers. The
-commands still work for reading or setting them directly:
-
-```
-toolsite notes myapp                    # read
-toolsite notes myapp --file NOTES.md    # write
-```
-
-Over MCP that is `app_notes(slug, notes?)`, reading when `notes` is omitted.
-They are stored beside the app rather than inside the bundle, so they are
-never served to a visitor and need no place in the build. The same applies to
-the `.meta` and `.icon` sidecars: none of the three is reachable under `/p/`.
+In a reporting tool: a connection of type `sqlite` with that URL and the token as its
+bearer token. It downloads the file on each sync.
 
 ## The index
 
 `GET /` lists published pages, newest first, each with an icon and title.
 Multi-page apps and bundles appear once, as their root. Hidden and unlisted
-pages don't appear, and neither does anything the viewer could not open — a
+pages do not appear, and neither does anything the viewer could not open; a
 gated app's title is as sensitive as its contents, so signing in changes what
-the index shows. There's a client-side filter over slugs and titles.
+the index shows. There is a client-side filter over slugs and titles.
 
-- **Title** — from the page's own `<title>` (first 8 KB scanned). Pages
+- **Title**: from the page's own `<title>` (first 8 KB scanned). Pages
   without one are listed by slug.
-- **Icon** — in priority order: an uploaded image (`?icon`), an emoji /
-  inline SVG / `data:` URI from `set_icon`, or a generated badge of the slug's
+- **Icon**: in priority order, an uploaded image (`?icon`), an emoji, inline
+  SVG or `data:` URI from `set_icon`, or a generated badge of the slug's
   initials on a hash-derived colour, stable forever.
 
 ## Endpoints
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `POST /mcp` | token or OAuth | The MCP server. |
-| `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed, `?handler` installs a wasm component. 64 MB. |
-| `ANY /p/<slug>` | public | The page, a bundle asset, or the app's handler. An app root redirects to `/p/<slug>/` so relative links resolve. |
+| `POST /mcp` | sign-in or token | The MCP server. |
+| `GET /.well-known/oauth-authorization-server`, `POST /register`, `GET\|POST /authorize`, `POST /token` | public | The OAuth server MCP clients sign in through. Present when `TOOLSITE_BASE_URL` is set. |
+| `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed, `?handler` installs a wasm component, `?migrations`, `?manifest`, `?source`, `?blob=<key>`. 64 MB. |
+| `ANY /p/<slug>` | gate | The page, a bundle asset, or the app's handler. An app root redirects to `/p/<slug>/` so relative links resolve. |
 | `GET /icon/<slug>` | public | A page's icon, if set. |
-| `GET /export/<app>.sqlite` | export token | A snapshot of that app's database, for a reporting tool. |
 | `PUT /blob/<ticket>` | ticket | A visitor's file, streamed to the app's storage. Minted by the app's handler. |
+| `GET /export/<app>.sqlite` | export token | A snapshot of that app's database, for a reporting tool. |
+| `GET /auth/login`, `/auth/login/<slug>`, `/auth/callback/<slug>`, `/auth/logout`, `/auth/setup`, `/auth/handoff`, `/auth/me` | public | Visitor sign-in: password, provider, one-time setup link, the app handoff, and who am I. |
+| `GET /settings/<token>` | link | Where someone pastes an app's settings in. |
+| `GET /admin/...` | admin account | The admin pages. |
+| `GET /guide` | public | How the platform works, for an agent about to build on it. |
 | `GET /wit/toolsite.wit` | public | The contract a handler compiles against. |
 | `GET /scaffold/<app>` | public | A gzipped tar of a handler crate ready to build. |
 | `GET /` | public | The index. |
 
 ## Auth
 
-Two independent modes — use either, or both at once. At least one is required.
+Two independent modes for `/mcp`; use either, or both at once. At least one
+is required to serve HTTP.
 
-- **Sign in** — set `TOOLSITE_BASE_URL`. The server is then an OAuth 2.1
+- **Sign in**: set `TOOLSITE_BASE_URL`. The server is then an OAuth 2.1
   authorization server for its own `/mcp`: a client registers itself
   (RFC 7591), the person signs in with an admin account and consents on a
   screen that names where the answer is going, and the client gets a token
@@ -624,7 +747,7 @@ Two independent modes — use either, or both at once. At least one is required.
   a month, rotating on every use. Every request re-checks the account, so
   disabling it ends its clients' access on their next call. Tokens live
   hashed in `.site/oauth.db`.
-- **Bearer token** — set `TOOLSITE_MCP_TOKEN`. Sent as
+- **Bearer token**: set `TOOLSITE_MCP_TOKEN`. Sent as
   `Authorization: Bearer <token>`; `x-api-key: <token>` is also accepted,
   since clients differ. For scripts and the CLI, or a client with a headers
   field. Rejected requests are logged at `warn` with the headers that
@@ -635,19 +758,19 @@ Two independent modes — use either, or both at once. At least one is required.
 
 | Variable | Required | Description |
 |---|---|---|
+| `TOOLSITE_BASE_URL` | if clients sign in | Base URL of the deployment, e.g. `https://host.com`. Turns the OAuth server on and is what upload URLs are built from. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
-| `TOOLSITE_BASE_URL` | if clients sign in | Base URL of the deployment, e.g. `https://host.com`. Turns the OAuth server on. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
-| `TOOLSITE_DATA_DIR` | no (default `/data`) | Where pages are stored. |
+| `TOOLSITE_DATA_DIR` | no (default `/data`) | Where everything is stored. |
 | `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME` and `_ALLOW_DOMAIN`. See Accounts. |
 | `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
 | `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
+| `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
-| `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker — see Settings. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
 
-`MCP` is in the token's name because it authenticates MCP *clients* — who
-may publish — and nothing else.
+`MCP` is in the token's name because it authenticates MCP *clients*, who may
+publish, and nothing else.
 
 Older names still answer (`TOOLSITE_TOKEN`, `BEARER_TOKEN`, `MCP_TOKEN`,
 `PUBLIC_BASE_URL`, `DATA_DIR` and so on), so an existing deployment needs no
@@ -659,16 +782,9 @@ reconnect it, after which both can go.
 Every app gets a SQLite database; there is nothing to switch on. `db.query`
 and `run_sql` always work. Files work the same way; a bucket is optional.
 
-Boot logs the effective configuration, so a misconfigured deploy is visible
-without a client to test against:
-
-```
-INFO toolsite: auth configuration bearer_auth=true oauth_auth=true base_url="https://host.com"
-```
-
 ## On disk
 
-Everything under `DATA_DIR` is plain files — no database:
+Everything under `TOOLSITE_DATA_DIR` is plain files:
 
 ```
 budget-2026.html          a single page          -> /p/budget-2026
@@ -677,11 +793,18 @@ budget-2026.meta          {"listed":true,...}
 myapp/index.html          app root               -> /p/myapp/
 myapp/about.html          a page of the app      -> /p/myapp/about
 myapp/assets/main.js      a bundle asset         -> /p/myapp/assets/main.js
+myapp/handler.wasm        its server-side code   (runs, never served)
 myapp/data.db             its SQLite database    (never served)
 myapp/.blobs/data/<key>   a stored file          (only through its handler)
+myapp.notes, .secrets, .jobs, .migrations, .source, .exports
+                          sidecars               (never served)
+.site/auth.db             accounts and sessions
+.site/oauth.db            MCP clients' tokens
+.trash/                   what remove_page moved aside
 ```
 
 Slugs are restricted to letters, numbers, `-`, `_` and `/`, so a slug can
-never escape `DATA_DIR`. Bundle paths additionally allow `.` inside a
-filename but never at the start of a segment, which rules out `..` and
-dotfiles in one stroke.
+never escape the data directory. Bundle paths and blob keys additionally
+allow `.` inside a filename but never at the start of a segment, which rules
+out `..` and dotfiles in one stroke; that is also why nothing under `.site/`,
+`.trash/` or `.blobs/` can ever be named by a URL.
