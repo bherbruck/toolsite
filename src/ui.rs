@@ -190,9 +190,16 @@ tbody tr:hover td { background: var(--soft); }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.actions-cell { text-align: right; white-space: nowrap; }
 td.actions-cell form { display: inline-flex; margin: 0; }
-.panel table { margin: 0 -1.25rem; width: calc(100% + 2.5rem); }
+/* A table fills its panel edge to edge. Inside a padded body it bleeds out
+   past the padding; placed directly in the panel it is simply full width. */
+.panel-body > table { margin: 0 -1.25rem; width: calc(100% + 2.5rem); }
+.panel-body > table + form { margin-top: 1rem; }
 .panel table th:first-child, .panel table td:first-child { padding-left: 1.25rem; }
 .panel table th:last-child, .panel table td:last-child { padding-right: 1.25rem; }
+.panel > table { table-layout: auto; }
+.panel > table tr:last-child td:first-child { border-bottom-left-radius: var(--radius); }
+.panel > table tr:last-child td:last-child { border-bottom-right-radius: var(--radius); }
+.panel { overflow: hidden; }
 a.row-link { color: inherit; font-weight: 500; }
 a.row-link:hover { text-decoration: underline; }
 
