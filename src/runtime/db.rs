@@ -184,31 +184,64 @@ pub fn run_as(
 /// What a scoped caller may reach, by name. Everything is matched case
 /// insensitively, as SQLite does.
 pub struct Scope {
-    /// Views that may be read.
+    /// Views that may be read, by their declared names.
     pub readable: HashSet<String>,
     /// Views that may also be inserted into, updated and deleted through.
     pub writable: HashSet<String>,
     /// The platform's own triggers on the writable views, whose base-table
-    /// writes are the only ones allowed.
+    /// writes are the only ones allowed. Trusted for writes alone: a person
+    /// can name a CTE after a trigger, and a CTE can read but never write.
     pub triggers: HashSet<String>,
+    /// The salted inner views behind the declared names. A base-table read
+    /// is allowed only when SQLite reports it as made through one of these.
+    /// The names are the secret: a CTE named after a declared view reads
+    /// nothing, because its reads are reported under the declared name, and
+    /// the declared name is not in this set.
+    pub inner: HashSet<String>,
 }
+
+/// Functions a person's SQL may not call. Everything else SQLite ships is
+/// pure computation over the row at hand.
+const DENIED_FUNCTIONS: [&str; 7] = [
+    "load_extension",
+    "fts3_tokenizer",
+    "readfile",
+    "writefile",
+    "edit",
+    "fsdir",
+    "zipfile",
+];
 
 impl Scope {
     /// Built from the app's meta: hand-written views are read only, policy
-    /// views read and perhaps write, with their generated triggers.
+    /// views read and perhaps write, with their generated triggers. Nothing
+    /// is reachable until it has been generated, so a declaration that has
+    /// not met its table yet opens nothing.
     pub fn of(meta: &crate::content::store::PageMeta) -> Self {
-        let mut readable: HashSet<String> = meta.queryable.iter().map(|v| v.to_lowercase()).collect();
+        let mut readable = HashSet::new();
         let mut writable = HashSet::new();
         let mut triggers = HashSet::new();
+        let mut inner = HashSet::new();
+        let generated = |name: &str| meta.generated.iter().any(|g| g.eq_ignore_ascii_case(name));
+        let salt = meta.access_salt.as_deref().unwrap_or("");
+        for view in &meta.queryable {
+            let behind = crate::runtime::access::inner_name(salt, view);
+            if salt.is_empty() || !generated(&behind) {
+                continue;
+            }
+            readable.insert(view.to_lowercase());
+            inner.insert(behind.to_lowercase());
+        }
         for policy in &meta.policies {
-            if !meta.generated.iter().any(|g| g.eq_ignore_ascii_case(&policy.view)) {
-                // Declared but not generated yet: nothing to reach.
+            let behind = crate::runtime::access::inner_name(salt, &policy.view);
+            if salt.is_empty() || !generated(&policy.view) || !generated(&behind) {
                 continue;
             }
             readable.insert(policy.view.to_lowercase());
+            inner.insert(behind.to_lowercase());
             if policy.write {
                 writable.insert(policy.view.to_lowercase());
-                for trigger in crate::runtime::access::trigger_names(&policy.view) {
+                for trigger in crate::runtime::access::trigger_names(salt, &policy.view) {
                     triggers.insert(trigger.to_lowercase());
                 }
             }
@@ -217,18 +250,21 @@ impl Scope {
             readable,
             writable,
             triggers,
+            inner,
         }
     }
 
     fn reads(&self, name: &str) -> bool {
         let name = name.to_lowercase();
-        self.readable.contains(&name) || self.writable.contains(&name)
+        self.readable.contains(&name) || self.writable.contains(&name) || self.inner.contains(&name)
     }
 
-    fn through(&self, accessor: Option<&str>) -> bool {
+    /// Through an inner view, or through one of the platform's own triggers,
+    /// whose collision check has to see every row. Both names are salted.
+    fn through_inner(&self, accessor: Option<&str>) -> bool {
         accessor.is_some_and(|a| {
             let a = a.to_lowercase();
-            self.readable.contains(&a) || self.writable.contains(&a) || self.triggers.contains(&a)
+            self.inner.contains(&a) || self.triggers.contains(&a)
         })
     }
 
@@ -237,10 +273,12 @@ impl Scope {
         let accessor = context.accessor;
         match context.action {
             AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
-            // A column read: of a permitted view directly, or of anything the
-            // view or a generated trigger reaches on the person's behalf.
+            // A column read: of a declared view, of an inner view, or of
+            // anything an inner view reaches on the person's behalf. A read
+            // made through a declared name or a trigger name is not enough,
+            // because both are names a CTE can borrow.
             AuthAction::Read { table_name, .. } => {
-                if self.reads(table_name) || self.through(accessor) {
+                if self.reads(table_name) || self.through_inner(accessor) {
                     Authorization::Allow
                 } else {
                     Authorization::Deny
@@ -258,7 +296,7 @@ impl Scope {
                 }
             }
             AuthAction::Function { function_name, .. } => {
-                if function_name.eq_ignore_ascii_case("load_extension") {
+                if DENIED_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(function_name)) {
                     Authorization::Deny
                 } else {
                     Authorization::Allow
@@ -270,6 +308,14 @@ impl Scope {
         }
     }
 }
+
+/// How long one scoped statement may run before it is interrupted, and how
+/// big one value or one statement may be. A person typing SQL gets an
+/// answer or a refusal, never the server's afternoon.
+pub(crate) const SCOPED_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(10);
+const SCOPED_MAX_VALUE_BYTES: i32 = 16 * 1024 * 1024;
+const SCOPED_MAX_SQL_BYTES: i32 = 256 * 1024;
+const SCOPED_MAX_COMPOUND: i32 = 50;
 
 /// Runs one statement as `identity`, inside `scope`: the declared views, read
 /// or written only as their policies allow, and nothing else in the file. For
@@ -291,10 +337,21 @@ pub fn run_scoped(
     }
     let conn = open_unguarded(&path, config.max_db_bytes)?;
     bind_identity(&conn, identity)?;
+    for (limit, value) in [
+        (Limit::SQLITE_LIMIT_LENGTH, SCOPED_MAX_VALUE_BYTES),
+        (Limit::SQLITE_LIMIT_SQL_LENGTH, SCOPED_MAX_SQL_BYTES),
+        (Limit::SQLITE_LIMIT_COMPOUND_SELECT, SCOPED_MAX_COMPOUND),
+    ] {
+        conn.set_limit(limit, value).map_err(|e| e.to_string())?;
+    }
+    let started = std::time::Instant::now();
+    conn.progress_handler(1_000, Some(move || started.elapsed() > SCOPED_WALL_CLOCK))
+        .map_err(|e| e.to_string())?;
     let names = Scope {
         readable: scope.readable.clone(),
         writable: scope.writable.clone(),
         triggers: scope.triggers.clone(),
+        inner: scope.inner.clone(),
     };
     conn.authorizer(Some(move |context: AuthContext<'_>| names.authorize(context)))
         .map_err(|e| e.to_string())?;
@@ -378,6 +435,12 @@ fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool) -> Res
         }
         Err(e) => return Err(describe(e)),
     };
+    // EXPLAIN prints the plan, and the plan names the inner views whose
+    // names are the scoped boundary's secret. It is for the app's author,
+    // through the admin's own path.
+    if !scripts && statement.is_explain() != 0 {
+        return Err("not authorized: explain is not available here".to_string());
+    }
 
     let bound: Vec<ToSqlOutput<'static>> = params
         .iter()
@@ -606,7 +669,9 @@ mod tests {
     fn shop(config: &Config, write: bool) -> Scope {
         run(config, "shop", "create table orders (id integer primary key, owner_id text, total real)", &[]).unwrap();
         run(config, "shop", "insert into orders (owner_id, total) values ('u-alice', 10), ('u-bob', 20), ('u-alice', 30)", &[]).unwrap();
-        run(config, "shop", "create view totals as select owner_id, sum(total) as total from orders group by owner_id", &[]).unwrap();
+        // The hand-written view, already moved behind its inner view the way
+        // regenerate does it.
+        run(config, "shop", "create view ts_abc_totals as select owner_id, sum(total) as total from orders group by owner_id; create view totals as select * from \"ts_abc_totals\"", &[]).unwrap();
         let policy = crate::content::store::Policy {
             table: "orders".into(),
             view: "my_orders".into(),
@@ -615,17 +680,19 @@ mod tests {
             write,
         };
         let columns = vec!["id".to_string(), "owner_id".to_string(), "total".to_string()];
-        run(config, "shop", &crate::runtime::access::generate(&policy, &columns), &[]).unwrap();
+        let keys = crate::runtime::access::Keys { rowid_alias: Some("id".into()), unique: Vec::new() };
+        run(config, "shop", &crate::runtime::access::generate(&policy, "abc", &columns, &keys), &[]).unwrap();
         // The platform writes these with the authorizer off; the test did the
         // same through run, whose authorizer allows DDL.
-        let mut generated = vec!["my_orders".to_string()];
+        let mut generated = vec!["my_orders".to_string(), "ts_abc_my_orders".to_string(), "ts_abc_totals".to_string()];
         if write {
-            generated.extend(crate::runtime::access::trigger_names("my_orders"));
+            generated.extend(crate::runtime::access::trigger_names("abc", "my_orders"));
         }
         let meta = crate::content::store::PageMeta {
             queryable: vec!["totals".into()],
             policies: vec![policy],
             generated,
+            access_salt: Some("abc".into()),
             ..Default::default()
         };
         Scope::of(&meta)

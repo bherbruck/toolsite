@@ -3917,21 +3917,18 @@ async fn a_policy_in_the_manifest_becomes_a_view_and_triggers_and_leaves_with_it
     let objects = toolsite::runtime::db::run(
         &config,
         "ledger",
-        "select type, name from sqlite_master where name like 'my_%' or name like 'ts_access_%' order by name",
+        "select type, name from sqlite_master where name like 'my_%' or name like 'ts_%' order by type, name",
         &[],
     )
     .unwrap();
-    let names: Vec<String> = objects.rows.iter().map(|r| r[1].as_str().unwrap().to_string()).collect();
-    assert_eq!(
-        names,
-        [
-            "my_orders", "my_records",
-            "ts_access_my_orders_delete", "ts_access_my_orders_insert", "ts_access_my_orders_update",
-            "ts_access_my_records_delete", "ts_access_my_records_insert", "ts_access_my_records_update",
-        ]
-    );
+    let public: Vec<String> = objects.rows.iter().filter(|r| r[0] == "view" && !r[1].as_str().unwrap().starts_with("ts_")).map(|r| r[1].as_str().unwrap().to_string()).collect();
+    assert_eq!(public, ["my_orders", "my_records"]);
+    let inner = objects.rows.iter().filter(|r| r[0] == "view" && r[1].as_str().unwrap().starts_with("ts_")).count();
+    let triggers = objects.rows.iter().filter(|r| r[0] == "trigger").count();
+    assert_eq!((inner, triggers), (2, 6), "{objects:?}");
     let meta = toolsite::content::store::read_meta(&config, "ledger").await;
-    assert_eq!(meta.generated.len(), 8);
+    assert_eq!(meta.generated.len(), 10, "{:?}", meta.generated);
+    assert!(meta.access_salt.is_some());
 
     // A column added later reaches the view after the migrations apply.
     toolsite::runtime::migrate::store(
@@ -3952,7 +3949,7 @@ async fn a_policy_in_the_manifest_becomes_a_view_and_triggers_and_leaves_with_it
     let left = toolsite::runtime::db::run(
         &config,
         "ledger",
-        "select count(*) from sqlite_master where name like 'my_%' or name like 'ts_access_%'",
+        "select count(*) from sqlite_master where name like 'my_%' or name like 'ts_%'",
         &[],
     )
     .unwrap();

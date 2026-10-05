@@ -82,6 +82,12 @@ pub struct PageMeta {
     /// policies, so a policy that is removed takes its objects with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated: Vec<String>,
+    /// A random part of every generated inner view's name. The scoped
+    /// authorizer trusts a base-table read only when it comes through one of
+    /// those names, and a person can name a CTE after anything they can
+    /// guess, so the name they would have to guess is not guessable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_salt: Option<String>,
 }
 
 /// One row-level access policy: who may see, and perhaps change, which rows
@@ -148,6 +154,7 @@ impl Default for PageMeta {
             queryable: Vec::new(),
             policies: Vec::new(),
             generated: Vec::new(),
+            access_salt: None,
         }
     }
 }

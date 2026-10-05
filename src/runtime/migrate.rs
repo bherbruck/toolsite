@@ -85,11 +85,13 @@ pub fn apply(config: &Config, app: &str) -> Result<(usize, usize, Vec<String>), 
     // added here reaches `select *` only through a fresh `create view`.
     let mut meta = crate::content::store::read_meta_blocking(config, app);
     let mut notes = Vec::new();
-    if !meta.policies.is_empty() || !meta.generated.is_empty() {
-        let (generated, access_notes) = crate::runtime::access::regenerate(config, app, &meta)?;
-        notes = access_notes;
-        if meta.generated != generated {
-            meta.generated = generated;
+    if !meta.policies.is_empty() || !meta.queryable.is_empty() || !meta.generated.is_empty() {
+        let regenerated = crate::runtime::access::regenerate(config, app, &meta)?;
+        notes = regenerated.notes;
+        let salt = Some(regenerated.salt);
+        if meta.generated != regenerated.generated || meta.access_salt != salt {
+            meta.generated = regenerated.generated;
+            meta.access_salt = salt;
             crate::content::store::write_meta_blocking(config, app, &meta)?;
         }
     }

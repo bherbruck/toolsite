@@ -104,6 +104,7 @@ impl MeHost {
                         readable: Default::default(),
                         writable: Default::default(),
                         triggers: Default::default(),
+                        inner: Default::default(),
                     },
                     Vec::new(),
                     Vec::new(),
