@@ -56,6 +56,42 @@ pub(crate) struct UploadQuery {
     pub(crate) migrations: Option<String>,
     /// One of the app's files, stored under the key given as the value.
     pub(crate) blob: Option<String>,
+    /// With `?source`: the commit message for the push to a linked
+    /// repository. Also taken from the `X-Toolsite-Message` header.
+    pub(crate) message: Option<String>,
+    /// The commit the published build came from, so the Repo tab can say
+    /// whether the live app is the repository's head. Also the
+    /// `X-Toolsite-Commit` header.
+    pub(crate) commit: Option<String>,
+}
+
+/// What a source upload knows about where it came from. A ticket or MCP
+/// upload is the publisher's act and pushes to a linked repository; a
+/// deploy-token upload comes from a pipeline and never pushes back.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceMeta {
+    pub(crate) push: bool,
+    pub(crate) message: Option<String>,
+    pub(crate) commit: Option<String>,
+}
+
+impl SourceMeta {
+    pub(crate) fn from_request(query: &UploadQuery, headers: &axum::http::HeaderMap, push: bool) -> Self {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let clean = |value: Option<String>| value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        Self {
+            push,
+            message: clean(query.message.clone()).or_else(|| header("x-toolsite-message")),
+            commit: clean(query.commit.clone()).or_else(|| header("x-toolsite-commit")),
+        }
+    }
 }
 
 pub(crate) enum UploadKind {
@@ -79,6 +115,7 @@ pub(crate) async fn store_upload(
     sub: Option<String>,
     kind: UploadKind,
     body: Bytes,
+    meta: SourceMeta,
 ) -> Response {
     let slug = {
         let now = Instant::now();
@@ -108,7 +145,7 @@ pub(crate) async fn store_upload(
             .into_response();
     }
 
-    store_for_slug(config, runtime, slug, kind, body).await
+    store_for_slug(config, runtime, slug, kind, body, meta).await
 }
 
 /// Writes `body` as `kind` at `slug`, for a caller that has already decided
@@ -120,9 +157,18 @@ pub(crate) async fn store_for_slug(
     slug: String,
     kind: UploadKind,
     body: Bytes,
+    meta: SourceMeta,
 ) -> Response {
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
+    }
+    // Whoever publishes may say which commit this came from; the Repo tab
+    // compares it with the branch head. Nothing else depends on it.
+    if let Some(sha) = &meta.commit {
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        if !crate::platform::github::record_deployed(config, &app, sha) {
+            tracing::info!(app = %app, "commit named on upload was not recorded: no live link, or not a sha");
+        }
     }
 
     // A file for the app to serve or read: seed images, a dataset, a model.
@@ -229,15 +275,28 @@ pub(crate) async fn store_for_slug(
             return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
         }
         tracing::info!(app = %app, bytes = body.len(), "source stored");
-        return (
-            StatusCode::OK,
-            format!(
-                "stored {} bytes of source for {app}; fetch it back with GET on this \
-                 same URL with ?source\n",
-                body.len()
-            ),
-        )
-            .into_response();
+        let mut text = format!(
+            "stored {} bytes of source for {app}; fetch it back with GET on this \
+             same URL with ?source\n",
+            body.len()
+        );
+        // A linked repository gets the same archive as a commit. Reported,
+        // never fatal: the upload itself has already succeeded.
+        if meta.push && let Some(link) = crate::platform::github::link(config, &app) {
+            match crate::platform::github::push_source(config, &app, &body, meta.message.as_deref()).await {
+                Ok(crate::platform::github::SourcePush::Pushed(sha)) => {
+                    text.push_str(&format!("pushed to {}@{} as {}\n", link.full_name(), link.branch, &sha[..sha.len().min(7)]));
+                }
+                Ok(crate::platform::github::SourcePush::Unchanged) => {
+                    text.push_str(&format!("repository {} unchanged: the branch already has these files\n", link.full_name()));
+                }
+                Err(why) => {
+                    tracing::warn!(app = %app, repo = %link.full_name(), %why, "source stored but not pushed");
+                    text.push_str(&format!("not pushed to {}: {why}\n", link.full_name()));
+                }
+            }
+        }
+        return (StatusCode::OK, text).into_response();
     }
 
     if let UploadKind::Handler = kind {
@@ -379,11 +438,13 @@ pub(crate) async fn upload_root(
     Path(ticket): Path<String>,
     Query(query): Query<UploadQuery>,
     uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Some(response) = refuse_unknown_flags(&uri) {
         return response;
     }
+    let meta = SourceMeta::from_request(&query, &headers, true);
     store_upload(
         &state.config,
         &state.runtime,
@@ -391,6 +452,7 @@ pub(crate) async fn upload_root(
         None,
         upload_kind(&query),
         body,
+        meta,
     )
     .await
 }
@@ -400,11 +462,13 @@ pub(crate) async fn upload_sub(
     Path((ticket, sub)): Path<(String, String)>,
     Query(query): Query<UploadQuery>,
     uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Some(response) = refuse_unknown_flags(&uri) {
         return response;
     }
+    let meta = SourceMeta::from_request(&query, &headers, true);
     store_upload(
         &state.config,
         &state.runtime,
@@ -412,6 +476,7 @@ pub(crate) async fn upload_sub(
         Some(sub),
         upload_kind(&query),
         body,
+        meta,
     )
     .await
 }
@@ -420,8 +485,8 @@ pub(crate) async fn upload_sub(
 /// reporting: an unknown flag used to fall through to "publish the body as a
 /// page", so probing for a flag that does not exist would overwrite the app's
 /// front page with whatever was being probed.
-pub(crate) const KNOWN_FLAGS: [&str; 7] = [
-    "icon", "bundle", "spa", "handler", "source", "manifest", "blob",
+pub(crate) const KNOWN_FLAGS: [&str; 9] = [
+    "icon", "bundle", "spa", "handler", "source", "manifest", "blob", "message", "commit",
 ];
 
 pub(crate) fn unknown_flags(uri: &axum::http::Uri) -> Vec<String> {

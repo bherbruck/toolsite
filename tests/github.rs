@@ -1,16 +1,19 @@
 //! Repositories and deploy tokens, end to end over the router, against a
 //! GitHub that lives in this process: a small axum app on a loopback port
-//! that checks the App JWT's signature, hands out installation tokens,
-//! keeps repositories, trees and secrets in memory, and opens sealed secrets
-//! with the key it published. Nothing here reaches the network.
+//! that checks the App JWT's signature, hands out installation tokens, and
+//! keeps repositories, trees, commits and tarballs in memory. Nothing here
+//! reaches the network.
 
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
-use toolsite::{build_router, platform::github::App, runtime::wasm::Runtime, Config};
+use toolsite::{build_router, platform::github::App, platform::upload::UploadTicket, runtime::wasm::Runtime, Config};
 use tower::ServiceExt;
 
 const TOKEN: &str = "publish-token";
@@ -139,6 +142,35 @@ fn store_source(config: &Config, app: &str) {
     std::fs::write(config.data_dir.join(format!("{app}.source")), archive).unwrap();
 }
 
+/// An upload ticket for `slug`, the way create_upload mints one.
+fn upload_ticket(config: &Config, slug: &str) -> String {
+    let ticket = format!("ticket-{}-{}", slug, config.uploads.lock().unwrap().len());
+    config.uploads.lock().unwrap().insert(
+        ticket.clone(),
+        UploadTicket { slug: slug.to_string(), expires_at: Instant::now() + Duration::from_secs(60) },
+    );
+    ticket
+}
+
+/// A PUT with no bearer: the ticket in the URL is the credential.
+fn put_plain(uri: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder().method("PUT").uri(uri).body(Body::from(body)).unwrap()
+}
+
+/// The paths in a stored source archive, sorted, `./` stripped.
+fn archive_paths(bytes: &[u8]) -> Vec<String> {
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    let mut paths: Vec<String> = archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().trim_start_matches("./").to_string())
+        .filter(|p| !p.is_empty() && !p.ends_with('/'))
+        .collect();
+    paths.sort();
+    paths
+}
+
 /// Installs the App on "acme" as the admin, the way GitHub's redirect does.
 async fn install(config: &Arc<Config>, session: &str) {
     let (status, _, headers) = send(config, get_as("/github/setup?installation_id=1", session)).await;
@@ -197,21 +229,22 @@ mod fake_github {
         pub default_branch: String,
         pub private: bool,
         pub files: BTreeMap<String, Vec<u8>>,
-        /// Plaintext, having been opened with the repository's key.
-        pub secrets: HashMap<String, String>,
-        pub dispatches: Vec<String>,
         pub head: String,
         pub commits_made: usize,
         pub topics: Vec<String>,
+        /// (sha, message), newest first.
+        pub history: Vec<(String, String)>,
+        pub tarball_downloads: usize,
     }
 
     pub struct Fake {
-        pub secret: crypto_box::SecretKey,
+        pub base: String,
         pub installations: Vec<(u64, &'static str, &'static str)>,
         pub repos: BTreeMap<String, Repo>,
         blobs: HashMap<String, Vec<u8>>,
         trees: HashMap<String, Vec<(String, String)>>,
-        commits: HashMap<String, String>,
+        /// commit sha -> (tree sha, message)
+        commits: HashMap<String, (String, String)>,
         pub last_jwt_claims: Option<serde_json::Value>,
         pub token_requests: usize,
     }
@@ -230,7 +263,7 @@ mod fake_github {
             let tree = sha(format!("tree:{owner}/{name}").as_bytes());
             self.trees.insert(tree.clone(), vec![("README.md".into(), blob)]);
             let commit = sha(format!("commit:{owner}/{name}").as_bytes());
-            self.commits.insert(commit.clone(), tree);
+            self.commits.insert(commit.clone(), (tree, "Initial commit".into()));
             let mut files = BTreeMap::new();
             files.insert("README.md".to_string(), readme);
             self.repos.insert(
@@ -241,16 +274,36 @@ mod fake_github {
                     default_branch: "main".into(),
                     private,
                     files,
-                    secrets: HashMap::new(),
-                    dispatches: Vec::new(),
-                    head: commit,
+                    head: commit.clone(),
                     commits_made: 0,
                     topics: Vec::new(),
+                    history: vec![(commit, "Initial commit".into())],
+                    tarball_downloads: 0,
                 },
             );
         }
         pub fn repo(&self, full: &str) -> &Repo {
             self.repos.get(&full.to_lowercase()).expect("no such repo in the fake")
+        }
+        /// Somebody else commits to a repository: the files change and the
+        /// branch moves, as a push from a laptop would.
+        pub fn commit_from_outside(&mut self, full: &str, path: &str, content: &[u8], message: &str) -> String {
+            let blob = sha(content);
+            self.blobs.insert(blob.clone(), content.to_vec());
+            let r = self.repos.get_mut(&full.to_lowercase()).unwrap();
+            r.files.insert(path.to_string(), content.to_vec());
+            let mut entries: Vec<(String, String)> = r.files.iter().map(|(p, b)| (p.clone(), sha(b))).collect();
+            entries.sort();
+            for b in r.files.values() {
+                self.blobs.insert(sha(b), b.clone());
+            }
+            let tree = sha(format!("{entries:?}").as_bytes());
+            let commit = sha(format!("{tree}{message}{}", r.history.len()).as_bytes());
+            r.head = commit.clone();
+            r.history.insert(0, (commit.clone(), message.to_string()));
+            self.trees.insert(tree.clone(), entries);
+            self.commits.insert(commit.clone(), (tree, message.to_string()));
+            commit
         }
     }
 
@@ -258,7 +311,7 @@ mod fake_github {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let fake: Shared = Arc::new(Mutex::new(Fake {
-            secret: crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng),
+            base: base.clone(),
             installations: vec![(1, "acme", "Organization"), (2, "octocat", "User")],
             repos: BTreeMap::new(),
             blobs: HashMap::new(),
@@ -281,10 +334,12 @@ mod fake_github {
             .route("/repos/{owner}/{repo}/git/trees", post(create_tree))
             .route("/repos/{owner}/{repo}/git/commits", post(create_commit))
             .route("/repos/{owner}/{repo}/git/refs/heads/{branch}", axum::routing::patch(update_ref))
+            .route("/repos/{owner}/{repo}/git/trees/{sha}", get(get_tree))
             .route("/repos/{owner}/{repo}/contents/{*path}", get(get_contents).put(put_contents))
-            .route("/repos/{owner}/{repo}/actions/secrets/public-key", get(public_key))
-            .route("/repos/{owner}/{repo}/actions/secrets/{name}", axum::routing::put(put_secret))
-            .route("/repos/{owner}/{repo}/actions/workflows/{file}/dispatches", post(dispatch))
+            .route("/repos/{owner}/{repo}/tarball/{reference}", get(tarball))
+            .route("/codeload/{owner}/{repo}/{sha}", get(codeload))
+            .route("/repos/{owner}/{repo}/commits", get(list_commits))
+            .route("/repos/{owner}/{repo}/compare/{basehead}", get(compare))
             .with_state(fake.clone());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -451,7 +506,7 @@ mod fake_github {
         }
         let fake = fake.lock().unwrap();
         match fake.commits.get(&sha) {
-            Some(tree) => Json(serde_json::json!({ "sha": sha, "tree": { "sha": tree } })).into_response(),
+            Some((tree, _)) => Json(serde_json::json!({ "sha": sha, "tree": { "sha": tree } })).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -478,11 +533,16 @@ mod fake_github {
             .unwrap_or_default();
         for item in body["tree"].as_array().unwrap() {
             let path = item["path"].as_str().unwrap().to_string();
-            let blob = item["sha"].as_str().unwrap().to_string();
-            assert!(fake.blobs.contains_key(&blob), "tree names a blob that was never stored");
             entries.retain(|(p, _)| p != &path);
-            entries.push((path, blob));
+            // A null sha deletes the path, as the Git Data API has it.
+            if let Some(blob) = item["sha"].as_str() {
+                assert!(fake.blobs.contains_key(blob), "tree names a blob that was never stored");
+                entries.push((path, blob.to_string()));
+            }
         }
+        // Git trees are sorted and content-addressed: the same files give
+        // the same sha, whichever order they arrived in.
+        entries.sort();
         let id = sha(format!("{entries:?}").as_bytes());
         fake.trees.insert(id.clone(), entries);
         (StatusCode::CREATED, Json(serde_json::json!({ "sha": id }))).into_response()
@@ -494,10 +554,11 @@ mod fake_github {
         }
         let tree = body["tree"].as_str().unwrap().to_string();
         let parents = body["parents"].as_array().cloned().unwrap_or_default();
-        let id = sha(format!("{tree}{parents:?}{}", body["message"]).as_bytes());
+        let message = body["message"].as_str().unwrap_or("").to_string();
+        let id = sha(format!("{tree}{parents:?}{message}").as_bytes());
         let mut fake = fake.lock().unwrap();
         assert!(fake.trees.contains_key(&tree), "commit names a tree that was never stored");
-        fake.commits.insert(id.clone(), tree);
+        fake.commits.insert(id.clone(), (tree, message));
         (StatusCode::CREATED, Json(serde_json::json!({ "sha": id }))).into_response()
     }
 
@@ -507,16 +568,17 @@ mod fake_github {
         }
         let sha = body["sha"].as_str().unwrap().to_string();
         let mut fake = fake.lock().unwrap();
-        let tree = fake.commits.get(&sha).cloned().expect("ref moved to an unknown commit");
+        let (tree, message) = fake.commits.get(&sha).cloned().expect("ref moved to an unknown commit");
         let entries = fake.trees.get(&tree).cloned().unwrap();
         let files: BTreeMap<String, Vec<u8>> = entries
             .into_iter()
             .map(|(path, blob)| (path, fake.blobs.get(&blob).cloned().unwrap()))
             .collect();
         let r = fake.repos.get_mut(&format!("{owner}/{repo}").to_lowercase()).unwrap();
-        r.head = sha;
+        r.head = sha.clone();
         r.files = files;
         r.commits_made += 1;
+        r.history.insert(0, (sha, message));
         Json(serde_json::json!({ "object": { "sha": r.head } })).into_response()
     }
 
@@ -547,38 +609,87 @@ mod fake_github {
         (StatusCode::CREATED, Json(serde_json::json!({ "content": {} }))).into_response()
     }
 
-    async fn public_key(State(fake): State<Shared>, headers: HeaderMap) -> Response {
+    async fn get_tree(State(fake): State<Shared>, Path((_o, _r, sha)): Path<(String, String, String)>, headers: HeaderMap) -> Response {
         if let Err(r) = installed(&headers) {
             return r;
         }
-        let public = fake.lock().unwrap().secret.public_key();
-        Json(serde_json::json!({ "key_id": "key-1", "key": BASE64.encode(public.as_bytes()) })).into_response()
+        let fake = fake.lock().unwrap();
+        match fake.trees.get(&sha) {
+            Some(entries) => {
+                let tree: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|(path, blob)| serde_json::json!({ "path": path, "type": "blob", "sha": blob, "mode": "100644" }))
+                    .collect();
+                Json(serde_json::json!({ "sha": sha, "tree": tree, "truncated": false })).into_response()
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
     }
 
-    async fn put_secret(State(fake): State<Shared>, Path((owner, repo, name)): Path<(String, String, String)>, headers: HeaderMap, Json(body): Json<serde_json::Value>) -> Response {
+    /// GitHub answers a tarball request with a redirect to a signed URL.
+    async fn tarball(State(fake): State<Shared>, Path((owner, repo, reference)): Path<(String, String, String)>, headers: HeaderMap) -> Response {
         if let Err(r) = installed(&headers) {
             return r;
         }
-        assert_eq!(body["key_id"], "key-1");
-        let sealed = BASE64.decode(body["encrypted_value"].as_str().unwrap()).unwrap();
-        let mut fake = fake.lock().unwrap();
-        let plain = fake.secret.unseal(&sealed).expect("the secret was not sealed to the repository's key");
-        let r = fake.repos.get_mut(&format!("{owner}/{repo}").to_lowercase()).unwrap();
-        r.secrets.insert(name, String::from_utf8(plain).unwrap());
-        StatusCode::CREATED.into_response()
+        let fake = fake.lock().unwrap();
+        let Some(r) = fake.repos.get(&format!("{owner}/{repo}").to_lowercase()) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if reference != r.default_branch && reference != r.head {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let to = format!("{}/codeload/{owner}/{repo}/{}", fake.base, r.head);
+        (StatusCode::FOUND, [(axum::http::header::LOCATION, to)]).into_response()
     }
 
-    async fn dispatch(State(fake): State<Shared>, Path((owner, repo, file)): Path<(String, String, String)>, headers: HeaderMap, Json(body): Json<serde_json::Value>) -> Response {
+    async fn codeload(State(fake): State<Shared>, Path((owner, repo, sha)): Path<(String, String, String)>) -> Response {
+        let mut fake = fake.lock().unwrap();
+        let Some(r) = fake.repos.get_mut(&format!("{owner}/{repo}").to_lowercase()) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        r.tarball_downloads += 1;
+        let top = format!("{owner}-{repo}-{}", &sha[..7]);
+        let files: Vec<(String, Vec<u8>)> = r.files.iter().map(|(p, b)| (format!("{top}/{p}"), b.clone())).collect();
+        let borrowed: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        let body = super::tgz(&borrowed);
+        ([(axum::http::header::CONTENT_TYPE, "application/x-gzip")], body).into_response()
+    }
+
+    async fn list_commits(State(fake): State<Shared>, Path((owner, repo)): Path<(String, String)>, headers: HeaderMap) -> Response {
         if let Err(r) = installed(&headers) {
             return r;
         }
-        let mut fake = fake.lock().unwrap();
-        let r = fake.repos.get_mut(&format!("{owner}/{repo}").to_lowercase()).unwrap();
-        if !r.files.contains_key(&format!(".github/workflows/{file}")) {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "message": "workflow not found" }))).into_response();
+        let fake = fake.lock().unwrap();
+        let r = fake.repo(&format!("{owner}/{repo}"));
+        let list: Vec<serde_json::Value> = r
+            .history
+            .iter()
+            .take(5)
+            .map(|(sha, message)| {
+                serde_json::json!({
+                    "sha": sha,
+                    "html_url": format!("https://github.com/{owner}/{repo}/commit/{sha}"),
+                    "commit": { "message": message, "author": { "name": "toolsite", "date": "2026-10-05T12:00:00Z" } }
+                })
+            })
+            .collect();
+        Json(list).into_response()
+    }
+
+    async fn compare(State(fake): State<Shared>, Path((owner, repo, basehead)): Path<(String, String, String)>, headers: HeaderMap) -> Response {
+        if let Err(r) = installed(&headers) {
+            return r;
         }
-        r.dispatches.push(body["ref"].as_str().unwrap_or("").to_string());
-        StatusCode::NO_CONTENT.into_response()
+        let Some((base, head)) = basehead.split_once("...") else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let fake = fake.lock().unwrap();
+        let r = fake.repo(&format!("{owner}/{repo}"));
+        let position = |wanted: &str| r.history.iter().position(|(sha, _)| sha.starts_with(wanted));
+        match (position(base), position(head)) {
+            (Some(b), Some(h)) => Json(serde_json::json!({ "ahead_by": b.saturating_sub(h), "behind_by": h.saturating_sub(b) })).into_response(),
+            _ => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "message": "Not Found" }))).into_response(),
+        }
     }
 }
 
@@ -626,7 +737,7 @@ async fn a_deploy_token_publishes_one_app_and_nothing_else() {
 // --- repositories --------------------------------------------------------------
 
 #[tokio::test]
-async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secrets() {
+async fn creating_a_repository_pushes_the_source_and_a_readme_in_one_commit() {
     let (fake, api) = fake_github::start().await;
     let (_dir, config) = github_server(&api);
     publish_app(&config, "shop");
@@ -635,8 +746,8 @@ async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secret
     install(&config, &session).await;
 
     let (status, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
-    assert!(page.contains(r#"value="toolsite-shop""#), "the form does not propose toolsite-<app>");
     assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.contains(r#"value="toolsite-shop""#), "the form does not propose toolsite-<app>");
     assert!(page.contains("Create a repository"));
     let token = form_token_from(&page);
 
@@ -648,7 +759,7 @@ async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secret
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(flash(&headers).starts_with("ok:"), "{}", flash(&headers));
 
-    {
+    let head = {
         let fake = fake.lock().unwrap();
         let claims = fake.last_jwt_claims.as_ref().expect("no App JWT was presented");
         assert_eq!(claims["iss"], "12345");
@@ -658,22 +769,24 @@ async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secret
         assert_eq!(repo.commits_made, 1, "the project should land in one commit");
         assert_eq!(repo.files.get("src/main.js").map(|b| b.as_slice()), Some(&b"console.log('hi')"[..]));
         assert!(repo.files.contains_key("package.json"));
-        assert!(repo.files.contains_key("README.md"), "the initial commit was lost");
+        let readme = String::from_utf8(repo.files["README.md"].clone()).unwrap();
+        assert!(readme.contains("shop") && readme.contains("toolsite deploy"), "no README of ours: {readme}");
         assert!(!repo.files.keys().any(|k| k.contains("node_modules")), "node_modules was pushed");
-        let workflow = String::from_utf8(repo.files[".github/workflows/toolsite.yml"].clone()).unwrap();
-        assert!(workflow.contains("TOOLSITE_APP: \"shop\""));
-        assert!(workflow.contains("/deploy/$TOOLSITE_APP"));
-        assert_eq!(repo.secrets.get("TOOLSITE_URL").map(String::as_str), Some(SITE));
-        let deploy_token = repo.secrets.get("TOOLSITE_DEPLOY_TOKEN").expect("no deploy token secret");
-        assert!(toolsite::platform::deploy::authorize(&config, "shop", deploy_token), "the secret is not a live deploy token");
-        assert!(!toolsite::platform::deploy::authorize(&config, "other", deploy_token));
-    }
+        assert!(!repo.files.keys().any(|k| k.starts_with(".github/")), "a workflow was pushed: {:?}", repo.files.keys());
+        assert_eq!(repo.history[0].1.lines().next(), Some("Add shop from toolsite"));
+        assert!(repo.history[0].1.ends_with("Published from toolsite"));
+        repo.head.clone()
+    };
+    assert!(toolsite::platform::deploy::list(&config, "shop").is_empty(), "a deploy token was minted for a mirror");
 
     let link = toolsite::platform::github::link(&config, "shop").expect("no link recorded");
     assert_eq!((link.owner.as_str(), link.repo.as_str(), link.branch.as_str()), ("acme", "shop", "main"));
+    assert_eq!(link.deployed.as_ref().map(|d| d.sha.as_str()), Some(head.as_str()), "the live app should be the commit just pushed");
     let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
     assert!(page.contains("acme/shop"));
-    assert!(page.contains("Sync repository"));
+    assert!(page.contains("Pull from repository"));
+    assert!(page.contains("The live app is the repository's head."), "{page}");
+    assert!(page.contains("Add shop from toolsite"), "the commit list is missing");
     let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
     assert!(page.contains("acme/shop"));
 
@@ -684,6 +797,7 @@ async fn creating_a_repository_pushes_the_project_the_workflow_and_sealed_secret
     )
     .await;
     assert!(flash(&headers).contains("already connected"));
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1);
 }
 
 #[tokio::test]
@@ -707,14 +821,20 @@ async fn an_app_without_stored_source_cannot_become_a_repository() {
 }
 
 #[tokio::test]
-async fn importing_a_repository_adds_the_workflow_sets_secrets_and_runs_it() {
+async fn importing_a_repository_pulls_its_branch_into_the_source_archive() {
     let (fake, api) = fake_github::start().await;
-    fake.lock().unwrap().add_repo("acme", "dashboard", true);
-    let (_dir, config) = github_server(&api);
+    {
+        let mut f = fake.lock().unwrap();
+        f.add_repo("acme", "dashboard", true);
+        f.commit_from_outside("acme/dashboard", "web/package.json", br#"{"name":"dash"}"#, "Add the web app");
+        f.commit_from_outside("acme/dashboard", "web/node_modules/x/index.js", b"nope", "Oops");
+        f.commit_from_outside("acme/dashboard", "docs/notes.md", b"# notes", "Notes");
+    }
+    let (dir, config) = github_server(&api);
     let session = admin(&config);
     install(&config, &session).await;
 
-    // From the GitHub page, as a new app.
+    // From the GitHub page, as a new app, from a subdirectory.
     let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
     assert!(page.contains("Import a repository"));
     let token = form_token_from(&page);
@@ -729,26 +849,27 @@ async fn importing_a_repository_adds_the_workflow_sets_secrets_and_runs_it() {
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(flash(&headers).starts_with("ok:"), "{}", flash(&headers));
+    assert!(flash(&headers).contains("source archive"), "{}", flash(&headers));
     // No app exists yet, so the person is kept on the GitHub page.
     assert_eq!(location(&headers), "/admin/github");
 
     {
         let fake = fake.lock().unwrap();
         let repo = fake.repo("acme/dashboard");
-        let workflow = String::from_utf8(repo.files[".github/workflows/toolsite.yml"].clone()).unwrap();
-        assert!(workflow.contains("TOOLSITE_APP: \"dash\""));
-        assert!(workflow.contains("working-directory: \"web\""));
-        assert!(workflow.contains("hashFiles('web/package.json')"));
-        assert_eq!(repo.files.get("README.md").map(|b| b.as_slice()), Some(&b"# hello"[..]), "an import must not touch the project");
-        assert_eq!(repo.secrets.get("TOOLSITE_URL").map(String::as_str), Some(SITE));
-        let deploy_token = repo.secrets.get("TOOLSITE_DEPLOY_TOKEN").unwrap();
-        assert!(toolsite::platform::deploy::authorize(&config, "dash", deploy_token));
-        assert_eq!(repo.dispatches, vec!["main".to_string()], "the first deploy was not started");
+        assert_eq!(repo.commits_made, 0, "an import must not touch the repository");
+        assert_eq!(repo.tarball_downloads, 1, "the branch should be pulled once");
         assert!(repo.topics.iter().any(|t| t == "toolsite"), "an imported repository was not tagged");
     }
+    let archive = std::fs::read(dir.path().join("dash.source")).expect("the branch was not stored as the source archive");
+    assert_eq!(archive_paths(&archive), ["package.json"], "only the project directory, without node_modules");
     let link = toolsite::platform::github::link(&config, "dash").unwrap();
     assert_eq!(link.directory, "web/");
     assert_eq!(link.branch, "main");
+    assert!(link.deployed.is_none(), "nothing was published, so nothing is live");
+    assert!(link.token_id.is_empty(), "a mirror needs no deploy token");
+    let status = toolsite::platform::github::status_text(&config, "dash").await;
+    assert!(status.contains("cannot be compared"), "{status}");
+    assert!(status.contains("Notes"), "the newest commit is not listed: {status}");
 
     // A repository the installation cannot reach is refused without a link.
     let (_, _, headers) = send(
@@ -761,90 +882,229 @@ async fn importing_a_repository_adds_the_workflow_sets_secrets_and_runs_it() {
 }
 
 #[tokio::test]
-async fn a_webhook_must_be_signed_and_records_pushes_and_deploys() {
+async fn publishing_source_to_a_linked_app_pushes_one_commit_with_the_publishers_message() {
+    let (fake, api) = fake_github::start().await;
+    let (dir, config) = github_server(&api);
+    publish_app(&config, "shop");
+    store_source(&config, "shop");
+    let session = admin(&config);
+    install(&config, &session).await;
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    let token = form_token_from(&page);
+    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1);
+
+    // The next publish: a new file, an old one gone, a message on the URL.
+    let next = tgz(&[
+        ("./package.json", br#"{"name":"shop","scripts":{"build":"vite build"}}"#),
+        ("./src/App.tsx", b"export default () => <p>phone</p>"),
+    ]);
+    let ticket = upload_ticket(&config, "shop");
+    let (status, body, _) = send(
+        &config,
+        put_plain(&format!("/upload/{ticket}?source&message=Fix%20the%20phone%20field%0A%0AIt%20was%20too%20short."), next.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("pushed to acme/shop@main as "), "{body}");
+    let head = {
+        let fake = fake.lock().unwrap();
+        let repo = fake.repo("acme/shop");
+        assert_eq!(repo.commits_made, 2, "one commit per publish");
+        assert!(repo.files.contains_key("src/App.tsx"));
+        assert!(!repo.files.contains_key("src/main.js"), "a file the project dropped is still in the repository");
+        assert!(repo.files.contains_key("README.md"), "toolsite's own README should survive a push that lacks one");
+        let (sha, message) = &repo.history[0];
+        assert_eq!(message, "Fix the phone field\n\nIt was too short.\n\nPublished from toolsite");
+        sha.clone()
+    };
+    assert_eq!(std::fs::read(dir.path().join("shop.source")).unwrap(), next, "the archive was not stored");
+    let link = toolsite::platform::github::link(&config, "shop").unwrap();
+    assert_eq!(link.last_push.as_ref().map(|p| p.sha.as_str()), Some(head.as_str()));
+    assert_eq!(link.deployed.as_ref().map(|d| d.sha.as_str()), Some(head.as_str()), "what was just published is what is live");
+
+    // The same archive again: stored, nothing to commit.
+    let ticket = upload_ticket(&config, "shop");
+    let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source"), next)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("unchanged"), "{body}");
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 2);
+
+    // The message may also travel as a header.
+    let third = tgz(&[("./package.json", b"{}"), ("./src/App.tsx", b"v3")]);
+    let ticket = upload_ticket(&config, "shop");
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!("/upload/{ticket}?source"))
+        .header("x-toolsite-message", "Third pass")
+        .body(Body::from(third))
+        .unwrap();
+    let (status, ..) = send(&config, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").history[0].1.lines().next(), Some("Third pass"));
+}
+
+#[tokio::test]
+async fn a_source_archive_arriving_by_deploy_token_is_stored_but_never_pushed_back() {
+    let (fake, api) = fake_github::start().await;
+    let (dir, config) = github_server(&api);
+    publish_app(&config, "shop");
+    store_source(&config, "shop");
+    let session = admin(&config);
+    install(&config, &session).await;
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    let token = form_token_from(&page);
+    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
+    let (_, deploy_token) = toolsite::platform::deploy::create(&config, "shop", "ci").unwrap();
+
+    let from_ci = tgz(&[("./package.json", b"{}"), ("./src/ci.js", b"built elsewhere")]);
+    let (status, body, _) = send(&config, put_bytes("/deploy/shop?source&commit=0123456789abcdef0123456789abcdef01234567", &deploy_token, from_ci.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("pushed to"), "a pipeline's archive was pushed back: {body}");
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1, "the repository must not gain a commit");
+    assert_eq!(std::fs::read(dir.path().join("shop.source")).unwrap(), from_ci);
+    // The pipeline said which commit it built: that is what is live now.
+    let link = toolsite::platform::github::link(&config, "shop").unwrap();
+    assert_eq!(link.deployed.as_ref().map(|d| d.sha.as_str()), Some("0123456789abcdef0123456789abcdef01234567"));
+    // Something that is not a sha is ignored, not stored.
+    let (status, ..) = send(&config, put_bytes("/deploy/shop?bundle&commit=not-a-sha", &deploy_token, tgz(&[("./index.html", b"<title>x</title>")]))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(toolsite::platform::github::link(&config, "shop").unwrap().deployed.unwrap().sha, "0123456789abcdef0123456789abcdef01234567");
+}
+
+#[tokio::test]
+async fn a_disconnected_link_does_not_push() {
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = github_server(&api);
+    publish_app(&config, "shop");
+    store_source(&config, "shop");
+    let session = admin(&config);
+    install(&config, &session).await;
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    let token = form_token_from(&page);
+    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
+    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=disconnect&app=shop&back=/admin/apps/shop/repo"))).await;
+    assert!(toolsite::platform::github::link(&config, "shop").is_none());
+
+    let ticket = upload_ticket(&config, "shop");
+    let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source"), tgz(&[("./package.json", b"{}"), ("./new.js", b"1")]))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("pushed to"), "{body}");
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1);
+}
+
+#[tokio::test]
+async fn the_repo_tab_says_when_the_repository_is_ahead_of_the_live_app() {
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = github_server(&api);
+    publish_app(&config, "shop");
+    store_source(&config, "shop");
+    let session = admin(&config);
+    install(&config, &session).await;
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    let token = form_token_from(&page);
+    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
+
+    // Somebody commits twice from a laptop.
+    let newest = {
+        let mut f = fake.lock().unwrap();
+        f.commit_from_outside("acme/shop", "src/a.js", b"a", "Add a");
+        f.commit_from_outside("acme/shop", "src/b.js", b"b", "Add b")
+    };
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    assert!(page.contains("The repository is 2 commits ahead of the live app."), "{page}");
+    assert!(page.contains("toolsite deploy"), "the page does not say what to do");
+    assert!(page.contains("Add b") && page.contains("Add a"), "the new commits are not listed");
+    let status = toolsite::platform::github::status_text(&config, "shop").await;
+    assert!(status.contains("2 commits ahead"), "{status}");
+
+    // A publish that names the head catches up.
+    let (_, deploy_token) = toolsite::platform::deploy::create(&config, "shop", "laptop").unwrap();
+    let (status, ..) = send(&config, put_bytes(&format!("/deploy/shop?bundle&commit={newest}"), &deploy_token, tgz(&[("./index.html", b"<title>v2</title>")]))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    assert!(page.contains("The live app is the repository's head."), "{page}");
+}
+
+#[tokio::test]
+async fn a_webhook_must_be_signed_and_a_push_from_elsewhere_is_pulled_in() {
     let (fake, api) = fake_github::start().await;
     fake.lock().unwrap().add_repo("acme", "dashboard", true);
-    let (_dir, config) = github_server(&api);
+    let (dir, config) = github_server(&api);
     let session = admin(&config);
     install(&config, &session).await;
     let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
     let token = form_token_from(&page);
     send(&config, post_form("/admin/repo", &session, format!("token={token}&action=import&app=dash&installation=1&repo=acme/dashboard&back=/admin/github"))).await;
+    assert_eq!(fake.lock().unwrap().repo("acme/dashboard").tarball_downloads, 1, "the import pulls once");
+    let first_head = fake.lock().unwrap().repo("acme/dashboard").head.clone();
 
-    let push = r#"{"ref":"refs/heads/main","after":"abcdef1234567890","repository":{"full_name":"acme/dashboard"}}"#;
-    let (status, ..) = send(&config, webhook("push", None, push)).await;
+    // Somebody pushes from a laptop; GitHub tells us.
+    let pushed = fake.lock().unwrap().commit_from_outside("acme/dashboard", "app.js", b"v2", "Work from a laptop");
+    let push = format!(r#"{{"ref":"refs/heads/main","after":"{pushed}","repository":{{"full_name":"acme/dashboard"}}}}"#);
+    let (status, ..) = send(&config, webhook("push", None, &push)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "an unsigned webhook was taken");
-    let (status, ..) = send(&config, webhook("push", Some(&sign("wrong-secret", push.as_bytes())), push)).await;
+    let (status, ..) = send(&config, webhook("push", Some(&sign("wrong-secret", push.as_bytes())), &push)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "a webhook signed with another secret was taken");
-    let (status, ..) = send(&config, webhook("push", Some(&sign("hook-secret", b"{}")), push)).await;
+    let (status, ..) = send(&config, webhook("push", Some(&sign("hook-secret", b"{}")), &push)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "a signature over a different body was taken");
-    assert!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.is_none());
+    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, first_head);
+    assert_eq!(fake.lock().unwrap().repo("acme/dashboard").tarball_downloads, 1);
 
-    let (status, ..) = send(&config, webhook("push", Some(&sign("hook-secret", push.as_bytes())), push)).await;
+    let (status, body, _) = send(&config, webhook("push", Some(&sign("hook-secret", push.as_bytes())), &push)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, "abcdef1234567890");
+    assert!(body.contains("pulled"), "{body}");
+    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, pushed);
+    assert_eq!(fake.lock().unwrap().repo("acme/dashboard").tarball_downloads, 2);
+    let archive = std::fs::read(dir.path().join("dash.source")).unwrap();
+    assert_eq!(archive_paths(&archive), ["README.md", "app.js"], "the pushed branch is not the source archive");
+    assert_eq!(fake.lock().unwrap().repo("acme/dashboard").commits_made, 0, "a pull must not push back");
+
+    // The same sha again is our own echo, or a replay: not pulled twice.
+    let (status, body, _) = send(&config, webhook("push", Some(&sign("hook-secret", push.as_bytes())), &push)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(!body.contains("pulled"), "{body}");
+    assert_eq!(fake.lock().unwrap().repo("acme/dashboard").tarball_downloads, 2);
 
     // Another branch is noise.
     let other = r#"{"ref":"refs/heads/feature","after":"ffff","repository":{"full_name":"acme/dashboard"}}"#;
     send(&config, webhook("push", Some(&sign("hook-secret", other.as_bytes())), other)).await;
-    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, "abcdef1234567890");
-
-    let run = r#"{"action":"completed","repository":{"full_name":"acme/dashboard"},"workflow_run":{"path":".github/workflows/toolsite.yml","conclusion":"success","html_url":"https://github.com/acme/dashboard/actions/runs/1"}}"#;
-    let (status, ..) = send(&config, webhook("workflow_run", Some(&sign("hook-secret", run.as_bytes())), run)).await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    let deploy = toolsite::platform::github::link(&config, "dash").unwrap().last_deploy.unwrap();
-    assert_eq!(deploy.conclusion, "success");
-    assert!(deploy.url.ends_with("/runs/1"));
+    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, pushed);
 
     // A repository nobody linked is acknowledged and ignored.
     let stranger = r#"{"ref":"refs/heads/main","after":"1","repository":{"full_name":"someone/else"}}"#;
     let (status, body, _) = send(&config, webhook("push", Some(&sign("hook-secret", stranger.as_bytes())), stranger)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(body.contains("ignored"));
-
-    let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
-    assert!(page.contains("success"));
 }
 
 #[tokio::test]
-async fn rotating_replaces_the_secret_and_disconnecting_ends_the_token() {
+async fn pulling_refreshes_the_source_archive_and_disconnecting_leaves_the_repository_alone() {
     let (fake, api) = fake_github::start().await;
     fake.lock().unwrap().add_repo("acme", "dashboard", true);
-    let (_dir, config) = github_server(&api);
+    let (dir, config) = github_server(&api);
     publish_app(&config, "dash");
     let session = admin(&config);
     install(&config, &session).await;
     let (_, page, _) = send(&config, get_as("/admin/apps/dash/repo", &session)).await;
     let token = form_token_from(&page);
     send(&config, post_form("/admin/repo", &session, format!("token={token}&action=import&app=dash&installation=1&repo=acme/dashboard&back=/admin/apps/dash/repo"))).await;
-    let first = fake.lock().unwrap().repo("acme/dashboard").secrets["TOOLSITE_DEPLOY_TOKEN"].clone();
+    assert_eq!(archive_paths(&std::fs::read(dir.path().join("dash.source")).unwrap()), ["README.md"]);
 
-    // Sync dispatches again.
-    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=sync&app=dash&back=/admin/apps/dash/repo"))).await;
-    assert_eq!(fake.lock().unwrap().repo("acme/dashboard").dispatches.len(), 2);
+    // The branch moves without a webhook reaching us; Pull catches up.
+    fake.lock().unwrap().commit_from_outside("acme/dashboard", "index.html", b"<title>d</title>", "Add a page");
+    let (status, _, headers) = send(&config, post_form("/admin/repo", &session, format!("token={token}&action=pull&app=dash&back=/admin/apps/dash/repo"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(flash(&headers).starts_with("ok:Pulled commit"), "{}", flash(&headers));
+    assert_eq!(archive_paths(&std::fs::read(dir.path().join("dash.source")).unwrap()), ["README.md", "index.html"]);
+    assert_eq!(fake.lock().unwrap().repo("acme/dashboard").commits_made, 0, "a pull must not write to the repository");
 
-    // Rotate: a new token shown once, in the secret, old one dead.
-    let (status, page, _) = send(&config, post_form("/admin/repo", &session, format!("token={token}&action=rotate&app=dash&back=/admin/apps/dash/repo"))).await;
-    assert_eq!(status, StatusCode::OK, "rotate should render the tab with the new token");
-    let shown = page
-        .split("id=\"fresh-deploy-token\">")
-        .nth(1)
-        .and_then(|rest| rest.split('<').next())
-        .expect("the new token is not shown")
-        .to_string();
-    let second = fake.lock().unwrap().repo("acme/dashboard").secrets["TOOLSITE_DEPLOY_TOKEN"].clone();
-    assert_eq!(shown, second);
-    assert_ne!(first, second);
-    assert!(!toolsite::platform::deploy::authorize(&config, "dash", &first), "the old token survived rotation");
-    assert!(toolsite::platform::deploy::authorize(&config, "dash", &second));
-
-    // Disconnect: link gone from the live set, token dead, repository untouched.
+    // Disconnect: link gone from the live set, repository untouched.
     let (status, _, headers) = send(&config, post_form("/admin/repo", &session, format!("token={token}&action=disconnect&app=dash&back=/admin/apps/dash/repo"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(flash(&headers).starts_with("ok:"));
     assert!(toolsite::platform::github::link(&config, "dash").is_none());
-    assert!(!toolsite::platform::deploy::authorize(&config, "dash", &second));
-    assert!(fake.lock().unwrap().repo("acme/dashboard").files.contains_key(".github/workflows/toolsite.yml"));
+    assert!(fake.lock().unwrap().repo("acme/dashboard").files.contains_key("index.html"));
     let (_, page, _) = send(&config, get_as("/admin/apps/dash/repo", &session)).await;
     assert!(page.contains("Create a repository"), "the tab should offer to connect again");
 }
@@ -919,8 +1179,8 @@ async fn the_unconfigured_github_page_walks_through_the_setup_with_every_value_c
         "TOOLSITE_GITHUB_APP_ID=",
         "TOOLSITE_GITHUB_WEBHOOK_SECRET=",
         "Contents: read and write",
+        "Administration: read and write",
         "Metadata: read",
-        "workflow_run",
         r#"data-copy="gh-env""#,
     ] {
         assert!(page.contains(needle), "setup page lacks {needle}");
@@ -933,6 +1193,7 @@ async fn the_unconfigured_github_page_walks_through_the_setup_with_every_value_c
         .expect("a generated webhook secret");
     assert_eq!(secret.len(), 40);
     assert!(page.contains(&format!("TOOLSITE_GITHUB_WEBHOOK_SECRET={secret}")));
+    assert!(!page.contains("Actions: read") && !page.contains("workflow_run"), "the setup still asks for Actions");
 }
 
 #[tokio::test]

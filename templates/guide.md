@@ -193,16 +193,29 @@ sets their own password through a one-time link.
 
 ## A repository
 
-An app can live in GitHub and deploy from there: `app_repo(app, "create")`
-makes a repository out of the source you published with `?source`, named
-`toolsite-<app>` unless you say otherwise and tagged with the `toolsite`
-topic, with a workflow that builds in GitHub Actions and deploys back here
-on every push;
-`app_repo(app, "import", repo: "owner/name")` connects a repository that
-already exists, and `app_repo(any, "discover")` lists the repositories
-tagged `toolsite` that nobody has imported yet, each with its import call. The site has to be configured with a GitHub App for either;
-`app_repo(app, "status")` says. Nothing is built on this server: keep
-publishing the source, and the repository carries it from there.
+An app's source can live in a GitHub repository, with its history. The
+repository is a mirror: toolsite pushes when the source is published and
+pulls when someone pushes. Nothing is built there; you build and publish from
+where you run, as always.
+
+- `app_repo(app, "create")` makes a repository out of the source you
+  published with `?source`, named `toolsite-<app>` unless you say otherwise,
+  tagged with the `toolsite` topic.
+- `app_repo(app, "import", repo: "owner/name")` links a repository that
+  already exists and pulls its branch into the app's source archive; fetch it
+  with `curl '<upload-url>?source' | tar xz`, build, publish.
+- Publishing the source of a linked app pushes a commit. Say why with
+  `'<upload-url>?source&message=<url-encoded text>'`, and name the commit the
+  build came from with `&commit=<sha>` so the Repo tab can tell whether the
+  live app is the repository's head.
+- `app_repo(app, "status")` says where the source is mirrored, the last
+  push, whether the repository is ahead of the live app, and the newest
+  commits. `app_repo(app, "pull")` pulls the branch again;
+  `app_repo(any, "discover")` lists the repositories tagged `toolsite` that
+  nobody has imported yet, each with its import call.
+
+The site has to be configured with a GitHub App for any of this;
+`app_repo(app, "installations")` says whether it is and on which accounts.
 
 ## Settings
 

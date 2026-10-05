@@ -47,7 +47,7 @@ platform/          the site as its owner uses it
   blob_upload.rs   PUT /blob/<ticket>: a browser's file, streamed to storage
   export.rs        GET /export/<app>.sqlite: one app's database for a per-app token
   deploy.rs        PUT /deploy/<app>: what an upload ticket takes, for a per-app token
-  github.rs        the GitHub App: repositories created or imported, their workflow, webhook
+  github.rs        the GitHub App: a repository per app as a source mirror, push on publish, pull on push
   scaffold.rs      the WIT and a buildable crate, served to agents
   secrets.rs       per-app settings, sealed at rest, entered by a person
   schedule.rs      cron jobs, run through the same handler a request uses

@@ -248,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
     };
     if let Some(app) = &github {
         if base_url.is_none() {
-            panic!("TOOLSITE_BASE_URL is required with TOOLSITE_GITHUB_*: the workflow deploys back to it");
+            panic!("TOOLSITE_BASE_URL is required with TOOLSITE_GITHUB_*: the README toolsite writes into a repository names the site");
         }
         tracing::info!(app_id = %app.app_id, webhook = app.install_url().is_some(), "github app configured");
     }
