@@ -255,7 +255,7 @@ can do here, and some things only happen here.
 | `POST /mcp` | sign-in or token | The MCP server. Streamable HTTP, no `/sse` suffix. |
 | `GET /.well-known/oauth-authorization-server`, `POST /register`, `/authorize`, `POST /token` | public | The OAuth server MCP clients sign in through. Present when `TOOLSITE_BASE_URL` is set. |
 | `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon`, `?bundle`, `&spa`, `?handler`, `?migrations`, `?manifest`, `?source`, `?blob=<key>`. 64 MB. |
-| `PUT /deploy/<app>[/<page>]` | deploy token | The same flags, for one app, from CI. |
+| `PUT /deploy/<app>[/<page>]` | deploy token | The same flags, for one app, from a CI system of your own. `&commit=<sha>` names the commit. |
 | `PUT /blob/<ticket>` | ticket | A visitor's file, streamed to the app's storage. Minted by the handler's `upload-url`. |
 | `GET /export/<app>.sqlite` | export token | A snapshot of that app's database, for a reporting tool. |
 | `ANY /p/<slug>` | gate | The page, a bundle asset, or the app's handler. |

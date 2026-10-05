@@ -147,7 +147,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/settings-link", post(admin::settings_link))
         .route("/admin/job-run", post(admin::run_job))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
-        // An app's repository: GitHub Actions builds, a per-app token deploys.
+        // An app's repository: a source mirror, pushed on publish and pulled on push.
         .route("/admin/github", get(github::github_page))
         .route("/admin/github/repos/search", get(github::repos_search))
         .route("/admin/repo", post(github::repo_action))

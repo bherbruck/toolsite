@@ -1,16 +1,19 @@
-//! Keeping an app's project in a GitHub repository, and deploying from it.
+//! Keeping an app's project in a GitHub repository.
 //!
-//! Toolsite does not build. It is one binary with no toolchain in it, and the
-//! build belongs where the source is: GitHub Actions runs it, and the result
-//! comes back through `PUT /deploy/<app>` with a token that can publish that
-//! one app and nothing else. What toolsite does is set that up and keep track:
+//! The repository is a source mirror with history, nothing more. Toolsite
+//! does not build and does not run anything in GitHub: an agent or the CLI
+//! has a toolchain where it runs and publishes in seconds, and that is where
+//! building belongs. What toolsite does:
 //!
-//! - **Create**: a new repository holding the app's stored source and a
-//!   workflow, with the two secrets the workflow needs.
-//! - **Import**: the same workflow and secrets added to a repository you
-//!   already have, then a first run.
-//! - **Watch**: a webhook records the last push and the last deploy, so the
-//!   Repo tab can say what happened without a trip to GitHub.
+//! - **Create**: a new repository holding the app's stored source.
+//! - **Import**: link a repository you already have and pull its branch into
+//!   the app's source archive, so the next session starts from it.
+//! - **Push**: publishing the source of a linked app commits it to the
+//!   branch, with the message the publisher gave.
+//! - **Pull**: a push webhook, or the Pull button, stores the branch as the
+//!   app's source archive again.
+//! - **Drift**: the link remembers which commit the live app came from, so
+//!   the Repo tab can say when the repository has moved ahead of it.
 //!
 //! Toolsite speaks to GitHub as a GitHub App: a JWT signed with the App's
 //! private key buys a short-lived installation token, scoped to the account
@@ -47,15 +50,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// The workflow every connected repository gets. `__APP__`, `__BRANCH__`,
-/// `__DIR__` and `__WORKDIR__` are filled in per app.
-pub const WORKFLOW_TEMPLATE: &str = include_str!("../../templates/toolsite.yml");
-pub const WORKFLOW_PATH: &str = ".github/workflows/toolsite.yml";
-const SECRET_URL: &str = "TOOLSITE_URL";
-const SECRET_TOKEN: &str = "TOOLSITE_DEPLOY_TOKEN";
 /// A source archive handed to a repository, at most.
 const MAX_SOURCE_FILES: usize = 2_000;
 const MAX_SOURCE_BYTES: usize = 50 * 1024 * 1024;
+/// How much of a branch tarball is taken back as the source archive.
+const MAX_PULL_BYTES: usize = crate::platform::upload::MAX_UPLOAD_BYTES;
+/// Commit messages a publisher gives: the subject is capped here.
+const MAX_SUBJECT: usize = 200;
+const TRAILER: &str = "Published from toolsite";
+const RECENT_COMMITS: usize = 5;
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Installation tokens last an hour; one is reused until it is nearly up.
 const TOKEN_REUSE: Duration = Duration::from_secs(50 * 60);
@@ -315,12 +318,11 @@ pub struct Push {
     pub sha: String,
 }
 
+/// Which commit the live app was published from, when anyone said.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Deploy {
+pub struct Deployed {
+    pub sha: String,
     pub at: u64,
-    /// GitHub's word: success, failure, cancelled, …
-    pub conclusion: String,
-    pub url: String,
 }
 
 /// An app's repository, in `<app>.repo`.
@@ -333,14 +335,18 @@ pub struct RepoLink {
     #[serde(default)]
     pub directory: String,
     pub installation_id: u64,
-    /// The deploy token the workflow holds, by id, so it can be rotated and
-    /// revoked without touching any other.
+    /// A deploy token an older link minted for a workflow. Empty now; kept so
+    /// disconnecting an old link still revokes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token_id: String,
     pub connected_at: u64,
+    /// The last commit seen on the branch: ours, or one the webhook told us of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_push: Option<Push>,
+    /// The commit the live app came from. Set by our own push, or by a
+    /// publisher that said `commit=<sha>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_deploy: Option<Deploy>,
+    pub deployed: Option<Deployed>,
     /// Kept rather than deleted when disconnected: nothing here destroys a
     /// record, and the history of where an app came from is worth having.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,19 +444,6 @@ fn clean_directory(directory: Option<&str>) -> Result<String, String> {
     Ok(format!("{trimmed}/"))
 }
 
-pub fn workflow_for(app: &str, branch: &str, directory: &str) -> String {
-    let workdir = if directory.is_empty() {
-        ".".to_string()
-    } else {
-        directory.trim_end_matches('/').to_string()
-    };
-    WORKFLOW_TEMPLATE
-        .replace("__APP__", app)
-        .replace("__BRANCH__", branch)
-        .replace("__WORKDIR__", &workdir)
-        .replace("__DIR__", directory)
-}
-
 // --- talking to a repository ---------------------------------------------------
 
 /// Every repository this site creates or imports carries this topic, so
@@ -525,49 +518,10 @@ impl Repo<'_> {
         self.expect("reading the repository", reqwest::Method::GET, "", None).await
     }
 
-    /// Sets a repository secret, sealed to the repository's public key the
-    /// way the Actions API demands.
-    async fn put_secret(&self, name: &str, value: &str) -> Result<(), String> {
-        let key = self
-            .expect("fetching the repository's public key", reqwest::Method::GET, "/actions/secrets/public-key", None)
-            .await?;
-        let key_id = key["key_id"].as_str().ok_or("public key answer had no key_id")?.to_string();
-        let public = key["key"].as_str().ok_or("public key answer had no key")?;
-        let sealed = seal(public, value)?;
-        self.expect(
-            &format!("setting the secret {name}"),
-            reqwest::Method::PUT,
-            &format!("/actions/secrets/{name}"),
-            Some(serde_json::json!({ "encrypted_value": sealed, "key_id": key_id })),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Creates or updates one file through the Contents API.
-    async fn put_file(&self, path: &str, content: &[u8], message: &str, branch: &str) -> Result<(), String> {
-        let (status, existing) = self
-            .call(reqwest::Method::GET, &format!("/contents/{path}?ref={branch}"), None)
-            .await?;
-        let mut body = serde_json::json!({
-            "message": message,
-            "content": BASE64.encode(content),
-            "branch": branch,
-        });
-        if status.is_success()
-            && let Some(sha) = existing["sha"].as_str()
-        {
-            body["sha"] = serde_json::Value::String(sha.to_string());
-        }
-        self.expect(&format!("writing {path}"), reqwest::Method::PUT, &format!("/contents/{path}"), Some(body))
-            .await?;
-        Ok(())
-    }
-
-    /// One commit with every file, on top of the branch's tip. A brand-new
-    /// repository is still being initialised for a moment after it is
-    /// created, so the tip is asked for with patience.
-    async fn commit_files(&self, branch: &str, files: &[(String, Vec<u8>)], message: &str) -> Result<String, String> {
+    /// The branch tip: commit and tree. A brand-new repository is still being
+    /// initialised for a moment after it is created, so the tip is asked for
+    /// with patience.
+    async fn head(&self, branch: &str) -> Result<(String, String), String> {
         let mut parent = None;
         for attempt in 0..6 {
             let (status, json) = self
@@ -586,10 +540,40 @@ impl Repo<'_> {
         let base = self
             .expect("reading the tip commit", reqwest::Method::GET, &format!("/git/commits/{parent}"), None)
             .await?;
-        let base_tree = base["tree"]["sha"].as_str().ok_or("the tip commit has no tree")?.to_string();
+        let tree = base["tree"]["sha"].as_str().ok_or("the tip commit has no tree")?.to_string();
+        Ok((parent, tree))
+    }
 
-        let mut entries = Vec::with_capacity(files.len());
-        for (path, content) in files {
+    /// Every blob in a tree, as (path, sha).
+    async fn tree_entries(&self, tree_sha: &str) -> Result<Vec<(String, String)>, String> {
+        let json = self
+            .expect("reading the tree", reqwest::Method::GET, &format!("/git/trees/{tree_sha}?recursive=1"), None)
+            .await?;
+        Ok(json["tree"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item["type"] == "blob")
+                    .filter_map(|item| Some((item["path"].as_str()?.to_string(), item["sha"].as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// One commit on top of the branch: `upserts` written, `deletions`
+    /// removed. Nothing is committed, and `None` comes back, when the result
+    /// would be the tree the branch already has.
+    async fn commit_tree(
+        &self,
+        branch: &str,
+        upserts: &[(String, Vec<u8>)],
+        deletions: &[String],
+        message: &str,
+    ) -> Result<Option<String>, String> {
+        let (parent, base_tree) = self.head(branch).await?;
+        let mut entries = Vec::with_capacity(upserts.len() + deletions.len());
+        for (path, content) in upserts {
             let blob = self
                 .expect(
                     &format!("storing {path}"),
@@ -601,6 +585,12 @@ impl Repo<'_> {
             let sha = blob["sha"].as_str().ok_or("blob answer had no sha")?.to_string();
             entries.push(serde_json::json!({ "path": path, "mode": "100644", "type": "blob", "sha": sha }));
         }
+        for path in deletions {
+            entries.push(serde_json::json!({ "path": path, "mode": "100644", "type": "blob", "sha": serde_json::Value::Null }));
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
         let tree = self
             .expect(
                 "building the tree",
@@ -610,6 +600,11 @@ impl Repo<'_> {
             )
             .await?;
         let tree_sha = tree["sha"].as_str().ok_or("tree answer had no sha")?.to_string();
+        // Trees are content-addressed: the same files give the same sha, so
+        // an unchanged project is caught here without a commit.
+        if tree_sha == base_tree {
+            return Ok(None);
+        }
         let commit = self
             .expect(
                 "writing the commit",
@@ -626,34 +621,88 @@ impl Repo<'_> {
             Some(serde_json::json!({ "sha": sha, "force": false })),
         )
         .await?;
-        Ok(sha)
+        Ok(Some(sha))
     }
 
-    async fn dispatch(&self, branch: &str) -> Result<(), String> {
-        self.expect(
-            "starting the workflow",
-            reqwest::Method::POST,
-            &format!("/actions/workflows/{}/dispatches", WORKFLOW_PATH.rsplit('/').next().unwrap_or("toolsite.yml")),
-            Some(serde_json::json!({ "ref": branch })),
-        )
-        .await?;
-        Ok(())
+    /// The branch as a gzipped tar, the way GitHub serves it: one top-level
+    /// directory named after the commit, which the caller strips.
+    async fn tarball(&self, reference: &str) -> Result<Vec<u8>, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| format!("http client: {}", reason(&e)))?;
+        // GitHub answers with a redirect to a signed download URL; reqwest
+        // follows it and drops the Authorization header across hosts.
+        let response = client
+            .get(format!("{}{}", self.app.api, self.path(&format!("/tarball/{reference}"))))
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28")
+            .header("user-agent", concat!("toolsite/", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|e| format!("GitHub did not answer: {}", reason(&e)))?;
+        if !response.status().is_success() {
+            return Err(format!("downloading the branch failed ({})", response.status()));
+        }
+        if response.content_length().is_some_and(|len| len as usize > MAX_PULL_BYTES) {
+            return Err(format!("the branch tarball is larger than {} MB", MAX_PULL_BYTES / 1024 / 1024));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| format!("the branch tarball could not be read: {}", reason(&e)))?;
+        if bytes.len() > MAX_PULL_BYTES {
+            return Err(format!("the branch tarball is larger than {} MB", MAX_PULL_BYTES / 1024 / 1024));
+        }
+        Ok(bytes.to_vec())
     }
-}
 
-/// libsodium's sealed box, which is what the Actions secrets API accepts.
-fn seal(public_key_b64: &str, value: &str) -> Result<String, String> {
-    let bytes = BASE64
-        .decode(public_key_b64)
-        .map_err(|_| "the repository's public key is not base64")?;
-    let key: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| "the repository's public key is not 32 bytes")?;
-    let public = crypto_box::PublicKey::from_bytes(key);
-    let sealed = public
-        .seal(&mut crypto_box::aead::OsRng, value.as_bytes())
-        .map_err(|_| "sealing the secret failed")?;
-    Ok(BASE64.encode(sealed))
+    /// The newest commits on a branch, newest first.
+    async fn commits(&self, branch: &str, count: usize) -> Result<Vec<Commit>, String> {
+        let json = self
+            .expect(
+                "listing commits",
+                reqwest::Method::GET,
+                &format!("/commits?sha={branch}&per_page={count}"),
+                None,
+            )
+            .await?;
+        Ok(json
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|c| Commit {
+                        sha: c["sha"].as_str().unwrap_or("").to_string(),
+                        subject: c["commit"]["message"]
+                            .as_str()
+                            .unwrap_or("")
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string(),
+                        author: c["commit"]["author"]["name"].as_str().unwrap_or("").to_string(),
+                        date: c["commit"]["author"]["date"].as_str().unwrap_or("").to_string(),
+                        url: c["html_url"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// How many commits `head` is ahead of `base`, or nothing when GitHub
+    /// cannot compare them (a rewritten branch, a sha it no longer has).
+    async fn ahead_by(&self, base: &str, head: &str) -> Option<u64> {
+        let (status, json) = self
+            .call(reqwest::Method::GET, &format!("/compare/{base}...{head}"), None)
+            .await
+            .ok()?;
+        if !status.is_success() {
+            return None;
+        }
+        json["ahead_by"].as_u64()
+    }
 }
 
 async fn open_repo<'a>(app: &'a App, installation_id: u64, owner: &str, name: &str) -> Result<Repo<'a>, String> {
@@ -707,7 +756,17 @@ pub async fn search_repos(config: &Config, installation_id: u64, q: &str, limit:
     Ok(out)
 }
 
-/// A repository tagged `toolsite` that no app deploys from yet.
+/// A repository tagged `toolsite` that no app is linked to yet.
+/// One commit on the linked branch, for the Repo tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Commit {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    pub date: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Discovered {
     pub installation_id: u64,
@@ -794,20 +853,61 @@ pub async fn discover(config: &Config) -> Result<Vec<Discovered>, String> {
 
 // --- the operations ------------------------------------------------------------
 
-fn site_url(config: &Config) -> Result<String, String> {
-    config
-        .base_url
-        .clone()
-        .ok_or_else(|| "TOOLSITE_BASE_URL must be set: the workflow needs to know where to deploy to".to_string())
+/// A publisher's commit message, made safe for a repository: the first line
+/// capped, control characters gone, a body kept after a blank line, and a
+/// trailer so a reader of the history can tell these commits apart.
+pub fn commit_message(given: Option<&str>, default: &str) -> String {
+    let clean = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect::<String>()
+    };
+    let text = given.map(clean).unwrap_or_default();
+    let mut lines = text.lines();
+    let subject: String = lines
+        .next()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.chars().take(MAX_SUBJECT).collect())
+        .unwrap_or_else(|| default.to_string());
+    let body = lines.collect::<Vec<_>>().join("\n");
+    let body = body.trim();
+    if body.is_empty() {
+        format!("{subject}\n\n{TRAILER}")
+    } else {
+        format!("{subject}\n\n{body}\n\n{TRAILER}")
+    }
 }
 
-fn mint_deploy_token(config: &Config, app: &str, full_name: &str) -> Result<(String, String), String> {
-    let (entry, token) = deploy::create(config, app, &format!("github:{full_name}"))?;
-    Ok((entry.id, token))
+fn valid_sha(sha: &str) -> bool {
+    (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Makes a repository for `app` out of its stored source, with the workflow
-/// and secrets a deploy needs.
+/// Remembers which commit the live app was published from. Nothing happens
+/// for an app without a live link or for a sha that is not one.
+pub fn record_deployed(config: &Config, app: &str, sha: &str) -> bool {
+    let sha = sha.trim().to_lowercase();
+    if !valid_sha(&sha) {
+        return false;
+    }
+    let Some(mut link) = link(config, app) else {
+        return false;
+    };
+    link.deployed = Some(Deployed { sha, at: now() });
+    write_link(config, app, &link).is_ok()
+}
+
+/// A README for a repository toolsite made, when the project brought none.
+fn readme_for(app: &str, site: &str) -> String {
+    format!(
+        "# {app}\n\nThe source of `{app}` on toolsite, kept here with its history. Publishing the \
+         source from toolsite pushes a commit; a push here is pulled back into the app's source \
+         archive. Building and publishing happen wherever the agent or the CLI runs:\n\n\
+         ```\ntoolsite deploy --slug {app}\n```\n\nThe app is served at {site}/p/{app}/.\n"
+    )
+}
+
+/// Makes a repository for `app` out of its stored source.
 pub async fn create(
     config: &Config,
     app_name: &str,
@@ -816,7 +916,10 @@ pub async fn create(
     private: bool,
 ) -> Result<RepoLink, String> {
     let app = app_of(config)?;
-    let site = site_url(config)?;
+    let site = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| config.local_base.clone());
     if !valid_app(app_name) {
         return Err("app must be one path segment of letters, numbers, '-' or '_'".into());
     }
@@ -873,15 +976,13 @@ pub async fn create(
         tracing::warn!(repo = %full_name, %why, "could not add the toolsite topic");
     }
 
-    let (token_id, deploy_token) = mint_deploy_token(config, app_name, &full_name)?;
-    repo.put_secret(SECRET_URL, &site).await?;
-    repo.put_secret(SECRET_TOKEN, &deploy_token).await?;
-
-    files.retain(|(path, _)| path != WORKFLOW_PATH);
-    files.push((WORKFLOW_PATH.to_string(), workflow_for(app_name, &branch, "").into_bytes()));
+    if !files.iter().any(|(path, _)| path.eq_ignore_ascii_case("README.md")) {
+        files.push(("README.md".to_string(), readme_for(app_name, &site).into_bytes()));
+    }
     let sha = repo
-        .commit_files(&branch, &files, &format!("Add {app_name} from toolsite, with its deploy workflow"))
-        .await?;
+        .commit_tree(&branch, &files, &[], &commit_message(None, &format!("Add {app_name} from toolsite")))
+        .await?
+        .unwrap_or_default();
 
     let link = RepoLink {
         owner,
@@ -889,10 +990,10 @@ pub async fn create(
         branch,
         directory: String::new(),
         installation_id,
-        token_id,
+        token_id: String::new(),
         connected_at: now(),
-        last_push: Some(Push { at: now(), sha }),
-        last_deploy: None,
+        last_push: Some(Push { at: now(), sha: sha.clone() }),
+        deployed: Some(Deployed { sha, at: now() }),
         disconnected_at: None,
     };
     write_link(config, app_name, &link)?;
@@ -900,8 +1001,14 @@ pub async fn create(
     Ok(link)
 }
 
-/// Connects `app` to a repository that already exists: workflow, secrets,
-/// and a first run. Nothing is cloned and nothing is built here.
+/// What a pull brought back.
+pub struct Pulled {
+    pub bytes: usize,
+    pub sha: String,
+}
+
+/// Links `app` to a repository that already exists and pulls its branch into
+/// the app's source archive. Nothing is built and nothing runs in GitHub.
 pub async fn import(
     config: &Config,
     app_name: &str,
@@ -911,7 +1018,6 @@ pub async fn import(
     directory: Option<&str>,
 ) -> Result<RepoLink, String> {
     let app = app_of(config)?;
-    let site = site_url(config)?;
     if !valid_app(app_name) {
         return Err("app must be one path segment of letters, numbers, '-' or '_'".into());
     }
@@ -938,98 +1044,245 @@ pub async fn import(
     };
     let full = format!("{}/{}", repo.owner, repo.name);
 
-    let (token_id, deploy_token) = mint_deploy_token(config, app_name, &full)?;
-    repo.put_secret(SECRET_URL, &site).await?;
-    repo.put_secret(SECRET_TOKEN, &deploy_token).await?;
-    repo.put_file(
-        WORKFLOW_PATH,
-        workflow_for(app_name, &branch, &directory).as_bytes(),
-        &format!("Deploy {app_name} to toolsite on push"),
-        &branch,
-    )
-    .await?;
-    // The workflow file has to exist before it can be dispatched; GitHub
-    // registers it a moment after the commit lands.
-    let mut started = Err(String::new());
-    for attempt in 0..5 {
-        started = repo.dispatch(&branch).await;
-        if started.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(600 * (attempt + 1))).await;
-    }
-    if let Err(why) = started {
-        tracing::warn!(app = %app_name, repo = %full, %why, "connected, but the first run did not start");
-    }
-
-    let link = RepoLink {
+    let mut link = RepoLink {
         owner: repo.owner.clone(),
         repo: repo.name.clone(),
         branch,
         directory,
         installation_id,
-        token_id,
+        token_id: String::new(),
         connected_at: now(),
         last_push: None,
-        last_deploy: None,
+        deployed: None,
         disconnected_at: None,
     };
+    let pulled = pull_into(config, app_name, &repo, &link).await?;
+    link.last_push = Some(Push { at: now(), sha: pulled.sha });
     write_link(config, app_name, &link)?;
-    tracing::info!(app = %app_name, repo = %full, "repository imported");
+    tracing::info!(app = %app_name, repo = %full, bytes = pulled.bytes, "repository imported and pulled");
     Ok(link)
 }
 
-/// Runs the workflow now.
-pub async fn sync(config: &Config, app_name: &str) -> Result<(), String> {
-    let app = app_of(config)?;
-    let link = link(config, app_name).ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
-    let repo = open_repo(app, link.installation_id, &link.owner, &link.repo).await?;
-    repo.dispatch(&link.branch).await
-}
-
-/// A new deploy token in the repository's secret, the old one dead.
-pub async fn rotate(config: &Config, app_name: &str) -> Result<String, String> {
+/// Pulls the linked branch into the app's source archive again.
+pub async fn pull(config: &Config, app_name: &str) -> Result<Pulled, String> {
     let app = app_of(config)?;
     let mut link = link(config, app_name).ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
     let repo = open_repo(app, link.installation_id, &link.owner, &link.repo).await?;
-    let (token_id, token) = mint_deploy_token(config, app_name, &link.full_name())?;
-    repo.put_secret(SECRET_TOKEN, &token).await?;
-    let _ = deploy::revoke(config, app_name, &link.token_id);
-    link.token_id = token_id;
+    let pulled = pull_into(config, app_name, &repo, &link).await?;
+    link.last_push = Some(Push { at: now(), sha: pulled.sha.clone() });
     write_link(config, app_name, &link)?;
-    Ok(token)
+    Ok(pulled)
 }
 
-/// Forgets the link and revokes its token. The repository stays.
+async fn pull_into(config: &Config, app_name: &str, repo: &Repo<'_>, link: &RepoLink) -> Result<Pulled, String> {
+    let (sha, _) = repo.head(&link.branch).await?;
+    let tarball = repo.tarball(&link.branch).await?;
+    let directory = link.directory.clone();
+    let archive = tokio::task::spawn_blocking(move || repack(&tarball, &directory))
+        .await
+        .map_err(|_| "repacking the branch failed".to_string())??;
+    let bytes = archive.len();
+    std::fs::write(config.data_dir.join(format!("{app_name}.source")), &archive)
+        .map_err(|e| format!("could not store the source archive: {e}"))?;
+    Ok(Pulled { bytes, sha })
+}
+
+/// GitHub's tarball has one top-level directory named after the commit;
+/// the stored archive has the project at its root, under `./`, the way an
+/// agent tars it. `directory` narrows to a project inside the repository.
+fn repack(tarball: &[u8], directory: &str) -> Result<Vec<u8>, String> {
+    let decoder = flate2::read::GzDecoder::new(tarball);
+    let mut archive = tar::Archive::new(decoder);
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut out = tar::Builder::new(encoder);
+    let mut total = 0usize;
+    for entry in archive.entries().map_err(|e| format!("the branch tarball could not be read: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("the branch tarball could not be read: {e}"))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+        let Some((_, rel)) = path.split_once('/') else {
+            continue;
+        };
+        let rel = match rel.strip_prefix(directory) {
+            Some(rel) if !rel.is_empty() => rel.to_string(),
+            _ => continue,
+        };
+        let first = rel.split('/').next().unwrap_or("");
+        if matches!(first, "node_modules" | "target" | "dist" | ".git") || rel.contains("/node_modules/") {
+            continue;
+        }
+        if !crate::content::slug::valid_asset_path(&rel) && !rel.starts_with(".github/") {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| e.to_string())?;
+        total += bytes.len();
+        if total > MAX_PULL_BYTES {
+            return Err(format!("the branch holds more than {} MB of files", MAX_PULL_BYTES / 1024 / 1024));
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        out.append_data(&mut header, format!("./{rel}"), bytes.as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    out.into_inner()
+        .and_then(|encoder| encoder.finish())
+        .map_err(|e| e.to_string())
+}
+
+/// What pushing a source archive did.
+pub enum SourcePush {
+    Pushed(String),
+    Unchanged,
+}
+
+/// Commits `archive` to the linked branch: files in it are written, tracked
+/// files under the project directory that it lacks are removed, `.github/`
+/// is left alone. The commit is also what the live app came from, since the
+/// same archive was just stored.
+pub async fn push_source(
+    config: &Config,
+    app_name: &str,
+    archive: &[u8],
+    message: Option<&str>,
+) -> Result<SourcePush, String> {
+    let app = app_of(config)?;
+    let mut link = link(config, app_name).ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
+    let files = crate::content::bundle::read_all_files(archive, MAX_SOURCE_FILES, MAX_SOURCE_BYTES)?;
+    if files.is_empty() {
+        return Err("the source archive holds no files".into());
+    }
+    let repo = open_repo(app, link.installation_id, &link.owner, &link.repo).await?;
+    let prefix = link.directory.clone();
+    let upserts: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(".github/"))
+        .map(|(path, bytes)| (format!("{prefix}{path}"), bytes))
+        .collect();
+    let (_, tree) = repo.head(&link.branch).await?;
+    let tracked = repo.tree_entries(&tree).await?;
+    let keep: std::collections::HashSet<&str> = upserts.iter().map(|(p, _)| p.as_str()).collect();
+    // Tracked files the project no longer has go, so the branch is the
+    // project. Two exceptions: anything under .github/, which is the
+    // repository's own, and a root README the project did not bring, which
+    // toolsite wrote when it made the repository.
+    let readme = format!("{prefix}README.md");
+    let deletions: Vec<String> = tracked
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| path.starts_with(&prefix))
+        .filter(|path| !path[prefix.len()..].starts_with(".github/") && !path.starts_with(".github/"))
+        .filter(|path| path != &readme)
+        .filter(|path| !keep.contains(path.as_str()))
+        .collect();
+    let message = commit_message(message, &format!("Update {app_name} from toolsite"));
+    match repo.commit_tree(&link.branch, &upserts, &deletions, &message).await? {
+        Some(sha) => {
+            link.last_push = Some(Push { at: now(), sha: sha.clone() });
+            link.deployed = Some(Deployed { sha: sha.clone(), at: now() });
+            write_link(config, app_name, &link)?;
+            tracing::info!(app = %app_name, repo = %link.full_name(), %sha, "source pushed");
+            Ok(SourcePush::Pushed(sha))
+        }
+        None => Ok(SourcePush::Unchanged),
+    }
+}
+
+/// Forgets the link and revokes any token an older link minted. The
+/// repository stays.
 pub fn disconnect(config: &Config, app_name: &str) -> Result<RepoLink, String> {
     let mut link = link(config, app_name).ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
-    let _ = deploy::revoke(config, app_name, &link.token_id);
+    if !link.token_id.is_empty() {
+        let _ = deploy::revoke(config, app_name, &link.token_id);
+    }
     link.disconnected_at = Some(now());
     write_link(config, app_name, &link)?;
     tracing::info!(app = %app_name, repo = %link.full_name(), "repository disconnected");
     Ok(link)
 }
 
-/// One line about the link, for a tool call.
-pub fn describe(config: &Config, app_name: &str) -> String {
-    match link(config, app_name) {
-        None => format!("{app_name} is not connected to a repository"),
-        Some(link) => {
-            let mut text = format!("{app_name} deploys from {} ({})", link.url(), link.branch);
-            if !link.directory.is_empty() {
-                text.push_str(&format!(", directory {}", link.directory));
-            }
-            match &link.last_push {
-                Some(push) => text.push_str(&format!("; last push {} ({} h ago)", &push.sha[..push.sha.len().min(7)], now().saturating_sub(push.at) / 3600)),
-                None => text.push_str("; no push seen yet"),
-            }
-            match &link.last_deploy {
-                Some(deploy) => text.push_str(&format!("; last deploy {} ({})", deploy.conclusion, deploy.url)),
-                None => text.push_str("; no deploy seen yet"),
-            }
-            text
+/// Where the branch stands against what is live.
+pub struct Drift {
+    pub head: String,
+    pub deployed: Option<String>,
+    /// Commits the branch is ahead of the live app, when they differ and
+    /// GitHub could count.
+    pub ahead_by: Option<u64>,
+}
+
+impl Drift {
+    fn live_is_head(&self) -> bool {
+        self.deployed
+            .as_ref()
+            .is_some_and(|d| *d == self.head || self.head.starts_with(d.as_str()))
+    }
+
+    pub fn sentence(&self) -> String {
+        match (&self.deployed, self.ahead_by) {
+            (None, _) => "No publish has named a commit yet, so the live app and the repository cannot be compared.".to_string(),
+            _ if self.live_is_head() => "The live app is the repository's head.".to_string(),
+            (Some(_), Some(n)) => format!(
+                "The repository is {n} commit{} ahead of the live app. Pull the source and run toolsite deploy, or ask the agent to.",
+                if n == 1 { "" } else { "s" }
+            ),
+            (Some(_), None) => "The repository has moved since the live app was published. Pull the source and run toolsite deploy, or ask the agent to.".to_string(),
         }
     }
+}
+
+/// The branch head, the recent commits and the drift, for the Repo tab and
+/// the status tool.
+pub async fn inspect(config: &Config, link: &RepoLink) -> Result<(Drift, Vec<Commit>), String> {
+    let app = app_of(config)?;
+    let repo = open_repo(app, link.installation_id, &link.owner, &link.repo).await?;
+    let (head, _) = repo.head(&link.branch).await?;
+    let commits = repo.commits(&link.branch, RECENT_COMMITS).await?;
+    let deployed = link.deployed.as_ref().map(|d| d.sha.clone());
+    let ahead_by = match &deployed {
+        Some(d) if *d != head && !head.starts_with(d.as_str()) => repo.ahead_by(d, &head).await,
+        _ => None,
+    };
+    Ok((Drift { head, deployed, ahead_by }, commits))
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+/// The link, the drift and the newest commits, for a tool call.
+pub async fn status_text(config: &Config, app_name: &str) -> String {
+    let Some(link) = link(config, app_name) else {
+        return format!("{app_name} is not connected to a repository");
+    };
+    let mut text = format!("{app_name} is mirrored at {} ({})", link.url(), link.branch);
+    if !link.directory.is_empty() {
+        text.push_str(&format!(", directory {}", link.directory));
+    }
+    match &link.last_push {
+        Some(push) => text.push_str(&format!("; last push {} ({} h ago)", short(&push.sha), now().saturating_sub(push.at) / 3600)),
+        None => text.push_str("; no push seen yet"),
+    }
+    match &link.deployed {
+        Some(d) => text.push_str(&format!("; live app from {}", short(&d.sha))),
+        None => text.push_str("; no publish has named a commit"),
+    }
+    match inspect(config, &link).await {
+        Ok((drift, commits)) => {
+            text.push_str(&format!("; head {}. {}", short(&drift.head), drift.sentence()));
+            if !commits.is_empty() {
+                text.push_str("\nRecent commits:");
+                for c in commits {
+                    text.push_str(&format!("\n  {}  {}  {}  {}", short(&c.sha), c.subject, c.author, c.date));
+                }
+            }
+        }
+        Err(why) => text.push_str(&format!("; GitHub did not answer: {why}")),
+    }
+    text
 }
 
 // --- webhook ---------------------------------------------------------------------
@@ -1073,8 +1326,9 @@ pub fn signature_valid(secret: &str, signature: Option<&str>, body: &[u8]) -> bo
     constant_time_eq(expected.as_bytes(), presented.trim().as_bytes())
 }
 
-/// `POST /github/webhook`: push and workflow_run, for repositories an app
-/// is linked to. Anything unsigned is refused before it is parsed.
+/// `POST /github/webhook`: a push to a linked branch. Anything unsigned is
+/// refused before it is parsed. A push that is not toolsite's own is pulled
+/// into the app's source archive, so the next session starts from it.
 pub(crate) async fn webhook(State(config): State<Arc<Config>>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(secret) = config.github.as_ref().and_then(|app| app.webhook_secret.as_deref()) else {
         tracing::warn!("webhook refused: TOOLSITE_GITHUB_WEBHOOK_SECRET is not set");
@@ -1095,52 +1349,56 @@ pub(crate) async fn webhook(State(config): State<Arc<Config>>, headers: HeaderMa
         Err(_) => return (StatusCode::BAD_REQUEST, "not JSON\n").into_response(),
     };
     let full_name = payload["repository"]["full_name"].as_str().unwrap_or("").to_string();
-    let outcome = tokio::task::spawn_blocking(move || record_event(&config, &event, &full_name, &payload)).await;
-    match outcome {
-        Ok(Some(what)) => {
-            tracing::info!(%what, "webhook recorded");
+    let recorded = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || record_event(&config, &event, &full_name, &payload)).await
+    };
+    match recorded {
+        Ok(Some(Recorded::Ours { full_name })) => {
+            tracing::info!(repo = %full_name, "webhook: our own push, nothing to pull");
             (StatusCode::ACCEPTED, "recorded\n").into_response()
         }
+        Ok(Some(Recorded::Push { app, full_name })) => match pull(&config, &app).await {
+            Ok(pulled) => {
+                tracing::info!(app = %app, repo = %full_name, bytes = pulled.bytes, sha = %pulled.sha, "webhook: branch pulled into the source archive");
+                (StatusCode::ACCEPTED, "recorded and pulled\n").into_response()
+            }
+            Err(why) => {
+                tracing::warn!(app = %app, repo = %full_name, %why, "webhook: push recorded, pull failed");
+                (StatusCode::ACCEPTED, "recorded; pull failed\n").into_response()
+            }
+        },
         Ok(None) => (StatusCode::ACCEPTED, "ignored\n").into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not record the event\n").into_response(),
     }
 }
 
-fn record_event(config: &Config, event: &str, full_name: &str, payload: &serde_json::Value) -> Option<String> {
-    let (app, mut link) = link_for_repo(config, full_name)?;
-    match event {
-        "push" => {
-            let reference = payload["ref"].as_str().unwrap_or("");
-            if reference != format!("refs/heads/{}", link.branch) {
-                return None;
-            }
-            let sha = payload["after"].as_str().unwrap_or("").to_string();
-            if sha.is_empty() {
-                return None;
-            }
-            link.last_push = Some(Push { at: now(), sha });
-            write_link(config, &app, &link).ok()?;
-            Some(format!("push to {full_name}"))
-        }
-        "workflow_run" => {
-            if payload["action"].as_str() != Some("completed") {
-                return None;
-            }
-            let run = &payload["workflow_run"];
-            let path = run["path"].as_str().unwrap_or("");
-            if !path.ends_with("toolsite.yml") {
-                return None;
-            }
-            link.last_deploy = Some(Deploy {
-                at: now(),
-                conclusion: run["conclusion"].as_str().unwrap_or("unknown").to_string(),
-                url: run["html_url"].as_str().unwrap_or("").to_string(),
-            });
-            write_link(config, &app, &link).ok()?;
-            Some(format!("deploy of {full_name}"))
-        }
-        _ => None,
+enum Recorded {
+    /// A push whose sha we already know: toolsite made it.
+    Ours { full_name: String },
+    /// Somebody else's push to the linked branch.
+    Push { app: String, full_name: String },
+}
+
+fn record_event(config: &Config, event: &str, full_name: &str, payload: &serde_json::Value) -> Option<Recorded> {
+    if event != "push" {
+        return None;
     }
+    let (app, mut link) = link_for_repo(config, full_name)?;
+    let reference = payload["ref"].as_str().unwrap_or("");
+    if reference != format!("refs/heads/{}", link.branch) {
+        return None;
+    }
+    let sha = payload["after"].as_str().unwrap_or("").to_string();
+    if sha.is_empty() {
+        return None;
+    }
+    if link.last_push.as_ref().is_some_and(|p| p.sha == sha) {
+        return Some(Recorded::Ours { full_name: full_name.to_string() });
+    }
+    link.last_push = Some(Push { at: now(), sha });
+    write_link(config, &app, &link).ok()?;
+    Some(Recorded::Push { app, full_name: full_name.to_string() })
 }
 
 // --- HTTP: setup, admin page, repo tab, actions ---------------------------------
@@ -1240,7 +1498,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
                         }
                     }
                 }))
-                (ui::panel("Import a repository", Some("Connect an existing repository as a new app. Toolsite adds the deploy workflow and the secrets, then runs the workflow one time."), html! {
+                (ui::panel("Import a repository", Some("Connect an existing repository as a new app. Toolsite pulls its branch into the source archive of the app. An agent or the CLI then builds and publishes it."), html! {
                     @if installs.is_empty() {
                         p."muted" { "Install the App first." }
                     } @else {
@@ -1289,14 +1547,14 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
                         p."muted" { "No app is connected to a repository. Open the Repo tab of an app to create or import a repository." }
                     } @else {
                         table {
-                            thead { tr { th { "App" } th { "Repository" } th { "Last push" } th { "Last deploy" } } }
+                            thead { tr { th { "App" } th { "Repository" } th { "Last push" } th { "Live app" } } }
                             tbody {
                                 @for (app, link) in &linked {
                                     tr {
                                         td { a."row-link" href={ "/admin/apps/" (app) "/repo" } { (app) } }
                                         td { a href=(link.url()) target="_blank" { (link.full_name()) } " " span."muted small" { (link.branch) } }
-                                        td."muted small" { @match &link.last_push { Some(p) => (ago(p.at)), None => "—" } }
-                                        td { (deploy_badge(link.last_deploy.as_ref())) }
+                                        td."muted small" { @match &link.last_push { Some(p) => { code { (short(&p.sha)) } " " (ago(p.at)) }, None => "none" } }
+                                        td."muted small" { @match &link.deployed { Some(d) => { code { (short(&d.sha)) } }, None => "unknown" } }
                                     }
                                 }
                             }
@@ -1313,22 +1571,12 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
             active: "github",
             title: "GitHub",
             crumbs: vec![],
-            subtitle: Some(html! { "Apps that deploy from a repository." }),
+            subtitle: Some(html! { "Apps that keep their source in a repository." }),
             actions: None,
             body,
             script: None,
         },
     )
-}
-
-fn deploy_badge(deploy: Option<&Deploy>) -> Markup {
-    html! {
-        @match deploy {
-            Some(d) if d.conclusion == "success" => a."badge ok" href=(d.url) target="_blank" { "success" },
-            Some(d) => a."badge warn" href=(d.url) target="_blank" { (d.conclusion) },
-            None => span."muted small" { "—" },
-        }
-    }
 }
 
 fn ago(seconds: u64) -> String {
@@ -1375,12 +1623,9 @@ fn setup_guide(base: &str) -> Markup {
             ul."small" {
                 li { "Contents: read and write" }
                 li { "Administration: read and write" }
-                li { "Secrets: read and write" }
-                li { "Actions: read and write" }
-                li { "Workflows: read and write" }
                 li { "Metadata: read" }
             }
-            p."small" { "Subscribe to these events: " code { "push" } ", " code { "workflow_run" } ". Set where the App can be installed to your account or to any account." }
+            p."small" { "Subscribe to this event: " code { "push" } ". Set where the App can be installed to your account or to any account." }
         }))
         (ui::panel("2. Generate a private key", Some("After GitHub creates the App, open the App page. Under Private keys, click Generate a private key. A .pem file downloads. Note the App ID at the top of the page and the slug in the page URL."), html! {}))
         (ui::panel("3. Set the variables", Some("Set these variables on the service and restart it. This page then shows an Install button."), html! {
@@ -1431,7 +1676,7 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
                     p."help" { "Enter a directory if the project is not at the repository root." }
                 }
             }
-            div."actions end" { button type="submit" { "Import and deploy" } }
+            div."actions end" { button type="submit" { "Import repository" } }
         }
     }
 }
@@ -1442,44 +1687,82 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
     let installs = installations(config);
     let has_source = config.data_dir.join(format!("{app}.source")).is_file();
     let tokens = deploy::list(config, app);
+    let inspected = match &link {
+        Some(link) if config.github.is_some() => Some(inspect(config, link).await),
+        _ => None,
+    };
     html! {
         @if config.github.is_none() {
-            (ui::panel("GitHub is not configured", Some("Set the TOOLSITE_GITHUB_* variables to connect repositories. Deploy tokens below work without GitHub, for other CI systems."), html! {}))
+            (ui::panel("GitHub is not configured", Some("Set the TOOLSITE_GITHUB_* variables to connect repositories. Deploy tokens below work without GitHub, for a CI system of your own."), html! {}))
         } @else if let Some(link) = &link {
-            (ui::panel("Repository", None, html! {
+            (ui::panel("Repository", Some("The repository holds the source and its history. Publishing the source pushes a commit. A push to the repository is pulled into the source archive. Building and publishing happen where the agent or the CLI runs."), html! {
                 dl."kv" {
                     dt { "Repository" } dd { a href=(link.url()) target="_blank" { (link.full_name()) } }
                     dt { "Branch" } dd { code { (link.branch) } @if !link.directory.is_empty() { " in " code { (link.directory) } } }
                     dt { "Connected" } dd { (ago(link.connected_at)) }
                     dt { "Last push" }
-                    dd { @match &link.last_push { Some(p) => { code { (&p.sha[..p.sha.len().min(7)]) } " " span."muted small" { (ago(p.at)) } }, None => "none" } }
-                    dt { "Last deploy" }
-                    dd { (deploy_badge(link.last_deploy.as_ref())) @if let Some(d) = &link.last_deploy { " " span."muted small" { (ago(d.at)) } } }
+                    dd { @match &link.last_push { Some(p) => { code { (short(&p.sha)) } " " span."muted small" { (ago(p.at)) } }, None => "none" } }
+                    dt { "Live app" }
+                    dd { @match &link.deployed { Some(d) => { code { (short(&d.sha)) } " " span."muted small" { (ago(d.at)) } }, None => span."muted small" { "no publish has named a commit" } } }
+                    @if let Some(Ok((drift, _))) = &inspected {
+                        dt { "Head" } dd { code { (short(&drift.head)) } }
+                    }
+                }
+                @match &inspected {
+                    Some(Ok((drift, _))) => {
+                        @if drift.live_is_head() {
+                            p."small" style="margin-top:.75rem" { span."badge ok" { "current" } " " (drift.sentence()) }
+                        } @else if drift.deployed.is_some() {
+                            p."small" style="margin-top:.75rem" { span."badge warn" { "behind" } " " (drift.sentence()) }
+                        } @else {
+                            p."muted small" style="margin-top:.75rem" { (drift.sentence()) }
+                        }
+                    }
+                    Some(Err(why)) => p."muted small" style="margin-top:.75rem" { "GitHub did not answer: " (why) },
+                    None => {}
                 }
                 div."actions" style="margin-top:1rem" {
-                    form method="post" action="/admin/repo" {
-                        (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "sync"))
-                        button type="submit" { "Sync repository" }
-                    }
                     form method="post" action="/admin/repo"
-                         data-confirm="Rotate the deploy token?"
-                         data-confirm-detail="Toolsite replaces the secret in the repository. The old token stops immediately."
-                         data-confirm-label="Rotate token" {
-                        (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "rotate"))
-                        button."quiet" type="submit" { "Rotate deploy token" }
+                         data-confirm="Pull from the repository?"
+                         data-confirm-detail="Toolsite stores the branch as the source archive of this app. The live app does not change until someone publishes."
+                         data-confirm-label="Pull from repository" {
+                        (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "pull"))
+                        button type="submit" { "Pull from repository" }
                     }
                     form method="post" action="/admin/repo"
                          data-confirm={ "Disconnect " (link.full_name()) "?" }
-                         data-confirm-detail="Toolsite revokes the deploy token. Pushes do not deploy. The repository is not changed."
+                         data-confirm-detail="Toolsite forgets the link. The repository and the app are not changed."
                          data-confirm-label="Disconnect repository" data-confirm-danger="1" {
                         (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("back", back)) (admin::hidden("action", "disconnect"))
                         button."danger quiet" type="submit" { "Disconnect repository" }
                     }
                 }
             }))
+            (ui::panel("Recent commits", Some("The newest commits on the branch."), html! {
+                @match &inspected {
+                    Some(Ok((_, commits))) if !commits.is_empty() => {
+                        table {
+                            thead { tr { th { "Commit" } th { "Subject" } th { "Author" } th { "Date" } } }
+                            tbody {
+                                @for c in commits {
+                                    tr {
+                                        td { a href=(c.url) target="_blank" { code { (short(&c.sha)) } } }
+                                        td { (c.subject) }
+                                        td."muted small" { (c.author) }
+                                        td."muted small" { (c.date) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => p."muted" { "The branch has no commits." },
+                    Some(Err(why)) => p."muted" { "GitHub did not answer: " (why) },
+                    None => p."muted" { "Not available." },
+                }
+            }))
         } @else {
             div."grid-2" {
-                (ui::panel("Create a repository", Some("Toolsite creates a repository with the source archive of this app and a deploy workflow. A push to the repository deploys the app here."), html! {
+                (ui::panel("Create a repository", Some("Toolsite creates a repository and pushes the source archive of this app. After that, publishing the source pushes a commit, and a push to the repository is pulled into the source archive."), html! {
                     @if installs.is_empty() {
                         p."muted" { "Install the App on an account first, from the " a href="/admin/github" { "GitHub page" } "." }
                     } @else if !has_source {
@@ -1506,7 +1789,7 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
                         }
                     }
                 }))
-                (ui::panel("Import a repository", Some("Connect an existing repository. Toolsite adds the workflow and the secrets, then runs the workflow."), html! {
+                (ui::panel("Import a repository", Some("Connect an existing repository. Toolsite pulls its branch into the source archive of this app. Nothing is built or published."), html! {
                     @if installs.is_empty() {
                         p."muted" { "Install the App first." }
                     } @else {
@@ -1519,10 +1802,10 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
         @if let Some(fresh) = fresh_token {
             (ui::panel("New deploy token", Some("Copy the token now. The token is shown one time only."), html! {
                 (ui::secret("fresh-deploy-token", fresh))
-                p."muted small" { "Send it as " code { "Authorization: Bearer <token>" } " with " code { "PUT " (deploy::deploy_url(config, app)) } "." }
+                (ui::secret("fresh-deploy-curl", &format!("tar -czf - -C dist . | curl -f -H 'Authorization: Bearer {fresh}' -T - '{}?bundle'", deploy::deploy_url(config, app))))
             }))
         }
-        (ui::panel("Deploy tokens", Some("A deploy token can publish this app only. Use it with PUT /deploy/<app> and the same flags as an upload ticket. The workflow holds one token. Create another token for a different CI system."), html! {
+        (ui::panel("Deploy tokens", Some("A deploy token can publish this app only, from a CI system of your own. Use it with PUT /deploy/<app> and the same flags as an upload ticket. Add commit=<sha> to say which commit was published."), html! {
             @if tokens.is_empty() {
                 p."muted" { "No deploy tokens. Create one below." }
             } @else {
@@ -1591,23 +1874,18 @@ pub(crate) async fn repo_action(
         "create" => match form.installation {
             Some(inst) => create(&config, &app, inst, form.repo.as_deref(), form.private.is_some())
                 .await
-                .map(|link| Some(format!("Repository {} is created. The project is pushed.", link.full_name()))),
+                .map(|link| Some(format!("Repository {} is created. The source is pushed.", link.full_name()))),
             None => Err("Choose an account.".into()),
         },
         "import" => match (form.installation, form.repo.as_deref()) {
             (Some(inst), Some(repo)) => import(&config, &app, inst, repo, form.branch.as_deref(), form.directory.as_deref())
                 .await
-                .map(|link| Some(format!("Repository {} is connected. The first deploy is running.", link.full_name()))),
+                .map(|link| Some(format!("Repository {} is connected. Its branch is in the source archive. Publish it with toolsite deploy, or ask the agent to.", link.full_name()))),
             _ => Err("Choose an account and a repository.".into()),
         },
-        "sync" => sync(&config, &app).await.map(|()| Some("The workflow is started.".to_string())),
-        "rotate" => match rotate(&config, &app).await {
-            Ok(token) => {
-                tracing::info!(admin = %admin.email, app = %app, "deploy token rotated");
-                return admin::app_tab(config, headers, app, "repo".into(), Some(admin::Fresh::DeployToken(token))).await;
-            }
-            Err(why) => Err(why),
-        },
+        "pull" | "sync" => pull(&config, &app)
+            .await
+            .map(|pulled| Some(format!("Pulled commit {} into the source archive ({} bytes).", short(&pulled.sha), pulled.bytes))),
         "disconnect" => {
             let (config2, app2) = (config.clone(), app.clone());
             match tokio::task::spawn_blocking(move || disconnect(&config2, &app2)).await {
@@ -1640,7 +1918,7 @@ pub(crate) async fn repo_action(
     match outcome {
         Ok(Some(text)) => {
             // An import from the GitHub page lands on the app's Repo tab once
-            // the app exists; before its first deploy there is no app page.
+            // the app exists; before its first publish there is no app page.
             let app_exists = config.data_dir.join(&app).is_dir();
             let to = if form.action == "import" && back == "/admin/github" && app_exists { tab } else { back };
             admin::redirect_flash(&to, true, text)
@@ -1737,16 +2015,56 @@ mod tests {
     }
 
     #[test]
-    fn the_workflow_is_filled_in_per_app_and_directory() {
-        let root = workflow_for("shop", "main", "");
-        assert!(root.contains("TOOLSITE_APP: \"shop\""));
-        assert!(root.contains("branches: [\"main\"]"));
-        assert!(root.contains("working-directory: \".\""));
-        assert!(root.contains("hashFiles('package.json')"));
-        let sub = workflow_for("shop", "trunk", "web/");
-        assert!(sub.contains("working-directory: \"web\""));
-        assert!(sub.contains("hashFiles('web/package.json')"));
-        assert!(!sub.contains("__"), "a placeholder survived: {sub}");
+    fn a_publishers_message_is_capped_cleaned_and_signed_off() {
+        let plain = commit_message(None, "Update shop from toolsite");
+        assert_eq!(plain, "Update shop from toolsite\n\nPublished from toolsite");
+        let given = commit_message(Some("  Fix the phone field \u{7}\n\nIt was too short.\n"), "x");
+        assert_eq!(given, "Fix the phone field\n\nIt was too short.\n\nPublished from toolsite");
+        let long = "a".repeat(300);
+        let capped = commit_message(Some(&long), "x");
+        assert_eq!(capped.lines().next().unwrap().len(), 200);
+        assert_eq!(commit_message(Some("   \n"), "fallback").lines().next(), Some("fallback"));
+    }
+
+    #[test]
+    fn a_pulled_tarball_loses_its_top_directory_and_keeps_the_project() {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        for (path, body) in [
+            ("acme-shop-abc123/README.md", &b"# shop"[..]),
+            ("acme-shop-abc123/web/package.json", &b"{}"[..]),
+            ("acme-shop-abc123/web/node_modules/x/index.js", &b"nope"[..]),
+            ("acme-shop-abc123/.github/workflows/old.yml", &b"on: push"[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, path, body).unwrap();
+        }
+        let tarball = tar.into_inner().unwrap().finish().unwrap();
+
+        let whole = crate::content::bundle::read_all_files(&repack(&tarball, "").unwrap(), 100, 1 << 20).unwrap();
+        let paths: Vec<&str> = whole.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["README.md", "web/package.json"], "{paths:?}");
+
+        let narrowed = crate::content::bundle::read_all_files(&repack(&tarball, "web/").unwrap(), 100, 1 << 20).unwrap();
+        let paths: Vec<&str> = narrowed.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["package.json"], "{paths:?}");
+    }
+
+    #[test]
+    fn drift_is_said_plainly_in_each_state() {
+        let unknown = Drift { head: "abc".into(), deployed: None, ahead_by: None };
+        assert!(unknown.sentence().contains("cannot be compared"));
+        let current = Drift { head: "abcdef1234".into(), deployed: Some("abcdef1".into()), ahead_by: None };
+        assert_eq!(current.sentence(), "The live app is the repository's head.");
+        let behind = Drift { head: "fff".into(), deployed: Some("aaa".into()), ahead_by: Some(3) };
+        assert!(behind.sentence().starts_with("The repository is 3 commits ahead of the live app."));
+        let one = Drift { head: "fff".into(), deployed: Some("aaa".into()), ahead_by: Some(1) };
+        assert!(one.sentence().starts_with("The repository is 1 commit ahead"));
+        let moved = Drift { head: "fff".into(), deployed: Some("aaa".into()), ahead_by: None };
+        assert!(moved.sentence().contains("has moved"));
     }
 
     #[test]
@@ -1769,24 +2087,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_secret_opens_only_with_the_repositorys_key() {
-        let secret = crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng);
-        let public = BASE64.encode(secret.public_key().as_bytes());
-        let sealed = seal(&public, "tsd_abc").unwrap();
-        let opened = secret.unseal(&BASE64.decode(sealed).unwrap()).unwrap();
-        assert_eq!(opened, b"tsd_abc");
-        let other = crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng);
-        assert!(other.unseal(&BASE64.decode(seal(&public, "x").unwrap()).unwrap()).is_err());
-    }
-
-    #[test]
     fn a_disconnected_link_is_kept_but_not_live() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::local(dir.path().to_path_buf(), "t");
         let (entry, token) = deploy::create(&config, "shop", "github:o/r").unwrap();
         write_link(&config, "shop", &RepoLink {
             owner: "o".into(), repo: "r".into(), branch: "main".into(), directory: String::new(),
-            installation_id: 1, token_id: entry.id, connected_at: now(), last_push: None, last_deploy: None, disconnected_at: None,
+            installation_id: 1, token_id: entry.id, connected_at: now(), last_push: None, deployed: None, disconnected_at: None,
         }).unwrap();
         assert_eq!(linked_apps(&config).len(), 1);
         assert_eq!(link_for_repo(&config, "O/R").map(|(app, _)| app), Some("shop".to_string()));
@@ -1794,6 +2101,6 @@ mod tests {
         assert!(link(&config, "shop").is_none());
         assert!(linked_apps(&config).is_empty());
         assert!(dir.path().join("shop.repo").exists(), "the record was destroyed");
-        assert!(!deploy::authorize(&config, "shop", &token), "the workflow's token outlived the link");
+        assert!(!deploy::authorize(&config, "shop", &token), "an older link's token outlived it");
     }
 }

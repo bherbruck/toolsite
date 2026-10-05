@@ -70,6 +70,14 @@ enum Command {
         /// Skip the project's own build and publish dist/ as it stands.
         #[arg(long)]
         no_build: bool,
+        /// Commit message for the push to the app's linked repository, if it
+        /// has one. Defaults to "Update <app> from toolsite".
+        #[arg(long)]
+        message: Option<String>,
+        /// The commit this build came from. Defaults to `git rev-parse HEAD`
+        /// when the project is a git checkout.
+        #[arg(long)]
+        commit: Option<String>,
     },
     /// Run SQL against one app's database.
     Sql {
@@ -232,6 +240,8 @@ fn run() -> Result<()> {
             spa,
             without_source,
             no_build,
+            message,
+            commit,
         } => deploy(
             &mcp,
             &url,
@@ -241,6 +251,8 @@ fn run() -> Result<()> {
             spa,
             !without_source,
             no_build,
+            message,
+            commit,
         ),
         Command::Fetch { slug, dir } => fetch(&mcp, slug, dir.unwrap_or_else(|| PathBuf::from("."))),
         Command::Sql { app, sql, params, as_user } => {
@@ -429,6 +441,20 @@ fn package_manager(dir: &Path) -> &'static str {
     "npm"
 }
 
+/// The checkout's HEAD, or nothing when `dir` is not a git checkout.
+fn git_head(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some(sha)
+}
+
 /// Runs the project's own build if it has one, so `deploy` means deploy what
 /// the source says rather than whatever happens to be sitting in dist.
 fn build_front_end(dir: &Path) -> Result<()> {
@@ -607,10 +633,15 @@ fn deploy(
     spa: bool,
     keep_source: bool,
     skip_build: bool,
+    message: Option<String>,
+    commit: Option<String>,
 ) -> Result<()> {
     if !skip_build {
         build_front_end(&dir)?;
     }
+    // Which commit this is, so the Repo tab can compare the live app with
+    // the branch. Only when the project is a checkout; silence otherwise.
+    let commit = commit.or_else(|| git_head(&dir));
     let project = read_project(&dir, slug, spa)?;
     println!("publishing {} from {}", project.slug, project.web_root.display());
 
@@ -701,12 +732,22 @@ fn deploy(
     if keep_source {
         match project_archive(&dir) {
             Ok(archive) => {
-                let response = client
+                let mut request = client
                     .put(format!("{upload_url}?source"))
-                    .body(archive)
-                    .send()?;
+                    .body(archive);
+                if let Some(message) = &message {
+                    request = request.query(&[("message", message.as_str())]);
+                }
+                if let Some(commit) = &commit {
+                    request = request.query(&[("commit", commit.as_str())]);
+                }
+                let response = request.send()?;
                 if response.status().is_success() {
+                    let text = response.text().unwrap_or_default();
                     println!("kept the project with it; `toolsite fetch` brings it back");
+                    for line in text.lines().filter(|l| l.starts_with("pushed") || l.starts_with("repository") || l.starts_with("not pushed")) {
+                        println!("{line}");
+                    }
                 } else {
                     eprintln!("warning: could not store the project alongside the app");
                 }

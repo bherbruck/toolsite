@@ -445,29 +445,29 @@ Overview page too.
 
 ## A repository
 
-An app can live in GitHub and deploy from there. GitHub Actions does the
-building; toolsite never clones or builds.
+An app's source can live in a GitHub repository, with its history. The
+repository is a mirror: toolsite pushes when you publish the source and pulls
+when someone pushes. Nothing is built or run in GitHub; you build and publish
+from where you run, as always.
 
 - `app_repo(app, "create")` makes a repository out of the source you
   published with `?source`, named `toolsite-<app>` unless `repo` says
-  otherwise, private unless `public: true`, tagged with the `toolsite` topic,
-  with `.github/workflows/toolsite.yml` and two repository secrets. Every push
-  to the branch deploys back to the same slug.
-- `app_repo(app, "import", repo: "owner/name", branch?, directory?)`
-  connects a repository that already exists: adds the workflow and secrets,
-  and starts the first deploy now.
-- `app_repo(app, "status")` says what is linked, the last push and the last
-  deploy; `"sync"` deploys now; `"disconnect"` revokes the deploy token and
+  otherwise, private unless `public: true`, tagged with the `toolsite` topic.
+- `app_repo(app, "import", repo: "owner/name", branch?, directory?)` links a
+  repository that already exists and pulls its branch into the app's source
+  archive. Fetch it with `curl -s '<upload-url>?source' | tar xz`, build, and
+  publish with `toolsite deploy`.
+- Publishing the source of a linked app pushes one commit. Say why with
+  `'<upload-url>?source&message=<url-encoded text>'` or
+  `toolsite deploy --message "..."`. Name the commit the build came from with
+  `&commit=<sha>` (`toolsite deploy` sends `git rev-parse HEAD` itself) so the
+  Repo tab can say whether the live app is the repository's head.
+- `app_repo(app, "status")` says what is linked, the last push, the drift,
+  and the newest commits; `"pull"` pulls the branch again; `"disconnect"`
   forgets the link, leaving the repository alone.
 - `app_repo(app, "discover")` lists repositories the installation can reach
   that carry the `toolsite` topic and are not linked yet. It proposes;
   nothing is imported until you say so.
-
-The workflow reads the project: `package.json` means `npm ci && npm run build`
-with `dist/` as the bundle; `handler/Cargo.toml` means a wasm handler built for
-`wasm32-wasip2`; `migrations/*.sql`, `toolsite.toml` and the source go up too.
-Keep publishing the source until the repository exists; after that the
-repository carries it.
 
 The site has to be configured with a GitHub App for any of this;
 `app_repo(app, "installations")` says whether it is and on which accounts. If

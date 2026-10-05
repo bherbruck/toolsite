@@ -1,7 +1,7 @@
 //! Letting something outside publish one app and nothing else:
 //! `PUT /deploy/<app>` with a bearer token minted for that app.
 //!
-//! This is what a build in GitHub Actions uses. The publish token could do
+//! This is for a CI system of your own. The publish token could do
 //! it, and could also run SQL against every other app and manage accounts,
 //! which is the wrong thing to put in a repository secret. A deploy token is
 //! scoped to one app, accepts exactly what an upload ticket accepts, and is
@@ -190,6 +190,7 @@ fn refuse_unknown(uri: &Uri) -> Option<Response> {
 
 /// `PUT /deploy/<app>`: the app's bundle, handler, migrations, manifest,
 /// source, a blob, or a single page, exactly as `/upload/<ticket>` takes them.
+/// `&commit=<sha>` says which commit the build came from.
 pub(crate) async fn deploy_root(
     State(state): State<AppState>,
     Path(app): Path<String>,
@@ -205,7 +206,9 @@ pub(crate) async fn deploy_root(
         return response;
     }
     tracing::info!(app = %app, bytes = body.len(), "deploy by token");
-    upload::store_for_slug(&state.config, &state.runtime, app, upload::upload_kind(&query), body).await
+    // A pipeline's source came from the repository; it is never pushed back.
+    let meta = upload::SourceMeta::from_request(&query, &headers, false);
+    upload::store_for_slug(&state.config, &state.runtime, app, upload::upload_kind(&query), body, meta).await
 }
 
 /// `PUT /deploy/<app>/<page>`: one page of a multi-page app.
@@ -227,7 +230,8 @@ pub(crate) async fn deploy_sub(
     if !valid_slug(&slug) {
         return (StatusCode::BAD_REQUEST, "page name must be path segments of letters, numbers, '-' or '_'\n").into_response();
     }
-    upload::store_for_slug(&state.config, &state.runtime, slug, upload::upload_kind(&query), body).await
+    let meta = upload::SourceMeta::from_request(&query, &headers, false);
+    upload::store_for_slug(&state.config, &state.runtime, slug, upload::upload_kind(&query), body, meta).await
 }
 
 #[cfg(test)]

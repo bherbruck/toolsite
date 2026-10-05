@@ -58,10 +58,12 @@ reporting tool pulls `GET /export/<app>.sqlite` with it and gets a consistent
 snapshot of the database.
 
 **Keeping it in GitHub.** On an app's Repo tab you create a repository from
-the app's stored source, or import one you already have. From then on a push
-to the branch builds in GitHub Actions and deploys here with a token that can
-publish that one app only. Toolsite never clones or builds; the Repo tab
-shows the last push and the last deploy.
+the app's stored source, or import one you already have. The repository
+holds the source and its history: toolsite pushes a commit when you publish
+the source and pulls the branch back when someone pushes. Building and
+publishing happen wherever the agent or the CLI runs, in seconds; nothing
+runs in GitHub. The Repo tab shows the newest commits and whether the live
+app is the repository's head.
 
 ## Deploy it
 
@@ -551,52 +553,68 @@ able to read a file, put it in the bundle; that is the whole rule.
 
 ## GitHub
 
-An app can live in a GitHub repository and deploy from it. The build runs in
-GitHub Actions, where the toolchain is; toolsite only sets the repository up
-and receives the result. Nothing is cloned or built on the server, which
-stays one binary.
+An app's source can live in a GitHub repository, with its history. The
+repository is a mirror: toolsite pushes to it when you publish the source and
+pulls from it when someone pushes. Building and publishing happen wherever the
+agent or the CLI runs, in seconds. Nothing is built or run in GitHub, and the
+server stays one binary with no toolchain in it.
 
 **Connecting.** Register a GitHub App once (below), set the variables, and
 install it on your account or organisation from `/admin/github`. GitHub sends
 you back to `/github/setup`, which records the installation.
 
 **Create.** On an app's Repo tab, "Create a repository": toolsite makes the
-repository (private unless you say otherwise), commits the app's stored
-source plus `.github/workflows/toolsite.yml` in one commit, and sets two
-repository secrets, `TOOLSITE_URL` and `TOOLSITE_DEPLOY_TOKEN`. The app must
-have had its source published (`?source`, which `toolsite deploy` does);
-without it there is nothing to put in the repository and the tab says so.
+repository (private unless you say otherwise, named `toolsite-<app>` unless
+you say otherwise, tagged `toolsite`) and commits the app's stored source in
+one commit, with a README when the project brings none. The app must have had
+its source published (`?source`, which `toolsite deploy` does); without it
+there is nothing to put in the repository and the tab says so.
 
 **Import.** "Import a repository", on the Repo tab or on the GitHub page for
 an app that does not exist yet: pick a repository the installation can reach
 (the picker searches; it never lists everything), optionally a branch and a
-subdirectory. Toolsite adds the workflow and the secrets to that repository
-and starts it, so the first deploy happens now.
+subdirectory. Toolsite links it and pulls the branch into the app's source
+archive. An agent then fetches it with `curl '<upload-url>?source' | tar xz`,
+builds, and publishes.
 
 **Discovery.** The GitHub page lists every repository the App can reach that
 carries the `toolsite` topic and is not yet connected, with the app name
 proposed from the repository name (`toolsite-shop` proposes `shop`) and an
-Import button per row. Repositories toolsite creates carry the topic; add it
-to any other repository to see it there. Nothing is imported until you click.
+Import button per row. Nothing is imported until you click.
 `app_repo(any, "discover")` gives an agent the same list.
 
-**The workflow** reads the project: `package.json` means `npm ci && npm run
-build` with `dist/` as the bundle; `handler/Cargo.toml` means a wasm handler
-built for `wasm32-wasip2`; `migrations/*.sql`, `toolsite.toml` (with `spa`)
-and the source archive go up too, each through `PUT /deploy/<app>` with the
-deploy token. It runs on every push to the branch and on "Sync now".
+**Push on publish.** Publishing the source of a linked app (`?source` through
+an upload ticket, or `toolsite deploy`) commits it to the branch: files in the
+archive are written, files the project dropped are removed, `.github/` and a
+README toolsite wrote are left alone, and an unchanged project makes no
+commit. Say why with `?source&message=<text>` or the `X-Toolsite-Message`
+header (`toolsite deploy --message "..."`); the first line is the subject,
+capped at 200 characters, and every such commit ends with the trailer
+"Published from toolsite". An archive that arrives through `PUT /deploy/<app>`
+with a deploy token is stored and never pushed, since it came from a pipeline.
 
-**Deploy tokens** are per app: `tsd_…`, hashed in `<app>.deploys`, accepting
-exactly the flags an upload ticket accepts, refused for any other app and
-never the publish token. The Repo tab mints extra ones for any other CI, and
-"Rotate deploy token" replaces the repository's secret and kills the old one.
-`app_deploy_tokens` does the same over MCP, `app_repo` does the rest
-(status, installations, create, import, sync, disconnect).
+**Pull on push.** The webhook at `/github/webhook` hears a push to the linked
+branch and stores the branch as the app's source archive, so the next session
+starts from what is in GitHub. Toolsite's own pushes are recognised and not
+pulled again. "Pull from repository" on the Repo tab does the same on demand,
+as does `app_repo(app, "pull")`.
 
-**The webhook** at `/github/webhook` records the last push on the linked
-branch and the result of the last workflow run, signed with the webhook
-secret; an unsigned or mis-signed call is refused. Disconnecting revokes the
-deploy token and forgets the link; the repository is left alone.
+**Drift.** The link remembers which commit the live app came from: toolsite's
+own push sets it, and a publish may name it with `&commit=<sha>` or the
+`X-Toolsite-Commit` header (`toolsite deploy` sends `git rev-parse HEAD` when
+the project is a checkout, `--commit` overrides). The Repo tab and
+`app_repo(app, "status")` then say "The live app is the repository's head" or
+"The repository is N commits ahead of the live app", with the newest five
+commits under it. When it is ahead, pull the source and run `toolsite deploy`,
+or ask the agent to.
+
+**Deploy tokens** are per app and independent of GitHub: `tsd_…`, hashed in
+`<app>.deploys`, accepting exactly the flags an upload ticket accepts at
+`PUT /deploy/<app>`, refused for any other app and never the publish token.
+They are for a CI system of your own. `app_deploy_tokens` mints and revokes
+them over MCP; the Repo tab does the same.
+
+Disconnecting forgets the link; the repository and the app are left alone.
 
 ### Registering the GitHub App
 
@@ -608,15 +626,15 @@ Settings → Developer settings → GitHub Apps → New GitHub App, then:
 | Setup URL | `https://<host>/github/setup`, with "Redirect on update" ticked |
 | Webhook URL | `https://<host>/github/webhook` |
 | Webhook secret | what you will set as `TOOLSITE_GITHUB_WEBHOOK_SECRET` |
-| Repository permissions | Contents: read and write · Administration: read and write · Secrets: read and write · Actions: read and write · Workflows: read and write · Metadata: read |
-| Subscribe to events | Push, Workflow run |
+| Repository permissions | Contents: read and write · Administration: read and write · Metadata: read |
+| Subscribe to events | Push |
 | Where can it be installed | Any account, or only yours |
 
 Generate a private key, then set `TOOLSITE_GITHUB_APP_ID` (the App ID on
 that page), `TOOLSITE_GITHUB_APP_PRIVATE_KEY` (the PEM, or base64 of it if
 your dashboard eats newlines), `TOOLSITE_GITHUB_APP_SLUG` (the name in the
 App's URL) and `TOOLSITE_GITHUB_WEBHOOK_SECRET`. `TOOLSITE_BASE_URL` must be
-set; the workflow deploys back to it.
+set; the README toolsite writes into a repository names it.
 
 Creating a repository on a personal account needs the App installed on that
 account with Administration permission; an organisation works the same way.
@@ -926,9 +944,9 @@ is required to serve HTTP.
 | `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `granted`. Set `granted` for an internal site. |
 | `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
 | `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
-| `TOOLSITE_GITHUB_APP_ID` / `TOOLSITE_GITHUB_APP_PRIVATE_KEY` | no | A GitHub App, so apps can live in repositories and deploy from Actions. The key is the PEM, raw or base64. Both or neither. See GitHub. |
+| `TOOLSITE_GITHUB_APP_ID` / `TOOLSITE_GITHUB_APP_PRIVATE_KEY` | no | A GitHub App, so an app's source can live in a repository. The key is the PEM, raw or base64. Both or neither. See GitHub. |
 | `TOOLSITE_GITHUB_APP_SLUG` | no | The App's URL name, for the install link on `/admin/github`. |
-| `TOOLSITE_GITHUB_WEBHOOK_SECRET` | no | Signs the pushes and workflow results GitHub sends to `/github/webhook`. Without it the webhook is closed. |
+| `TOOLSITE_GITHUB_WEBHOOK_SECRET` | no | Signs the pushes GitHub sends to `/github/webhook`. Without it the webhook is closed. |
 | `TOOLSITE_GITHUB_API` | no | The API base, `https://api.github.com` unless you run GitHub Enterprise. |
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
