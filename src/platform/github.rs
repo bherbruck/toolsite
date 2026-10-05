@@ -707,6 +707,91 @@ pub async fn search_repos(config: &Config, installation_id: u64, q: &str, limit:
     Ok(out)
 }
 
+/// A repository tagged `toolsite` that no app deploys from yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Discovered {
+    pub installation_id: u64,
+    pub account: String,
+    pub full_name: String,
+    pub private: bool,
+    pub default_branch: String,
+    /// The app name to propose: the repository name without a leading
+    /// `toolsite-`, made into a slug.
+    pub proposed_app: String,
+}
+
+/// The app name a repository suggests for itself.
+pub fn proposed_app_name(repo_name: &str) -> String {
+    let base = repo_name
+        .strip_prefix("toolsite-")
+        .or_else(|| repo_name.strip_prefix("Toolsite-"))
+        .unwrap_or(repo_name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() { "app".to_string() } else { trimmed }
+}
+
+const DISCOVER_PAGES: usize = 10;
+
+/// Every repository the installations can reach that carries the `toolsite`
+/// topic and is not linked to an app. Discovery proposes; nothing is
+/// imported until someone says so.
+pub async fn discover(config: &Config) -> Result<Vec<Discovered>, String> {
+    let app = app_of(config)?;
+    let linked: Vec<String> = linked_apps(config)
+        .into_iter()
+        .map(|(_, link)| link.full_name().to_lowercase())
+        .collect();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for inst in installations(config) {
+        let token = app.token(inst.id).await?;
+        for page in 1..=DISCOVER_PAGES {
+            let (status, body) = call(
+                &app.api,
+                &format!("Bearer {token}"),
+                reqwest::Method::GET,
+                &format!("/installation/repositories?per_page=100&page={page}"),
+                None,
+            )
+            .await?;
+            if !status.is_success() {
+                return Err(format!("GitHub would not list repositories for {} ({status}): {}", inst.account, api_message(&body)));
+            }
+            let items = body["repositories"].as_array().cloned().unwrap_or_default();
+            let count = items.len();
+            for item in items {
+                let tagged = item["topics"]
+                    .as_array()
+                    .is_some_and(|topics| topics.iter().any(|t| t.as_str() == Some(TOPIC)));
+                let Some(full) = item["full_name"].as_str() else { continue };
+                // A repository two installations can both reach is still one
+                // repository; the first installation that lists it owns the row.
+                if !tagged || linked.iter().any(|l| l == &full.to_lowercase()) || !seen.insert(full.to_lowercase()) {
+                    continue;
+                }
+                let name = item["name"].as_str().unwrap_or(full.rsplit('/').next().unwrap_or(full));
+                out.push(Discovered {
+                    installation_id: inst.id,
+                    account: inst.account.clone(),
+                    full_name: full.to_string(),
+                    private: item["private"].as_bool().unwrap_or(true),
+                    default_branch: item["default_branch"].as_str().unwrap_or("main").to_string(),
+                    proposed_app: proposed_app_name(name),
+                });
+            }
+            if count < 100 {
+                break;
+            }
+        }
+    }
+    out.sort_by_key(|d| d.full_name.to_lowercase());
+    Ok(out)
+}
+
 // --- the operations ------------------------------------------------------------
 
 fn site_url(config: &Config) -> Result<String, String> {
@@ -1128,6 +1213,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
         Some(app) => {
             let installs = installations(&config);
             let linked = linked_apps(&config);
+            let discovered = discover(&config).await;
             html! {
                 (ui::panel("Installations", Some("The App can create and read repositories in these accounts."), html! {
                     @if installs.is_empty() {
@@ -1159,6 +1245,43 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
                         p."muted" { "Install the App first." }
                     } @else {
                         (import_form(&token, &installs, None, "/admin/github"))
+                    }
+                }))
+                (ui::panel("Repositories tagged toolsite", Some("Repositories the App can reach that carry the toolsite topic and are not connected to an app. Nothing is imported until you click Import."), html! {
+                    @match &discovered {
+                        Err(why) => p."muted" { "GitHub did not answer: " (why) },
+                        Ok(found) if found.is_empty() => p."muted" { "No tagged repository is waiting. Repositories that toolsite creates carry the topic. Add the topic to any other repository to see it here." },
+                        Ok(found) => {
+                            table {
+                                thead { tr { th { "Repository" } th { "Branch" } th { "App name" } th {} } }
+                                tbody {
+                                    @for (i, d) in found.iter().enumerate() {
+                                        tr {
+                                            td {
+                                                a href={ "https://github.com/" (d.full_name) } target="_blank" { (d.full_name) }
+                                                " " @if d.private { span."badge" { "private" } } @else { span."badge" { "public" } }
+                                            }
+                                            td."muted small" { (d.default_branch) }
+                                            td {
+                                                form method="post" action="/admin/repo" id={ "discover-" (i) } {
+                                                    (admin::hidden("token", &token)) (admin::hidden("action", "import")) (admin::hidden("back", "/admin/github"))
+                                                    (admin::hidden("installation", &d.installation_id.to_string()))
+                                                    (admin::hidden("repo", &d.full_name))
+                                                    (admin::hidden("branch", &d.default_branch))
+                                                    (ui::combobox_full("app", "/admin/apps/search", "app name", &d.proposed_app, None, &format!("-{i}")))
+                                                }
+                                            }
+                                            td."actions-cell" {
+                                                button."quiet sm" type="submit" form={ "discover-" (i) } { "Import" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div."actions" style="margin-top: .75rem" {
+                        a."btn quiet sm" href="/admin/github" { "Refresh" }
                     }
                 }))
                 (ui::panel("Connected apps", None, html! {
@@ -1193,7 +1316,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
             subtitle: Some(html! { "Apps that deploy from a repository." }),
             actions: None,
             body,
-            script: Some(PICKER_SCRIPT),
+            script: None,
         },
     )
 }
@@ -1218,34 +1341,6 @@ fn ago(seconds: u64) -> String {
     }
 }
 
-/// Fills a repository picker from `/admin/github/repos/search` as the
-/// person types. Without script the field still takes `owner/name`.
-const PICKER_SCRIPT: &str = r#"
-<script>
-document.querySelectorAll('input[data-repo-picker]').forEach((input) => {
-  const list = document.getElementById(input.getAttribute('list'));
-  const installation = () => {
-    const select = input.form && input.form.querySelector('select[name=installation]');
-    return select ? select.value : '';
-  };
-  let timer = null;
-  input.addEventListener('input', () => {
-    clearTimeout(timer);
-    const q = input.value.trim();
-    if (!q) return;
-    timer = setTimeout(async () => {
-      try {
-        const res = await fetch('/admin/github/repos/search?installation=' + encodeURIComponent(installation()) + '&q=' + encodeURIComponent(q));
-        if (!res.ok) return;
-        const names = await res.json();
-        list.innerHTML = '';
-        names.forEach((name) => { const o = document.createElement('option'); o.value = name; list.appendChild(o); });
-      } catch {}
-    }, 150);
-  });
-});
-</script>
-"#;
 
 /// What to paste where, when no App exists yet. Every value a person types
 /// into GitHub or the service's variables is a copy row, and the webhook
@@ -1309,9 +1404,9 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
                 (admin::hidden("app", app))
             } @else {
                 div."field" {
-                    label for="import-app" { "App name" }
-                    input id="import-app" name="app" placeholder="my-app" required pattern="[A-Za-z0-9_-]+";
-                    p."help" { "The app is served at /p/<name>/." }
+                    label { "App name" }
+                    (ui::combobox("app", "/admin/apps/search", "my-app"))
+                    p."help" { "Type to search the apps, or enter a new name. The app is served at /p/<name>/." }
                 }
             }
             div."field" {
@@ -1321,9 +1416,8 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
                 }
             }
             div."field" {
-                label for="import-repo" { "Repository" }
-                input id="import-repo" name="repo" list="repo-options" placeholder="owner/name" required autocomplete="off" data-repo-picker;
-                datalist id="repo-options" {}
+                label { "Repository" }
+                (ui::combobox_prefilled("repo", "/admin/github/repos/search", "owner/name", "", Some("installation")))
                 p."help" { "Type to search the repositories of the account." }
             }
             div."grid-2" {
@@ -1657,6 +1751,10 @@ mod tests {
 
     #[test]
     fn names_that_could_reach_outside_a_repository_are_refused() {
+        assert_eq!(proposed_app_name("toolsite-shop"), "shop");
+        assert_eq!(proposed_app_name("Toolsite-My.App"), "my-app");
+        assert_eq!(proposed_app_name("plain"), "plain");
+        assert_eq!(proposed_app_name("toolsite-"), "app");
         assert!(valid_repo_name("my-app.v2"));
         assert!(!valid_repo_name("../x"));
         assert!(!valid_repo_name(".git"));

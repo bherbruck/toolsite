@@ -364,7 +364,7 @@ mod fake_github {
         let repos: Vec<serde_json::Value> = fake
             .repos
             .values()
-            .map(|r| serde_json::json!({ "name": r.name, "full_name": format!("{}/{}", r.owner, r.name), "owner": { "login": r.owner }, "default_branch": r.default_branch, "private": r.private }))
+            .map(|r| serde_json::json!({ "name": r.name, "full_name": format!("{}/{}", r.owner, r.name), "owner": { "login": r.owner }, "default_branch": r.default_branch, "private": r.private, "topics": r.topics }))
             .collect();
         Json(serde_json::json!({ "total_count": repos.len(), "repositories": repos })).into_response()
     }
@@ -933,4 +933,64 @@ async fn the_unconfigured_github_page_walks_through_the_setup_with_every_value_c
         .expect("a generated webhook secret");
     assert_eq!(secret.len(), 40);
     assert!(page.contains(&format!("TOOLSITE_GITHUB_WEBHOOK_SECRET={secret}")));
+}
+
+#[tokio::test]
+async fn tagged_repositories_are_proposed_for_import_and_linked_or_untagged_ones_are_not() {
+    let (fake, api) = fake_github::start().await;
+    {
+        let mut f = fake.lock().unwrap();
+        f.add_repo("acme", "toolsite-shop", true);
+        f.add_repo("acme", "toolsite-crm", false);
+        f.add_repo("acme", "notes", false);
+        f.repos.get_mut("acme/toolsite-shop").unwrap().topics.push("toolsite".into());
+        f.repos.get_mut("acme/toolsite-crm").unwrap().topics.push("toolsite".into());
+    }
+    let (_dir, config) = github_server(&api);
+    let session = admin(&config);
+    install(&config, &session).await;
+
+    // crm is connected already, so discovery must leave it out.
+    let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
+    let token = form_token_from(&page);
+    let (status, ..) = send(
+        &config,
+        post_form("/admin/repo", &session, format!("token={token}&action=import&app=crm&installation=1&repo=acme/toolsite-crm&back=/admin/github")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
+    let panel = page
+        .split("Repositories tagged toolsite")
+        .nth(1)
+        .and_then(|rest| rest.split("Connected apps").next())
+        .expect("no discovery panel");
+    assert!(panel.contains("acme/toolsite-shop"), "a tagged, unlinked repository is missing");
+    assert!(panel.contains(r#"value="shop""#), "the proposed app name is not shop: {panel}");
+    assert!(!panel.contains("acme/toolsite-crm"), "a connected repository was proposed again");
+    assert!(!panel.contains("acme/notes"), "an untagged repository was proposed");
+    assert!(!page.contains("<datalist"), "a datalist is still on the page");
+    assert!(page.contains(r#"role="combobox""#));
+
+    // The same list, as the tool's discover action reads it.
+    let found = toolsite::platform::github::discover(&config).await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].full_name, "acme/toolsite-shop");
+    assert_eq!(found[0].proposed_app, "shop");
+    assert_eq!(found[0].installation_id, 1);
+    assert!(found[0].private);
+
+    // The row's Import button performs the import; afterwards nothing waits.
+    let (status, _, headers) = send(
+        &config,
+        post_form("/admin/repo", &session, format!("token={token}&action=import&app=shop&installation=1&repo=acme/toolsite-shop&branch=main&back=/admin/github")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(flash(&headers).starts_with("ok:"), "{}", flash(&headers));
+    assert!(toolsite::platform::github::link(&config, "shop").is_some());
+    assert!(toolsite::platform::github::discover(&config).await.unwrap().is_empty());
+    let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
+    assert!(page.contains("No tagged repository is waiting"));
 }

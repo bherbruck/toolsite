@@ -199,7 +199,8 @@ makes a repository out of the source you published with `?source`, named
 topic, with a workflow that builds in GitHub Actions and deploys back here
 on every push;
 `app_repo(app, "import", repo: "owner/name")` connects a repository that
-already exists. The site has to be configured with a GitHub App for either;
+already exists, and `app_repo(any, "discover")` lists the repositories
+tagged `toolsite` that nobody has imported yet, each with its import call. The site has to be configured with a GitHub App for either;
 `app_repo(app, "status")` says. Nothing is built on this server: keep
 publishing the source, and the repository carries it from there.
 

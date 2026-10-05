@@ -75,7 +75,7 @@ pub(crate) struct RepoRequest {
     #[schemars(description = "The app. For import, the slug the repository will be served at; it need not exist yet.")]
     pub(crate) app: String,
     #[schemars(
-        description = "'status' says what the app deploys from. 'create' makes a new repository from the app's stored source (publish it with ?source first). 'import' connects a repository you already have, adds the deploy workflow and secrets, and runs it. 'sync' runs the workflow now. 'disconnect' revokes the deploy token and forgets the link; the repository stays. 'installations' lists the accounts the GitHub App is installed on."
+        description = "'status' says what the app deploys from. 'discover' lists repositories tagged toolsite that no app deploys from yet, each with the import call to make (the app argument is ignored; pass any name). 'create' makes a new repository from the app's stored source (publish it with ?source first). 'import' connects a repository you already have, adds the deploy workflow and secrets, and runs it. 'sync' runs the workflow now. 'disconnect' revokes the deploy token and forgets the link; the repository stays. 'installations' lists the accounts the GitHub App is installed on."
     )]
     pub(crate) action: String,
     #[schemars(description = "For create: the repository name, default the app's slug. For import: owner/name of the existing repository.")]
@@ -343,6 +343,27 @@ impl PageHost {
                 (Err(why), _) => Err(why),
                 (_, None) => Err("import needs repo: owner/name".into()),
             },
+            "discover" => github::discover(config).await.map(|found| {
+                if found.is_empty() {
+                    "no repository tagged toolsite is waiting to be imported".to_string()
+                } else {
+                    found
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "{}  branch {}  {}  -> app_repo(app: \"{}\", action: \"import\", repo: \"{}\", installation: {})",
+                                d.full_name,
+                                d.default_branch,
+                                if d.private { "private" } else { "public" },
+                                d.proposed_app,
+                                d.full_name,
+                                d.installation_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }),
             "sync" => github::sync(config, &app).await.map(|()| format!("workflow started for {app}")),
             "disconnect" => {
                 let (config2, app2) = (config.clone(), app.clone());
@@ -352,7 +373,7 @@ impl PageHost {
                     .and_then(|r| r)
                     .map(|link| format!("{app} no longer deploys from {}; the repository is untouched", link.full_name()))
             }
-            other => Err(format!("action must be status, installations, create, import, sync or disconnect, not '{other}'")),
+            other => Err(format!("action must be status, installations, discover, create, import, sync or disconnect, not '{other}'")),
         };
         Ok(match outcome {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),

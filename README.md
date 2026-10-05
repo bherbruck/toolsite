@@ -573,6 +573,13 @@ an app that does not exist yet: pick a repository the installation can reach
 subdirectory. Toolsite adds the workflow and the secrets to that repository
 and starts it, so the first deploy happens now.
 
+**Discovery.** The GitHub page lists every repository the App can reach that
+carries the `toolsite` topic and is not yet connected, with the app name
+proposed from the repository name (`toolsite-shop` proposes `shop`) and an
+Import button per row. Repositories toolsite creates carry the topic; add it
+to any other repository to see it there. Nothing is imported until you click.
+`app_repo(any, "discover")` gives an agent the same list.
+
 **The workflow** reads the project: `package.json` means `npm ci && npm run
 build` with `dist/` as the bundle; `handler/Cargo.toml` means a wasm handler
 built for `wasm32-wasip2`; `migrations/*.sql`, `toolsite.toml` (with `spa`)
