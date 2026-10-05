@@ -1059,11 +1059,31 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
         Err(response) => return response,
     };
     let token = admin::form_token(&config, &admin);
+    let base = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| config.local_base.clone());
     let body = match config.github.as_ref() {
-        None => ui::panel(
-            "Not configured",
-            Some("Register a GitHub App and set TOOLSITE_GITHUB_APP_ID, TOOLSITE_GITHUB_APP_PRIVATE_KEY, TOOLSITE_GITHUB_APP_SLUG and TOOLSITE_GITHUB_WEBHOOK_SECRET. The README has the exact permissions."),
-            html! {},
+        None => setup_guide(&base),
+        Some(app) if installations(&config).is_empty() => ui::panel(
+            "Install the App",
+            Some("The App is configured. Install it on the account or organisation whose repositories it should reach; GitHub sends you back here."),
+            html! {
+                div."actions" {
+                    @if let Some(url) = app.install_url() {
+                        a."btn" href=(url) { "Install on an account" }
+                    } @else {
+                        span."muted small" { "Set TOOLSITE_GITHUB_APP_SLUG for an install button, or install from GitHub's developer settings; it sends you back here." }
+                    }
+                    form method="post" action="/admin/repo" {
+                        (admin::hidden("token", &token)) (admin::hidden("action", "refresh")) (admin::hidden("app", "-"))
+                        button."quiet" type="submit" { "Refresh" }
+                    }
+                }
+                p."muted small" style="margin-top: 1rem" {
+                    "Double-check the App's webhook URL is " code { (base) "/github/webhook" } "."
+                }
+            },
         ),
         Some(app) => {
             let installs = installations(&config);
@@ -1186,6 +1206,60 @@ document.querySelectorAll('input[data-repo-picker]').forEach((input) => {
 });
 </script>
 "#;
+
+/// What to paste where, when no App exists yet. Every value a person types
+/// into GitHub or the service's variables is a copy row, and the webhook
+/// secret is minted here so the same value lands in both places.
+fn setup_guide(base: &str) -> Markup {
+    let secret = crate::content::slug::random_token(40);
+    let name = format!(
+        "toolsite-{}",
+        base.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split([':', '/'])
+            .next()
+            .unwrap_or("site")
+            .split('.')
+            .next()
+            .unwrap_or("site")
+    );
+    let env_block = format!(
+        "TOOLSITE_GITHUB_APP_ID=\nTOOLSITE_GITHUB_APP_PRIVATE_KEY=\nTOOLSITE_GITHUB_APP_SLUG=\nTOOLSITE_GITHUB_WEBHOOK_SECRET={secret}"
+    );
+    html! {
+        (ui::panel("1. Create a GitHub App", Some("Open the form below in a new tab and paste these values in. Leave everything else as GitHub sets it."), html! {
+            p { a."btn" href="https://github.com/settings/apps/new" target="_blank" rel="noopener" { "Open github.com/settings/apps/new" } }
+            dl."kv" style="margin-top: .75rem" {
+                dt { "GitHub App name" } dd { (ui::secret("gh-name", &name)) }
+                dt { "Homepage URL" } dd { (ui::secret("gh-home", base)) }
+                dt { "Setup URL" } dd { (ui::secret("gh-setup", &format!("{base}/github/setup"))) p."muted small" { "Tick \"Redirect on update\"." } }
+                dt { "Webhook URL" } dd { (ui::secret("gh-webhook", &format!("{base}/github/webhook"))) }
+                dt { "Webhook secret" } dd { (ui::secret("gh-secret", &secret)) p."muted small" { "Made for you just now. Paste this same value in step 3." } }
+            }
+            p."small" style="margin-top: .75rem" { "Repository permissions:" }
+            ul."small" {
+                li { "Contents: read and write" }
+                li { "Administration: read and write" }
+                li { "Secrets: read and write" }
+                li { "Actions: read and write" }
+                li { "Workflows: read and write" }
+                li { "Metadata: read" }
+            }
+            p."small" { "Subscribe to events: " code { "push" } ", " code { "workflow_run" } ". Where it can be installed: your account, or any." }
+        }))
+        (ui::panel("2. Generate a private key", Some("On the App's page after it is created: Private keys, Generate a private key. A .pem file downloads. Note the App ID at the top of that page and the slug in its URL."), html! {}))
+        (ui::panel("3. Set these variables on the service", Some("Then restart. This page shows an Install button once the App is configured."), html! {
+            div."secret" {
+                pre id="gh-env" style="flex: 1; margin: 0; background: none; border: 0; padding: 0" { (env_block) }
+                button."quiet sm" type="button" data-copy="gh-env" { "Copy" }
+            }
+            p."muted small" {
+                "APP_ID is the number on the App's page. PRIVATE_KEY is the .pem's contents, or base64 of it, on one line. "
+                "SLUG is the name in the App's URL. The secret is the one from step 1."
+            }
+        }))
+    }
+}
 
 fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: &str) -> Markup {
     html! {

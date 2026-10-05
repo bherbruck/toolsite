@@ -870,3 +870,38 @@ async fn without_a_github_app_the_pages_say_so_and_the_webhook_is_closed() {
     let (status, ..) = send(&config, webhook("push", Some("sha256=00"), "{}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+
+#[tokio::test]
+async fn the_unconfigured_github_page_walks_through_the_setup_with_every_value_copyable() {
+    let (_dir, plain) = plain_server();
+    let config = Arc::new(Config {
+        base_url: Some(SITE.to_string()),
+        ..Config::local(plain.data_dir.clone(), TOKEN)
+    });
+    let session = admin(&config);
+    let (status, page, _) = send(&config, get_as("/admin/github", &session)).await;
+    assert_eq!(status, StatusCode::OK);
+    for needle in [
+        "https://github.com/settings/apps/new",
+        &format!("{SITE}/github/setup"),
+        &format!("{SITE}/github/webhook"),
+        "Redirect on update",
+        "TOOLSITE_GITHUB_APP_ID=",
+        "TOOLSITE_GITHUB_WEBHOOK_SECRET=",
+        "Contents: read and write",
+        "Metadata: read",
+        "workflow_run",
+        r#"data-copy="gh-env""#,
+    ] {
+        assert!(page.contains(needle), "setup page lacks {needle}");
+    }
+    // The secret in step 1 is the one in step 3.
+    let secret = page
+        .split(r#"id="gh-secret">"#)
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("a generated webhook secret");
+    assert_eq!(secret.len(), 40);
+    assert!(page.contains(&format!("TOOLSITE_GITHUB_WEBHOOK_SECRET={secret}")));
+}

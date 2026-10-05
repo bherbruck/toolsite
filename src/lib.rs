@@ -114,6 +114,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin", get(admin::accounts_page))
         .route("/admin/apps", get(admin::apps_page))
         .route("/admin/apps/{app}", get(admin::app_overview))
+        .route("/admin/apps/{app}/source", get(admin::download_source))
         .route("/admin/apps/{app}/{tab}", get(admin::app_tab_page))
         .route("/admin/apps/search", get(admin::search_apps))
         .route("/admin/accounts", get(admin::accounts_page))

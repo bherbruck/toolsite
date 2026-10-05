@@ -152,6 +152,7 @@ spa  = false
 gate = "public"            # or authenticated, granted
 icon = "🧺"
 allow_http = ["api.example.com"]
+roles = ["viewer", "editor"]  # what the handler checks; a hint for whoever grants
 
 [[route]]                  # note the singular; unknown keys are refused
 path = "/admin"
@@ -183,7 +184,9 @@ Say `gate = "public"` only when the app really should be open to anyone.
 `[[route]]` applies a gate to a path prefix, longest match winning, so a
 public page and a private one live in one app. Past the door it is the app's
 call: read `identity::current-role()` and decide what "editor" means. The
-platform never interprets a role.
+platform never interprets a role. Declare the roles your handler checks
+(`roles = ["viewer", "editor"]` in toolsite.toml) so whoever grants access
+can pick the right word; it is a hint, and any role can still be granted.
 
 There is no public signup. Accounts are created by the owner, and a person
 sets their own password through a one-time link.
