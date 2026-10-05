@@ -248,13 +248,13 @@ a.row-link:hover { text-decoration: underline; }
    is the default; List packs each entry into one bordered row. */
 /* Cards: a grid of tiles, icon on top. The stack is the markup either way;
    only the presentation changes with the toggle. */
-#list:not(.view-list) {
+.stack#list:not(.view-list) {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: .75rem;
 }
-#list:not(.view-list) .card { align-items: center; gap: .75rem; padding: .85rem 1rem; }
-#list:not(.view-list) .icon { width: 2.25rem; height: 2.25rem; }
-#list:not(.view-list) .meta { min-width: 0; flex: 1; }
-#list:not(.view-list) .meta .slug { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stack#list:not(.view-list) .card { align-items: center; gap: .75rem; padding: .85rem 1rem; }
+.stack#list:not(.view-list) .icon { width: 2.25rem; height: 2.25rem; }
+.stack#list:not(.view-list) .meta { min-width: 0; flex: 1; }
+.stack#list:not(.view-list) .meta .slug { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stack.view-list { gap: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--card); }
 .stack.view-list .card { border: 0; border-bottom: 1px solid var(--border); border-radius: 0; box-shadow: none; padding: .45rem .75rem; }
 .stack.view-list li:last-child .card { border-bottom: 0; }
