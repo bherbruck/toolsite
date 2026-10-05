@@ -234,6 +234,28 @@ a.row-link:hover { text-decoration: underline; }
 .title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: .25rem; }
 .title-row .muted { margin: 0; }
 
+/* A combobox: the menu hangs under the input and is exactly its width. */
+.combo { position: relative; display: inline-block; width: 100%; max-width: 28rem; }
+form.row .combo { width: auto; flex: 1 1 14rem; }
+.combo input { width: 100%; }
+.combo-menu {
+  position: absolute; left: 0; right: 0; top: calc(100% + .25rem); z-index: 30;
+  margin: 0; padding: .25rem; list-style: none;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 8px 24px #0002; max-height: 16rem; overflow-y: auto;
+}
+.combo-menu[hidden] { display: none; }
+.combo-menu li {
+  display: flex; align-items: baseline; gap: .5rem; min-width: 0;
+  padding: .4rem .6rem; border-radius: calc(var(--radius) - .15rem);
+  cursor: pointer; font-size: .9rem;
+}
+.combo-menu li .value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.combo-menu li .hint { color: var(--muted); font-size: .8rem; margin-left: auto; white-space: nowrap; }
+.combo-menu li:hover, .combo-menu li[aria-selected="true"] { background: var(--soft); }
+.combo-menu li.none { color: var(--muted); cursor: default; }
+.combo-menu li.none:hover { background: none; }
+
 /* A segmented control: two or three choices, one active. */
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: calc(var(--radius) - .1rem); overflow: hidden; }
 .seg button {
@@ -436,29 +458,108 @@ pub const SHELL_SCRIPT: &str = r#"
   document.querySelectorAll('.flash [data-dismiss]').forEach((button) => {
     button.addEventListener('click', () => button.closest('.flash').remove());
   });
-  // A picker is a plain text input whose <datalist> fills from the server
-  // as the person types. Without script it is still a text input.
-  document.querySelectorAll('input[data-search]').forEach((input) => {
-    const list = document.getElementById(input.getAttribute('list'));
-    if (!list) return;
+  // A combobox: the input fetches matches as the person types and shows
+  // them in a menu under itself. Without script it is a text input.
+  document.querySelectorAll('.combo').forEach((combo) => {
+    const input = combo.querySelector('input[data-search]');
+    const menu = combo.querySelector('.combo-menu');
+    if (!input || !menu) return;
     let timer = null;
+    let controller = null;
+    let items = [];
+    let active = -1;
+    const close = () => {
+      menu.hidden = true;
+      menu.replaceChildren();
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
+      items = [];
+      active = -1;
+    };
+    const pick = (value) => { input.value = value; close(); input.focus(); };
+    const highlight = (index) => {
+      active = index;
+      items.forEach((li, i) => {
+        li.setAttribute('aria-selected', i === index ? 'true' : 'false');
+        if (i === index) {
+          input.setAttribute('aria-activedescendant', li.id);
+          li.scrollIntoView({ block: 'nearest' });
+        }
+      });
+    };
+    const show = (found, q) => {
+      menu.replaceChildren();
+      items = [];
+      active = -1;
+      if (!found.length) {
+        const none = document.createElement('li');
+        none.className = 'none';
+        none.textContent = 'No matches for ' + q;
+        menu.appendChild(none);
+      }
+      found.forEach((item, i) => {
+        const li = document.createElement('li');
+        li.id = menu.id + '-' + i;
+        li.setAttribute('role', 'option');
+        li.setAttribute('aria-selected', 'false');
+        const value = document.createElement('span');
+        value.className = 'value';
+        value.textContent = item.value;
+        li.appendChild(value);
+        if (item.label && item.label !== item.value) {
+          const hint = document.createElement('span');
+          hint.className = 'hint';
+          hint.textContent = item.label;
+          li.appendChild(hint);
+        }
+        // mousedown, so the pick lands before the input blurs.
+        li.addEventListener('mousedown', (event) => { event.preventDefault(); pick(item.value); });
+        li.addEventListener('mousemove', () => highlight(i));
+        menu.appendChild(li);
+        items.push(li);
+      });
+      menu.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+    };
     input.addEventListener('input', () => {
       clearTimeout(timer);
       const q = input.value.trim();
-      if (!q) { list.replaceChildren(); return; }
+      if (!q) { close(); return; }
       timer = setTimeout(async () => {
+        if (controller) controller.abort();
+        controller = new AbortController();
         try {
-          const res = await fetch(input.dataset.search + '?q=' + encodeURIComponent(q), { credentials: 'same-origin' });
+          const res = await fetch(input.dataset.search + '?q=' + encodeURIComponent(q), {
+            credentials: 'same-origin', signal: controller.signal,
+          });
           if (!res.ok) return;
-          const found = await res.json();
-          list.replaceChildren(...found.map((item) => {
-            const option = document.createElement('option');
-            option.value = item.value;
-            if (item.label && item.label !== item.value) option.label = item.label;
-            return option;
-          }));
+          show(await res.json(), q);
         } catch {}
       }, 150);
+    });
+    input.addEventListener('keydown', (event) => {
+      if (menu.hidden) return;
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        if (items.length) highlight((active + 1) % items.length);
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (items.length) highlight((active - 1 + items.length) % items.length);
+      } else if (event.key === 'Enter') {
+        // The menu is open: Enter chooses, it does not submit.
+        event.preventDefault();
+        if (active >= 0) pick(items[active].querySelector('.value').textContent);
+        else if (items.length === 1) pick(items[0].querySelector('.value').textContent);
+        else close();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+      } else if (event.key === 'Tab') {
+        close();
+      }
+    });
+    document.addEventListener('mousedown', (event) => {
+      if (!combo.contains(event.target)) close();
     });
   });
 })();
@@ -640,12 +741,19 @@ pub fn tabs(items: &[(&str, &str, &str)], active: &str) -> Markup {
 /// the person types, through the shared shell script. It submits whatever
 /// was typed, so it works with no script, and it never renders the whole
 /// set of apps or accounts into the page the way a `<select>` would.
+/// A text input with a menu of matches from `search_url?q=` under it, the
+/// width of the input, picked with the keyboard or the mouse. Without
+/// script it is a text input that submits whatever was typed.
 pub fn combobox(name: &str, search_url: &str, placeholder: &str) -> Markup {
-    let list_id = format!("{name}-matches");
+    let menu_id = format!("{name}-matches");
     html! {
-        input name=(name) placeholder=(placeholder) list=(list_id) data-search=(search_url)
-              autocomplete="off" required;
-        datalist id=(list_id) {}
+        div."combo" {
+            input name=(name) placeholder=(placeholder) data-search=(search_url)
+                  autocomplete="off" required
+                  role="combobox" aria-autocomplete="list" aria-expanded="false"
+                  aria-controls=(menu_id) aria-haspopup="listbox";
+            ul."combo-menu" id=(menu_id) role="listbox" hidden {}
+        }
     }
 }
 

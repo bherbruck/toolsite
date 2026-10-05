@@ -3305,6 +3305,8 @@ async fn an_account_page_shows_grants_and_lets_an_admin_change_them() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("No grants"));
     assert!(page.contains(r#"data-search="/admin/apps/search""#), "the app picker is not a combobox");
+    assert!(page.contains(r#"role="combobox""#), "the picker is not a real combobox");
+    assert!(!page.contains("<datalist"), "a native datalist is still in use");
     assert!(!page.contains("<select"), "a select lists every app");
     let token = form_token_from(&page);
 
