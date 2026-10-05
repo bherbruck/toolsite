@@ -646,6 +646,9 @@ An app's gate is one of:
 | `authenticated` | any signed-in account |
 | `granted` | only accounts granted access to that app |
 
+An admin passes every gate: they can grant themselves anything from the
+admin page, so asking them to do it app by app would only add a step.
+
 An app that has not chosen follows the site default, `TOOLSITE_DEFAULT_ACCESS`,
 which is `public` unless you set it. An internal deployment sets it to
 `granted` or `authenticated` once, and every app is closed from the moment it

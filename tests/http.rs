@@ -3412,3 +3412,28 @@ async fn the_global_access_page_is_gone_but_its_action_remains() {
     let (_, page, _) = send(&config, get_as("/admin/apps", &boss)).await;
     assert!(!page.contains(r#"href="/admin/access""#), "the sidebar still links to it");
 }
+
+#[tokio::test]
+async fn an_admin_opens_a_granted_app_without_a_grant_and_a_visitor_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        default_gate: "granted".to_string(),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    write_page(&config, "internal/index", "<title>Internal</title>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let reader = sign_in(&config, "reader@example.com", "correct horse battery");
+
+    let (_, index, _) = send(&config, get_as("/", &boss)).await;
+    assert!(index.contains("Internal"), "the admin's index hid an app they can manage");
+    let (boss_app, _) = hand_off(&config, &boss, "internal").await;
+    let (status, ..) = send(&config, get_as_app("/p/internal/", "internal", &boss_app)).await;
+    assert_eq!(status, StatusCode::OK, "the admin was kept out of a granted app");
+
+    let (_, index, _) = send(&config, get_as("/", &reader)).await;
+    assert!(!index.contains("Internal"), "a visitor without a grant saw the app");
+    let (status, ..) = send(&config, get_as("/p/internal/", &reader)).await;
+    assert_ne!(status, StatusCode::OK, "a visitor without a grant got in");
+}

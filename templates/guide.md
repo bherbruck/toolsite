@@ -176,7 +176,7 @@ A gate decides whether a request arrives:
 | `authenticated` | any signed-in account |
 | `granted` | accounts given access to that app |
 
-An app that names no gate follows the site's default, which the owner set
+An admin account passes every gate. An app that names no gate follows the site's default, which the owner set
 for the whole deployment; on an internal site that is usually `granted`.
 Say `gate = "public"` only when the app really should be open to anyone.
 

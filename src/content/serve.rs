@@ -343,7 +343,11 @@ async fn admits(
     match gate {
         "public" => true,
         "authenticated" => visitor.is_some(),
+        // An admin can grant themselves anything from the admin page, so a
+        // gate keeps nothing from them; asking them to do it app by app
+        // would only add a step. The owner walks in.
         "granted" => match visitor {
+            Some(user) if user.is_admin => true,
             Some(user) => {
                 let (config, user, app) = (config.clone(), user.clone(), app.to_string());
                 tokio::task::spawn_blocking(move || {
