@@ -146,6 +146,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/notes", post(admin::change_notes))
         .route("/admin/settings-link", post(admin::settings_link))
         .route("/admin/job-run", post(admin::run_job))
+        .route("/admin/scope", post(admin::change_scope))
+        .route("/admin/folder", post(admin::new_folder))
+        .route("/admin/move", post(admin::move_app))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
         // An app's repository: a source mirror, pushed on publish and pulled on push.
         .route("/admin/github", get(github::github_page))

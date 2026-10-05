@@ -26,6 +26,11 @@ use tokio::fs;
 pub struct UploadTicket {
     pub slug: String,
     pub expires_at: Instant,
+    /// The account that asked for it, when one was signed in. Checked again
+    /// when the file arrives, so a scope revoked in between still counts.
+    pub user: Option<String>,
+    /// The folder a new app lands in on its first publish.
+    pub project: Option<String>,
 }
 
 pub(crate) const UPLOAD_TTL: Duration = Duration::from_secs(900);
@@ -117,12 +122,12 @@ pub(crate) async fn store_upload(
     body: Bytes,
     meta: SourceMeta,
 ) -> Response {
-    let slug = {
+    let (slug, user, project) = {
         let now = Instant::now();
         let mut tickets = config.uploads.lock().unwrap();
         tickets.retain(|_, t| t.expires_at > now);
         match tickets.get(ticket) {
-            Some(t) => t.slug.clone(),
+            Some(t) => (t.slug.clone(), t.user.clone(), t.project.clone()),
             None => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -145,7 +150,63 @@ pub(crate) async fn store_upload(
             .into_response();
     }
 
-    store_for_slug(config, runtime, slug, kind, body, meta).await
+    // The ticket says who asked. Their editor scope has to hold now, not
+    // only when the ticket was minted.
+    let app = slug.split('/').next().unwrap_or(&slug).to_string();
+    if let Some(user_id) = &user {
+        // A new app is judged by the folder it is about to land in.
+        let folder = if crate::content::store::app_exists(config, &app).await {
+            crate::content::store::app_folder(config, &app).await
+        } else {
+            project.clone().unwrap_or_default()
+        };
+        let path = if folder.is_empty() { app.clone() } else { format!("{folder}/{app}") };
+        let (check, who, in_folder, which) = (config.clone_for_task(), user_id.clone(), folder, app.clone());
+        let held = tokio::task::spawn_blocking(move || {
+            crate::accounts::users::user_by_id(&check, &who)
+                .and_then(|user| crate::accounts::users::app_scope(&check, &user, &in_folder, &which))
+        })
+        .await
+        .ok()
+        .flatten();
+        if !held.is_some_and(|held| held >= crate::accounts::users::Scope::Editor) {
+            tracing::warn!(app = %app, path = %path, "upload refused: the account no longer has editor access");
+            return (
+                StatusCode::FORBIDDEN,
+                format!("the account behind this upload URL needs editor access at {path}\n"),
+            )
+                .into_response();
+        }
+    }
+
+    let response = store_for_slug(config, runtime, slug, kind, body, meta).await;
+    if response.status().is_success() {
+        stamp_new_app(config, &app, user.as_deref(), project.as_deref()).await;
+    }
+    response
+}
+
+/// Records, once, who first published an app and the folder it landed in.
+/// An editor may later remove what it created and nothing else; the folder
+/// decides who may manage it from here on.
+pub(crate) async fn stamp_new_app(config: &Config, app: &str, user_id: Option<&str>, project: Option<&str>) {
+    let mut meta = read_meta(config, app).await;
+    let mut changed = false;
+    if meta.created_by.is_none()
+        && let Some(user_id) = user_id
+    {
+        meta.created_by = Some(user_id.to_string());
+        changed = true;
+    }
+    if meta.project.is_none()
+        && let Some(project) = project.filter(|p| !p.is_empty())
+    {
+        meta.project = Some(project.to_string());
+        changed = true;
+    }
+    if changed {
+        let _ = write_meta(config, app, &meta).await;
+    }
 }
 
 /// Writes `body` as `kind` at `slug`, for a caller that has already decided

@@ -16,11 +16,11 @@
 //! admin who happens to be visiting it.
 
 use crate::{
-    accounts::users::{self, User},
+    accounts::users::{self, Scope, User},
     config::Config,
     content::{
         slug::valid_slug,
-        store::{collect_slugs, read_meta, write_meta, PathRule},
+        store::{self, collect_slugs, read_meta, write_meta, PathRule},
     },
     platform::export,
     ui::{self, Flash},
@@ -51,6 +51,107 @@ pub(crate) async fn require_admin(config: &Arc<Config>, headers: &HeaderMap) -> 
         // again — that would loop.
         Some(_) => Err((StatusCode::FORBIDDEN, "not an admin").into_response()),
         None => Err(Redirect::to("/auth/login?next=/admin").into_response()),
+    }
+}
+
+/// What the signed-in account holds at `path`, the one question every
+/// admin page and action asks.
+pub(crate) async fn held(config: &Arc<Config>, user: &User, path: &str) -> Option<Scope> {
+    let (config, user, path) = (config.clone(), user.clone(), path.to_string());
+    tokio::task::spawn_blocking(move || users::effective_scope(&config, &user, &path))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Whether the account may manage anything at all, which is what opens the
+/// admin pages: a site admin, or editor or admin somewhere in the tree.
+pub(crate) async fn manages_something(config: &Arc<Config>, user: &User) -> bool {
+    let (config, user) = (config.clone(), user.clone());
+    tokio::task::spawn_blocking(move || users::holds_anywhere(&config, &user, Scope::Editor))
+        .await
+        .unwrap_or(false)
+}
+
+/// Anyone who may enter the admin pages. What they then see is decided
+/// page by page from what they hold.
+pub(crate) async fn require_entry(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
+    match users::current_site_user(config, headers).await {
+        Some(user) if manages_something(config, &user).await => Ok(user),
+        Some(_) => Err((StatusCode::FORBIDDEN, "not an admin").into_response()),
+        None => Err(Redirect::to("/auth/login?next=/admin").into_response()),
+    }
+}
+
+/// `needed` at `path`: an app's path in the tree, or a folder.
+pub(crate) async fn require_scope(
+    config: &Arc<Config>,
+    headers: &HeaderMap,
+    path: &str,
+    needed: Scope,
+) -> Result<User, Response> {
+    let user = match users::current_site_user(config, headers).await {
+        Some(user) => user,
+        None => return Err(Redirect::to("/auth/login?next=/admin").into_response()),
+    };
+    match held(config, &user, path).await {
+        Some(have) if have >= needed => Ok(user),
+        _ => {
+            tracing::warn!(email = %user.email, path = %path, needed = %needed, "admin refused: scope");
+            Err((
+                StatusCode::FORBIDDEN,
+                format!("You need {needed} access at {} for this.", if path.is_empty() { "the site" } else { path }),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// A folder is open to someone who manages it, or who holds something
+/// inside it and needs to walk down to that.
+pub(crate) async fn may_see_folder(config: &Arc<Config>, user: &User, folder: &str) -> bool {
+    if held(config, user, folder).await.is_some_and(|have| have >= Scope::Editor) {
+        return true;
+    }
+    let (config, user, folder) = (config.clone(), user.clone(), folder.to_string());
+    tokio::task::spawn_blocking(move || users::holds_below(&config, &user, &folder))
+        .await
+        .unwrap_or(false)
+}
+
+/// The path scopes are matched against for an app.
+pub(crate) async fn app_path(config: &Config, app: &str) -> String {
+    store::logical_path(config, app).await
+}
+
+/// What the account may do to one app, wherever it sits.
+pub(crate) async fn held_on(config: &Arc<Config>, user: &User, app: &str) -> Option<Scope> {
+    let folder = store::app_folder(config, app).await;
+    let (config, user, app) = (config.clone(), user.clone(), app.to_string());
+    tokio::task::spawn_blocking(move || users::app_scope(&config, &user, &folder, &app))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `needed` on one app.
+pub(crate) async fn require_app(
+    config: &Arc<Config>,
+    headers: &HeaderMap,
+    app: &str,
+    needed: Scope,
+) -> Result<User, Response> {
+    let user = match users::current_site_user(config, headers).await {
+        Some(user) => user,
+        None => return Err(Redirect::to("/auth/login?next=/admin").into_response()),
+    };
+    match held_on(config, &user, app).await {
+        Some(have) if have >= needed => Ok(user),
+        _ => {
+            let path = app_path(config, app).await;
+            tracing::warn!(email = %user.email, path = %path, needed = %needed, "admin refused: scope");
+            Err((StatusCode::FORBIDDEN, format!("You need {needed} access at {path} for this.")).into_response())
+        }
     }
 }
 
@@ -119,7 +220,9 @@ pub(crate) fn clear_flash() -> (header::HeaderName, String) {
 
 /// The rail every signed-in page shares, including the index. `active` names
 /// the current section so its link is marked rather than followed.
-pub(crate) fn sidebar(active: &str, viewer: Option<&User>) -> Markup {
+/// `manages` says whether the viewer holds editor or admin somewhere, which
+/// is what shows the Admin group to someone who is not a site admin.
+pub(crate) fn sidebar(active: &str, viewer: Option<&User>, manages: bool) -> Markup {
     let is_admin = viewer.is_some_and(|user| user.is_admin);
     html! {
         a."brand" href="/" { span."mark" { "t" } "toolsite" }
@@ -127,13 +230,15 @@ pub(crate) fn sidebar(active: &str, viewer: Option<&User>) -> Markup {
             div."label" { "Site" }
             a."active"[active == "site"] href="/" { "Apps" }
         }
-        @if is_admin {
+        @if is_admin || manages {
             div."nav-group" {
                 div."label" { "Admin" }
                 a."active"[active == "apps"] href="/admin/apps" { "Apps" }
-                a."active"[active == "accounts"] href="/admin/accounts" { "Accounts" }
-                a."active"[active == "exports"] href="/admin/exports" { "Exports" }
-                a."active"[active == "github"] href="/admin/github" { "GitHub" }
+                @if is_admin {
+                    a."active"[active == "accounts"] href="/admin/accounts" { "Accounts" }
+                    a."active"[active == "exports"] href="/admin/exports" { "Exports" }
+                    a."active"[active == "github"] href="/admin/github" { "GitHub" }
+                }
             }
         }
         div."spacer" {
@@ -167,7 +272,7 @@ pub(crate) fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> R
     let flash = take_flash(headers);
     let markup = ui::shell(
         page.title,
-        sidebar(page.active, Some(admin)),
+        sidebar(page.active, Some(admin), true),
         html! {
             @if !page.crumbs.is_empty() {
                 nav."crumbs" {
@@ -197,6 +302,20 @@ pub(crate) fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> R
     response
 }
 
+/// The three platform scopes as radios: a fixed, short choice.
+fn scope_choice(default: &str) -> Markup {
+    html! {
+        span."seg" role="radiogroup" {
+            @for scope in ["viewer", "editor", "admin"] {
+                label."seg-item" {
+                    input type="radio" name="scope" value=(scope) checked[scope == default];
+                    " " (scope)
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn hidden(name: &str, value: &str) -> Markup {
     html! { input type="hidden" name=(name) value=(value); }
 }
@@ -211,6 +330,8 @@ const PAGE_SIZE: usize = 50;
 pub struct ListQuery {
     q: Option<String>,
     page: Option<usize>,
+    /// The folder a list is scoped to, for the apps tree.
+    folder: Option<String>,
 }
 
 struct Listing<T> {
@@ -326,15 +447,19 @@ pub async fn search_apps(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    if let Err(response) = require_admin(&config, &headers).await {
-        return response;
-    }
+    let viewer = match require_entry(&config, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
     let q = query.q.as_deref().unwrap_or("").trim().to_lowercase();
     if q.is_empty() {
         return ([no_store()], Json(Vec::<Match>::new())).into_response();
     }
     let mut found = Vec::new();
     for app in app_names(&config).await {
+        if !viewer.is_admin && !held_on(&config, &viewer, &app).await.is_some_and(|have| have >= Scope::Editor) {
+            continue;
+        }
         let path = crate::content::store::page_path(&config, &app).await;
         let title = match &path {
             Some(path) => crate::content::store::page_title(path).await,
@@ -403,33 +528,123 @@ pub async fn apps_page(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
+    let viewer = match require_entry(&config, &headers).await {
+        Ok(user) => user,
         Err(response) => return response,
     };
+    let folder = query.folder.clone().unwrap_or_default();
+    let folder = folder.trim_matches('/').to_string();
+    if !users::valid_prefix(&folder) || !store::folder_exists(&config, &folder).await {
+        return (StatusCode::NOT_FOUND, "no such folder").into_response();
+    }
+    if !may_see_folder(&config, &viewer, &folder).await {
+        return (StatusCode::FORBIDDEN, format!("You hold no access under {}.", if folder.is_empty() { "the site" } else { &folder })).into_response();
+    }
+    let here = held(&config, &viewer, &folder).await;
+    let is_admin_here = here == Some(Scope::Admin);
+
+    // Subfolders the viewer may enter, with what sits in each.
+    let all_apps = store::apps_with_folders(&config).await;
+    let mut folders = Vec::new();
+    for sub in store::subfolders(&config, &folder).await {
+        if !may_see_folder(&config, &viewer, &sub.path).await {
+            continue;
+        }
+        let apps_below = all_apps.iter().filter(|(_, in_folder)| users::prefix_covers(&sub.path, in_folder)).count();
+        folders.push((sub, apps_below));
+    }
+
+    // Apps directly in this folder that the viewer may manage.
     let mut rows = Vec::new();
-    for app in app_names(&config).await {
-        rows.push(app_row(&config, &app).await);
+    for (app, in_folder) in &all_apps {
+        if in_folder != &folder {
+            continue;
+        }
+        if !held_on(&config, &viewer, app).await.is_some_and(|have| have >= Scope::Editor) {
+            continue;
+        }
+        rows.push(app_row(&config, app).await);
     }
     let count = rows.len();
     let listing = paginate(rows, &query, |row| {
         format!("{} {}", row.app, row.title.as_deref().unwrap_or(""))
     });
+    let list_path = if folder.is_empty() {
+        "/admin/apps".to_string()
+    } else {
+        format!("/admin/apps?folder={}", urlencoding::encode(&folder))
+    };
+
+    // Who holds what here: rows on this folder, and rows from above.
+    let scopes = {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || users::list_scopes(&config).unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    };
+    let direct: Vec<&users::ScopeGrant> = scopes.iter().filter(|row| row.prefix == folder).collect();
+    let inherited: Vec<&users::ScopeGrant> = scopes
+        .iter()
+        .filter(|row| row.prefix != folder && users::prefix_covers(&row.prefix, &folder))
+        .collect();
+
+    let token = form_token(&config, &viewer);
+    let title = if folder.is_empty() { "Apps".to_string() } else { folder.rsplit('/').next().unwrap_or(&folder).to_string() };
+    let crumbs: Vec<(String, String)> = std::iter::once(("Apps".to_string(), "/admin/apps".to_string()))
+        .chain(store::folder_chain(&format!("{folder}/x")).into_iter().filter(|chain| chain != &folder).map(|chain| {
+            let name = chain.rsplit('/').next().unwrap_or(&chain).to_string();
+            (name, format!("/admin/apps?folder={}", urlencoding::encode(&chain)))
+        }))
+        .collect();
+    let crumb_refs: Vec<(&str, &str)> = if folder.is_empty() {
+        Vec::new()
+    } else {
+        crumbs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+    };
+    let folder_label = if folder.is_empty() { "the site".to_string() } else { folder.clone() };
+    let subtitle = if folder.is_empty() {
+        html! { (count) " apps at the root" }
+    } else {
+        html! { code { (folder) } " · " (count) " apps" }
+    };
+
     admin_page(
         &headers,
-        &admin,
+        &viewer,
         Page {
             active: "apps",
-            title: "Apps",
-            crumbs: vec![],
-            subtitle: Some(html! { (count) " published" }),
-            actions: None,
+            title: &title,
+            crumbs: crumb_refs,
+            subtitle: Some(subtitle),
+            actions: Some(html! {
+                @match here {
+                    Some(scope) => span."badge solid" { "you: " (scope) },
+                    None => span."badge" { "you: inside only" },
+                }
+            }),
             script: (count > 0).then_some(ui::FILTER_SCRIPT),
             body: html! {
-                @if count == 0 {
-                    (ui::panel("No apps", Some("There are no apps. An agent publishes an app with create_upload."), html! {}))
-                } @else {
-                    (search_box(&listing, "/admin/apps", "Search apps"))
+                @if !folders.is_empty() {
+                    section."panel" {
+                        div."panel-head" { h3 { "Folders" } }
+                        table {
+                            thead { tr { th { "Folder" } th { "Path" } th."num" { "Apps below" } } }
+                            tbody {
+                                @for (sub, apps_below) in &folders {
+                                    tr {
+                                        td { a."row-link" href={ "/admin/apps?folder=" (urlencoding::encode(&sub.path)) } { (sub.name) } }
+                                        td { code { (sub.path) } }
+                                        td."num" { (apps_below) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                @if count == 0 && folders.is_empty() {
+                    (ui::panel("No apps", Some("There are no apps here. An agent publishes an app with create_upload. An admin can add a folder below."), html! {}))
+                } @else if count > 0 {
+                    (search_box(&listing, &list_path, "Search apps"))
                     section."panel" {
                         table {
                             thead { tr { th { "App" } th { "Access" } th { "Handler" } th { "Updated" } th {} } }
@@ -457,8 +672,69 @@ pub async fn apps_page(
                         }
                     }
                     p."no-match" id="no-match" { "No app on this page matches. Press Enter to search all apps." }
-                    (pager(&listing, "/admin/apps"))
+                    (pager(&listing, &list_path))
                 }
+
+                @if is_admin_here {
+                    (ui::panel("New folder", Some("A folder groups apps. Access given on a folder applies to every folder and app inside it."), html! {
+                        form."row" method="post" action="/admin/folder" {
+                            (hidden("token", &token)) (hidden("parent", &folder)) (hidden("back", &list_path))
+                            input name="name" placeholder="Folder name" required pattern="[A-Za-z0-9_-]+";
+                            button."quiet" type="submit" { "Create folder" }
+                        }
+                    }))
+                }
+
+                (ui::panel("Access to this folder", Some("Viewer opens the apps here. Editor also publishes and changes apps here. Admin also sets access here. Access on a folder applies to everything inside it."), html! {
+                    @if is_admin_here {
+                        form."row" method="post" action="/admin/scope" {
+                            (hidden("token", &token)) (hidden("prefix", &folder)) (hidden("back", &list_path)) (hidden("action", "grant"))
+                            (ui::combobox("email", "/admin/accounts/search", "Type an email"))
+                            (scope_choice("editor"))
+                            button type="submit" { "Give access" }
+                        }
+                    }
+                    @if direct.is_empty() && inherited.is_empty() {
+                        p."muted" { "Nobody holds access at " (folder_label) ". Site admins hold admin everywhere." }
+                    } @else {
+                        table {
+                            thead { tr { th { "Account" } th { "Scope" } th { "From" } th {} } }
+                            tbody {
+                                @for row in &direct {
+                                    tr {
+                                        td { (row.email) }
+                                        td { span."badge solid" { (row.scope) } }
+                                        td."muted small" { "here" }
+                                        td."actions-cell" {
+                                            @if is_admin_here {
+                                                form method="post" action="/admin/scope"
+                                                     data-confirm={ "Revoke " (row.scope) " for " (row.email) "?" }
+                                                     data-confirm-detail="The account keeps every other scope it holds."
+                                                     data-confirm-label="Revoke access" data-confirm-danger="1" {
+                                                    (hidden("token", &token)) (hidden("prefix", &row.prefix)) (hidden("email", &row.email))
+                                                    (hidden("back", &list_path)) (hidden("action", "revoke"))
+                                                    button."danger quiet sm" type="submit" { "Revoke access" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                @for row in &inherited {
+                                    tr {
+                                        td { (row.email) }
+                                        td { span."badge" { (row.scope) } }
+                                        td."muted small" {
+                                            @if row.prefix.is_empty() { "the site" } @else {
+                                                a href={ "/admin/apps?folder=" (urlencoding::encode(&row.prefix)) } { (row.prefix) }
+                                            }
+                                        }
+                                        td {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }))
             },
         },
     )
@@ -522,10 +798,6 @@ pub(crate) async fn app_tab(
     tab: String,
     fresh: Option<Fresh>,
 ) -> Response {
-    let admin = match require_admin(&config, &headers).await {
-        Ok(admin) => admin,
-        Err(response) => return response,
-    };
     if !export::valid_app(&app) || !TABS.iter().any(|(key, _)| *key == tab) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
@@ -533,6 +805,12 @@ pub(crate) async fn app_tab(
     if !exists {
         return (StatusCode::NOT_FOUND, "no such app").into_response();
     }
+    let needed = if matches!(tab.as_str(), "access" | "exports" | "repo") { Scope::Admin } else { Scope::Editor };
+    let admin = match require_app(&config, &headers, &app, needed).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let is_admin_here = held_on(&config, &admin, &app).await == Some(Scope::Admin);
 
     let token = form_token(&config, &admin);
     let meta = read_meta(&config, &app).await;
@@ -543,12 +821,13 @@ pub(crate) async fn app_tab(
     let tab_items: Vec<(&str, &str, &str)> = TABS
         .iter()
         .zip(hrefs.iter())
+        .filter(|((key, _), _)| is_admin_here || !matches!(*key, "access" | "exports" | "repo"))
         .map(|((key, label), (_, href))| (*key, *label, href.as_str()))
         .collect();
     let back = tab_href(&app, &tab);
 
     let body = match tab.as_str() {
-        "overview" => render_overview(&config, &app, &meta, &token, &back).await,
+        "overview" => render_overview(&config, &app, &meta, &token, &back, is_admin_here).await,
         "access" => render_access_tab(&config, &app, &meta, &token, &back).await,
         "repo" => {
             let fresh_token = match &fresh {
@@ -623,7 +902,9 @@ async fn render_overview(
     meta: &crate::content::store::PageMeta,
     token: &str,
     back: &str,
+    is_admin_here: bool,
 ) -> Markup {
+    let folder = meta.project.clone().unwrap_or_default();
     let dir = config.data_dir.join(app);
     let has_handler = dir.join("handler.wasm").is_file();
     let db_bytes = tokio::fs::metadata(dir.join("data.db")).await.ok().map(|m| m.len());
@@ -645,6 +926,12 @@ async fn render_overview(
         div."grid-2" {
             (ui::panel("About", None, html! {
                 dl."kv" {
+                    dt { "Folder" }
+                    dd {
+                        @if folder.is_empty() { "the root" } @else {
+                            a href={ "/admin/apps?folder=" (urlencoding::encode(&folder)) } { (folder) }
+                        }
+                    }
                     dt { "Title" } dd { (title.as_deref().unwrap_or("—")) }
                     dt { "Updated" } dd { @match modified { Some(m) => (crate::content::store::relative_time(m)), None => "—" } }
                     dt { "Handler" } dd { @if has_handler { "wasm component" } @else { "none" } }
@@ -671,6 +958,15 @@ async fn render_overview(
                         span { "The URL returns 404. The app does not show on the index. The files stay." }
                     }
                     div."actions end" { button type="submit" { "Save visibility" } }
+                }
+            }))
+        }
+        @if is_admin_here {
+            (ui::panel("Folder", Some("Move the app to another folder. The URL does not change. Access given on the app follows it; access from the folders changes to the new folders."), html! {
+                form."row" method="post" action="/admin/move" {
+                    (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                    input name="folder" value=(folder) placeholder="Folder path, empty for the root" pattern="[A-Za-z0-9_/-]*";
+                    button."quiet" type="submit" { "Move app" }
                 }
             }))
         }
@@ -707,11 +1003,11 @@ pub async fn download_source(
     headers: HeaderMap,
     Path(app): Path<String>,
 ) -> Response {
-    if let Err(response) = require_admin(&config, &headers).await {
-        return response;
-    }
     if !export::valid_app(&app) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    if let Err(response) = require_app(&config, &headers, &app, Scope::Editor).await {
+        return response;
     }
     let path = config.data_dir.join(format!("{app}.source"));
     let file = match tokio::fs::File::open(&path).await {
@@ -1157,7 +1453,7 @@ async fn render_account_page(
         Err(response) => return response,
     };
     let wanted = email.trim().to_lowercase();
-    let (account, grants) = {
+    let (account, grants, scopes) = {
         let (config, wanted) = (config.clone(), wanted.clone());
         tokio::task::spawn_blocking(move || {
             let account = users::list_accounts(&config)
@@ -1170,10 +1466,15 @@ async fn render_account_page(
                 .filter(|(_, who, _)| who == &wanted)
                 .map(|(app, _, role)| (app, role))
                 .collect();
-            (account, grants)
+            let scopes: Vec<users::ScopeGrant> = users::list_scopes(&config)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| row.email == wanted)
+                .collect();
+            (account, grants, scopes)
         })
         .await
-        .unwrap_or((None, Vec::new()))
+        .unwrap_or((None, Vec::new(), Vec::new()))
     };
     let Some(account) = account else {
         return (StatusCode::NOT_FOUND, "no such account").into_response();
@@ -1202,6 +1503,43 @@ async fn render_account_page(
                         (ui::secret("setup-link", link))
                     }))
                 }
+                (ui::panel("Projects", Some("What this account may do to the platform, from a folder down. Viewer opens apps. Editor also publishes and changes apps. Admin also sets access. An empty folder is the whole site."), html! {
+                    form."row" method="post" action="/admin/scope" {
+                        (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("action", "grant"))
+                        input name="prefix" placeholder="Folder path, or empty for the site" pattern="[A-Za-z0-9_/-]*";
+                        (scope_choice("editor"))
+                        button type="submit" { "Give access" }
+                    }
+                    @if scopes.is_empty() {
+                        p."muted" { "No access of its own. Give access above, or on a folder's page." }
+                    } @else {
+                        table {
+                            thead { tr { th { "Folder" } th { "Scope" } th {} } }
+                            tbody {
+                                @for row in &scopes {
+                                    tr {
+                                        td {
+                                            @if row.prefix.is_empty() { "the site" } @else {
+                                                a."row-link" href={ "/admin/apps?folder=" (urlencoding::encode(&row.prefix)) } { (row.prefix) }
+                                            }
+                                        }
+                                        td { span."badge solid" { (row.scope) } }
+                                        td."actions-cell" {
+                                            form method="post" action="/admin/scope"
+                                                 data-confirm={ "Revoke " (row.scope) " at " (if row.prefix.is_empty() { "the site" } else { row.prefix.as_str() }) "?" }
+                                                 data-confirm-detail="The account keeps every other scope it holds."
+                                                 data-confirm-label="Revoke access" data-confirm-danger="1" {
+                                                (hidden("token", &token)) (hidden("prefix", &row.prefix)) (hidden("email", &account.email))
+                                                (hidden("back", &back)) (hidden("action", "revoke"))
+                                                button."danger quiet sm" type="submit" { "Revoke access" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }))
                 (ui::panel("Grants", Some("A grant applies only to an app with access set to granted. The app reads the role. The usual role is viewer."), html! {
                     form."row" method="post" action="/admin/access" {
                         (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("allow", "1"))
@@ -1424,6 +1762,36 @@ pub(crate) async fn checked(config: &Arc<Config>, headers: &HeaderMap, token: &s
     Ok(admin)
 }
 
+/// The same, for an action on one app: the form token, and `needed` there.
+pub(crate) async fn checked_app(
+    config: &Arc<Config>,
+    headers: &HeaderMap,
+    token: &str,
+    app: &str,
+    needed: Scope,
+) -> Result<User, Response> {
+    let user = require_app(config, headers, app, needed).await?;
+    if !check_form_token(config, &user, token) {
+        return Err((StatusCode::FORBIDDEN, "The form is out of date. Reload the page and try again.").into_response());
+    }
+    Ok(user)
+}
+
+/// The same, for an action at a folder: the form token, and `needed` there.
+pub(crate) async fn checked_at(
+    config: &Arc<Config>,
+    headers: &HeaderMap,
+    token: &str,
+    path: &str,
+    needed: Scope,
+) -> Result<User, Response> {
+    let user = require_scope(config, headers, path, needed).await?;
+    if !check_form_token(config, &user, token) {
+        return Err((StatusCode::FORBIDDEN, "The form is out of date. Reload the page and try again.").into_response());
+    }
+    Ok(user)
+}
+
 #[derive(Deserialize)]
 pub struct NewAccount {
     token: String,
@@ -1605,7 +1973,10 @@ pub async fn change_access(
     headers: HeaderMap,
     Form(form): Form<AccessChange>,
 ) -> Response {
-    if let Err(response) = checked(&config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if let Err(response) = checked_app(&config, &headers, &form.token, &form.app, Scope::Admin).await {
         return response;
     }
     let back = back_or(form.back.as_deref(), "/admin/accounts");
@@ -1654,7 +2025,10 @@ pub async fn change_gate(
     headers: HeaderMap,
     Form(form): Form<GateChange>,
 ) -> Response {
-    if let Err(response) = checked(&config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if let Err(response) = checked_app(&config, &headers, &form.token, &form.app, Scope::Admin).await {
         return response;
     }
     let back = back_or(form.back.as_deref(), "/admin/apps");
@@ -1691,7 +2065,10 @@ pub async fn change_rule(
     headers: HeaderMap,
     Form(form): Form<RuleChange>,
 ) -> Response {
-    if let Err(response) = checked(&config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if let Err(response) = checked_app(&config, &headers, &form.token, &form.app, Scope::Admin).await {
         return response;
     }
     let back = back_or(form.back.as_deref(), "/admin/apps");
@@ -1739,7 +2116,10 @@ pub async fn change_visibility(
     headers: HeaderMap,
     Form(form): Form<VisibilityChange>,
 ) -> Response {
-    if let Err(response) = checked(&config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if let Err(response) = checked_app(&config, &headers, &form.token, &form.app, Scope::Editor).await {
         return response;
     }
     let back = back_or(form.back.as_deref(), "/admin/apps");
@@ -1768,7 +2148,10 @@ pub async fn change_notes(
     headers: HeaderMap,
     Form(form): Form<NotesChange>,
 ) -> Response {
-    if let Err(response) = checked(&config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if let Err(response) = checked_app(&config, &headers, &form.token, &form.app, Scope::Editor).await {
         return response;
     }
     let back = back_or(form.back.as_deref(), "/admin/apps");
@@ -1794,7 +2177,10 @@ pub async fn settings_link(
     headers: HeaderMap,
     Form(form): Form<AppOnly>,
 ) -> Response {
-    if let Err(response) = checked(&config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if let Err(response) = checked_app(&config, &headers, &form.token, &form.app, Scope::Editor).await {
         return response;
     }
     match crate::platform::secrets::create_entry(&config, &form.app) {
@@ -1816,7 +2202,10 @@ pub async fn run_job(
     headers: HeaderMap,
     Form(form): Form<JobRun>,
 ) -> Response {
-    if let Err(response) = checked(&state.config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    if let Err(response) = checked_app(&state.config, &headers, &form.token, &form.app, Scope::Editor).await {
         return response;
     }
     let back = back_or(form.back.as_deref(), "/admin/apps");
@@ -1841,7 +2230,10 @@ pub async fn change_export(
     headers: HeaderMap,
     Form(form): Form<ExportChange>,
 ) -> Response {
-    let admin = match checked(&config, &headers, &form.token).await {
+    if !valid_slug(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    let admin = match checked_app(&config, &headers, &form.token, &form.app, Scope::Admin).await {
         Ok(admin) => admin,
         Err(response) => return response,
     };
@@ -1877,4 +2269,162 @@ pub async fn change_export(
         }
         _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     }
+}
+
+// --- projects: folders, scopes, moves -------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ScopeChange {
+    token: String,
+    action: String,
+    prefix: String,
+    email: String,
+    scope: Option<String>,
+    back: Option<String>,
+}
+
+/// Gives or takes a scope at a folder or an app path. The caller needs admin
+/// there, may give at most what it holds there, and never grants above it,
+/// because the prefix in the form is the one the page was for.
+pub async fn change_scope(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<ScopeChange>,
+) -> Response {
+    let prefix = form.prefix.trim_matches('/').to_string();
+    if !users::valid_prefix(&prefix) {
+        return (StatusCode::BAD_REQUEST, "invalid folder").into_response();
+    }
+    let admin = match checked_at(&config, &headers, &form.token, &prefix, Scope::Admin).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), "/admin/apps");
+    let email = form.email.trim().to_lowercase();
+    let where_ = if prefix.is_empty() { "the site".to_string() } else { prefix.clone() };
+    match form.action.as_str() {
+        "grant" => {
+            let Some(scope) = form.scope.as_deref().and_then(Scope::parse) else {
+                return redirect_flash(&back, false, "Choose viewer, editor or admin.");
+            };
+            // A folder admin cannot hand out more than it holds; a site
+            // admin holds admin everywhere.
+            if !admin.is_admin {
+                let mine = held(&config, &admin, &prefix).await.unwrap_or(Scope::Viewer);
+                if scope > mine {
+                    return redirect_flash(&back, false, format!("You hold {mine} at {where_} and cannot give {scope}."));
+                }
+            }
+            let (config2, who, at, by) = (config.clone(), email.clone(), prefix.clone(), admin.email.clone());
+            let outcome = tokio::task::spawn_blocking(move || {
+                users::grant_scope(&config2, &who, &at, scope, Some(&by))
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    tracing::info!(admin = %admin.email, account = %email, prefix = %prefix, scope = %scope, "scope granted");
+                    redirect_flash(&back, true, format!("{email} is {scope} at {where_}."))
+                }
+                Ok(Err(message)) => redirect_flash(&back, false, message),
+                Err(_) => redirect_flash(&back, false, "Access was not changed."),
+            }
+        }
+        "revoke" => {
+            let (config2, who, at) = (config.clone(), email.clone(), prefix.clone());
+            let outcome = tokio::task::spawn_blocking(move || users::revoke_scope(&config2, &who, &at)).await;
+            match outcome {
+                Ok(Ok(())) => {
+                    tracing::info!(admin = %admin.email, account = %email, prefix = %prefix, "scope revoked");
+                    redirect_flash(&back, true, format!("{email} has no access of its own at {where_} now."))
+                }
+                Ok(Err(message)) => redirect_flash(&back, false, message),
+                Err(_) => redirect_flash(&back, false, "Access was not changed."),
+            }
+        }
+        _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct NewFolder {
+    token: String,
+    parent: String,
+    name: String,
+    back: Option<String>,
+}
+
+pub async fn new_folder(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<NewFolder>,
+) -> Response {
+    let parent = form.parent.trim_matches('/').to_string();
+    if !users::valid_prefix(&parent) {
+        return (StatusCode::BAD_REQUEST, "invalid folder").into_response();
+    }
+    let admin = match checked_at(&config, &headers, &form.token, &parent, Scope::Admin).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), "/admin/apps");
+    match store::create_folder(&config, &parent, form.name.trim()).await {
+        Ok(folder) => {
+            tracing::info!(admin = %admin.email, folder = %folder.path, "folder created");
+            redirect_flash(
+                &format!("/admin/apps?folder={}", urlencoding::encode(&folder.path)),
+                true,
+                format!("Folder {} is created.", folder.path),
+            )
+        }
+        Err(message) => redirect_flash(&back, false, message),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MoveApp {
+    token: String,
+    app: String,
+    folder: String,
+    back: Option<String>,
+}
+
+/// Moves an app to another folder. Admin at both ends, since access from
+/// the old folders stops and access from the new ones starts.
+pub async fn move_app(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<MoveApp>,
+) -> Response {
+    if !export::valid_app(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    let target = form.folder.trim_matches('/').to_string();
+    if !users::valid_prefix(&target) {
+        return (StatusCode::BAD_REQUEST, "invalid folder").into_response();
+    }
+    let from = app_path(&config, &form.app).await;
+    let admin = match checked_app(&config, &headers, &form.token, &form.app, Scope::Admin).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), &format!("/admin/apps/{}", form.app));
+    if !store::folder_exists(&config, &target).await {
+        return redirect_flash(&back, false, format!("There is no folder '{target}'."));
+    }
+    if let Err(response) = require_scope(&config, &headers, &target, Scope::Admin).await {
+        return response;
+    }
+    let to = if target.is_empty() { form.app.clone() } else { format!("{target}/{}", form.app) };
+    if from == to {
+        return redirect_flash(&back, true, "The app is already there.");
+    }
+    let mut meta = read_meta(&config, &form.app).await;
+    meta.project = (!target.is_empty()).then(|| target.clone());
+    if write_meta(&config, &form.app, &meta).await.is_err() {
+        return redirect_flash(&back, false, "The app was not moved.");
+    }
+    let (config2, old, new) = (config.clone(), from.clone(), to.clone());
+    let _ = tokio::task::spawn_blocking(move || users::move_scopes(&config2, &old, &new)).await;
+    tracing::info!(admin = %admin.email, app = %form.app, from = %from, to = %to, "app moved");
+    redirect_flash(&back, true, format!("{} is now at {to}.", form.app))
 }

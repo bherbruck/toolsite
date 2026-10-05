@@ -49,10 +49,11 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
     };
     let token = form_token(&config, &user);
     let flash = take_flash(&headers);
+    let manages = crate::platform::admin::manages_something(&config, &user).await;
 
     let markup = ui::shell(
         "Your account",
-        sidebar("account", Some(&user)),
+        sidebar("account", Some(&user), manages),
         html! {
             div."title-row" {
                 div {

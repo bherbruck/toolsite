@@ -259,6 +259,12 @@ form.row .combo { width: auto; flex: 1 1 14rem; }
 .combo-menu li.none { color: var(--muted); cursor: default; }
 .combo-menu li.none:hover { background: none; }
 
+/* Radios dressed as a segmented control, for a short fixed choice in a row form. */
+.seg-item { display: inline-flex; align-items: center; gap: .3rem; padding: .35rem .6rem; font-size: .85rem; cursor: pointer; }
+.seg-item + .seg-item { border-left: 1px solid var(--border); }
+.seg-item:has(input:checked) { background: var(--soft); font-weight: 500; }
+.seg-item input { margin: 0; }
+
 /* A segmented control: two or three choices, one active. */
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: calc(var(--radius) - .1rem); overflow: hidden; }
 .seg button {

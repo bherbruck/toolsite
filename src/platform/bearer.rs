@@ -8,6 +8,14 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Who is behind an MCP request. `None` is a static token or the stdio
+/// transport, which have every power; `Some` is the account behind an OAuth
+/// token, whose scopes decide what each tool may do for it.
+#[derive(Clone, Debug)]
+pub struct Caller {
+    pub user: Option<crate::accounts::users::User>,
+}
+
 /// Clients disagree about how to present a static token: most send
 /// `Authorization: Bearer <token>`, some send `x-api-key`. Accept either —
 /// it's the same secret.
@@ -31,11 +39,12 @@ pub(crate) fn presented_token(headers: &HeaderMap) -> Option<&str> {
 pub(crate) async fn require_bearer(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     let presented = presented_token(&headers);
     if presented.is_some_and(|token| config.valid_tokens.iter().any(|v| v == token)) {
+        request.extensions_mut().insert(Caller { user: None });
         return next.run(request).await;
     }
     // Not a static token: perhaps one the OAuth server issued to a person.
@@ -44,13 +53,20 @@ pub(crate) async fn require_bearer(
     if let Some(token) = presented.filter(|_| config.oauth_enabled())
         && let Some(user) = client_oauth::token_user(&config, token).await
     {
-        if user.is_admin {
-            tracing::debug!(email = %user.email, "mcp request as a signed-in admin");
+        let (may_publish_config, may_publish_user) = (config.clone(), user.clone());
+        let may_publish = tokio::task::spawn_blocking(move || {
+            crate::accounts::users::holds_anywhere(&may_publish_config, &may_publish_user, crate::accounts::users::Scope::Editor)
+        })
+        .await
+        .unwrap_or(false);
+        if may_publish {
+            tracing::debug!(email = %user.email, "mcp request as a signed-in account");
+            request.extensions_mut().insert(Caller { user: Some(user) });
             return next.run(request).await;
         }
-        // A real account, but not one that may publish. Its client belongs on
-        // /me/mcp; say so rather than a bare 401.
-        tracing::warn!(email = %user.email, path = %request.uri().path(), "401: the account is not an admin; use /me/mcp");
+        // A real account, but one that may publish nowhere. Its client
+        // belongs on /me/mcp; say so rather than a bare 401.
+        tracing::warn!(email = %user.email, path = %request.uri().path(), "401: the account holds no editor or admin scope; use /me/mcp");
         return (
             StatusCode::UNAUTHORIZED,
             "this account cannot publish; connect to /me/mcp to read what it may open\n",

@@ -28,6 +28,15 @@ CREATE TABLE invites (
     expires_at integer not null
 )
 CREATE INDEX invites_by_user on invites(user_id)
+CREATE TABLE scopes (
+    user_id    text not null references users(id),
+    prefix     text not null,
+    scope      text not null check (scope in ('viewer', 'editor', 'admin')),
+    granted_by text,
+    created_at integer not null,
+    primary key (user_id, prefix)
+)
+CREATE INDEX scopes_by_prefix on scopes(prefix)
 CREATE TABLE sessions (
     token_hash text primary key,
     user_id    text not null references users(id),

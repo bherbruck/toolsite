@@ -147,7 +147,7 @@ fn upload_ticket(config: &Config, slug: &str) -> String {
     let ticket = format!("ticket-{}-{}", slug, config.uploads.lock().unwrap().len());
     config.uploads.lock().unwrap().insert(
         ticket.clone(),
-        UploadTicket { slug: slug.to_string(), expires_at: Instant::now() + Duration::from_secs(60) },
+        UploadTicket { slug: slug.to_string(), expires_at: Instant::now() + Duration::from_secs(60), user: None, project: None },
     );
     ticket
 }

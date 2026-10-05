@@ -243,6 +243,11 @@ No filesystem, no environment, no sockets beyond that allowlist. wasi is
 linked because a `wasm32-wasip2` guest imports it through std, but the context
 grants nothing.
 
+**Scopes.** Apps sit in a project tree and the account behind your connection
+may hold `editor` on one folder only. A refused tool names the folder and the
+scope it needs ("holds editor at ops/yard; this needs admin"). Publish under a
+folder you hold, or ask for the scope; `list_pages` shows what you may open.
+
 **Access.** A gate decides whether a request arrives; what it may then do is
 yours to decide. An app that names no gate follows the site's default
 (`TOOLSITE_DEFAULT_ACCESS`), which on an internal site is usually `granted`,

@@ -570,6 +570,243 @@ pub fn has_grant(config: &Config, user: &User, app: &str) -> bool {
     .is_ok()
 }
 
+// --- platform scopes ----------------------------------------------------
+//
+// A grant's role is the app's business. A scope is the platform's: it says
+// what an account may do to the platform from one point of the project tree
+// down, in three words the platform itself acts on.
+
+/// Ordered: a stronger scope can do everything a weaker one can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Scope {
+    Viewer,
+    Editor,
+    Admin,
+}
+
+impl Scope {
+    pub fn parse(word: &str) -> Option<Scope> {
+        match word {
+            "viewer" => Some(Scope::Viewer),
+            "editor" => Some(Scope::Editor),
+            "admin" => Some(Scope::Admin),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Viewer => "viewer",
+            Scope::Editor => "editor",
+            Scope::Admin => "admin",
+        }
+    }
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One scope row: who holds what, where.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeGrant {
+    pub email: String,
+    pub user_id: String,
+    pub prefix: String,
+    pub scope: Scope,
+}
+
+/// A prefix is the root (empty), a folder path, or an app's path. Segments
+/// follow the slug rules, so a prefix can never name `.site` or climb.
+pub fn valid_prefix(prefix: &str) -> bool {
+    prefix.is_empty() || valid_slug(prefix)
+}
+
+/// Whether a scope at `prefix` covers `path`: the root covers everything,
+/// otherwise the path is the prefix or sits under it.
+pub fn prefix_covers(prefix: &str, path: &str) -> bool {
+    prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+pub fn grant_scope(
+    config: &Config,
+    email: &str,
+    prefix: &str,
+    scope: Scope,
+    granted_by: Option<&str>,
+) -> Result<(), String> {
+    if !valid_prefix(prefix) {
+        return Err("prefix must be empty, or path segments of letters, numbers, '-' or '_'".into());
+    }
+    let conn = open(config)?;
+    let email = normalise(email);
+    let user_id: String = conn
+        .query_row("select id from users where email = ?", [&email], |row| row.get(0))
+        .map_err(|_| format!("no account for {email}"))?;
+    conn.execute(
+        "insert into scopes (user_id, prefix, scope, granted_by, created_at) values (?, ?, ?, ?, ?)
+         on conflict(user_id, prefix) do update set scope = excluded.scope, granted_by = excluded.granted_by",
+        rusqlite::params![user_id, prefix, scope.as_str(), granted_by, now() as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn revoke_scope(config: &Config, email: &str, prefix: &str) -> Result<(), String> {
+    let conn = open(config)?;
+    let email = normalise(email);
+    let changed = conn
+        .execute(
+            "delete from scopes where prefix = ? and user_id in (select id from users where email = ?)",
+            rusqlite::params![prefix, email],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err(format!("{email} holds no scope at '{prefix}'"));
+    }
+    Ok(())
+}
+
+/// Every scope row, with the account's email, ordered by prefix then email.
+pub fn list_scopes(config: &Config) -> Result<Vec<ScopeGrant>, String> {
+    let conn = open(config)?;
+    let mut statement = conn
+        .prepare(
+            "select users.email, users.id, scopes.prefix, scopes.scope
+               from scopes join users on users.id = scopes.user_id
+              order by scopes.prefix, users.email",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .filter_map(|(email, user_id, prefix, scope)| {
+            Scope::parse(&scope).map(|scope| ScopeGrant {
+                email,
+                user_id,
+                prefix,
+                scope,
+            })
+        })
+        .collect())
+}
+
+/// The scopes one account holds, by prefix.
+pub fn scopes_for(config: &Config, user_id: &str) -> Vec<(String, Scope)> {
+    let Ok(conn) = open(config) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = conn.prepare("select prefix, scope from scopes where user_id = ? order by prefix") else {
+        return Vec::new();
+    };
+    statement
+        .query_map([user_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map(|rows| {
+            rows.filter_map(Result::ok)
+                .filter_map(|(prefix, scope)| Scope::parse(&scope).map(|scope| (prefix, scope)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The one question every check asks: what may this account do at `path`?
+/// The strongest scope held on the path or any prefix above it; a site admin
+/// is admin everywhere. Scopes only add, so nothing below can narrow what a
+/// row above grants.
+pub fn effective_scope(config: &Config, user: &User, path: &str) -> Option<Scope> {
+    if user.is_admin {
+        return Some(Scope::Admin);
+    }
+    scopes_for(config, &user.id)
+        .into_iter()
+        .filter(|(prefix, _)| prefix_covers(prefix, path))
+        .map(|(_, scope)| scope)
+        .max()
+}
+
+/// What the account may do to one app, which sits in `folder` (empty for
+/// the root): the strongest scope over the app's path, or viewer if the
+/// account holds a plain grant on the app. The grant is the old way in and
+/// still works everywhere it did.
+pub fn app_scope(config: &Config, user: &User, folder: &str, app: &str) -> Option<Scope> {
+    if user.is_admin {
+        return Some(Scope::Admin);
+    }
+    let path = if folder.is_empty() { app.to_string() } else { format!("{folder}/{app}") };
+    let held = effective_scope(config, user, &path);
+    if has_grant(config, user, app) {
+        held.max(Some(Scope::Viewer))
+    } else {
+        held
+    }
+}
+
+/// The folder a new app goes in when the caller names none: the one folder
+/// the account is editor or admin of. The root if it holds that there;
+/// nothing if it holds several folders and must say which.
+pub fn default_folder_for(config: &Config, user: &User) -> Option<String> {
+    if user.is_admin {
+        return Some(String::new());
+    }
+    let mut folders: Vec<String> = scopes_for(config, &user.id)
+        .into_iter()
+        .filter(|(_, scope)| *scope >= Scope::Editor)
+        .map(|(prefix, _)| prefix)
+        .collect();
+    if folders.iter().any(String::is_empty) {
+        return Some(String::new());
+    }
+    folders.sort();
+    folders.dedup();
+    // Folders nested in one another are one choice: the outermost.
+    let outermost: Vec<String> = folders
+        .iter()
+        .filter(|f| !folders.iter().any(|other| other != *f && prefix_covers(other, f)))
+        .cloned()
+        .collect();
+    match outermost.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+/// Whether the account holds `at_least` anywhere at all. What decides if a
+/// client it connects may publish.
+pub fn holds_anywhere(config: &Config, user: &User, at_least: Scope) -> bool {
+    user.is_admin || scopes_for(config, &user.id).into_iter().any(|(_, scope)| scope >= at_least)
+}
+
+/// Whether the account holds any scope strictly inside `prefix`, which is
+/// what lets them walk down the tree to it.
+pub fn holds_below(config: &Config, user: &User, prefix: &str) -> bool {
+    scopes_for(config, &user.id)
+        .into_iter()
+        .any(|(held, _)| held != prefix && prefix_covers(prefix, &held))
+}
+
+/// Moves an app's own scope rows when the app moves in the tree, so a scope
+/// given on the app follows it.
+pub fn move_scopes(config: &Config, from: &str, to: &str) -> Result<(), String> {
+    let conn = open(config)?;
+    conn.execute(
+        "update or replace scopes set prefix = ? where prefix = ?",
+        rusqlite::params![to, from],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
     header?
         .split(';')
@@ -638,6 +875,81 @@ mod tests {
             tempfile::tempdir().unwrap(),
             Config::local(dir.keep(), "test-token"),
         )
+    }
+
+
+    // --- scopes -------------------------------------------------------------
+
+    fn person(config: &Config, email: &str) -> User {
+        sign_up(config, email, "correct horse battery").unwrap()
+    }
+
+    #[test]
+    fn the_strongest_scope_above_a_path_applies_and_nothing_narrows_it() {
+        let (_t, config) = config();
+        let ann = person(&config, "ann@example.com");
+        grant_scope(&config, "ann@example.com", "ops", Scope::Admin, None).unwrap();
+        grant_scope(&config, "ann@example.com", "ops/yard", Scope::Viewer, None).unwrap();
+        assert_eq!(effective_scope(&config, &ann, "ops/yard/checklist"), Some(Scope::Admin), "a weaker row below narrowed an admin above");
+        assert_eq!(effective_scope(&config, &ann, "ops"), Some(Scope::Admin));
+        assert_eq!(effective_scope(&config, &ann, "finance"), None);
+        assert_eq!(effective_scope(&config, &ann, "opsx"), None, "a prefix matched by text, not by segment");
+    }
+
+    #[test]
+    fn one_person_holds_many_scopes_and_each_applies_in_its_place() {
+        let (_t, config) = config();
+        let bo = person(&config, "bo@example.com");
+        grant_scope(&config, "bo@example.com", "ops/warehouse", Scope::Editor, None).unwrap();
+        grant_scope(&config, "bo@example.com", "finance/reports", Scope::Viewer, None).unwrap();
+        grant_scope(&config, "bo@example.com", "labs", Scope::Admin, None).unwrap();
+        assert_eq!(effective_scope(&config, &bo, "ops/warehouse/tool"), Some(Scope::Editor));
+        assert_eq!(effective_scope(&config, &bo, "finance/reports/q3"), Some(Scope::Viewer));
+        assert_eq!(effective_scope(&config, &bo, "labs/x/y"), Some(Scope::Admin));
+        assert_eq!(effective_scope(&config, &bo, "finance/ledger"), None);
+        assert!(holds_anywhere(&config, &bo, Scope::Editor));
+        assert!(holds_below(&config, &bo, "finance"));
+        assert!(!holds_below(&config, &bo, "ops/warehouse"), "a row at the folder itself is not below it");
+        assert_eq!(default_folder_for(&config, &bo), None, "editor in two folders has to say which");
+        assert_eq!(scopes_for(&config, &bo.id).len(), 3);
+    }
+
+    #[test]
+    fn a_grant_on_an_app_is_viewer_on_that_app_wherever_it_sits() {
+        let (_t, config) = config();
+        let cy = person(&config, "cy@example.com");
+        grant(&config, "cy@example.com", "ledger", "editor").unwrap();
+        assert_eq!(app_scope(&config, &cy, "finance", "ledger"), Some(Scope::Viewer));
+        assert_eq!(app_scope(&config, &cy, "", "ledger"), Some(Scope::Viewer));
+        assert_eq!(app_scope(&config, &cy, "finance", "other"), None);
+        revoke(&config, "cy@example.com", "ledger").unwrap();
+        assert_eq!(app_scope(&config, &cy, "finance", "ledger"), None, "a revoked grant still opened the app");
+        // A real scope on the folder is what it is, grant or not.
+        grant_scope(&config, "cy@example.com", "finance", Scope::Editor, None).unwrap();
+        assert_eq!(app_scope(&config, &cy, "finance", "ledger"), Some(Scope::Editor));
+    }
+
+    #[test]
+    fn a_site_admin_is_admin_everywhere_and_a_scope_needs_a_valid_prefix() {
+        let (_t, config) = config();
+        let root = sign_up_as(&config, "root@example.com", "correct horse battery", true).unwrap();
+        assert_eq!(effective_scope(&config, &root, "anything/at/all"), Some(Scope::Admin));
+        assert_eq!(default_folder_for(&config, &root), Some(String::new()));
+        assert!(grant_scope(&config, "root@example.com", "../x", Scope::Viewer, None).is_err());
+        assert!(grant_scope(&config, "root@example.com", ".site", Scope::Viewer, None).is_err());
+        assert!(grant_scope(&config, "nobody@example.com", "ops", Scope::Viewer, None).is_err());
+        assert!(revoke_scope(&config, "root@example.com", "ops").is_err(), "revoking nothing said yes");
+    }
+
+    #[test]
+    fn an_apps_own_scopes_follow_it_when_it_moves() {
+        let (_t, config) = config();
+        let di = person(&config, "di@example.com");
+        grant_scope(&config, "di@example.com", "tool", Scope::Editor, None).unwrap();
+        assert_eq!(effective_scope(&config, &di, "tool"), Some(Scope::Editor));
+        move_scopes(&config, "tool", "ops/tool").unwrap();
+        assert_eq!(effective_scope(&config, &di, "tool"), None);
+        assert_eq!(effective_scope(&config, &di, "ops/tool"), Some(Scope::Editor));
     }
 
     #[test]

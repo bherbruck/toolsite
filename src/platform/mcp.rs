@@ -1,14 +1,20 @@
 use crate::{
+    accounts::users::{self, Scope},
     config::Config,
     content::{
         slug::{random_slug, random_token, valid_segment, valid_slug},
         store::{collect_slugs, page_path, page_title, page_url, read_meta, relative_time, write_meta},
     },
-    platform::upload::{upload_url, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
+    platform::{
+        bearer::Caller,
+        upload::{upload_url, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
+    },
     runtime::db,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    service::RequestContext,
+    RoleServer,
     model::{
         CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
         ServerInfo,
@@ -26,6 +32,11 @@ use tokio::fs;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PushPageRequest {
+    #[schemars(
+        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: an app is moved from the admin page."
+    )]
+    pub(crate) project: Option<String>,
+
     #[schemars(description = "Full self-contained HTML document (inline any CSS/JS).")]
     pub(crate) html: String,
     #[schemars(
@@ -43,6 +54,11 @@ pub(crate) struct PullPageRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PushAppRequest {
     #[schemars(
+        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: an app is moved from the admin page."
+    )]
+    pub(crate) project: Option<String>,
+
+    #[schemars(
         description = "App namespace all pages are published under, e.g. 'myapp'. Letters, numbers, '-' and '_' only."
     )]
     pub(crate) app: String,
@@ -54,6 +70,11 @@ pub(crate) struct PushAppRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CreateUploadRequest {
+    #[schemars(
+        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: an app is moved from the admin page."
+    )]
+    pub(crate) project: Option<String>,
+
     #[schemars(
         description = "Slug the upload writes to. Random one is generated if omitted. For a multi-page app pass the app name, then upload one file per page."
     )]
@@ -299,13 +320,150 @@ impl PageHost {
         }
     }
 
+    /// Who is calling: the account behind an OAuth token, or nobody in
+    /// particular for a static token or the stdio transport, which have
+    /// every power. The bearer middleware put it on the HTTP request.
+    fn caller(ctx: &RequestContext<RoleServer>) -> Caller {
+        ctx.extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Caller>().cloned())
+            .unwrap_or(Caller { user: None })
+    }
+
+    /// Refuses the call unless the caller holds `needed` at the app that
+    /// `slug` belongs to. The refusal names the place and the scope it would
+    /// take, so an agent can ask for the right thing.
+    async fn allowed(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        slug: &str,
+        needed: Scope,
+    ) -> Result<Caller, CallToolResult> {
+        let caller = Self::caller(ctx);
+        let Some(user) = caller.user.clone() else {
+            return Ok(caller);
+        };
+        let app = slug.split('/').next().unwrap_or(slug).to_string();
+        let path = crate::content::store::logical_path(&self.config, &app).await;
+        let held = self.held_on(&user, &app).await;
+        if held.is_some_and(|held| held >= needed) {
+            Ok(caller)
+        } else {
+            tracing::warn!(email = %user.email, path = %path, needed = %needed, "tool refused: scope");
+            Err(CallToolResult::error(vec![ContentBlock::text(match held {
+                Some(held) => format!(
+                    "{} holds {held} at {path}; this needs {needed}. Ask an admin of that project for it.",
+                    user.email
+                ),
+                None => format!(
+                    "{} holds no access at {path}; this needs {needed}. Ask an admin of that project for it.",
+                    user.email
+                ),
+            })]))
+        }
+    }
+
+    /// What `user` may do to `app`, wherever it sits.
+    async fn held_on(&self, user: &users::User, app: &str) -> Option<Scope> {
+        let folder = crate::content::store::app_folder(&self.config, app).await;
+        let (config, user, app) = (self.config.clone(), user.clone(), app.to_string());
+        tokio::task::spawn_blocking(move || users::app_scope(&config, &user, &folder, &app))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// For publishing: an app that exists is judged where it sits; a new one
+    /// by the folder it is about to land in, named by `project` or implied
+    /// by the one folder the account is editor of. Returns the caller and
+    /// the folder to record on a first publish.
+    async fn allowed_to_publish(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        slug: &str,
+        project: Option<&str>,
+    ) -> Result<(Caller, Option<String>), CallToolResult> {
+        let caller = Self::caller(ctx);
+        let app = slug.split('/').next().unwrap_or(slug).to_string();
+        let project = project.map(|p| p.trim_matches('/').to_string()).filter(|p| !p.is_empty());
+        if crate::content::store::app_exists(&self.config, &app).await {
+            return self.allowed(ctx, slug, Scope::Editor).await.map(|caller| (caller, None));
+        }
+        let Some(user) = caller.user.clone() else {
+            if let Some(folder) = &project
+                && !crate::content::store::folder_exists(&self.config, folder).await
+            {
+                return Err(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "there is no folder '{folder}'; an admin creates folders on /admin/apps"
+                ))]));
+            }
+            return Ok((caller, project));
+        };
+        let folder = match project {
+            Some(folder) => folder,
+            None => {
+                let (config, who) = (self.config.clone(), user.clone());
+                match tokio::task::spawn_blocking(move || users::default_folder_for(&config, &who)).await.ok().flatten() {
+                    Some(folder) => folder,
+                    None => {
+                        return Err(CallToolResult::error(vec![ContentBlock::text(format!(
+                            "{} holds editor in more than one folder; pass project: \"<folder>\" to say where {app} goes.",
+                            user.email
+                        ))]));
+                    }
+                }
+            }
+        };
+        if !crate::content::store::folder_exists(&self.config, &folder).await {
+            return Err(CallToolResult::error(vec![ContentBlock::text(format!(
+                "there is no folder '{folder}'; an admin creates folders on /admin/apps"
+            ))]));
+        }
+        let (config, who, at) = (self.config.clone(), user.clone(), folder.clone());
+        let held = tokio::task::spawn_blocking(move || users::effective_scope(&config, &who, &at))
+            .await
+            .ok()
+            .flatten();
+        if held.is_some_and(|held| held >= Scope::Editor) {
+            Ok((caller, Some(folder)))
+        } else {
+            let place = if folder.is_empty() { "the root".to_string() } else { folder.clone() };
+            tracing::warn!(email = %user.email, folder = %place, "publish refused: scope");
+            Err(CallToolResult::error(vec![ContentBlock::text(match held {
+                Some(held) => format!("{} holds {held} at {place}; publishing a new app there needs editor.", user.email),
+                None => format!("{} holds no access at {place}; publishing a new app there needs editor.", user.email),
+            })]))
+        }
+    }
+
+    /// For the few tools that are about the site rather than an app.
+    fn root_only(ctx: &RequestContext<RoleServer>) -> Result<Caller, CallToolResult> {
+        let caller = Self::caller(ctx);
+        match &caller.user {
+            Some(user) if !user.is_admin => Err(CallToolResult::error(vec![ContentBlock::text(
+                format!("{} is not a site admin; only a site admin may do that.", user.email),
+            )])),
+            _ => Ok(caller),
+        }
+    }
+
+    /// Remembers who first published an app and where it landed.
+    async fn stamp_new_app(&self, app: &str, caller: &Caller, project: Option<&str>) {
+        let user_id = caller.user.as_ref().map(|user| user.id.as_str());
+        crate::platform::upload::stamp_new_app(&self.config, app, user_id, project).await;
+    }
+
     #[tool(
         description = "Keep an app's source in a GitHub repository, with history. The repository is a mirror: publishing the source of a linked app pushes a commit (say why with ?source&message=...), and a push to the repository is pulled into the app's source archive. Nothing is built or run in GitHub; you build and publish from wherever you run, as always. 'create' needs the app's source to have been published with ?source, names the repository toolsite-<app> unless repo says otherwise, and tags it with the toolsite topic. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts."
     )]
     pub(crate) async fn app_repo(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(RepoRequest { app, action, repo, branch, directory, installation, public }): Parameters<RepoRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Admin).await {
+            return Ok(refused);
+        }
         use crate::platform::github;
         if !github::valid_app(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
@@ -392,8 +550,12 @@ impl PageHost {
     )]
     pub(crate) async fn app_deploy_tokens(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(DeployTokenRequest { app, action, label, id }): Parameters<DeployTokenRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Admin).await {
+            return Ok(refused);
+        }
         use crate::platform::deploy;
         if !deploy::valid_app(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
@@ -440,8 +602,12 @@ impl PageHost {
     )]
     pub(crate) async fn app_exports(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(ExportRequest { app, action, label, id }): Parameters<ExportRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Admin).await {
+            return Ok(refused);
+        }
         if !crate::platform::export::valid_app(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "app must be one path segment of letters, numbers, '-' or '_'",
@@ -498,7 +664,8 @@ impl PageHost {
     )]
     async fn push_page(
         &self,
-        Parameters(PushPageRequest { html, slug }): Parameters<PushPageRequest>,
+        ctx: RequestContext<RoleServer>,
+        Parameters(PushPageRequest { html, slug, project }): Parameters<PushPageRequest>,
     ) -> Result<CallToolResult, McpError> {
         let slug = slug.unwrap_or_else(random_slug);
         if !valid_slug(&slug) {
@@ -506,6 +673,10 @@ impl PageHost {
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
             )]));
         }
+        let (caller, folder) = match self.allowed_to_publish(&ctx, &slug, project.as_deref()).await {
+            Ok(allowed) => allowed,
+            Err(refused) => return Ok(refused),
+        };
 
         let path = self.config.data_dir.join(format!("{slug}.html"));
         if let Some(parent) = path.parent() {
@@ -516,6 +687,8 @@ impl PageHost {
         fs::write(&path, html)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        self.stamp_new_app(&app, &caller, folder.as_deref()).await;
 
         let url = page_url(&self.config, &slug);
         Ok(CallToolResult::success(vec![ContentBlock::text(url)]))
@@ -524,8 +697,12 @@ impl PageHost {
     #[tool(description = "Fetch the current HTML source of a previously pushed page by its slug, so it can be edited and pushed back.")]
     async fn pull_page(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(PullPageRequest { slug }): Parameters<PullPageRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &slug, Scope::Editor).await {
+            return Ok(refused);
+        }
         if !valid_slug(&slug) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
@@ -545,7 +722,8 @@ impl PageHost {
     )]
     async fn push_app(
         &self,
-        Parameters(PushAppRequest { app, pages }): Parameters<PushAppRequest>,
+        ctx: RequestContext<RoleServer>,
+        Parameters(PushAppRequest { app, pages, project }): Parameters<PushAppRequest>,
     ) -> Result<CallToolResult, McpError> {
         if !valid_segment(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
@@ -557,6 +735,10 @@ impl PageHost {
                 "pages must not be empty",
             )]));
         }
+        let (caller, folder) = match self.allowed_to_publish(&ctx, &app, project.as_deref()).await {
+            Ok(allowed) => allowed,
+            Err(refused) => return Ok(refused),
+        };
         for name in pages.keys() {
             if !valid_segment(name) {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
@@ -585,6 +767,7 @@ impl PageHost {
             urls.push(format!("{name}: {}", page_url(&self.config, &slug)));
         }
         urls.sort();
+        self.stamp_new_app(&app, &caller, folder.as_deref()).await;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             urls.join("\n"),
         )]))
@@ -595,7 +778,8 @@ impl PageHost {
     )]
     async fn create_upload(
         &self,
-        Parameters(CreateUploadRequest { slug }): Parameters<CreateUploadRequest>,
+        ctx: RequestContext<RoleServer>,
+        Parameters(CreateUploadRequest { slug, project }): Parameters<CreateUploadRequest>,
     ) -> Result<CallToolResult, McpError> {
         let slug = slug.unwrap_or_else(random_slug);
         if !valid_slug(&slug) {
@@ -603,6 +787,10 @@ impl PageHost {
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
             )]));
         }
+        let (caller, folder) = match self.allowed_to_publish(&ctx, &slug, project.as_deref()).await {
+            Ok(allowed) => allowed,
+            Err(refused) => return Ok(refused),
+        };
 
         let ticket = random_token(32);
         {
@@ -614,6 +802,8 @@ impl PageHost {
                 UploadTicket {
                     slug: slug.clone(),
                     expires_at: now + UPLOAD_TTL,
+                    user: caller.user.as_ref().map(|user| user.id.clone()),
+                    project: folder,
                 },
             );
         }
@@ -691,8 +881,12 @@ impl PageHost {
     )]
     pub(crate) async fn run_sql(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(RunSqlRequest { app, sql, params, as_user }): Parameters<RunSqlRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
+            return Ok(refused);
+        }
         let config = self.config.clone();
         let params = params.unwrap_or_default();
         let as_user = as_user.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
@@ -744,12 +938,16 @@ impl PageHost {
     )]
     pub(crate) async fn create_user(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(CreateUserRequest {
             email,
             password,
             admin,
         }): Parameters<CreateUserRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = Self::root_only(&ctx) {
+            return Ok(refused);
+        }
         let config = self.config.clone();
         let outcome =
             tokio::task::spawn_blocking(move || match password {
@@ -791,8 +989,12 @@ impl PageHost {
     )]
     pub(crate) async fn app_migrations(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(MigrationsRequest { app, files }): Parameters<MigrationsRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
+            return Ok(refused);
+        }
         if !valid_slug(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
@@ -848,6 +1050,7 @@ impl PageHost {
     )]
     pub(crate) async fn app_jobs(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(ScheduleRequest {
             app,
             name,
@@ -856,6 +1059,9 @@ impl PageHost {
             run_now,
         }): Parameters<ScheduleRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
+            return Ok(refused);
+        }
         if !valid_slug(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
@@ -912,6 +1118,7 @@ impl PageHost {
     )]
     pub(crate) async fn app_settings(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(SecretRequest {
             app,
             name,
@@ -919,6 +1126,9 @@ impl PageHost {
             link,
         }): Parameters<SecretRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
+            return Ok(refused);
+        }
         if !valid_slug(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
@@ -964,8 +1174,12 @@ impl PageHost {
     )]
     pub(crate) async fn app_notes(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(NotesRequest { slug, notes }): Parameters<NotesRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &slug, Scope::Editor).await {
+            return Ok(refused);
+        }
         if !valid_slug(&slug) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
@@ -996,8 +1210,12 @@ impl PageHost {
     )]
     pub(crate) async fn set_user_active(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(SetActiveRequest { email, active }): Parameters<SetActiveRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = Self::root_only(&ctx) {
+            return Ok(refused);
+        }
         let config = self.config.clone();
         let owned = email.clone();
         let outcome =
@@ -1020,6 +1238,7 @@ impl PageHost {
     )]
     pub(crate) async fn set_access(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(AccessRequest {
             app,
             email,
@@ -1027,6 +1246,9 @@ impl PageHost {
             role,
         }): Parameters<AccessRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Admin).await {
+            return Ok(refused);
+        }
         if !valid_slug(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
@@ -1066,9 +1288,11 @@ impl PageHost {
     )]
     async fn list_pages(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(ListPagesRequest { include_all }): Parameters<ListPagesRequest>,
     ) -> Result<CallToolResult, McpError> {
         let include_all = include_all.unwrap_or(false);
+        let caller = Self::caller(&ctx);
         let mut slugs = Vec::new();
         collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
 
@@ -1077,6 +1301,17 @@ impl PageHost {
             let meta = read_meta(&self.config, &slug).await;
             if !include_all && (meta.hidden || !meta.listed) {
                 continue;
+            }
+            // A signed-in caller sees what it may open: public and signed-in
+            // apps, and the ones it holds a scope on.
+            if let Some(user) = &caller.user {
+                let app = slug.split('/').next().unwrap_or(&slug).to_string();
+                let gate = meta.gate_for("/", &self.config.default_gate).to_string();
+                let open = matches!(gate.as_str(), "public" | "authenticated")
+                    || self.held_on(user, &app).await.is_some();
+                if !open {
+                    continue;
+                }
             }
             let path = page_path(&self.config, &slug).await;
             let modified = match &path {
@@ -1117,6 +1352,7 @@ impl PageHost {
     )]
     pub(crate) async fn remove_page(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(RemoveRequest {
             slug,
             confirm,
@@ -1127,6 +1363,22 @@ impl PageHost {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "pass confirm: \"{slug}\" to remove it"
             ))]));
+        }
+        let caller = match self.allowed(&ctx, &slug, Scope::Editor).await {
+            Ok(caller) => caller,
+            Err(refused) => return Ok(refused),
+        };
+        if let Some(user) = &caller.user {
+            let app = slug.split('/').next().unwrap_or(&slug).to_string();
+            let path = crate::content::store::logical_path(&self.config, &app).await;
+            let is_admin_here = self.held_on(user, &app).await == Some(Scope::Admin);
+            let created_it = read_meta(&self.config, &app).await.created_by.as_deref() == Some(user.id.as_str());
+            if !is_admin_here && !created_it {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{} may remove only apps it created under {path}; removing {app} needs admin there.",
+                    user.email
+                ))]));
+            }
         }
         let config = self.config.clone_for_task();
         let at = std::time::SystemTime::now()
@@ -1164,6 +1416,7 @@ impl PageHost {
     )]
     async fn set_visibility(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(SetVisibilityRequest {
             slug,
             hidden,
@@ -1181,6 +1434,10 @@ impl PageHost {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "pass hidden, listed or gate",
             )]));
+        }
+        let needed = if gate.is_some() || path.is_some() { Scope::Admin } else { Scope::Editor };
+        if let Err(refused) = self.allowed(&ctx, &slug, needed).await {
+            return Ok(refused);
         }
         if let Some(gate) = &gate {
             let allowed = matches!(gate.as_str(), "public" | "authenticated" | "granted")
@@ -1259,8 +1516,12 @@ impl PageHost {
     )]
     async fn set_icon(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(SetIconRequest { slug, icon }): Parameters<SetIconRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &slug, Scope::Editor).await {
+            return Ok(refused);
+        }
         if !valid_slug(&slug) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
@@ -1304,8 +1565,12 @@ impl PageHost {
     )]
     async fn pull_app(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(PullAppRequest { app }): Parameters<PullAppRequest>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
+            return Ok(refused);
+        }
         if !valid_segment(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "app must be non-empty and contain only letters, numbers, '-' or '_'",

@@ -744,6 +744,40 @@ of that account. There is no mailer, so there is no reset email: someone who
 has forgotten their password asks an admin, who issues a new setup link from
 the account's page in the admin.
 
+### Projects and scopes
+
+Apps sit in folders, and folders nest: `ops`, `ops/yard`. The tree is the
+platform's; an app's URL is its slug wherever it sits, so moving an app
+changes who manages it, not where visitors find it. Folders are made on
+`/admin/apps`, and an app is moved from its Overview tab.
+
+A scope says what an account may do to the platform from a folder down.
+Unlike a grant's role, which only the app reads, the platform acts on it.
+
+| Scope | May |
+|---|---|
+| `viewer` | open the apps under the folder |
+| `editor` | also publish and change apps there, and remove apps it created |
+| `admin` | also set access and route rules, give and take scopes at or below the folder, and manage exports and repositories there |
+
+Scopes only add. The strongest scope held on an app's folder or any folder
+above it applies, so a scope given on `ops` applies to `ops/yard` and every
+app in both. A person may hold many scopes: editor under `ops/yard`, viewer
+under `finance/reports`, admin under `labs`. A site admin is admin at the
+root and so everywhere. A grant on an app counts as viewer on that app.
+
+The part that pays for it: an editor connects Claude to `/mcp` and publishes,
+but only under the folders it holds. A tool that is asked to touch something
+else refuses and names the folder and the scope it would take. A static
+`TOOLSITE_MCP_TOKEN` keeps every power, as the CLI relies on it. An account
+with only viewer scopes is turned away at the consent page.
+
+A folder's page lists who holds what there, with inherited rows marked by
+the folder they come from, and an admin of the folder gives access with an
+account picker. A folder admin never grants above its folder, and never a
+scope stronger than its own. An admin who is not a site admin opens the
+admin pages and sees only the folders and apps it holds scope on.
+
 ### Gates
 
 An app's gate is one of:
@@ -752,7 +786,7 @@ An app's gate is one of:
 |---|---|
 | `public` | anyone |
 | `authenticated` | any signed-in account |
-| `granted` | only accounts granted access to that app |
+| `granted` | accounts with a grant on the app, or any scope on it or a folder above it |
 
 An admin passes every gate: they can grant themselves anything from the
 admin page, so asking them to do it app by app would only add a step.

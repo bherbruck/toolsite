@@ -70,6 +70,15 @@ pub struct PageMeta {
     /// granted, and the platform never interprets one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// The project folder this app sits in, as a path like `ops/yard`.
+    /// Absent means the root. Folders are a tree the platform keeps; the
+    /// URL of an app does not change when it moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// The account that first published it, when one was signed in. An
+    /// editor may remove what it created and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
     /// Hand-written views a person may query from outside the app, read
     /// only. Declared as `[access] views = [...]` in toolsite.toml.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -150,6 +159,8 @@ impl Default for PageMeta {
             gate: None,
             allow_http: Vec::new(),
             rules: Vec::new(),
+            project: None,
+            created_by: None,
             roles: Vec::new(),
             queryable: Vec::new(),
             policies: Vec::new(),
@@ -405,4 +416,132 @@ pub(crate) fn collect_slugs<'a>(
             }
         }
     })
+}
+
+// --- projects ----------------------------------------------------------------
+//
+// A project is a folder in a tree the platform keeps, and an app belongs to
+// one. The tree is logical: an app's URL is its slug whatever folder it is
+// in, so moving an app changes who may manage it, not where it lives. The
+// tree is kept under `.site/`, which no slug can name.
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq)]
+pub struct Folder {
+    /// `ops`, `ops/yard`. Segments follow the slug rules.
+    pub path: String,
+    pub name: String,
+    pub created_at: u64,
+}
+
+fn projects_path(config: &Config) -> PathBuf {
+    config.data_dir.join(".site").join("projects.json")
+}
+
+pub async fn list_folders(config: &Config) -> Vec<Folder> {
+    match fs::read_to_string(projects_path(config)).await {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+async fn write_folders(config: &Config, folders: &[Folder]) -> std::io::Result<()> {
+    let path = projects_path(config);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let json = serde_json::to_string_pretty(folders).map_err(std::io::Error::other)?;
+    fs::write(path, json).await
+}
+
+/// Whether `path` is a folder. The root always is and has no row.
+pub async fn folder_exists(config: &Config, path: &str) -> bool {
+    path.is_empty() || list_folders(config).await.iter().any(|folder| folder.path == path)
+}
+
+/// Creates `parent/name`. The parent must exist, or be the root.
+pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<Folder, String> {
+    if !crate::content::slug::valid_segment(name) {
+        return Err("a folder name is letters, numbers, '-' or '_'".into());
+    }
+    if !(parent.is_empty() || crate::content::slug::valid_slug(parent)) {
+        return Err("invalid parent folder".into());
+    }
+    let mut folders = list_folders(config).await;
+    if !parent.is_empty() && !folders.iter().any(|folder| folder.path == parent) {
+        return Err(format!("there is no folder '{parent}'"));
+    }
+    let path = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
+    if folders.iter().any(|folder| folder.path == path) {
+        return Err(format!("there is already a folder '{path}'"));
+    }
+    let folder = Folder {
+        path,
+        name: name.to_string(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    folders.push(folder.clone());
+    folders.sort_by(|a, b| a.path.cmp(&b.path));
+    write_folders(config, &folders).await.map_err(|e| e.to_string())?;
+    Ok(folder)
+}
+
+/// The folders directly inside `parent`.
+pub async fn subfolders(config: &Config, parent: &str) -> Vec<Folder> {
+    list_folders(config)
+        .await
+        .into_iter()
+        .filter(|folder| match folder.path.rsplit_once('/') {
+            Some((above, _)) => above == parent,
+            None => parent.is_empty(),
+        })
+        .collect()
+}
+
+/// The folder chain above a path, outermost first: `ops/yard/x` gives
+/// `ops`, `ops/yard`.
+pub fn folder_chain(path: &str) -> Vec<String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    (1..segments.len()).map(|n| segments[..n].join("/")).collect()
+}
+
+/// Whether anything has been published at `app` yet: its directory or a
+/// single page. A new app is placed in a folder on its first publish.
+pub async fn app_exists(config: &Config, app: &str) -> bool {
+    fs::metadata(config.data_dir.join(app)).await.is_ok()
+        || fs::metadata(config.data_dir.join(format!("{app}.html"))).await.is_ok()
+}
+
+/// The folder an app sits in, empty for the root.
+pub async fn app_folder(config: &Config, app: &str) -> String {
+    read_meta(config, app).await.project.unwrap_or_default()
+}
+
+/// Where an app sits in the tree: its folder path plus its slug, for
+/// display and for the scope rows an admin gives on the app itself.
+pub async fn logical_path(config: &Config, app: &str) -> String {
+    match read_meta(config, app).await.project {
+        Some(folder) if !folder.is_empty() => format!("{folder}/{app}"),
+        _ => app.to_string(),
+    }
+}
+
+/// Every app's slug with the folder it is in.
+pub async fn apps_with_folders(config: &Config) -> Vec<(String, String)> {
+    let mut slugs = Vec::new();
+    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
+    let mut apps: Vec<String> = slugs
+        .into_iter()
+        .map(|slug| slug.split('/').next().unwrap_or(&slug).to_string())
+        .collect();
+    apps.sort();
+    apps.dedup();
+    let mut out = Vec::with_capacity(apps.len());
+    for app in apps {
+        let folder = read_meta(config, &app).await.project.unwrap_or_default();
+        out.push((app, folder));
+    }
+    out
 }
