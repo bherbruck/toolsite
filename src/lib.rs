@@ -13,7 +13,7 @@ use crate::{
     platform::{
         admin, blob_upload,
         bearer::require_bearer,
-        export,
+        deploy, export, github,
         client_oauth::{
             authorize_decide, authorize_form, oauth_authorization_server_metadata,
             oauth_protected_resource_metadata, register, token_endpoint,
@@ -123,6 +123,14 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/settings-link", post(admin::settings_link))
         .route("/admin/job-run", post(admin::run_job))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
+        // An app's repository: GitHub Actions builds, a per-app token deploys.
+        .route("/admin/github", get(github::github_page))
+        .route("/admin/github/repos/search", get(github::repos_search))
+        .route("/admin/repo", post(github::repo_action))
+        .route("/github/setup", get(github::setup))
+        .route("/github/webhook", post(github::webhook))
+        .route("/deploy/{app}", put(deploy::deploy_root).post(deploy::deploy_root))
+        .route("/deploy/{app}/{*sub}", put(deploy::deploy_sub).post(deploy::deploy_sub))
         // One app's database, whole, for a token minted for that app alone.
         .route("/export/{file}", get(export::download))
         // Trades the site session for one scoped to a single app; the only

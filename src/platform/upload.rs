@@ -108,6 +108,19 @@ pub(crate) async fn store_upload(
             .into_response();
     }
 
+    store_for_slug(config, runtime, slug, kind, body).await
+}
+
+/// Writes `body` as `kind` at `slug`, for a caller that has already decided
+/// the writer may: an upload ticket, or a deploy token for the app. The slug
+/// is validated and may include a page name.
+pub(crate) async fn store_for_slug(
+    config: &Config,
+    runtime: &Runtime,
+    slug: String,
+    kind: UploadKind,
+    body: Bytes,
+) -> Response {
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "body is empty\n").into_response();
     }

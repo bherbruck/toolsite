@@ -71,6 +71,38 @@ pub(crate) struct SetIconRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RepoRequest {
+    #[schemars(description = "The app. For import, the slug the repository will be served at; it need not exist yet.")]
+    pub(crate) app: String,
+    #[schemars(
+        description = "'status' says what the app deploys from. 'create' makes a new repository from the app's stored source (publish it with ?source first). 'import' connects a repository you already have, adds the deploy workflow and secrets, and runs it. 'sync' runs the workflow now. 'disconnect' revokes the deploy token and forgets the link; the repository stays. 'installations' lists the accounts the GitHub App is installed on."
+    )]
+    pub(crate) action: String,
+    #[schemars(description = "For create: the repository name, default the app's slug. For import: owner/name of the existing repository.")]
+    pub(crate) repo: Option<String>,
+    #[schemars(description = "For import: the branch to deploy from, default the repository's default branch.")]
+    pub(crate) branch: Option<String>,
+    #[schemars(description = "For import: the folder inside the repository that holds the project, if not the root.")]
+    pub(crate) directory: Option<String>,
+    #[schemars(description = "Installation id from 'installations'. Optional when the App is installed on exactly one account.")]
+    pub(crate) installation: Option<u64>,
+    #[schemars(description = "For create: make the repository public. Private unless said otherwise.")]
+    pub(crate) public: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DeployTokenRequest {
+    #[schemars(description = "App the token may publish.")]
+    pub(crate) app: String,
+    #[schemars(description = "'create' mints a token and returns it once; 'list' shows the tokens that exist; 'revoke' ends the one named by id.")]
+    pub(crate) action: String,
+    #[schemars(description = "For create: what will hold the token, e.g. 'ci'. Required.")]
+    pub(crate) label: Option<String>,
+    #[schemars(description = "For revoke: the token's id, as list shows it.")]
+    pub(crate) id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExportRequest {
     #[schemars(description = "App whose database the token reads.")]
     pub(crate) app: String,
@@ -261,6 +293,119 @@ impl PageHost {
             runtime,
             tool_router: Self::tool_router(),
         }
+    }
+
+    #[tool(
+        description = "Keep an app in a GitHub repository and deploy it from there. GitHub Actions does the building and sends the result to PUT <site>/deploy/<app> with a token that publishes this one app only; toolsite never clones or builds. 'create' needs the app's source to have been published with ?source. After a connection, every push to the branch deploys; 'sync' deploys now. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts."
+    )]
+    pub(crate) async fn app_repo(
+        &self,
+        Parameters(RepoRequest { app, action, repo, branch, directory, installation, public }): Parameters<RepoRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::platform::github;
+        if !github::valid_app(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be one path segment of letters, numbers, '-' or '_'",
+            )]));
+        }
+        let config = &self.config;
+        let pick_installation = |given: Option<u64>| -> Result<u64, String> {
+            if let Some(id) = given {
+                return Ok(id);
+            }
+            let installs = github::installations(config);
+            match installs.as_slice() {
+                [one] => Ok(one.id),
+                [] => Err("the GitHub App is not installed anywhere yet; install it from /admin/github".into()),
+                many => Err(format!(
+                    "pass installation: one of {}",
+                    many.iter().map(|i| format!("{} ({})", i.id, i.account)).collect::<Vec<_>>().join(", ")
+                )),
+            }
+        };
+        let outcome: Result<String, String> = match action.as_str() {
+            "status" => Ok(github::describe(config, &app)),
+            "installations" => match github::refresh_installations(config).await {
+                Ok(list) if list.is_empty() => Ok("the App is installed nowhere yet".to_string()),
+                Ok(list) => Ok(list.iter().map(|i| format!("{}  {} ({})", i.id, i.account, i.kind)).collect::<Vec<_>>().join("\n")),
+                Err(why) => Err(why),
+            },
+            "create" => match pick_installation(installation) {
+                Ok(inst) => github::create(config, &app, inst, repo.as_deref(), !public.unwrap_or(false))
+                    .await
+                    .map(|link| format!("created {} on branch {}; pushes to it deploy {app}", link.url(), link.branch)),
+                Err(why) => Err(why),
+            },
+            "import" => match (pick_installation(installation), repo.as_deref()) {
+                (Ok(inst), Some(repo)) => github::import(config, &app, inst, repo, branch.as_deref(), directory.as_deref())
+                    .await
+                    .map(|link| format!("connected {} ({}) to {app}; the first deploy is running", link.url(), link.branch)),
+                (Err(why), _) => Err(why),
+                (_, None) => Err("import needs repo: owner/name".into()),
+            },
+            "sync" => github::sync(config, &app).await.map(|()| format!("workflow started for {app}")),
+            "disconnect" => {
+                let (config2, app2) = (config.clone(), app.clone());
+                tokio::task::spawn_blocking(move || github::disconnect(&config2, &app2))
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                    .map(|link| format!("{app} no longer deploys from {}; the repository is untouched", link.full_name()))
+            }
+            other => Err(format!("action must be status, installations, create, import, sync or disconnect, not '{other}'")),
+        };
+        Ok(match outcome {
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
+    }
+
+    #[tool(
+        description = "A token that may publish one app and nothing else, for CI: PUT <site>/deploy/<app> takes the same flags as an upload ticket (?bundle&spa, ?handler, ?migrations, ?manifest, ?source, ?blob=<key>, or a page) with Authorization: Bearer <token>. app_repo mints one itself for a connected repository; use this for any other pipeline. Returned once, stored only as a hash."
+    )]
+    pub(crate) async fn app_deploy_tokens(
+        &self,
+        Parameters(DeployTokenRequest { app, action, label, id }): Parameters<DeployTokenRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::platform::deploy;
+        if !deploy::valid_app(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be one path segment of letters, numbers, '-' or '_'",
+            )]));
+        }
+        let config = self.config.clone();
+        let url = deploy::deploy_url(&config, &app);
+        let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
+            "create" => deploy::create(&config, &app, &label.unwrap_or_default()).map(|(entry, token)| {
+                format!(
+                    "Token {} for {app} ({}). Shown once:\n\n{token}\n\nUse it as\n\n  tar -czf - -C dist . | curl -f -H 'Authorization: Bearer {token}' -T - '{url}?bundle'",
+                    entry.id, entry.label
+                )
+            }),
+            "list" => {
+                let tokens = deploy::list(&config, &app);
+                if tokens.is_empty() {
+                    return Ok(format!("no deploy tokens for {app}"));
+                }
+                Ok(tokens
+                    .iter()
+                    .map(|t| format!("{}  {}  last used {}", t.id, t.label, match t.last_used {
+                        Some(_) => "recently",
+                        None => "never",
+                    }))
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "revoke" => deploy::revoke(&config, &app, &id.unwrap_or_default())
+                .map(|()| "revoked; whatever holds it gets 401 from now on".to_string()),
+            other => Err(format!("action must be create, list or revoke, not '{other}'")),
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(match outcome {
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
     }
 
     #[tool(

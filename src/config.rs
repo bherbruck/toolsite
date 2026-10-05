@@ -1,6 +1,6 @@
 use crate::{
     accounts::providers::{PendingLogin, Provider},
-    platform::upload::UploadTicket,
+    platform::{github, upload::UploadTicket},
     runtime::blobs::{self, Blobs},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
@@ -30,6 +30,9 @@ pub struct Config {
     pub providers: Vec<Provider>,
     /// Provider sign-ins begun and not yet answered, by state.
     pub logins: Mutex<HashMap<String, PendingLogin>>,
+    /// The GitHub App this site speaks as, when one is configured. Lets an
+    /// app live in a repository and deploy from it.
+    pub github: Option<github::App>,
 }
 
 impl Config {
@@ -55,6 +58,7 @@ impl Config {
             blob_uploads: Mutex::new(HashMap::new()),
             providers: Vec::new(),
             logins: Mutex::new(HashMap::new()),
+            github: None,
         }
     }
 
@@ -73,6 +77,7 @@ impl Config {
             blob_uploads: Mutex::new(HashMap::new()),
             providers: Vec::new(),
             logins: Mutex::new(HashMap::new()),
+            github: None,
         }
     }
 }
