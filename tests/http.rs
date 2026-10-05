@@ -3439,3 +3439,135 @@ async fn an_admin_opens_a_granted_app_without_a_grant_and_a_visitor_does_not() {
     let (status, ..) = send(&config, get_as("/p/internal/", &reader)).await;
     assert_ne!(status, StatusCode::OK, "a visitor without a grant got in");
 }
+
+
+// --- an app's source, from the admin -----------------------------------------
+
+#[tokio::test]
+async fn an_admin_downloads_the_stored_source_and_nobody_else_can() {
+    let (dir, config) = server();
+    write_page(&config, "reports/index", "<h1>r</h1>");
+    let archive: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join("reports.source"), &archive).unwrap();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let reader = sign_in(&config, "reader@example.com", "correct horse battery");
+
+    // The overview offers it.
+    let (_, page, _) = send(&config, get_as("/admin/apps/reports", &boss)).await;
+    assert!(page.contains("/admin/apps/reports/source"), "no download offered");
+
+    let (status, body, headers) =
+        send_bytes_with_headers(&config, get_as("/admin/apps/reports/source", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, archive, "the bytes differ from the stored archive");
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    assert_eq!(header("content-disposition"), Some("attachment; filename=\"reports-source.tar.gz\""));
+    assert_eq!(header("cache-control"), Some("no-store"));
+
+    // A visitor, a stranger, and the public site all get nothing.
+    let (status, ..) = send(&config, get_as("/admin/apps/reports/source", &reader)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, ..) = send(&config, get("/admin/apps/reports/source")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, ..) = send(&config, get("/p/reports.source")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the archive was served publicly");
+
+    // An app with no source says so, with 404 on the download.
+    write_page(&config, "bare/index", "<h1>b</h1>");
+    let (status, ..) = send(&config, get_as("/admin/apps/bare/source", &boss)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, page, _) = send(&config, get_as("/admin/apps/bare", &boss)).await;
+    assert!(page.contains("No source stored"));
+}
+
+// --- declared roles are a hint ---------------------------------------------------
+
+#[tokio::test]
+async fn roles_an_app_declares_are_offered_when_granting_but_never_required() {
+    let (_dir, config) = server();
+    write_page(&config, "board/index", "<h1>b</h1>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+
+    // Before the manifest says anything: a plain field, viewer by default.
+    let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
+    assert!(!page.contains("role-hints"));
+    assert!(page.contains(r#"name="role" value="viewer""#));
+
+    let changed = toolsite::platform::manifest::apply(&config, "board", "roles = [\"editor\", \"approver\"]\n")
+        .await
+        .unwrap();
+    assert!(changed.iter().any(|c| c.contains("roles")), "{changed:?}");
+    let meta = toolsite::content::store::read_meta(&config, "board").await;
+    assert_eq!(meta.roles, ["editor", "approver"]);
+
+    // Offered on the app's Access tab and on the account page.
+    let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
+    assert!(page.contains(r#"<option value="approver">"#), "declared roles are not offered");
+    assert!(page.contains(r#"name="role" value="editor""#), "the first declared role is not the default");
+    let (_, page, _) = send(&config, get_as("/admin/accounts/reader@example.com", &boss)).await;
+    assert!(page.contains(r#"<option value="editor">"#));
+
+    // Still only a hint: an undeclared role is granted without complaint.
+    let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
+    let token = form_token_from(&page);
+    let (status, ..) = send(
+        &config,
+        post_form("/admin/access", &boss, format!("token={token}&app=board&email=reader@example.com&allow=1&role=auditor")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        toolsite::accounts::users::role_for(&config, &account_id(&config, "reader@example.com"), "board").as_deref(),
+        Some("auditor")
+    );
+    let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
+    assert!(page.contains("auditor"));
+    assert!(!page.contains("badge warn"), "an undeclared role was flagged");
+
+    // Withdrawing the hint leaves the grant alone.
+    toolsite::platform::manifest::apply(&config, "board", "roles = []\n").await.unwrap();
+    assert!(toolsite::content::store::read_meta(&config, "board").await.roles.is_empty());
+    assert_eq!(
+        toolsite::accounts::users::role_for(&config, &account_id(&config, "reader@example.com"), "board").as_deref(),
+        Some("auditor")
+    );
+}
+
+fn account_id(config: &Config, email: &str) -> String {
+    toolsite::accounts::users::log_in(config, email, "correct horse battery").unwrap().0.id
+}
+
+#[tokio::test]
+async fn a_new_export_token_comes_with_the_pull_ready_to_paste() {
+    let (_dir, config) = server();
+    seed_db(&config, "sales");
+    write_page(&config, "sales/index", "<h1>sales</h1>");
+    toolsite::accounts::users::sign_up_as(&config, "owner@example.com", "correct horse", true).unwrap();
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/admin/apps/sales/exports", &session)).await;
+    let form_token = form_token_from(&page);
+    let body = format!("token={form_token}&action=create&app=sales&label=reporting");
+    let (status, page, _) = send(&config, form_post("/admin/exports", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::OK);
+    let token = page
+        .split("id=\"fresh-token\">tse_")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .map(|rest| format!("tse_{rest}"))
+        .expect("the token");
+    // maud escapes the quotes; what matters is that the token and the URL
+    // sit in the one copyable line.
+    let line = page
+        .split(r#"id="fresh-token-curl">"#)
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("a ready-to-paste pull on the page");
+    assert!(line.starts_with("curl -H "), "{line}");
+    assert!(line.contains(&format!("Authorization: Bearer {token}")), "{line}");
+    assert!(line.ends_with("-o sales.sqlite http://localhost:8080/export/sales.sqlite"), "{line}");
+    assert!(page.contains(r#"data-copy="fresh-token-curl""#), "the pull has no copy button");
+}

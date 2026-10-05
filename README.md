@@ -386,6 +386,7 @@ A handler can make HTTP requests, but only to hosts its app named:
 
 ```toml
 allow_http = ["api.github.com", "*.example.com"]
+roles = ["viewer", "editor"]   # the roles the handler checks; a hint for whoever grants
 ```
 
 ```rust

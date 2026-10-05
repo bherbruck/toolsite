@@ -65,6 +65,11 @@ pub struct PageMeta {
     /// this. Longest matching prefix wins.
     #[serde(default)]
     pub rules: Vec<PathRule>,
+    /// Roles the app's handler checks, declared in toolsite.toml so whoever
+    /// grants access can pick the right word. A hint only: any role may be
+    /// granted, and the platform never interprets one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -109,6 +114,7 @@ impl Default for PageMeta {
             gate: None,
             allow_http: Vec::new(),
             rules: Vec::new(),
+            roles: Vec::new(),
         }
     }
 }

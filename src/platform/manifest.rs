@@ -40,6 +40,11 @@ pub struct Manifest {
     /// list takes the capability away.
     #[serde(default)]
     pub allow_http: Option<Vec<String>>,
+    /// Roles the handler checks with identity::current-role, offered as
+    /// suggestions wherever access is granted. Absent leaves whatever is
+    /// declared; an empty list withdraws the hint.
+    #[serde(default)]
+    pub roles: Option<Vec<String>>,
     #[serde(default, rename = "route")]
     pub routes: Vec<Route>,
     #[serde(default, rename = "job")]
@@ -71,7 +76,7 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         // difference between [[job]] and [[jobs]] is invisible otherwise.
         format!(
             "could not read toolsite.toml: {e}\nKeys it takes: slug, spa, gate, icon, \
-             allow_http, [[route]] (path, gate), [[job]] (name, schedule, path)."
+             allow_http, roles, [[route]] (path, gate), [[job]] (name, schedule, path)."
         )
     })?;
 
@@ -110,6 +115,22 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         if meta.gate != wanted {
             changed.push(format!("gate = {gate}"));
             meta.gate = wanted;
+        }
+    }
+
+    if let Some(roles) = manifest.roles {
+        let roles: Vec<String> = roles
+            .into_iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        if meta.roles != roles {
+            changed.push(if roles.is_empty() {
+                "roles cleared".to_string()
+            } else {
+                format!("roles = [{}]", roles.join(", "))
+            });
+            meta.roles = roles;
         }
     }
 

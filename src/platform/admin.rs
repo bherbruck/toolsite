@@ -636,6 +636,11 @@ async fn render_overview(
         Some(path) => tokio::fs::metadata(path).await.ok().and_then(|m| m.modified().ok()),
         None => None,
     };
+    let source = tokio::fs::metadata(config.data_dir.join(format!("{app}.source")))
+        .await
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()));
+    let page_url = crate::content::store::page_url(config, app);
     html! {
         div."grid-2" {
             (ui::panel("About", None, html! {
@@ -669,7 +674,93 @@ async fn render_overview(
                 }
             }))
         }
+        (ui::panel("Source", Some("The project the app was built from, as the agent stored it. A bundle cannot be turned back into its source, so this is the copy."), html! {
+            @match source {
+                Some((bytes, modified)) => {
+                    dl."kv" {
+                        dt { "Archive" } dd { (human_bytes(bytes)) ", gzipped tar" }
+                        dt { "Stored" } dd { @match modified { Some(m) => (crate::content::store::relative_time(m)), None => "—" } }
+                    }
+                    div."actions" style="margin-top: .75rem" {
+                        a."btn" href={ "/admin/apps/" (app) "/source" } { "Download source" }
+                        a."btn quiet" href=(page_url) target="_blank" { "Open the app as served" }
+                    }
+                }
+                None => {
+                    p."muted" {
+                        "No source stored. Ask the agent to publish it with " code { "?source" }
+                        " on its upload URL; the " a href="/guide" { "guide" } " says how. "
+                        "Until then the page as served is all there is: "
+                        a href=(page_url) target="_blank" { (page_url) } "."
+                    }
+                }
+            }
+        }))
     }
+}
+
+/// `GET /admin/apps/<app>/source`: the stored project archive, for an admin
+/// and nobody else. The public site refuses `.source` outright; this is the
+/// one door to it.
+pub async fn download_source(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Path(app): Path<String>,
+) -> Response {
+    if let Err(response) = require_admin(&config, &headers).await {
+        return response;
+    }
+    if !export::valid_app(&app) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let path = config.data_dir.join(format!("{app}.source"));
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(_) => return (StatusCode::NOT_FOUND, "no source stored for this app").into_response(),
+    };
+    let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let stream = tokio_util::io::ReaderStream::new(file);
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{app}-source.tar.gz\""),
+        )
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// The role field on a grant form. Declared roles are offered, any word is
+/// accepted: the platform never interprets a role, so it never refuses one.
+fn role_input(declared: &[String]) -> Markup {
+    let first = declared.first().map(String::as_str).unwrap_or("viewer");
+    html! {
+        input name="role" value=(first) placeholder="role" size="8"
+              list=[(!declared.is_empty()).then_some("role-hints")]
+              title="A word the app reads with identity::current-role";
+        @if !declared.is_empty() {
+            datalist id="role-hints" {
+                @for role in declared { option value=(role) {} }
+            }
+        }
+    }
+}
+
+/// Every role any app declares, for a form that is not about one app. A
+/// hint, so a bounded read is plenty.
+async fn all_declared_roles(config: &Config) -> Vec<String> {
+    let mut roles = Vec::new();
+    for app in app_names(config).await.into_iter().take(200) {
+        for role in read_meta(config, &app).await.roles {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+        }
+    }
+    roles
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -765,7 +856,7 @@ async fn render_access_tab(
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))
                 label."small" for="email" { "Add a person" }
                 (ui::combobox("email", "/admin/accounts/search", "Start typing an email…"))
-                input name="role" value="viewer" placeholder="role" size="8" title="A word the app reads with identity::current-role";
+                (role_input(&meta.roles))
                 button type="submit" { "Add" }
             }
             @if grants.is_empty() {
@@ -809,9 +900,15 @@ fn render_exports_tab(
     html! {
         @if let Some(fresh) = fresh {
             (ui::panel("Your new token", Some("Copy it now. It is not stored and will not be shown again."), html! {
+                p."small" { "The token:" }
                 (ui::secret("fresh-token", fresh))
+                p."small" { "Or the whole pull, ready to paste:" }
+                (ui::secret(
+                    "fresh-token-curl",
+                    &format!("curl -H 'Authorization: Bearer {fresh}' -o {app}.sqlite {url}"),
+                ))
                 p."muted small" {
-                    "Point the tool at " code { (url) } " with " code { "Authorization: Bearer <token>" } "."
+                    "In a reporting tool: a sqlite connection with URL " code { (url) } " and the token as its bearer token."
                 }
             }))
         }
@@ -1057,6 +1154,7 @@ async fn render_account_page(
     let token = form_token(&config, &admin);
     let back = format!("/admin/accounts/{}", urlencoding::encode(&account.email));
     let is_self = account.email == admin.email;
+    let declared_roles = all_declared_roles(&config).await;
     let title = account.email.clone();
     admin_page(
         &headers,
@@ -1082,7 +1180,7 @@ async fn render_account_page(
                         (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("allow", "1"))
                         label."small" for="app" { "Add to an app" }
                         (ui::combobox("app", "/admin/apps/search", "Start typing an app…"))
-                        input name="role" value="viewer" placeholder="role" size="8";
+                        (role_input(&declared_roles))
                         button type="submit" { "Add" }
                     }
                     @if grants.is_empty() {
