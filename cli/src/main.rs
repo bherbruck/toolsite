@@ -102,8 +102,9 @@ enum Command {
     /// Decide who may reach an app, or one path within it.
     Gate {
         app: String,
-        /// public (anyone), authenticated (any account), or granted (only
-        /// accounts you have granted).
+        /// public (anyone), authenticated (any account), granted (only
+        /// accounts you have granted), or default (follow the site's
+        /// TOOLSITE_DEFAULT_GATE).
         gate: String,
         /// Apply it to paths starting here instead of the whole app, e.g.
         /// --path /admin. Longest matching prefix wins.

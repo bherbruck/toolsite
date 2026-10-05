@@ -177,7 +177,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<TOOLSITE_MCP_TOKEN>
 | `toolsite secret <app> [NAME --value v] [--link]` | List setting names, set one, or print a link for someone to paste values into. |
 | `toolsite job <app> [name] [--schedule c --path p] [--now] [--remove]` | List, set, run or remove a scheduled job. |
 | `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
-| `toolsite gate <app> <public\|authenticated\|granted> [--path /prefix]` | Decide who may reach an app, or one path within it. |
+| `toolsite gate <app> <public\|authenticated\|granted\|default> [--path /prefix]` | Decide who may reach an app, or one path within it. |
 | `toolsite grant <app> <email> [--role r]` / `revoke` | Access for a `granted` app. |
 | `toolsite user disable <email>` / `enable` | Stop an account signing in and end its live sessions. Reversible. |
 
@@ -642,9 +642,16 @@ An app's gate is one of:
 
 | Gate | Who gets in |
 |---|---|
-| `public` (default) | anyone |
+| `public` | anyone |
 | `authenticated` | any signed-in account |
 | `granted` | only accounts granted access to that app |
+
+An app that has not chosen follows the site default, `TOOLSITE_DEFAULT_ACCESS`,
+which is `public` unless you set it. An internal deployment sets it to
+`granted` or `authenticated` once, and every app is closed from the moment it
+is published; an app that should be open says `public` itself. The admin
+page marks apps that follow the default, and `toolsite gate <app> default`
+puts one back on it.
 
 A gate can cover one part of an app instead of all of it, which is how a
 public page and a private one live in the same bundle:
@@ -765,6 +772,7 @@ is required to serve HTTP.
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where everything is stored. |
 | `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME` and `_ALLOW_DOMAIN`. See Accounts. |
+| `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `granted`. Set `granted` for an internal site. |
 | `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
 | `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |

@@ -111,7 +111,7 @@ pub(crate) struct SetVisibilityRequest {
     )]
     pub(crate) listed: Option<bool>,
     #[schemars(
-        description = "Who may reach the app: 'public' (anyone), 'authenticated' (any signed-in account), or 'granted' (only accounts given access with set_access)."
+        description = "Who may reach the app: 'public' (anyone), 'authenticated' (any signed-in account), 'granted' (only accounts given access with set_access), or 'default' to follow the site's TOOLSITE_DEFAULT_ACCESS, which is what an app does until told otherwise."
     )]
     pub(crate) gate: Option<String>,
     #[schemars(
@@ -980,9 +980,11 @@ impl PageHost {
             )]));
         }
         if let Some(gate) = &gate {
-            if !matches!(gate.as_str(), "public" | "authenticated" | "granted") {
+            let allowed = matches!(gate.as_str(), "public" | "authenticated" | "granted")
+                || (gate == "default" && path.is_none());
+            if !allowed {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "gate must be 'public', 'authenticated' or 'granted'",
+                    "gate must be 'public', 'authenticated' or 'granted' (or 'default' for the whole app, meaning the site's TOOLSITE_DEFAULT_ACCESS)",
                 )]));
             }
         }
@@ -1014,7 +1016,7 @@ impl PageHost {
                     ))]));
                 }
             }
-            (None, Some(gate)) => meta.gate = gate,
+            (None, Some(gate)) => meta.gate = (gate != "default").then_some(gate),
             (None, None) => {}
         }
         write_meta(&self.config, &slug, &meta)

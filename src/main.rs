@@ -217,6 +217,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // What an app is until it says otherwise. An internal deployment sets
+    // this to granted or authenticated once and never thinks about it again.
+    let default_gate = read(&["TOOLSITE_DEFAULT_ACCESS"]).unwrap_or_else(|| "public".into());
+    if !toolsite::content::store::GATES.contains(&default_gate.as_str()) {
+        panic!(
+            "TOOLSITE_DEFAULT_ACCESS must be one of {}, not {default_gate:?}",
+            toolsite::content::store::GATES.join(", ")
+        );
+    }
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
 
@@ -226,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
         bearer_auth = bearer_token.is_some(),
         oauth_auth = base_url.is_some(),
         base_url = base_url.as_deref().unwrap_or("<unset>"),
+        default_access = %default_gate,
         "auth configuration"
     );
     tracing::info!(
@@ -246,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
         blob_uploads: Mutex::new(HashMap::new()),
         providers,
         logins: Mutex::new(HashMap::new()),
+        default_gate,
     });
 
     let runtime = Runtime::new()?;
@@ -303,6 +315,7 @@ fn run_user_command(
         blob_uploads: Mutex::new(HashMap::new()),
         providers: Vec::new(),
         logins: Mutex::new(HashMap::new()),
+        default_gate: "public".to_string(),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

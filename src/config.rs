@@ -30,6 +30,9 @@ pub struct Config {
     pub providers: Vec<Provider>,
     /// Provider sign-ins begun and not yet answered, by state.
     pub logins: Mutex<HashMap<String, PendingLogin>>,
+    /// The gate an app has until it says otherwise. "public" for a site on
+    /// the open internet; "granted" or "authenticated" for an internal one.
+    pub default_gate: String,
 }
 
 impl Config {
@@ -53,6 +56,7 @@ impl Config {
             // scheduler runs handlers, which may well store files.
             blobs: self.blobs.clone_settings(),
             blob_uploads: Mutex::new(HashMap::new()),
+            default_gate: self.default_gate.clone(),
             providers: Vec::new(),
             logins: Mutex::new(HashMap::new()),
         }
@@ -73,6 +77,7 @@ impl Config {
             blob_uploads: Mutex::new(HashMap::new()),
             providers: Vec::new(),
             logins: Mutex::new(HashMap::new()),
+            default_gate: "public".to_string(),
         }
     }
 }

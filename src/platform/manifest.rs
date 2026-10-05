@@ -61,7 +61,7 @@ pub struct Job {
     pub path: String,
 }
 
-const GATES: [&str; 3] = ["public", "authenticated", "granted"];
+use crate::content::store::GATES;
 
 /// Applies a manifest to one app, reporting what changed so a deploy says
 /// what it did rather than only that it finished.
@@ -78,8 +78,8 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
     // Everything is checked before anything is written: half an applied
     // manifest is worse than a rejected one.
     if let Some(gate) = &manifest.gate {
-        if !GATES.contains(&gate.as_str()) {
-            return Err(format!("gate must be one of {}", GATES.join(", ")));
+        if !GATES.contains(&gate.as_str()) && gate != "default" {
+            return Err(format!("gate must be one of {}, or default", GATES.join(", ")));
         }
     }
     for route in &manifest.routes {
@@ -106,9 +106,10 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         }
     }
     if let Some(gate) = manifest.gate {
-        if meta.gate != gate {
+        let wanted = (gate != "default").then_some(gate.clone());
+        if meta.gate != wanted {
             changed.push(format!("gate = {gate}"));
-            meta.gate = gate;
+            meta.gate = wanted;
         }
     }
 
@@ -220,8 +221,8 @@ mod tests {
 
         let meta = read_meta(&config, "board").await;
         assert!(meta.spa);
-        assert_eq!(meta.gate_for("/"), "public");
-        assert_eq!(meta.gate_for("/triage"), "authenticated");
+        assert_eq!(meta.gate_for("/", "granted"), "public");
+        assert_eq!(meta.gate_for("/triage", "granted"), "authenticated");
         assert_eq!(schedule::read_jobs(&config, "board").len(), 1);
     }
 
@@ -276,7 +277,7 @@ mod tests {
         assert!(error.contains("must start with '/'"), "got {error}");
 
         // The valid half must not have been applied.
-        assert_eq!(read_meta(&config, "board").await.gate, "public");
+        assert_eq!(read_meta(&config, "board").await.gate.as_deref(), Some("public"));
     }
 
     #[tokio::test]

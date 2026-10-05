@@ -269,7 +269,7 @@ async fn gate_check(
         .strip_prefix(&format!("/p/{app}"))
         .unwrap_or(path)
         .to_string();
-    let gate = read_meta(config, app).await.gate_for(&within).to_string();
+    let gate = read_meta(config, app).await.gate_for(&within, &config.default_gate).to_string();
     if admits(config, &gate, app, visitor).await {
         return None;
     }
@@ -527,23 +527,7 @@ pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> 
     None
 }
 
-pub(crate) const INDEX_SEARCH_SCRIPT: &str = r#"
-<script>
-  const input = document.getElementById('q');
-  const items = Array.from(document.getElementById('list').children);
-  const noMatch = document.getElementById('no-match');
-  input.addEventListener('input', () => {
-    const q = input.value.trim().toLowerCase();
-    let visible = 0;
-    items.forEach((li) => {
-      const match = (li.dataset.slug + ' ' + (li.dataset.title || '')).includes(q);
-      li.style.display = match ? '' : 'none';
-      if (match) visible++;
-    });
-    noMatch.style.display = (items.length > 0 && visible === 0 && q !== '') ? 'block' : 'none';
-  });
-</script>
-"#;
+
 
 pub(crate) struct PageCard {
     pub(crate) slug: String,
@@ -569,7 +553,7 @@ pub(crate) async fn index(
         if meta.hidden || !meta.listed {
             continue;
         }
-        if !admits(&config, meta.gate_for("/"), slug, viewer.as_ref()).await {
+        if !admits(&config, meta.gate_for("/", &config.default_gate), slug, viewer.as_ref()).await {
             continue;
         }
         let path = page_path(&config, slug).await;
@@ -643,7 +627,7 @@ pub(crate) async fn index(
         "Pages",
         crate::platform::admin::sidebar("pages", viewer.as_ref()),
         body,
-        (!cards.is_empty()).then_some(INDEX_SEARCH_SCRIPT),
+        (!cards.is_empty()).then_some(crate::ui::FILTER_SCRIPT),
     );
     Html(markup.into_string())
 }

@@ -401,6 +401,27 @@ pub const SHELL_SCRIPT: &str = r#"
 </script>
 "#;
 
+/// Narrows a list as the reader types: the element `#list`'s children are
+/// shown or hidden by their `data-slug` and `data-title`, and `#no-match`
+/// appears when nothing is left. Shared by the index and the apps list.
+pub const FILTER_SCRIPT: &str = r#"
+<script>
+  const input = document.getElementById('q');
+  const items = Array.from(document.getElementById('list').children);
+  const noMatch = document.getElementById('no-match');
+  input.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    let visible = 0;
+    items.forEach((li) => {
+      const match = (li.dataset.slug + ' ' + (li.dataset.title || '')).includes(q);
+      li.style.display = match ? '' : 'none';
+      if (match) visible++;
+    });
+    noMatch.style.display = (items.length > 0 && visible === 0 && q !== '') ? 'block' : 'none';
+  });
+</script>
+"#;
+
 /// A full document. `script` is emitted verbatim at the end of the body, so
 /// callers keep control of anything interactive.
 pub fn page(title: &str, body: Markup, script: Option<&str>) -> Markup {

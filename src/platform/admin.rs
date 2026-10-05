@@ -156,6 +156,7 @@ struct Page<'a> {
     subtitle: Option<Markup>,
     actions: Option<Markup>,
     body: Markup,
+    script: Option<&'static str>,
 }
 
 /// Wraps a section's content, so each page differs only in what it renders.
@@ -181,7 +182,7 @@ fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> Response {
             (ui::flash(flash.as_ref()))
             (page.body)
         },
-        None,
+        page.script,
     );
     let mut response = ([no_store()], Html(markup.into_string())).into_response();
     if flash.is_some() {
@@ -216,6 +217,7 @@ struct AppRow {
     app: String,
     title: Option<String>,
     gate: String,
+    follows_default: bool,
     hidden: bool,
     has_handler: bool,
     modified: Option<std::time::SystemTime>,
@@ -235,7 +237,8 @@ async fn app_row(config: &Config, app: &str) -> AppRow {
     AppRow {
         app: app.to_string(),
         title,
-        gate: meta.gate,
+        gate: meta.gate(&config.default_gate).to_string(),
+        follows_default: meta.gate.is_none(),
         hidden: meta.hidden,
         has_handler: config.data_dir.join(app).join("handler.wasm").is_file(),
         modified,
@@ -261,21 +264,28 @@ pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) ->
             crumbs: vec![],
             subtitle: Some(html! { (count) " published" }),
             actions: None,
+            script: (!rows.is_empty()).then_some(ui::FILTER_SCRIPT),
             body: html! {
                 @if rows.is_empty() {
                     (ui::panel("Nothing published yet", Some("An agent publishes with create_upload; apps appear here as they land."), html! {}))
                 } @else {
+                    input type="search" id="q" placeholder="Find an app…" autocomplete="off" autofocus;
                     section."panel" {
                         table {
-                            thead { tr { th { "App" } th { "Gate" } th { "Handler" } th { "Updated" } th {} } }
-                            tbody {
+                            thead { tr { th { "App" } th { "Access" } th { "Handler" } th { "Updated" } th {} } }
+                            tbody id="list" {
                                 @for row in &rows {
-                                    tr {
+                                    tr data-slug=(row.app.to_lowercase())
+                                       data-title=(row.title.as_deref().unwrap_or_default().to_lowercase()) {
                                         td {
                                             a."row-link" href={ "/admin/apps/" (row.app) } { (row.title.as_deref().unwrap_or(&row.app)) }
                                             @if row.title.is_some() { " " span."muted small" { (row.app) } }
                                         }
-                                        td { (gate_badge(&row.gate)) @if row.hidden { " " span."badge warn" { "hidden" } } }
+                                        td {
+                                            (gate_badge(&row.gate))
+                                            @if row.follows_default { " " span."muted small" { "site default" } }
+                                            @if row.hidden { " " span."badge warn" { "hidden" } }
+                                        }
                                         td { @if row.has_handler { span."badge" { "wasm" } } @else { span."muted small" { "static" } } }
                                         td."muted small" {
                                             @if let Some(modified) = row.modified { (crate::content::store::relative_time(modified)) }
@@ -286,6 +296,7 @@ pub async fn apps_page(State(config): State<Arc<Config>>, headers: HeaderMap) ->
                             }
                         }
                     }
+                    p."no-match" id="no-match" { "No app matches that." }
                 }
             },
         },
@@ -423,10 +434,11 @@ async fn app_tab(
             crumbs: vec![("Apps", "/admin/apps")],
             subtitle: Some(html! { a href=(url) target="_blank" { (url) } }),
             actions: Some(html! {
-                (gate_badge(&meta.gate))
+                (gate_badge(meta.gate(&config.default_gate)))
                 @if meta.hidden { span."badge warn" { "hidden" } }
                 @if !meta.listed { span."badge" { "unlisted" } }
             }),
+            script: None,
             body: html! {
                 (ui::tabs(&tab_items, &tab))
                 (body)
@@ -525,26 +537,34 @@ async fn render_access_tab(
             .collect()
     };
     html! {
-        (ui::panel("Who may reach it", Some("The gate for the whole app. Route rules below make exceptions by path."), html! {
+        (ui::panel("Who may open it", Some("Access for the whole app. Route rules below make exceptions by path."), html! {
             form method="post" action="/admin/gate" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                 div."choices" {
+                    label."choice" {
+                        input type="radio" name="gate" value="default" checked[meta.gate.is_none()];
+                        strong { "Site default" }
+                        span {
+                            "Currently " (config.default_gate) ". Set once for the whole site with "
+                            code { "TOOLSITE_DEFAULT_ACCESS" } "; apps that have not chosen follow it."
+                        }
+                    }
                     @for (value, label, help) in GATES {
                         label."choice" {
-                            input type="radio" name="gate" value=(value) checked[meta.gate == value];
+                            input type="radio" name="gate" value=(value) checked[meta.gate.as_deref() == Some(value)];
                             strong { (label) }
                             span { (help) }
                         }
                     }
                 }
-                div."actions end" { button type="submit" { "Save gate" } }
+                div."actions end" { button type="submit" { "Save access" } }
             }
         }))
 
-        (ui::panel("Route rules", Some("A path prefix with its own gate. Longest match wins, so a public app can have a private corner."), html! {
+        (ui::panel("Route rules", Some("A path prefix with its own access rule. Longest match wins, so a public app can have a private corner."), html! {
             @if !meta.rules.is_empty() {
                 table {
-                    thead { tr { th { "Prefix" } th { "Gate" } th {} } }
+                    thead { tr { th { "Prefix" } th { "Access" } th {} } }
                     tbody {
                         @for rule in &meta.rules {
                             tr {
@@ -570,7 +590,7 @@ async fn render_access_tab(
             }
         }))
 
-        (ui::panel("Granted accounts", Some("Only matters while the gate, or a rule, says granted."), html! {
+        (ui::panel("Granted accounts", Some("Only matters while access, or a rule, says granted."), html! {
             @if grants.is_empty() {
                 p."muted" { "Nobody has been granted access yet." }
             } @else {
@@ -768,6 +788,7 @@ pub async fn accounts_page(State(config): State<Arc<Config>>, headers: HeaderMap
             crumbs: vec![],
             subtitle: Some(html! { (accounts.len()) " accounts" }),
             actions: Some(html! { a."btn" href="/admin/accounts/new" { "New account" } }),
+            script: None,
             body: html! {
                 @if accounts.is_empty() {
                     (ui::panel("No accounts yet", Some("Create the first one, or run `toolsite user add` on the machine."), html! {}))
@@ -824,6 +845,7 @@ pub async fn new_account_page(State(config): State<Arc<Config>>, headers: Header
             crumbs: vec![("Accounts", "/admin/accounts")],
             subtitle: None,
             actions: None,
+            script: None,
             body: ui::panel("Account", Some("A password set here is one you have to pass on. Prefer an invite: `toolsite user add` prints a one-time link."), html! {
                 form method="post" action="/admin/users" {
                     (hidden("token", &token)) (hidden("back", "/admin/accounts"))
@@ -875,9 +897,10 @@ pub async fn access_page(State(config): State<Arc<Config>>, headers: HeaderMap) 
             crumbs: vec![],
             subtitle: Some(html! { "Every grant on the site. Edit them on each app's Access tab." }),
             actions: None,
+            script: None,
             body: html! {
                 @if grants.is_empty() {
-                    (ui::panel("No grants", Some("Grants only matter for apps gated \"granted\". Set a gate on an app's Access tab first."), html! {}))
+                    (ui::panel("No grants", Some("Grants only matter for apps whose access is \"granted\". Set that on an app's Access tab first."), html! {}))
                 } @else {
                     section."panel" {
                         table {
@@ -927,6 +950,7 @@ pub async fn exports_page(State(config): State<Arc<Config>>, headers: HeaderMap)
             crumbs: vec![],
             subtitle: Some(html! { "Tokens that let a reporting tool pull one app's database. Mint them on the app's Exports tab." }),
             actions: None,
+            script: None,
             body: html! {
                 @if tokens.is_empty() {
                     (ui::panel("No export tokens", Some("Open an app and use its Exports tab to create one."), html! {}))
@@ -1093,14 +1117,18 @@ pub async fn change_gate(
     if !valid_slug(&form.app) {
         return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
     }
-    if !GATES.iter().any(|(value, ..)| *value == form.gate) {
+    if form.gate != "default" && !GATES.iter().any(|(value, ..)| *value == form.gate) {
         return (StatusCode::BAD_REQUEST, "unknown gate").into_response();
     }
     let mut meta = read_meta(&config, &form.app).await;
-    meta.gate = form.gate.clone();
+    meta.gate = (form.gate != "default").then(|| form.gate.clone());
+    let said = match meta.gate.as_deref() {
+        Some(gate) => format!("{} is now {gate}.", form.app),
+        None => format!("{} follows the site default, {}.", form.app, config.default_gate),
+    };
     match write_meta(&config, &form.app, &meta).await {
-        Ok(()) => redirect_flash(&back, true, format!("{} is now {}.", form.app, form.gate)),
-        Err(_) => redirect_flash(&back, false, "Could not save the gate."),
+        Ok(()) => redirect_flash(&back, true, said),
+        Err(_) => redirect_flash(&back, false, "Could not save access."),
     }
 }
 

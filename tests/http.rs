@@ -3177,3 +3177,69 @@ async fn route_rules_are_added_and_removed_from_the_access_tab() {
     .await;
     assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")));
 }
+
+// --- the site default for access ---------------------------------------------
+
+#[tokio::test]
+async fn an_app_that_names_no_access_follows_the_site_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        default_gate: "granted".to_string(),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    write_page(&config, "internal/index", "<title>Internal</title>");
+    write_page(&config, "brochure/index", "<title>Brochure</title>");
+    std::fs::write(
+        dir.path().join("brochure.meta"),
+        r#"{"listed":true,"hidden":false,"spa":false,"gate":"public","allow_http":[],"rules":[]}"#,
+    )
+    .unwrap();
+
+    // Nothing said: closed, as the site asked.
+    let (status, ..) = send(&config, get("/p/internal/")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "an unconfigured app was open on a granted-by-default site");
+    // Said public: open.
+    let (status, ..) = send(&config, get("/p/brochure/")).await;
+    assert_eq!(status, StatusCode::OK);
+    // And the index agrees.
+    let (_, index, _) = send(&config, get("/")).await;
+    assert!(index.contains("Brochure"));
+    assert!(!index.contains("Internal"), "a closed app was listed to a stranger");
+
+    // The same files on an open-by-default site are open.
+    let open = Arc::new(Config::local(dir.path().to_path_buf(), TOKEN));
+    let (status, ..) = send(&open, get("/p/internal/")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_admin_can_put_an_app_back_on_the_site_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        default_gate: "authenticated".to_string(),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    write_page(&config, "reports/index", "<h1>r</h1>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
+    let token = form_token_from(&page);
+    assert!(page.contains(r#"value="default" checked"#), "a fresh app is not shown on the default");
+
+    send(&config, post_form("/admin/gate", &boss, format!("token={token}&app=reports&gate=public"))).await;
+    let (status, ..) = send(&config, get("/p/reports/")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, page, _) = send(&config, get_as("/admin/apps", &boss)).await;
+    assert!(!page.contains("site default"), "an app with its own setting was marked as following the default");
+
+    send(&config, post_form("/admin/gate", &boss, format!("token={token}&app=reports&gate=default"))).await;
+    let (status, ..) = send(&config, get("/p/reports/")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "back on the default, the app should be closed again");
+    // Wherever the sidecar landed, it names no gate.
+    let meta = std::fs::read_to_string(dir.path().join("reports.meta"))
+        .or_else(|_| std::fs::read_to_string(dir.path().join("reports/index.meta")))
+        .unwrap();
+    assert!(!meta.contains("gate"), "following the default should leave no gate in the file: {meta}");
+    let (_, page, _) = send(&config, get_as("/admin/apps", &boss)).await;
+    assert!(page.contains("site default"));
+}

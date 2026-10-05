@@ -52,8 +52,10 @@ pub struct PageMeta {
     #[serde(default)]
     pub spa: bool,
     /// Who may reach this app: "public", "authenticated", or "granted".
-    #[serde(default = "public")]
-    pub gate: String,
+    /// Absent means the site's default (`TOOLSITE_DEFAULT_ACCESS`), so an
+    /// internal deployment can be gated everywhere without touching apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
     /// Hosts this app's handler may reach. Empty means none, which is the
     /// default: a capability nobody asked for is not granted.
     #[serde(default)]
@@ -73,8 +75,13 @@ pub struct PathRule {
 }
 
 impl PageMeta {
+    /// The app's own gate, or the site's default when it has not said.
+    pub fn gate<'a>(&'a self, default: &'a str) -> &'a str {
+        self.gate.as_deref().unwrap_or(default)
+    }
+
     /// The gate that applies to one path within this app.
-    pub fn gate_for(&self, path: &str) -> &str {
+    pub fn gate_for<'a>(&'a self, path: &str, default: &'a str) -> &'a str {
         self.rules
             .iter()
             .filter(|rule| path.starts_with(&rule.prefix))
@@ -82,13 +89,12 @@ impl PageMeta {
             // /admin without ordering mattering.
             .max_by_key(|rule| rule.prefix.len())
             .map(|rule| rule.gate.as_str())
-            .unwrap_or(&self.gate)
+            .unwrap_or_else(|| self.gate(default))
     }
 }
 
-pub(crate) fn public() -> String {
-    "public".to_string()
-}
+/// The gates an app, a rule or the site default may name.
+pub const GATES: [&str; 3] = ["public", "authenticated", "granted"];
 
 pub(crate) fn yes() -> bool {
     true
@@ -100,7 +106,7 @@ impl Default for PageMeta {
             listed: true,
             hidden: false,
             spa: false,
-            gate: public(),
+            gate: None,
             allow_http: Vec::new(),
             rules: Vec::new(),
         }
