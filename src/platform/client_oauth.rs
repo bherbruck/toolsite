@@ -309,16 +309,16 @@ async fn consenting_admin(
     query: Option<&str>,
 ) -> Result<User, Response> {
     match users::current_site_user(config, headers).await {
-        Some(user) if user.is_admin => Ok(user),
+        Some(user) if may_publish(config, &user).await => Ok(user),
         Some(user) => {
-            tracing::warn!(email = %user.email, "authorize refused: not an admin");
+            tracing::warn!(email = %user.email, "authorize refused: no editor or admin scope");
             Err(plain_page(
                 StatusCode::FORBIDDEN,
                 "This account cannot publish",
                 html! {
                     p."muted" {
-                        "You are signed in as " (user.email) ". This account is not an admin account. "
-                        "Only an admin can connect a client that publishes to this site."
+                        "You are signed in as " (user.email) ". This account can open apps but cannot publish. "
+                        "Ask an admin for editor access to a project, then try again."
                     }
                     form method="post" action="/auth/logout" {
                         button type="submit" { "Sign out" }
@@ -504,11 +504,22 @@ fn pkce_matches(verifier: &str, challenge: &str) -> bool {
 /// refused here, and every request after is refused by the bearer check.
 async fn publishing_user(config: &Arc<Config>, user_id: &str) -> Option<User> {
     let (config, id) = (config.clone(), user_id.to_string());
-    tokio::task::spawn_blocking(move || users::user_by_id(&config, &id))
+    tokio::task::spawn_blocking(move || {
+        users::user_by_id(&config, &id)
+            .filter(|user| users::holds_anywhere(&config, user, users::Scope::Editor))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Whether the account may connect a publishing client: a site admin, or
+/// an editor or admin somewhere in the project tree.
+async fn may_publish(config: &Arc<Config>, user: &User) -> bool {
+    let (config, user) = (config.clone(), user.clone());
+    tokio::task::spawn_blocking(move || users::holds_anywhere(&config, &user, users::Scope::Editor))
         .await
-        .ok()
-        .flatten()
-        .filter(|user| user.is_admin)
+        .unwrap_or(false)
 }
 
 fn token_response(issued: store::Issued) -> Response {

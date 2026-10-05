@@ -351,10 +351,13 @@ async fn admits(
         // would only add a step. The owner walks in.
         "granted" => match visitor {
             Some(user) if user.is_admin => true,
+            // Any scope at the app or a folder above it opens the door; the
+            // per-app grants of old are viewer scopes on the app now.
             Some(user) => {
+                let folder = crate::content::store::app_folder(config, app).await;
                 let (config, user, app) = (config.clone(), user.clone(), app.to_string());
                 tokio::task::spawn_blocking(move || {
-                    crate::accounts::users::has_grant(&config, &user, &app)
+                    crate::accounts::users::app_scope(&config, &user, &folder, &app).is_some()
                 })
                 .await
                 .unwrap_or(false)
@@ -638,9 +641,13 @@ pub(crate) async fn index(
     };
     // The same shell as the admin pages, so the one person who may go there
     // sees the door, and everyone else sees the apps and a way to sign in.
+    let manages = match &viewer {
+        Some(user) => crate::platform::admin::manages_something(&config, user).await,
+        None => false,
+    };
     let markup = crate::ui::shell(
         "Apps",
-        crate::platform::admin::sidebar("site", viewer.as_ref()),
+        crate::platform::admin::sidebar("site", viewer.as_ref(), manages),
         body,
         (!cards.is_empty()).then_some(crate::ui::FILTER_SCRIPT),
     );

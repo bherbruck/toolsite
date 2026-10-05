@@ -251,6 +251,8 @@ pub fn create_entry(config: &Config, app: &str) -> Result<String, String> {
         crate::platform::upload::UploadTicket {
             slug: app.to_string(),
             expires_at: now + ENTRY_TTL,
+            user: None,
+            project: None,
         },
     );
 

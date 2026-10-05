@@ -8,6 +8,14 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Who is behind an MCP request. `None` is a static token or the stdio
+/// transport, which have every power; `Some` is the account behind an OAuth
+/// token, whose scopes decide what each tool may do for it.
+#[derive(Clone, Debug)]
+pub struct Caller {
+    pub user: Option<crate::accounts::users::User>,
+}
+
 /// Clients disagree about how to present a static token: most send
 /// `Authorization: Bearer <token>`, some send `x-api-key`. Accept either —
 /// it's the same secret.
@@ -31,11 +39,12 @@ pub(crate) fn presented_token(headers: &HeaderMap) -> Option<&str> {
 pub(crate) async fn require_bearer(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     let presented = presented_token(&headers);
     if presented.is_some_and(|token| config.valid_tokens.iter().any(|v| v == token)) {
+        request.extensions_mut().insert(Caller { user: None });
         return next.run(request).await;
     }
     // Not a static token: perhaps one the OAuth server issued to a person.
@@ -44,7 +53,8 @@ pub(crate) async fn require_bearer(
     if let Some(token) = presented.filter(|_| config.oauth_enabled())
         && let Some(user) = client_oauth::token_user(&config, token).await
     {
-        tracing::debug!(email = %user.email, "mcp request as a signed-in admin");
+        tracing::debug!(email = %user.email, "mcp request as a signed-in account");
+        request.extensions_mut().insert(Caller { user: Some(user) });
         return next.run(request).await;
     }
 

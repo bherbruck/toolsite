@@ -169,13 +169,20 @@ Anything the file does not mention is left alone.
 
 ## Access
 
+Publishing may be limited to a folder. Apps sit in a project tree, and the
+account behind your connection may hold editor on `ops/yard` and nothing
+elsewhere. A tool that is asked to touch an app outside that refuses with the
+folder and the scope it would take, for example "holds editor at ops/yard;
+this needs admin". Ask the person for the scope, or publish under a folder you
+hold; `list_pages` shows what you may open.
+
 A gate decides whether a request arrives:
 
 | Gate | Who |
 |---|---|
 | `public` | anyone |
 | `authenticated` | any signed-in account |
-| `granted` | accounts given access to that app |
+| `granted` | accounts with a grant on the app, or a scope on it or a folder above it |
 
 An admin account passes every gate. An app that names no gate follows the site's default, which the owner set
 for the whole deployment; on an internal site that is usually `granted`.

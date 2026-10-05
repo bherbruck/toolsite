@@ -69,6 +69,8 @@ fn ticket(config: &Config, slug: &str, ttl: Duration) -> String {
         UploadTicket {
             slug: slug.to_string(),
             expires_at: Instant::now() + ttl,
+            user: None,
+            project: None,
         },
     );
     token
@@ -2178,7 +2180,7 @@ async fn a_visitor_account_cannot_connect_a_publishing_client() {
 
     let (status, page, _) = send(&config, get_as(&authorize_url(&client_id, CALLBACK), &session)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(page.contains("not an admin"), "{page}");
+    assert!(page.contains("cannot publish"), "{page}");
 
     // Nor by posting the decision straight in, skipping the screen.
     let body = format!(
@@ -3747,4 +3749,398 @@ async fn an_admin_creates_an_account_with_a_setup_link_the_owner_uses_once() {
     )
     .await;
     assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")));
+}
+
+// --- projects and scopes ---------------------------------------------------
+//
+// Apps sit in folders; a scope says what an account may do from a folder
+// down; an editor's Claude publishes where the editor may and nowhere else.
+
+/// One MCP session over the real router: the same router for every call,
+/// since the session lives in it.
+struct Mcp {
+    router: axum::Router,
+    token: String,
+    session: String,
+    next_id: u64,
+}
+
+fn mcp_data(body: &str) -> serde_json::Value {
+    let data: Vec<&str> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .collect();
+    let raw = data.last().copied().unwrap_or(body.trim());
+    serde_json::from_str(raw).unwrap_or_else(|_| panic!("not JSON-RPC: {body}"))
+}
+
+impl Mcp {
+    async fn open(config: &Arc<Config>, token: &str) -> Mcp {
+        let router = build_router(config.clone(), Runtime::new().unwrap());
+        let initialize = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "localhost")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(initialize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "initialize refused");
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .expect("no session id")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut mcp = Mcp { router, token: token.to_string(), session, next_id: 1 };
+        mcp.post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
+        mcp
+    }
+
+    async fn post(&mut self, body: &str) -> (StatusCode, String) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "localhost")
+                    .header("authorization", format!("Bearer {}", self.token))
+                    .header("mcp-session-id", &self.session)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Calls a tool and returns (is_error, the text of its first content block).
+    async fn call(&mut self, name: &str, arguments: serde_json::Value) -> (bool, String) {
+        self.next_id += 1;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": self.next_id, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        let (status, text) = self.post(&body.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {text}");
+        let reply = mcp_data(&text);
+        let result = &reply["result"];
+        assert!(!result.is_null(), "{name} answered with no result: {reply}");
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap_or("").to_string();
+        (is_error, text)
+    }
+}
+
+/// A site that knows its address (so sign-in works) and also takes a static
+/// token (so a test can act as the platform itself).
+fn scoped_site() -> (TempDir, Arc<Config>) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        data_dir: dir.path().to_path_buf(),
+        base_url: Some(BASE.to_string()),
+        local_base: "http://localhost:8080".to_string(),
+        valid_tokens: vec![TOKEN.to_string()],
+        uploads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        ..Config::local(dir.path().to_path_buf(), "unused")
+    });
+    (dir, config)
+}
+
+async fn folder(config: &Config, parent: &str, name: &str) {
+    toolsite::content::store::create_folder(config, parent, name).await.unwrap();
+}
+
+/// An app that already exists in a folder, closed to strangers.
+async fn app_in(config: &Config, app: &str, in_folder: &str) {
+    write_page(config, &format!("{app}/index"), &format!("<title>{app}</title>"));
+    let meta = toolsite::content::store::PageMeta {
+        project: Some(in_folder.to_string()),
+        gate: Some("granted".to_string()),
+        ..Default::default()
+    };
+    toolsite::content::store::write_meta(config, app, &meta).await.unwrap();
+}
+
+fn scope(config: &Config, email: &str, prefix: &str, scope: &str) {
+    let scope = toolsite::accounts::users::Scope::parse(scope).unwrap();
+    toolsite::accounts::users::grant_scope(config, email, prefix, scope, None).unwrap();
+}
+
+/// Signs the account's Claude in: register, consent, exchange.
+async fn mcp_token_for(config: &Arc<Config>, email: &str, password: &str) -> String {
+    let session = sign_in(config, email, password);
+    let client_id = register(config, CALLBACK).await;
+    let code = consent(config, &session, &client_id, CALLBACK).await;
+    let (status, tokens) = exchange(config, &exchange_body(&client_id, &code, CALLBACK, VERIFIER)).await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    tokens["access_token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn an_editor_publishes_in_its_folder_and_is_refused_everywhere_else() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "warehouse").await;
+    folder(&config, "", "finance").await;
+    app_in(&config, "ledger", "finance").await;
+    account(&config, "ed@example.com", "correct horse");
+    scope(&config, "ed@example.com", "ops/warehouse", "editor");
+    let token = mcp_token_for(&config, "ed@example.com", "correct horse").await;
+    let mut mcp = Mcp::open(&config, &token).await;
+
+    // A new app with no folder named lands in the one folder ed holds.
+    let (is_error, text) = mcp.call("create_upload", serde_json::json!({ "slug": "wh-tool" })).await;
+    assert!(!is_error, "{text}");
+    let upload = text.lines().find_map(|line| line.split_whitespace().find(|w| w.contains("/upload/"))).expect("no upload url");
+    let path = upload.trim_end_matches('\'').strip_prefix(BASE).unwrap().to_string();
+    let (status, body, _) = send(&config, put_bytes(&path, "text/html", b"<title>WH</title>")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let meta = toolsite::content::store::read_meta(&config, "wh-tool").await;
+    assert_eq!(meta.project.as_deref(), Some("ops/warehouse"), "the new app did not land in the editor's folder");
+    assert!(meta.created_by.is_some(), "the creator was not recorded");
+
+    // Naming another folder is refused with the folder and the scope.
+    let (is_error, text) = mcp.call("create_upload", serde_json::json!({ "slug": "fin-tool", "project": "finance" })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("finance") && text.contains("editor"), "{text}");
+
+    // An app that exists elsewhere is out of reach, and the refusal says where.
+    let (is_error, text) = mcp.call("run_sql", serde_json::json!({ "app": "ledger", "sql": "select 1" })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("finance/ledger") && text.contains("editor"), "{text}");
+    let (is_error, text) = mcp.call("app_notes", serde_json::json!({ "slug": "ledger" })).await;
+    assert!(is_error, "{text}");
+
+    // Setting access on its own app needs admin, which it is not.
+    let (is_error, text) = mcp.call("set_visibility", serde_json::json!({ "slug": "wh-tool", "gate": "public" })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("admin"), "{text}");
+    // Hiding it is an editor's.
+    let (is_error, text) = mcp.call("set_visibility", serde_json::json!({ "slug": "wh-tool", "listed": false })).await;
+    assert!(!is_error, "{text}");
+
+    // Site-wide tools are the site admin's.
+    let (is_error, text) = mcp.call("create_user", serde_json::json!({ "email": "x@example.com" })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("site admin"), "{text}");
+
+    // The list is what ed may open: its app, not the ledger.
+    let (_, text) = mcp.call("list_pages", serde_json::json!({ "include_all": true })).await;
+    assert!(text.contains("wh-tool"), "{text}");
+    assert!(!text.contains("ledger"), "ed saw an app it cannot open: {text}");
+}
+
+#[tokio::test]
+async fn several_scopes_on_one_account_each_apply_in_their_own_folder() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "warehouse").await;
+    folder(&config, "", "finance").await;
+    folder(&config, "finance", "reports").await;
+    app_in(&config, "q3", "finance/reports").await;
+    app_in(&config, "ledger", "finance").await;
+    account(&config, "bo@example.com", "correct horse");
+    scope(&config, "bo@example.com", "ops/warehouse", "editor");
+    scope(&config, "bo@example.com", "finance/reports", "viewer");
+    let token = mcp_token_for(&config, "bo@example.com", "correct horse").await;
+    let mut mcp = Mcp::open(&config, &token).await;
+
+    // Viewer lists the reports app and may open it, but cannot publish there.
+    let (_, text) = mcp.call("list_pages", serde_json::json!({ "include_all": true })).await;
+    assert!(text.contains("\"q3\""), "{text}");
+    assert!(!text.contains("ledger"), "{text}");
+    let (is_error, text) = mcp.call("create_upload", serde_json::json!({ "slug": "q4", "project": "finance/reports" })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("viewer") && text.contains("finance/reports"), "{text}");
+    let (is_error, text) = mcp.call("app_notes", serde_json::json!({ "slug": "q3", "notes": "x" })).await;
+    assert!(is_error, "a viewer wrote notes: {text}");
+
+    // Editor under the warehouse publishes there, with no folder named.
+    let (is_error, text) = mcp.call("push_page", serde_json::json!({ "slug": "wh-page", "html": "<title>wh</title>" })).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        toolsite::content::store::read_meta(&config, "wh-page").await.project.as_deref(),
+        Some("ops/warehouse")
+    );
+    // And the viewer's app is open to them at the door.
+    let session = sign_in(&config, "bo@example.com", "correct horse");
+    let (q3_cookie, _) = hand_off(&config, &session, "q3").await;
+    let (status, ..) = send(&config, get_as_app("/p/q3/", "q3", &q3_cookie)).await;
+    assert_eq!(status, StatusCode::OK, "a viewer scope did not open the app");
+}
+
+#[tokio::test]
+async fn an_editor_removes_only_the_apps_it_created() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    account(&config, "ed@example.com", "correct horse");
+    scope(&config, "ed@example.com", "ops", "editor");
+    // The platform itself puts an app in the folder first.
+    let mut platform = Mcp::open(&config, TOKEN).await;
+    let (is_error, text) = platform
+        .call("push_app", serde_json::json!({ "app": "theirs", "project": "ops", "pages": { "index": "<title>theirs</title>" } }))
+        .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(toolsite::content::store::read_meta(&config, "theirs").await.project.as_deref(), Some("ops"));
+
+    let token = mcp_token_for(&config, "ed@example.com", "correct horse").await;
+    let mut mcp = Mcp::open(&config, &token).await;
+    let (is_error, text) = mcp.call("push_page", serde_json::json!({ "slug": "mine", "html": "<title>mine</title>" })).await;
+    assert!(!is_error, "{text}");
+
+    let (is_error, text) = mcp.call("remove_page", serde_json::json!({ "slug": "theirs", "confirm": "theirs" })).await;
+    assert!(is_error, "an editor removed an app it did not create: {text}");
+    assert!(text.contains("admin"), "{text}");
+    assert!(config.data_dir.join("theirs/index.html").exists());
+
+    let (is_error, text) = mcp.call("remove_page", serde_json::json!({ "slug": "mine", "confirm": "mine" })).await;
+    assert!(!is_error, "{text}");
+    assert!(!config.data_dir.join("mine.html").exists());
+}
+
+#[tokio::test]
+async fn a_folder_admin_sees_its_subtree_and_nothing_else() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    folder(&config, "", "finance").await;
+    app_in(&config, "forklifts", "ops/yard").await;
+    app_in(&config, "ledger", "finance").await;
+    account(&config, "fa@example.com", "correct horse");
+    scope(&config, "fa@example.com", "ops", "admin");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+
+    let (status, page, _) = send(&config, get_as("/admin/apps", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("folder=ops"), "the folder they admin is not listed");
+    assert!(!page.contains("folder=finance"), "a folder they hold nothing in was listed");
+    assert!(!page.contains("ledger"));
+    let (status, page, _) = send(&config, get_as("/admin/apps?folder=ops/yard", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("forklifts"));
+    assert!(page.contains("Create folder"), "a folder admin cannot make folders in its subtree");
+    let (status, ..) = send(&config, get_as("/admin/apps?folder=finance", &fa)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a direct URL to another folder opened");
+    let (status, ..) = send(&config, get_as("/admin/apps/ledger", &fa)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, ..) = send(&config, get_as("/admin/apps/forklifts/access", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+    for site_only in ["/admin/accounts", "/admin/exports", "/admin/github", "/admin/accounts/new"] {
+        let (status, ..) = send(&config, get_as(site_only, &fa)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{site_only} opened for a folder admin");
+    }
+    // The sidebar shows the one entry they have.
+    let (_, page, _) = send(&config, get_as("/admin/apps", &fa)).await;
+    assert!(!page.contains("href=\"/admin/accounts\""), "the accounts link was shown to a folder admin");
+}
+
+#[tokio::test]
+async fn a_folder_admin_grants_at_or_below_its_folder_and_never_above() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    account(&config, "fa@example.com", "correct horse");
+    account(&config, "new@example.com", "correct horse");
+    account(&config, "ed@example.com", "correct horse");
+    scope(&config, "fa@example.com", "ops/yard", "admin");
+    scope(&config, "ed@example.com", "ops/yard", "editor");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/admin/apps?folder=ops/yard", &fa)).await;
+    let token = form_token_from(&page);
+
+    // Above its folder: refused.
+    let (status, ..) = send(&config, post_form("/admin/scope", &fa, format!("token={token}&action=grant&prefix=ops&email=new@example.com&scope=viewer"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, ..) = send(&config, post_form("/admin/scope", &fa, format!("token={token}&action=grant&prefix=&email=new@example.com&scope=viewer"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // At its folder, up to its own scope: fine.
+    let (status, ..) = send(&config, post_form("/admin/scope", &fa, format!("token={token}&action=grant&prefix=ops/yard&email=new@example.com&scope=admin"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let held: Vec<_> = toolsite::accounts::users::list_scopes(&config).unwrap().into_iter().filter(|r| r.email == "new@example.com").collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].prefix, "ops/yard");
+    // An editor cannot give access at all. Its folder page carries no such
+    // form; the token it does hold, from an app page, buys nothing here.
+    app_in(&config, "forklifts", "ops/yard").await;
+    let ed = sign_in(&config, "ed@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/admin/apps?folder=ops/yard", &ed)).await;
+    assert!(!page.contains("Give access"), "an editor was offered the access form");
+    let (_, page, _) = send(&config, get_as("/admin/apps/forklifts", &ed)).await;
+    let ed_token = form_token_from(&page);
+    let (status, ..) = send(&config, post_form("/admin/scope", &ed, format!("token={ed_token}&action=grant&prefix=ops/yard&email=new@example.com&scope=viewer"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_viewer_only_account_is_refused_at_the_mcp_consent() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "finance").await;
+    account(&config, "vi@example.com", "correct horse");
+    scope(&config, "vi@example.com", "finance", "viewer");
+    let session = sign_in(&config, "vi@example.com", "correct horse");
+    let client_id = register(&config, CALLBACK).await;
+    let (status, page, _) = send(&config, get_as(&authorize_url(&client_id, CALLBACK), &session)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(page.contains("cannot publish"), "{page}");
+    // Give them editor somewhere and the door opens.
+    scope(&config, "vi@example.com", "finance", "editor");
+    let (status, ..) = send(&config, get_as(&authorize_url(&client_id, CALLBACK), &session)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_project_tree_is_never_served_and_a_moved_app_keeps_its_url() {
+    let (dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    assert!(dir.path().join(".site/projects.json").exists());
+    let (status, ..) = send(&config, get("/p/.site/projects.json")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, get("/p/.site/")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Moving an app changes who manages it, not where it is.
+    write_page(&config, "tool/index", "<title>tool</title>");
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/admin/apps/tool", &boss)).await;
+    let token = form_token_from(&page);
+    let (status, ..) = send(&config, post_form("/admin/move", &boss, format!("token={token}&app=tool&folder=ops"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(toolsite::content::store::read_meta(&config, "tool").await.project.as_deref(), Some("ops"));
+    let (status, ..) = send(&config, get("/p/tool/")).await;
+    assert_eq!(status, StatusCode::OK, "the URL changed when the app moved");
+    let (status, ..) = send(&config, post_form("/admin/move", &boss, format!("token={token}&app=tool&folder=nowhere"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "a bad folder should come back with a message, not a bare error");
+    assert_eq!(toolsite::content::store::read_meta(&config, "tool").await.project.as_deref(), Some("ops"));
+}
+
+#[tokio::test]
+async fn a_static_token_keeps_every_power() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    let mut platform = Mcp::open(&config, TOKEN).await;
+    let (is_error, text) = platform.call("push_page", serde_json::json!({ "slug": "anywhere", "html": "<title>a</title>" })).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(toolsite::content::store::read_meta(&config, "anywhere").await.project, None, "a static token's app went into a folder it did not name");
+    let (is_error, text) = platform.call("create_user", serde_json::json!({ "email": "made@example.com" })).await;
+    assert!(!is_error, "{text}");
+    let (is_error, text) = platform.call("remove_page", serde_json::json!({ "slug": "anywhere", "confirm": "anywhere" })).await;
+    assert!(!is_error, "{text}");
 }
