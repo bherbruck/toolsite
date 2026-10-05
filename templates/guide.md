@@ -227,10 +227,24 @@ write = true
 ```
 
 The `where` may use any table or view in the app's database. It must prepare
-as `select 1 from <table> where (<where>)` and may not contain `;`. The view
-is `my_<table>` unless `view = "..."` says otherwise. A table declared
-`without rowid` cannot take `write = true`. Hand-written views go under
-`[access] views = ["my_summary"]` and are read only.
+as `select 1 from <table> where (<where>)` and may not contain `;` or a `?`.
+The view is `my_<table>` unless `view = "..."` says otherwise. A table
+declared `without rowid` cannot take `write = true`. Hand-written views go
+under `[access] views = ["my_summary"]` and are read only; a declared view
+must be a view that reads tables directly, since a view it reads through is
+closed unless declared as well. Names starting with `ts_` are the
+platform's.
+
+Three facts to write policies by:
+
+- Against a NULL identity a `where` matches nothing. `current_user()` is
+  NULL for a job and for an anonymous visitor, and `owner_id = NULL` is not
+  true. Never write `or current_user() is null` to "let the job see
+  everything": it lets everyone with no identity see everything.
+- A row with a NULL owner is nobody's.
+- `insert or replace`, upserts and `update or replace` cannot remove a row
+  the person cannot see; a colliding key is refused before the write runs.
+  Changing a primary key through the view is refused too.
 
 What this buys: a regular account connects Claude to `<site>/me/mcp`, calls
 `my_apps`, and queries the declared views as themselves. A handler can offer

@@ -867,13 +867,45 @@ write = true
 ```
 
 The `where` may reference any table or view in the app's own database. It
-must prepare as `select 1 from <table> where (<where>)` and may not contain a
-semicolon. A `without rowid` table cannot take `write = true`. Hand-written
-views are shared read only with `[access] views = ["my_summary"]`.
+must prepare as `select 1 from <table> where (<where>)`, may not contain a
+semicolon or a bound parameter, and must name a table that exists. A
+`without rowid` table cannot take `write = true`. Hand-written views are
+shared read only with `[access] views = ["my_summary"]`; a declared view
+must be a view, not a table, and should read from tables directly, because
+a view it reads through is not reachable unless it is declared too.
 
-The generated objects are the platform's: rebuilt whenever the manifest or
-the schema changes, so a new column reaches the view, and dropped when the
-policy goes. The app's Access tab lists them.
+Rules the policy's author must know:
+
+- A `where` compared against a NULL identity matches nothing, never
+  everything: `owner_id = current_user()` is NULL for a scheduled job or an
+  anonymous visitor, and NULL is not true. A policy written as
+  `owner_id = current_user() or current_user() is null` opens every row to
+  nobody in particular; do not write that.
+- A row whose owner column is NULL belongs to nobody and is visible to
+  nobody through an owner policy.
+- `insert or replace`, `replace into`, upserts and `update or replace`
+  cannot remove a row the person cannot see: a write that would collide with
+  an existing primary key or unique index is aborted before it runs, under
+  every conflict clause.
+- Changing a row's primary key through the view is refused.
+- A delete through the view runs the table's own `on delete cascade`, which
+  is the app's schema doing what it says.
+
+The generated objects are the platform's: every declared name becomes a
+one-line view over an inner view whose name carries a random part, and the
+triggers carry it too. Names starting with `ts_` are reserved for them. They
+are rebuilt whenever the manifest or the schema changes, so a new column
+reaches the view, and dropped when the policy goes; a declared hand-written
+view gets its own definition back. The app's Access tab lists them. If a
+migration breaks a policy, say by dropping its column, the migration fails
+and says so rather than leaving the table open.
+
+What a person's SQL may do, whether over `/me/mcp`, through `query-scoped`
+or as `run_sql as_user`: one statement, SELECT on the declared views, writes
+on writable ones, no transaction, no `explain`, no pragma, no schema change,
+no attach, nothing from the filesystem. One statement may run for ten
+seconds, carry 256 KB of SQL and produce values of up to 16 MB; past that it
+is interrupted. Every refusal reads "not authorized".
 
 Three callers see the boundary:
 

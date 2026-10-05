@@ -252,16 +252,19 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
             });
             meta.policies = policies;
         }
-        let (generated, notes) = {
+        let regenerated = {
             let (config, app, meta_copy) = (config.clone_for_task(), app.to_string(), meta_snapshot(&meta));
             tokio::task::spawn_blocking(move || crate::runtime::access::regenerate(&config, &app, &meta_copy))
                 .await
                 .map_err(|e| e.to_string())??
         };
-        if meta.generated != generated {
-            meta.generated = generated;
+        if meta.generated != regenerated.generated {
+            meta.generated = regenerated.generated;
         }
-        changed.extend(notes);
+        if meta.access_salt.as_deref() != Some(regenerated.salt.as_str()) {
+            meta.access_salt = Some(regenerated.salt);
+        }
+        changed.extend(regenerated.notes);
     }
 
     write_meta(config, app, &meta)
