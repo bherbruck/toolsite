@@ -510,25 +510,42 @@ pub fn app_token_from_cookies(header: Option<&str>, app: &str) -> Option<String>
     cookie_value(header, &app_cookie_name(app))
 }
 
-pub fn set_cookie_header(token: &str) -> String {
+/// `Secure` whenever the site is reached over TLS, which is every real
+/// deployment. A plain-http address — a LAN box, a laptop — would have the
+/// browser drop a Secure cookie on the floor and sign-in would silently do
+/// nothing, so there the flag is left off. The address is the deployment's
+/// own word for how it is reached; nothing from the request decides this.
+fn secure_flag(config: &Config) -> &'static str {
+    match config.base_url.as_deref() {
+        Some(base) if base.starts_with("http://") => "",
+        _ => " Secure;",
+    }
+}
+
+pub fn set_cookie_header(config: &Config, token: &str) -> String {
     format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age={}",
+        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax;{} Max-Age={}",
+        secure_flag(config),
         SESSION_LIFETIME.as_secs()
     )
 }
 
 /// Scoped to the app's own subtree. Everything else matches the site cookie:
 /// out of reach of script, and never sent over plain HTTP.
-pub fn set_app_cookie_header(app: &str, token: &str, max_age: u64) -> String {
+pub fn set_app_cookie_header(config: &Config, app: &str, token: &str, max_age: u64) -> String {
     format!(
-        "{name}={token}; Path={path}; HttpOnly; SameSite=Lax; Secure; Max-Age={max_age}",
+        "{name}={token}; Path={path}; HttpOnly; SameSite=Lax;{secure} Max-Age={max_age}",
         name = app_cookie_name(app),
         path = app_cookie_path(app),
+        secure = secure_flag(config),
     )
 }
 
-pub fn clear_cookie_header() -> String {
-    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0")
+pub fn clear_cookie_header(config: &Config) -> String {
+    format!(
+        "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax;{} Max-Age=0",
+        secure_flag(config)
+    )
 }
 
 #[cfg(test)]
@@ -749,22 +766,51 @@ mod tests {
         assert!(token_from_cookies(None).is_none());
     }
 
+    fn deployed_at(base: Option<&str>) -> Config {
+        Config {
+            base_url: base.map(str::to_string),
+            ..Config::local(std::env::temp_dir(), "t")
+        }
+    }
+
     #[test]
     fn the_cookie_is_not_reachable_from_script_or_plain_http() {
-        for header in [set_cookie_header("abc"), set_app_cookie_header("notes", "abc", 60)] {
+        // A real address is https, and so is an unset one by default.
+        for config in [deployed_at(Some("https://site.test")), deployed_at(None)] {
+            for header in [
+                set_cookie_header(&config, "abc"),
+                set_app_cookie_header(&config, "notes", "abc", 60),
+                clear_cookie_header(&config),
+            ] {
+                assert!(header.contains("HttpOnly"), "{header}");
+                assert!(header.contains("Secure"), "{header}");
+                assert!(header.contains("SameSite=Lax"), "{header}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_plain_http_deployment_gets_a_cookie_the_browser_will_keep() {
+        // Otherwise sign-in on a LAN box silently does nothing: the browser
+        // drops a Secure cookie set over http.
+        let config = deployed_at(Some("http://10.0.0.5:8080"));
+        for header in [
+            set_cookie_header(&config, "abc"),
+            set_app_cookie_header(&config, "notes", "abc", 60),
+        ] {
+            assert!(!header.contains("Secure"), "{header}");
             assert!(header.contains("HttpOnly"), "{header}");
-            assert!(header.contains("Secure"), "{header}");
-            assert!(header.contains("SameSite=Lax"), "{header}");
         }
     }
 
     #[test]
     fn an_apps_cookie_is_confined_to_that_apps_path() {
-        let header = set_app_cookie_header("notes", "abc", 60);
+        let config = deployed_at(None);
+        let header = set_app_cookie_header(&config, "notes", "abc", 60);
         assert!(header.contains("Path=/p/notes/"), "{header}");
         assert!(header.starts_with("ts_app_notes=abc;"), "{header}");
         // The site cookie is the one thing that stays origin-wide.
-        assert!(set_cookie_header("abc").contains("Path=/;"));
+        assert!(set_cookie_header(&config, "abc").contains("Path=/;"));
     }
 
     #[test]
@@ -916,14 +962,15 @@ pub async fn login_submit(
     Form(credentials): Form<Credentials>,
 ) -> Response {
     let next = safe_next(credentials.next.as_deref());
+    let worker = config.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        log_in(&config, &credentials.email, &credentials.password)
+        log_in(&worker, &credentials.email, &credentials.password)
     })
     .await;
 
     match outcome {
         Ok(Ok((_, token))) => (
-            [(header::SET_COOKIE, set_cookie_header(&token))],
+            [(header::SET_COOKIE, set_cookie_header(&config, &token))],
             Redirect::to(&next),
         )
             .into_response(),
@@ -938,10 +985,11 @@ pub async fn logout(State(config): State<Arc<Config>>, headers: HeaderMap) -> Re
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok()),
     ) {
-        let _ = tokio::task::spawn_blocking(move || log_out(&config, &token)).await;
+        let worker = config.clone();
+        let _ = tokio::task::spawn_blocking(move || log_out(&worker, &token)).await;
     }
     (
-        [(header::SET_COOKIE, clear_cookie_header())],
+        [(header::SET_COOKIE, clear_cookie_header(&config))],
         Redirect::to("/"),
     )
         .into_response()
@@ -1017,14 +1065,15 @@ pub async fn handoff(
     };
 
     let app = params.app.clone();
+    let worker = config.clone();
     let outcome =
-        tokio::task::spawn_blocking(move || create_app_session(&config, &site_token, &app)).await;
+        tokio::task::spawn_blocking(move || create_app_session(&worker, &site_token, &app)).await;
 
     match outcome {
         Ok(Ok((_, token, max_age))) => (
             [(
                 header::SET_COOKIE,
-                set_app_cookie_header(&params.app, &token, max_age),
+                set_app_cookie_header(&config, &params.app, &token, max_age),
             )],
             Redirect::to(&next),
         )
@@ -1350,7 +1399,7 @@ pub async fn setup_submit(
         // Signed in on the spot: having just proved they hold the link and
         // chosen the password, asking them to type it again is theatre.
         Ok(Ok((user, session))) => (
-            [(header::SET_COOKIE, set_cookie_header(&session))],
+            [(header::SET_COOKIE, set_cookie_header(&config, &session))],
             Redirect::to(if user.is_admin { "/admin" } else { "/" }),
         )
             .into_response(),

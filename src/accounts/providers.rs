@@ -546,7 +546,7 @@ pub async fn callback(
             tracing::info!(provider = %slug, %email, "signed in through a provider");
             (
                 [
-                    (header::SET_COOKIE, users::set_cookie_header(&token)),
+                    (header::SET_COOKIE, users::set_cookie_header(&config, &token)),
                     (header::CACHE_CONTROL, "no-store".to_string()),
                 ],
                 Redirect::to(&pending.next),
