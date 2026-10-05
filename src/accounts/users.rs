@@ -22,7 +22,7 @@ use argon2::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,
@@ -280,6 +280,119 @@ pub fn user_by_id(config: &Config, id: &str) -> Option<User> {
         },
     )
     .ok()
+}
+
+// --- signing in through a provider ---------------------------------------
+//
+// The provider proves an email; these decide what account that is. Kept
+// here because they touch the users and identities tables; the protocol
+// itself lives in `providers.rs`.
+
+/// The account a provider identity was linked to before, if any. Nothing for
+/// a disabled account: a provider login is still a login.
+pub fn user_by_identity(config: &Config, provider: &str, provider_id: &str) -> Option<User> {
+    let conn = open(config).ok()?;
+    conn.query_row(
+        "select users.id, users.email, users.is_admin
+           from identities join users on users.id = identities.user_id
+          where identities.provider = ? and identities.provider_id = ?
+            and users.disabled_at is null",
+        rusqlite::params![provider, provider_id],
+        |row| {
+            Ok(User {
+                id: row.get(0)?,
+                email: row.get(1)?,
+                is_admin: row.get::<_, i64>(2)? != 0,
+            })
+        },
+    )
+    .ok()
+}
+
+/// What stands at an email: an active account, a disabled one, or nothing.
+/// Three answers rather than two because a disabled account must be refused
+/// outright, not treated as room to create a new one.
+pub enum AtEmail {
+    Active(User),
+    Disabled,
+    Nobody,
+}
+
+pub fn account_at_email(config: &Config, email: &str) -> Result<AtEmail, String> {
+    let conn = open(config)?;
+    let email = normalise(email);
+    let found: Option<(String, bool, Option<i64>)> = conn
+        .query_row(
+            "select id, is_admin, disabled_at from users where email = ?",
+            [&email],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(match found {
+        None => AtEmail::Nobody,
+        Some((_, _, Some(_))) => AtEmail::Disabled,
+        Some((id, is_admin, None)) => AtEmail::Active(User { id, email, is_admin }),
+    })
+}
+
+/// Remembers that this provider identity is this account, so the next sign-in
+/// does not depend on the email staying the same.
+pub fn link_identity(config: &Config, provider: &str, provider_id: &str, user_id: &str) -> Result<(), String> {
+    let conn = open(config)?;
+    conn.execute(
+        "insert into identities (provider, provider_id, user_id) values (?, ?, ?)
+         on conflict(provider, provider_id) do update set user_id = excluded.user_id",
+        rusqlite::params![provider, provider_id, user_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// An account with no password, the way an invitation creates one: the
+/// provider is how this person signs in. Never an admin.
+pub fn create_provider_account(config: &Config, email: &str) -> Result<User, String> {
+    let email = normalise(email);
+    if !email.contains('@') || email.len() < 3 {
+        return Err("that does not look like an email address".into());
+    }
+    let conn = open(config)?;
+    let id = crate::content::slug::random_token(16);
+    conn.execute(
+        "insert into users (id, email, password_hash, created_at, is_admin)
+         values (?, ?, null, ?, 0)",
+        rusqlite::params![&id, &email, now() as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(User {
+        id,
+        email,
+        is_admin: false,
+    })
+}
+
+/// A site session for an account whose identity was proven some other way
+/// than a password. Refuses a disabled account, like every other door.
+pub fn start_session(config: &Config, user_id: &str) -> Result<String, String> {
+    let conn = open(config)?;
+    let active: bool = conn
+        .query_row(
+            "select disabled_at is null from users where id = ?",
+            [user_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "no such account".to_string())?;
+    if !active {
+        return Err("this account is disabled".into());
+    }
+    let token = crate::content::slug::random_token(48);
+    let expires = now() + SESSION_LIFETIME.as_secs();
+    conn.execute(
+        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, null)",
+        rusqlite::params![hash_token(&token), user_id, expires as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(token)
 }
 
 /// Who a *site* session token belongs to. A token scoped to an app is not
@@ -755,8 +868,12 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> &'h str {
         .unwrap_or("<none>")
 }
 
-pub async fn login_form(Query(params): Query<NextPage>) -> Response {
+pub async fn login_form(
+    State(config): State<Arc<Config>>,
+    Query(params): Query<NextPage>,
+) -> Response {
     let next = safe_next(params.next.as_deref());
+    let encoded_next = urlencoding::encode(&next);
     let markup = crate::ui::form_page(
         "Sign in",
         maud::html! {
@@ -768,6 +885,18 @@ pub async fn login_form(Query(params): Query<NextPage>) -> Response {
                 input name="password" type="password" placeholder="Password"
                       autocomplete="current-password" required;
                 button type="submit" { "Sign in" }
+            }
+            // One button per provider the deployment configured. Each goes
+            // out through /auth/login/<slug> and comes back to `next`.
+            @if !config.providers.is_empty() {
+                div."column" style="margin-top: 1rem" {
+                    p."muted" style="margin: 0 0 .5rem" { "or" }
+                    @for provider in &config.providers {
+                        a."btn quiet" href={ "/auth/login/" (provider.slug) "?next=" (encoded_next) } {
+                            "Sign in with " (provider.name)
+                        }
+                    }
+                }
             }
         },
     );

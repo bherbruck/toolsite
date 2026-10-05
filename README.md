@@ -294,6 +294,46 @@ A password is never typed by whoever does the inviting: the account is created
 without one, and the link is the only way to set it. `--password` exists for
 scripts, at the cost of putting it in shell history.
 
+### Signing in with a provider
+
+Google, Microsoft, an Entra tenant, GitHub, or anything that speaks OpenID
+Connect (Keycloak, Okta, Auth0) can be a sign-in button. Each is a group of
+environment variables under one slug; the slug is the URL and the default
+button text:
+
+```env
+TOOLSITE_LOGIN_GOOGLE_CLIENT_ID=…               presets: issuer known
+TOOLSITE_LOGIN_GOOGLE_CLIENT_SECRET=…
+TOOLSITE_LOGIN_GITHUB_CLIENT_ID=…
+TOOLSITE_LOGIN_GITHUB_CLIENT_SECRET=…
+TOOLSITE_LOGIN_MICROSOFT_CLIENT_ID=…            personal and any work account
+TOOLSITE_LOGIN_MICROSOFT_CLIENT_SECRET=…
+TOOLSITE_LOGIN_ENTRA_TENANT=…                   one tenant
+TOOLSITE_LOGIN_ENTRA_CLIENT_ID=…
+TOOLSITE_LOGIN_ENTRA_CLIENT_SECRET=…
+TOOLSITE_LOGIN_KEYCLOAK_ISSUER=https://sso.example.com/realms/main
+TOOLSITE_LOGIN_KEYCLOAK_CLIENT_ID=…             any other slug: say its issuer
+TOOLSITE_LOGIN_KEYCLOAK_CLIENT_SECRET=…
+TOOLSITE_LOGIN_KEYCLOAK_NAME="Company SSO"      optional button text
+TOOLSITE_LOGIN_ENTRA_ALLOW_DOMAIN=example.com   optional, per provider
+```
+
+Register `https://yourdomain.com/auth/callback/<slug>` (lowercase) as the
+redirect URI at the provider. `TOOLSITE_BASE_URL` must be set.
+
+There is still no public signup. A provider login signs in the account that
+already holds that email and links the identity, so a later rename at the
+provider lands on the same account. With `ALLOW_DOMAIN`, an unknown email
+under that domain gets an account made on first sign-in, never an admin one.
+Anyone else is told to ask an admin. A disabled account is refused however
+it arrives.
+
+Under the hood: authorization code with PKCE, a single-use state that lasts
+ten minutes, and a nonce checked against the id token, which is verified
+against the provider's published keys (asymmetric algorithms only). An email
+the provider marks unverified is refused. GitHub has no id token, so its
+primary verified email is read from the API.
+
 An admin account can do all of that from `/admin` instead: list accounts, add
 one, disable or re-enable it, set any app's gate, and grant or revoke access.
 Disabling ends the account's live sessions immediately rather than waiting for
@@ -598,6 +638,7 @@ Two independent modes — use either, or both at once. At least one is required.
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
 | `TOOLSITE_BASE_URL` | if clients sign in | Base URL of the deployment, e.g. `https://host.com`. Turns the OAuth server on. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where pages are stored. |
+| `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME` and `_ALLOW_DOMAIN`. See Accounts. |
 | `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
 | `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |

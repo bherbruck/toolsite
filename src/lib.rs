@@ -8,7 +8,7 @@ pub mod ui;
 pub use config::Config;
 
 use crate::{
-    accounts::users,
+    accounts::{providers, users},
     content::serve::{index, serve_icon, serve_page},
     platform::{
         admin, blob_upload,
@@ -96,6 +96,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/scaffold/handler.tar.gz", get(scaffold::handler_scaffold))
         .route("/scaffold/{app}", get(scaffold::handler_scaffold_named))
         .route("/auth/login", get(users::login_form).post(users::login_submit))
+        // Signing in through a provider: out to it, and back.
+        .route("/auth/login/{provider}", get(providers::begin))
+        .route("/auth/callback/{provider}", get(providers::callback))
         .route("/auth/logout", post(users::logout).get(users::logout))
         .route("/auth/me", get(users::me))
         .route("/settings/{token}", get(secrets::entry_form))

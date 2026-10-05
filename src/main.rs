@@ -199,6 +199,24 @@ async fn main() -> anyhow::Result<()> {
         _ => panic!("set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET together, or neither"),
     };
 
+    // Ways to sign in besides a password: TOOLSITE_LOGIN_<SLUG>_CLIENT_ID and
+    // friends, one group per provider. A broken group is a startup error,
+    // not a button that fails when someone clicks it.
+    let providers = toolsite::accounts::providers::from_env(std::env::vars())
+        .unwrap_or_else(|why| panic!("{why}"));
+    if base_url.is_none() && !providers.is_empty() {
+        panic!("TOOLSITE_BASE_URL is required with TOOLSITE_LOGIN_* (the provider sends people back to it)");
+    }
+    for provider in &providers {
+        tracing::info!(
+            provider = %provider.slug,
+            name = %provider.name,
+            kind = provider.kind_name(),
+            allow_domain = provider.allow_domain.as_deref().unwrap_or("<none>"),
+            "sign-in provider"
+        );
+    }
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
 
@@ -226,6 +244,8 @@ async fn main() -> anyhow::Result<()> {
         max_db_bytes,
         blobs,
         blob_uploads: Mutex::new(HashMap::new()),
+        providers,
+        logins: Mutex::new(HashMap::new()),
     });
 
     let runtime = Runtime::new()?;
@@ -281,6 +301,8 @@ fn run_user_command(
         max_db_bytes: toolsite::config::DEFAULT_MAX_DB_BYTES,
         blobs: toolsite::runtime::blobs::Blobs::local(toolsite::config::DEFAULT_MAX_BLOB_BYTES),
         blob_uploads: Mutex::new(HashMap::new()),
+        providers: Vec::new(),
+        logins: Mutex::new(HashMap::new()),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

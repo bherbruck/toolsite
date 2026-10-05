@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 argon2 = "0.5.3"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["macros"] }
 base64 = "0.22.1"
 chacha20poly1305 = "0.11.0"
 chrono = "0.4.45"
@@ -18,7 +18,7 @@ maud = "0.27.0"
 rand = "0.10.2"
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io", "schemars"] }
 # rustls plus bundled roots: no OpenSSL in the runtime image.
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "charset", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "webpki-roots", "charset", "stream", "json"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits"] }
 rusqlite_migration = "2.6.0"
 schemars = "1.2.1"
@@ -38,6 +38,8 @@ rusty-s3 = "0.10"
 futures-util = "0.3.34"
 bytes = "1.12.1"
 tokio-util = { version = "0.7.19", features = ["io"] }
+jsonwebtoken = "9"
+url = "2.5.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"

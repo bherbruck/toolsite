@@ -1,4 +1,5 @@
 use crate::{
+    accounts::providers::{PendingLogin, Provider},
     platform::upload::UploadTicket,
     runtime::blobs::{self, Blobs},
 };
@@ -25,6 +26,10 @@ pub struct Config {
     pub blobs: Blobs,
     /// Browser uploads a handler has minted and nobody has spent yet.
     pub blob_uploads: Mutex<HashMap<String, blobs::UploadTicket>>,
+    /// Ways to sign in besides a password, from the environment.
+    pub providers: Vec<Provider>,
+    /// Provider sign-ins begun and not yet answered, by state.
+    pub logins: Mutex<HashMap<String, PendingLogin>>,
 }
 
 impl Config {
@@ -48,6 +53,8 @@ impl Config {
             // scheduler runs handlers, which may well store files.
             blobs: self.blobs.clone_settings(),
             blob_uploads: Mutex::new(HashMap::new()),
+            providers: Vec::new(),
+            logins: Mutex::new(HashMap::new()),
         }
     }
 
@@ -64,6 +71,8 @@ impl Config {
             max_db_bytes: DEFAULT_MAX_DB_BYTES,
             blobs: Blobs::local(DEFAULT_MAX_BLOB_BYTES),
             blob_uploads: Mutex::new(HashMap::new()),
+            providers: Vec::new(),
+            logins: Mutex::new(HashMap::new()),
         }
     }
 }

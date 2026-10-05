@@ -63,6 +63,7 @@ runtime/           executing an app's own code and data
 
 accounts/          people who USE published apps
   users.rs         accounts, sessions, grants, sign-in routes
+  providers.rs     signing in through Google, Entra, GitHub or any OIDC issuer
 
 wit/               the contract guests compile against
 cli/               the `toolsite` command (standalone crate)

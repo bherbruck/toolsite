@@ -2712,3 +2712,336 @@ async fn an_admin_mints_a_token_on_the_exports_page_and_sees_it_once() {
     let (status, ..) = send(&config, get_as("/admin/exports", &reader)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+// --- signing in through a provider ----------------------------------------
+//
+// The provider proves an email; toolsite decides which account that is. These
+// run the whole dance against a small OpenID provider in this process, bound
+// to 127.0.0.1 on a port nobody else has, with a real RS256 key — so the
+// signature, issuer, audience and nonce checks are the real ones.
+
+mod fake_idp {
+    use axum::{
+        extract::{Form, Query, State},
+        response::{IntoResponse, Redirect},
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    pub struct Fake {
+        pub base: String,
+        pub sub: String,
+        pub email: String,
+        pub email_verified: Option<bool>,
+        /// Put this nonce in the token instead of the one the request carried.
+        pub wrong_nonce: Option<String>,
+        /// Leave the email out of the id token, so userinfo has to answer.
+        pub email_in_userinfo_only: bool,
+        codes: HashMap<String, String>,
+    }
+
+    pub type Shared = Arc<Mutex<Fake>>;
+
+    const KEY_PEM: &[u8] = include_bytes!("fixtures/oidc-test-key.pem");
+    const JWKS: &str = include_str!("fixtures/oidc-test-jwks.json");
+
+    pub async fn start() -> (Shared, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let fake: Shared = Arc::new(Mutex::new(Fake {
+            base: base.clone(),
+            sub: "sub-alice".into(),
+            email: "alice@example.com".into(),
+            email_verified: Some(true),
+            wrong_nonce: None,
+            email_in_userinfo_only: false,
+            codes: HashMap::new(),
+        }));
+        let app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .route("/jwks", get(|| async { ([("content-type", "application/json")], JWKS) }))
+            .route("/authorize", get(authorize))
+            .route("/token", post(token))
+            .route("/userinfo", get(userinfo))
+            .with_state(fake.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (fake, base)
+    }
+
+    async fn discovery(State(fake): State<Shared>) -> Json<serde_json::Value> {
+        let base = fake.lock().unwrap().base.clone();
+        Json(serde_json::json!({
+            "issuer": base,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "jwks_uri": format!("{base}/jwks"),
+            "userinfo_endpoint": format!("{base}/userinfo"),
+        }))
+    }
+
+    async fn authorize(
+        State(fake): State<Shared>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> axum::response::Response {
+        let code = format!("code-{}", q.get("state").cloned().unwrap_or_default());
+        fake.lock()
+            .unwrap()
+            .codes
+            .insert(code.clone(), q.get("nonce").cloned().unwrap_or_default());
+        let back = format!(
+            "{}?code={code}&state={}",
+            q["redirect_uri"],
+            q.get("state").cloned().unwrap_or_default()
+        );
+        Redirect::to(&back).into_response()
+    }
+
+    async fn token(
+        State(fake): State<Shared>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let (claims, access) = {
+            let mut fake = fake.lock().unwrap();
+            let Some(nonce) = fake.codes.remove(form.get("code").map(String::as_str).unwrap_or("")) else {
+                return Json(serde_json::json!({ "error": "invalid_grant" }));
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut claims = serde_json::json!({
+                "iss": fake.base,
+                "aud": form.get("client_id").cloned().unwrap_or_default(),
+                "sub": fake.sub,
+                "iat": now,
+                "exp": now + 300,
+                "nonce": fake.wrong_nonce.clone().unwrap_or(nonce),
+            });
+            if !fake.email_in_userinfo_only {
+                claims["email"] = serde_json::json!(fake.email);
+                if let Some(verified) = fake.email_verified {
+                    claims["email_verified"] = serde_json::json!(verified);
+                }
+            }
+            (claims, format!("access-{}", fake.sub))
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("test-key-1".into());
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(KEY_PEM).unwrap();
+        let id_token = jsonwebtoken::encode(&header, &claims, &key).unwrap();
+        Json(serde_json::json!({
+            "access_token": access,
+            "token_type": "Bearer",
+            "id_token": id_token,
+        }))
+    }
+
+    async fn userinfo(State(fake): State<Shared>) -> Json<serde_json::Value> {
+        let fake = fake.lock().unwrap();
+        Json(serde_json::json!({
+            "sub": fake.sub,
+            "email": fake.email,
+            "email_verified": fake.email_verified,
+        }))
+    }
+}
+
+/// A deployment with one OIDC provider pointing at the fake, which issues
+/// tokens for `allow_domain` if given.
+async fn server_with_provider(allow_domain: Option<&str>) -> (TempDir, Arc<Config>, fake_idp::Shared) {
+    use toolsite::accounts::providers::{IssuerRule, Kind, Provider};
+    let (fake, base) = fake_idp::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        base_url: Some("http://localhost:8080".to_string()),
+        providers: vec![Provider {
+            slug: "fake".into(),
+            name: "Fake IdP".into(),
+            kind: Kind::Oidc {
+                issuer: base.clone(),
+                issuer_claim: IssuerRule::Exactly(base.clone()),
+            },
+            client_id: "toolsite-test".into(),
+            client_secret: "shh".into(),
+            allow_domain: allow_domain.map(str::to_string),
+        }],
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    (dir, config, fake)
+}
+
+/// Does what the browser would: leaves through toolsite, visits the
+/// provider, and brings its answer back. Returns the callback's response.
+async fn sign_in_through(config: &Arc<Config>, next: &str) -> (StatusCode, String, Vec<(String, String)>) {
+    let (status, _, headers) = send(config, get(&format!("/auth/login/fake?next={}", urlencoding::encode(next)))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "no redirect to the provider");
+    let to_provider = location(&headers);
+    assert!(to_provider.contains("code_challenge_method=S256"), "{to_provider}");
+    assert!(to_provider.contains("nonce="), "{to_provider}");
+
+    // The provider answers with a redirect back to toolsite.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let answer = client.get(&to_provider).send().await.unwrap();
+    assert_eq!(answer.status(), reqwest::StatusCode::SEE_OTHER);
+    let back = answer.headers()["location"].to_str().unwrap().to_string();
+    let path = back.strip_prefix("http://localhost:8080").expect("the provider was given our redirect_uri");
+    send(config, get(path)).await
+}
+
+fn session_cookie(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, v)| k == "set-cookie" && v.starts_with("ts_session="))
+        .map(|(_, v)| v.split(';').next().unwrap().trim_start_matches("ts_session=").to_string())
+}
+
+#[tokio::test]
+async fn the_sign_in_page_offers_each_configured_provider() {
+    let (_dir, config, _) = server_with_provider(None).await;
+    let (status, page, _) = send(&config, get("/auth/login?next=/admin")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Sign in with Fake IdP"), "{page}");
+    assert!(page.contains("/auth/login/fake?next=%2Fadmin"), "next is not carried: {page}");
+
+    let (_dir, plain) = server();
+    let (_, page, _) = send(&plain, get("/auth/login")).await;
+    assert!(!page.contains("Sign in with"), "a button with no provider behind it");
+}
+
+#[tokio::test]
+async fn a_provider_login_signs_in_the_account_that_holds_that_email_and_links_it() {
+    let (_dir, config, fake) = server_with_provider(None).await;
+    account(&config, "alice@example.com", "correct horse");
+
+    let (status, _, headers) = sign_in_through(&config, "/p/somewhere/").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/p/somewhere/");
+    let token = session_cookie(&headers).expect("no session cookie");
+    let (_, me, _) = send(&config, get_as("/auth/me", &token)).await;
+    assert!(me.contains("alice@example.com"), "{me}");
+
+    // From now on it is the identity that counts, not the email: the
+    // provider renaming the person still lands on the same account.
+    fake.lock().unwrap().email = "alice.renamed@example.com".into();
+    let (status, _, headers) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let token = session_cookie(&headers).unwrap();
+    let (_, me, _) = send(&config, get_as("/auth/me", &token)).await;
+    assert!(me.contains("alice@example.com"), "{me}");
+}
+
+#[tokio::test]
+async fn an_unknown_email_is_refused_and_no_account_appears() {
+    let (_dir, config, fake) = server_with_provider(None).await;
+    fake.lock().unwrap().email = "stranger@example.com".into();
+
+    let (status, page, headers) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(page.contains("No account"), "{page}");
+    assert!(session_cookie(&headers).is_none(), "a cookie was set for a refused sign-in");
+    assert!(matches!(
+        toolsite::accounts::users::account_at_email(&config, "stranger@example.com").unwrap(),
+        toolsite::accounts::users::AtEmail::Nobody
+    ));
+}
+
+#[tokio::test]
+async fn an_allowed_domain_gets_an_account_made_but_never_an_admin_one() {
+    let (_dir, config, fake) = server_with_provider(Some("example.com")).await;
+    fake.lock().unwrap().email = "newcomer@example.com".into();
+
+    let (status, _, headers) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let token = session_cookie(&headers).unwrap();
+    let (_, me, _) = send(&config, get_as("/auth/me", &token)).await;
+    assert!(me.contains("newcomer@example.com"), "{me}");
+    let (status, ..) = send(&config, get_as("/admin", &token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a provider-made account was an admin");
+
+    // A neighbouring domain is not that domain.
+    fake.lock().unwrap().email = "other@notexample.com".into();
+    fake.lock().unwrap().sub = "sub-other".into();
+    let (status, ..) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_token_for_a_different_sign_in_or_a_forged_callback_is_refused() {
+    let (_dir, config, fake) = server_with_provider(None).await;
+    account(&config, "alice@example.com", "correct horse");
+
+    fake.lock().unwrap().wrong_nonce = Some("not-this-one".into());
+    let (status, _, headers) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "a token with the wrong nonce was accepted");
+    assert!(session_cookie(&headers).is_none());
+    fake.lock().unwrap().wrong_nonce = None;
+
+    // A callback nobody started.
+    let (status, ..) = send(&config, get("/auth/callback/fake?code=whatever&state=made-up")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // And one for a provider that does not exist.
+    let (status, ..) = send(&config, get("/auth/callback/nope?code=x&state=y")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, get("/auth/login/nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_state_is_spent_by_its_first_use() {
+    let (_dir, config, _) = server_with_provider(None).await;
+    account(&config, "alice@example.com", "correct horse");
+    let (status, _, headers) = send(&config, get("/auth/login/fake")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let to_provider = location(&headers);
+    let state = query_param(&to_provider, "state").unwrap();
+    // Reusing the state without going through the provider: the first try
+    // spends it (and fails at the token step, since the code is junk), and
+    // the second is already unknown.
+    let (first, ..) = send(&config, get(&format!("/auth/callback/fake?code=junk&state={state}"))).await;
+    assert_eq!(first, StatusCode::BAD_GATEWAY);
+    let (second, ..) = send(&config, get(&format!("/auth/callback/fake?code=junk&state={state}"))).await;
+    assert_eq!(second, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_disabled_account_cannot_come_in_through_a_provider_either() {
+    let (_dir, config, _) = server_with_provider(Some("example.com")).await;
+    account(&config, "alice@example.com", "correct horse");
+    toolsite::accounts::users::set_active(&config, "alice@example.com", false).unwrap();
+
+    let (status, page, headers) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(page.contains("disabled"), "{page}");
+    assert!(session_cookie(&headers).is_none());
+}
+
+#[tokio::test]
+async fn an_email_the_provider_will_not_vouch_for_is_refused() {
+    let (_dir, config, fake) = server_with_provider(Some("example.com")).await;
+    fake.lock().unwrap().email_verified = Some(false);
+    let (status, ..) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(matches!(
+        toolsite::accounts::users::account_at_email(&config, "alice@example.com").unwrap(),
+        toolsite::accounts::users::AtEmail::Nobody
+    ));
+}
+
+#[tokio::test]
+async fn an_email_missing_from_the_token_is_fetched_from_userinfo() {
+    let (_dir, config, fake) = server_with_provider(None).await;
+    account(&config, "alice@example.com", "correct horse");
+    fake.lock().unwrap().email_in_userinfo_only = true;
+    let (status, _, headers) = sign_in_through(&config, "/").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(session_cookie(&headers).is_some());
+}
