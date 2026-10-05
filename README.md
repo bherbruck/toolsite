@@ -24,7 +24,7 @@ asks for an upload URL, writes the file, and sends it.
   for anyone signed in, or for the people you name. No public signup, ever.
 - **One admin page.** Apps, accounts, access, and export tokens, with a page
   per app for its gate, route rules, grants, settings, jobs and notes.
-- **Reporting on your data.** A tool like a reporting tool pulls an app's database
+- **Reporting on your data.** A reporting tool pulls an app's database
   with a token that opens that app and nothing else.
 - **Nothing destroys data.** Taking a page down is a flag. Removing an app
   moves its files to `.trash/`. Disabling an account keeps it.
@@ -684,7 +684,7 @@ subdomain per app if that ever stops being true.
 
 ## Exporting a database
 
-A reporting tool that pulls SQLite over HTTP (a reporting tool, for one) can read an
+A reporting tool that pulls SQLite over HTTP can read an
 app's database with a token minted for that app alone:
 
 ```
@@ -700,7 +700,7 @@ and nothing else; the publish token is refused there. Revoke from either place
 and the tool gets 401 on its next pull. Tokens live hashed in
 `<app>.exports`, so removing the app takes them with it.
 
-In a reporting tool: a connection of type `sqlite` with that URL and the token as its
+In the reporting tool: a connection of type `sqlite` with that URL and the token as its
 bearer token. It downloads the file on each sync.
 
 ## The index

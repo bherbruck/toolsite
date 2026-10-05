@@ -5,7 +5,7 @@
 //! which is exactly why it is the wrong thing to hand a reporting tool. An
 //! export token is narrower on every axis: one app, read only, a whole-file
 //! snapshot rather than arbitrary SQL, revocable on its own. It is what an
-//! owner pastes into something like a reporting tool, which pulls a SQLite file over
+//! owner pastes into a reporting tool that pulls a SQLite file over
 //! HTTP on a schedule.
 //!
 //! What goes over the wire is a snapshot taken with `VACUUM INTO`, never the

@@ -264,7 +264,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Read-only access to one app's database from outside: a token for GET <site>/export/<app>.sqlite, which answers with a consistent snapshot of the whole SQLite file. For reporting tools that pull SQLite over HTTP (a reporting tool and the like). Each token opens one app only and is revocable on its own; the publish token is never accepted there. The token is returned once, by this call, and stored only as a hash."
+        description = "Read-only access to one app's database from outside: a token for GET <site>/export/<app>.sqlite, which answers with a consistent snapshot of the whole SQLite file. For reporting tools that pull SQLite over HTTP (a BI or sync tool). Each token opens one app only and is revocable on its own; the publish token is never accepted there. The token is returned once, by this call, and stored only as a hash."
     )]
     pub(crate) async fn app_exports(
         &self,
@@ -281,7 +281,7 @@ impl PageHost {
             "create" => crate::platform::export::create(&config, &app, &label.unwrap_or_default()).map(
                 |(entry, token)| {
                     format!(
-                        "Token {} for {app} ({}). Shown once:\n\n{token}\n\nUse it as\n\n  curl -H 'Authorization: Bearer {token}' -o {app}.sqlite {url}\n\nIn a reporting tool: a sqlite connection with URL {url} and that bearer token.",
+                        "Token {} for {app} ({}). Shown once:\n\n{token}\n\nUse it as\n\n  curl -H 'Authorization: Bearer {token}' -o {app}.sqlite {url}\n\nIn the reporting tool: a sqlite connection with URL {url} and that bearer token.",
                         entry.id, entry.label
                     )
                 },
