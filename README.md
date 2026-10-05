@@ -6,9 +6,11 @@ instead of a file you have to find somewhere to host, you get a link. The link
 is on your domain, behind your sign-in if you want it, with its own database,
 its own files, and a page where you decide who may open it.
 
-It is one container: an MCP server that agents publish through, and the web
-host that serves what they published. Nothing an agent builds passes through
-the conversation. It asks for an upload URL, writes the file, and sends it.
+It is one program: an MCP server that agents publish through, and the web
+host that serves what they published, in a single binary with no database to
+run beside it. Ship it as a container or run the binary on a machine you
+already have. Nothing an agent builds passes through the conversation. It
+asks for an upload URL, writes the file, and sends it.
 
 ## What you get
 
@@ -57,8 +59,9 @@ snapshot of the database.
 
 ## Deploy it
 
-You need a domain pointing at the container and a persistent directory at
-`/data`. Everything lives there as plain files; losing it loses every app.
+You need a domain pointing at the server and a persistent directory for its
+data, `/data` by default. Everything lives there as plain files; losing it
+loses every app.
 
 **Railway.** Deploy the repository as a service, attach a Volume at `/data`
 (the Dockerfile has no `VOLUME` line on purpose; Railway's builder rejects
@@ -114,8 +117,8 @@ and pages are viewable. HTTP `/mcp` still refuses everything without a token
 or a sign-in. Logs go to stderr, since stdout is the protocol.
 
 Set `TOOLSITE_BASE_URL` to where the outside world reaches the server.
-Without it, the upload URLs handed to an agent point at the container's own
-port, which nothing outside can use, and clients cannot sign in. Boot logs the
+Without it, the upload URLs handed to an agent point at the server's own
+local port, which nothing outside can use, and clients cannot sign in. Boot logs the
 effective configuration, so a misconfigured deploy is visible without a client
 to test against:
 
