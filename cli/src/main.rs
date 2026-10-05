@@ -104,7 +104,7 @@ enum Command {
         app: String,
         /// public (anyone), authenticated (any account), granted (only
         /// accounts you have granted), or default (follow the site's
-        /// TOOLSITE_DEFAULT_GATE).
+        /// TOOLSITE_DEFAULT_ACCESS).
         gate: String,
         /// Apply it to paths starting here instead of the whole app, e.g.
         /// --path /admin. Longest matching prefix wins.
