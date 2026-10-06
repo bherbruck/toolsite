@@ -73,7 +73,8 @@ back into the conversation either; `curl` it to a file and edit that.
   conventions from a neighbouring app.
 - `GET <server>/examples` lists working apps to start from or copy a part
   of: `kitchen-sink` (every capability), `orders`, `static-report`,
-  `blob-gallery`, `inventory-policies`. `toolsite init <name> --example
+  `blob-gallery`, `inventory-policies`, `live-board` (live connections).
+  `toolsite init <name> --example
   <example>` unpacks one with its slug and base path set.
 
 ## The CLI (preferred when installed)

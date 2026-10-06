@@ -72,6 +72,9 @@ Either way the slug, the base path and the package names are set for
   with `x-toolsite-blob`.
 - `inventory-policies`: tables and policies only, with the `as_user` steps
   that prove them.
+- `live-board`: a shared board over a declared socket. Changes by request,
+  then `publish`; the board as the first message; presence; a nudge to one
+  person through `user:<id>`; a front end that reconnects.
 
 ## Publishing
 

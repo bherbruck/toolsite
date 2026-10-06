@@ -180,8 +180,8 @@ agent about to build a handler, a schema or a gate.
 `GET /examples` lists working example apps, and `GET /examples/<name>.tar.gz`
 hands one over (`?slug=` renames it and sets its base path). They live in
 [`examples/`](examples/): `kitchen-sink` uses every capability, one screen
-each; `orders`, `static-report`, `blob-gallery` and `inventory-policies` are
-smaller and focused. The same apps are test fixtures: `tests/examples.rs`
+each; `orders`, `static-report`, `blob-gallery`, `inventory-policies` and
+`live-board` are smaller and focused. The same apps are test fixtures: `tests/examples.rs`
 publishes each one through the router and checks what its README claims.
 
 ## The CLI
@@ -680,6 +680,11 @@ The rules:
 Connections live in one server process. Toolsite runs as one instance, so
 that is all of them; a deployment with several instances would need a shared
 bus first.
+
+[`examples/live-board`](examples/live-board/) puts this together: a shared
+board where changes go through the API and then `publish`, the board is the
+first message of each connection, presence lives on a topic and a nudge
+reaches one person through `user:<id>`.
 
 ### TCP and UDP
 
