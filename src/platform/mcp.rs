@@ -1114,6 +1114,8 @@ impl PageHost {
             Err(refused) => return Ok(refused),
         };
 
+        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        let is_new = !crate::content::store::app_exists(&self.config, &app).await;
         let path = self.config.data_dir.join(format!("{slug}.html"));
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -1123,7 +1125,9 @@ impl PageHost {
         fs::write(&path, html)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let app = slug.split('/').next().unwrap_or(&slug).to_string();
+        if is_new {
+            crate::platform::upload::forget_stale_access(&self.config, &app, folder.as_deref()).await;
+        }
         self.stamp_new_app(&app, &caller, folder.as_deref()).await;
 
         let url = page_url(&self.config, &slug);
@@ -1265,9 +1269,13 @@ impl PageHost {
         }
 
         let app_dir = self.config.data_dir.join(&app);
+        let is_new = !crate::content::store::app_exists(&self.config, &app).await;
         fs::create_dir_all(&app_dir)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if is_new {
+            crate::platform::upload::forget_stale_access(&self.config, &app, folder.as_deref()).await;
+        }
 
         let mut urls = Vec::new();
         for (name, html) in &pages {

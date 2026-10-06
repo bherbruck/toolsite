@@ -910,3 +910,47 @@ async fn a_manager_cannot_rename_or_move_a_project_into_or_over_a_sibling_it_doe
     }
     assert!(store::folder_exists(&w.config, "ops/warehouse").await && store::folder_exists(&w.config, "finance").await);
 }
+
+/// Access set on a path before any app lives there must not open the app
+/// that is published there later.
+#[tokio::test]
+async fn access_waiting_at_an_empty_path_does_not_open_the_app_published_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = std::sync::Arc::new(toolsite::Config {
+        default_gate: "restricted".to_string(),
+        ..toolsite::Config::local(dir.path().to_path_buf(), "test-token")
+    });
+    toolsite::accounts::users::sign_up(&config, "early@example.com", "correct horse battery").unwrap();
+    // A grant and a row recorded before the app exists.
+    toolsite::accounts::users::grant(&config, "early@example.com", "later", "viewer").unwrap();
+    let early = toolsite::accounts::users::log_in(&config, "early@example.com", "correct horse battery").unwrap().0;
+    toolsite::accounts::users::grant_scope(&config, "early@example.com", "later", toolsite::accounts::users::Scope::Viewer, None).unwrap();
+
+    // The app arrives through an upload ticket, as an agent publishes.
+    let ticket = "t-later".to_string();
+    config.uploads.lock().unwrap().insert(
+        ticket.clone(),
+        toolsite::platform::upload::UploadTicket {
+            slug: "later".to_string(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            user: None,
+            project: None,
+        },
+    );
+    let request = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("/upload/{ticket}"))
+        .body(axum::body::Body::from("<title>Later</title><h1>later</h1>"))
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(
+        toolsite::build_router(config.clone(), toolsite::runtime::wasm::Runtime::new().unwrap()),
+        request,
+    )
+    .await
+    .unwrap();
+    assert!(response.status().is_success(), "{}", response.status());
+
+    let locks = toolsite::content::store::locked_prefixes_blocking(&config);
+    let held = toolsite::accounts::users::app_scope(&config, &early, "", "later", &locks);
+    assert!(held.is_none(), "an account granted before the app existed holds {held:?} on it");
+}

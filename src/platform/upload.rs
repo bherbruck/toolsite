@@ -201,11 +201,36 @@ pub(crate) async fn store_for_publisher(
         }
     }
 
+    let is_new = !crate::content::store::app_exists(config, &app).await;
     let response = store_for_slug(config, runtime, slug, kind, body, meta).await;
     if response.status().is_success() {
+        if is_new {
+            forget_stale_access(config, &app, project.as_deref()).await;
+        }
         stamp_new_app(config, &app, user.as_deref(), project.as_deref()).await;
     }
     response
+}
+
+/// A new app starts with no one holding anything on it. Rows or grants left
+/// at its path, set before it existed or by a different app that once lived
+/// there, would otherwise open it to whoever holds them. They go to the log,
+/// not to the bin: an app that never existed has no trash entry to keep them in.
+pub(crate) async fn forget_stale_access(config: &Config, app: &str, project: Option<&str>) {
+    let folder = project.filter(|p| !p.is_empty()).unwrap_or("");
+    let path = if folder.is_empty() { app.to_string() } else { format!("{folder}/{app}") };
+    let (cfg, app_owned, path_owned) = (config.clone_for_task(), app.to_string(), path.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::accounts::users::forget_app(&cfg, &app_owned, &path_owned)
+    })
+    .await;
+    if let Ok(Ok(dropped)) = outcome {
+        let empty = dropped.get("access").and_then(|v| v.as_array()).is_none_or(|a| a.is_empty())
+            && dropped.get("grants").and_then(|v| v.as_array()).is_none_or(|a| a.is_empty());
+        if !empty {
+            tracing::warn!(app = %app, path = %path, dropped = %dropped, "a new app had access rows waiting at its path; they were removed");
+        }
+    }
 }
 
 /// Records, once, who first published an app and the folder it landed in.
