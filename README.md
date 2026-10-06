@@ -1038,12 +1038,36 @@ session, in a cookie scoped to `/p/<app>/`, is the only thing that satisfies a
 gate. `/auth/handoff` mints the second from the first, and refuses to do so
 for anything the browser reports as a background fetch.
 
-**Scope note.** Every app shares one origin, so cookie `Path` decides which
-requests carry a session, not which page asked. That contains accidents
-between apps but does not stop a deliberate one: a script can navigate the
-visitor through the handoff and then use the resulting cookie. This is a fine
-trade when every app is one you deployed, and it is the reason to reach for a
-subdomain per app if that ever stops being true.
+### One origin: what is protected and what is not
+
+Every app is served under `/p/<app>/` on the same origin as `/admin`,
+`/account`, the consent screen and the settings entry form. The browser
+treats them as one site, and anyone who can publish an app, including a
+deploy-token holder or someone who can push to an app's repository, can put
+a script there. Protected now:
+
+- toolsite's own pages (`/`, `/browse`, `/admin`, `/account`, `/authorize`,
+  `/settings`, `/auth/setup`) are handed out only to a navigation in a tab,
+  as the browser's fetch metadata reports it, or to a script that already
+  shows the visitor's form token. An app's script cannot fetch them to read
+  a form token, data or a secret.
+- Those pages refuse to be framed (`X-Frame-Options: DENY`,
+  `frame-ancestors 'none'`).
+- Those pages and app pages never share a browsing context group
+  (`Cross-Origin-Opener-Policy`), so a window an app opens on `/admin` is
+  one its script cannot reach into.
+- Form tokens are derived with a key only the server holds
+  (`.site/form.key`), never from anything an app can learn.
+- App code never sees toolsite's cookies, cannot set them, and a socket
+  upgrade from another site is refused.
+
+Not protected yet: a script in one app can send requests to another app's
+`/p/<other>/...` as the visitor, because each app's cookie is scoped by path
+on one origin and the browser attaches it to any request to that path. It
+can also walk the visitor through the handoff to get that cookie. The full
+fix is a separate origin for apps, a subdomain per app or one apps host
+apart from the admin host. Until then, treat every app on a site as trusted
+with every visitor's access to every other app on it.
 
 ## Row-level access
 

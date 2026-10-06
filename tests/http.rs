@@ -7049,3 +7049,91 @@ async fn a_token_signed_in_for_one_apps_tools_stays_bound_to_them_through_a_refr
     assert!(opens(access.clone(), "/p/farm/mcp").await);
     assert!(!opens(access, "/mcp").await, "a refresh widened the token");
 }
+
+// --- toolsite's own pages against scripts in apps -----------------------------
+//
+// Apps share the site's origin, so a script in an app could fetch an admin
+// page and read its form token, frame it, or open it and reach into it.
+
+/// A GET as a browser describes it: mode and destination from fetch metadata.
+fn browser_get(uri: &str, session: &str, mode: &str, dest: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("cookie", format!("ts_session={session}"))
+        .header("sec-fetch-site", "same-origin")
+        .header("sec-fetch-mode", mode)
+        .header("sec-fetch-dest", dest)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_script_in_an_app_cannot_fetch_or_frame_toolsites_own_pages() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+
+    for path in ["/admin", "/admin/accounts", "/account", "/authorize?client_id=x", "/settings/abc", "/", "/browse/ops"] {
+        let (status, body, _) = send(&config, browser_get(path, &boss, "cors", "empty")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a script fetched {path}");
+        assert!(!body.contains("name=\"token\""), "{path} leaked a form token in its refusal");
+        let (status, ..) = send(&config, browser_get(path, &boss, "navigate", "iframe")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} loaded in a frame");
+    }
+
+    // A tab may open them, and so may a client that is not a browser.
+    let (status, ..) = send(&config, browser_get("/admin", &boss, "navigate", "document")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, ..) = send(&config, get_as("/admin", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn toolsites_own_pages_refuse_framing_and_keep_apart_from_app_windows() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, _, headers) = send(&config, get_as("/admin", &boss)).await;
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    assert_eq!(header("x-frame-options").as_deref(), Some("DENY"));
+    assert_eq!(header("content-security-policy").as_deref(), Some("frame-ancestors 'none'"));
+    assert_eq!(header("cross-origin-opener-policy").as_deref(), Some("same-origin"));
+
+    // An app page never says the same, so it cannot share a group with them.
+    write_page(&config, "notes", "<title>Notes</title>");
+    let (_, _, headers) = send(&config, get("/p/notes")).await;
+    let coop = headers.iter().find(|(k, _)| k == "cross-origin-opener-policy").map(|(_, v)| v.clone());
+    assert_eq!(coop.as_deref(), Some("same-origin-allow-popups"));
+}
+
+#[tokio::test]
+async fn toolsites_own_scripts_reach_their_json_only_with_the_form_token() {
+    let (_dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/admin", &boss)).await;
+    let token = form_token_from(&page);
+
+    for path in [
+        "/admin/accounts/search?q=",
+        "/admin/apps/search?q=",
+        "/admin/projects/search?q=",
+        "/admin/permissions/candidates?q=&path=",
+    ] {
+        // A script with no token, as an app's would be: refused.
+        let (status, ..) = send(&config, browser_get(path, &boss, "cors", "empty")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} answered a script without the token");
+        // toolsite's own script, which shows the token from its page.
+        let mut request = browser_get(path, &boss, "cors", "empty");
+        request.headers_mut().insert("x-toolsite-form", token.parse().unwrap());
+        let (status, body, _) = send(&config, request).await;
+        assert!(status.is_success(), "{path}: {status}");
+        assert!(!body.contains(&token), "{path} returned a form token");
+    }
+
+    // A wrong token is no token.
+    let mut request = browser_get("/admin/accounts/search?q=", &boss, "cors", "empty");
+    request.headers_mut().insert("x-toolsite-form", "guess".parse().unwrap());
+    let (status, ..) = send(&config, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

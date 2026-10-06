@@ -28,6 +28,7 @@ pub mod mcp_me;
 pub mod scaffold;
 pub mod schedule;
 pub mod secrets;
+pub mod shield;
 pub mod trash;
 pub mod upload;
 pub mod websocket;

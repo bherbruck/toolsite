@@ -621,6 +621,13 @@ input[type=search] { width: 100%; margin-bottom: 1.25rem; }
 pub const SHELL_SCRIPT: &str = r#"
 <script>
 (() => {
+  // toolsite's own pages may only be fetched by a script that shows the
+  // visitor's form token, which these pages carry in their forms and an
+  // app's script cannot read.
+  const formHeaders = (form) => {
+    const field = (form && form.elements && form.elements.token) || document.querySelector('input[name="token"]');
+    return field && field.value ? { 'x-toolsite-form': field.value } : {};
+  };
   const dialog = document.getElementById('confirm');
   if (dialog) {
     let pending = null;
@@ -710,7 +717,7 @@ pub const SHELL_SCRIPT: &str = r#"
   const grid = document.getElementById('perm-grid');
   if (grid) {
     const redraw = async (refocus) => {
-      const page = await fetch(location.href, { credentials: 'same-origin' });
+      const page = await fetch(location.href, { credentials: 'same-origin', headers: formHeaders() });
       const doc = new DOMParser().parseFromString(await page.text(), 'text/html');
       const fresh = doc.getElementById('perm-people');
       const here = document.getElementById('perm-people');
@@ -727,7 +734,7 @@ pub const SHELL_SCRIPT: &str = r#"
       try {
         const res = await fetch(form.action, {
           method: 'POST', credentials: 'same-origin',
-          headers: { 'x-toolsite-fetch': '1' },
+          headers: { 'x-toolsite-fetch': '1', ...formHeaders() },
           body: new URLSearchParams(new FormData(form)),
         });
         const reply = await res.json().catch(() => ({ ok: false, message: 'The change was not saved.' }));
@@ -871,7 +878,7 @@ pub const SHELL_SCRIPT: &str = r#"
             }
           });
           const res = await fetch(url, {
-            credentials: 'same-origin', signal: controller.signal,
+            credentials: 'same-origin', signal: controller.signal, headers: formHeaders(input.form),
           });
           if (!res.ok) return;
           const found = await res.json();

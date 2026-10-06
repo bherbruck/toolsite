@@ -10,10 +10,13 @@
 //! Sessions come in two tiers, because every app shares one origin. A *site*
 //! session proves who the person is and nothing else. An *app* session is a
 //! separate token, scoped to one app and delivered in a cookie the browser
-//! only sends to `/p/<app>/`. A page can therefore never borrow the visitor's
-//! standing with a neighbouring app: the credential is not in its jar to
-//! send. Access to an app is granted by the handoff, never assumed from being
-//! signed in.
+//! only sends to `/p/<app>/`. That keeps a page from *reading* a neighbour's
+//! credential, and the host strips every `ts_` cookie before app code sees a
+//! request. It does not stop a script in app A from *sending* a request to
+//! `/p/<appB>/`: on one origin the browser attaches B's cookie to it, so A
+//! can act as the visitor towards B. Only a separate origin for apps closes
+//! that; see `platform::shield` for what is closed until then. Access to an
+//! app is granted by the handoff, never assumed from being signed in.
 
 use crate::{config::Config, content::slug::valid_slug, runtime::db};
 use argon2::{
@@ -73,8 +76,10 @@ pub fn app_cookie_name(app: &str) -> String {
     format!("ts_app_{app}")
 }
 
-/// The whole isolation story in one line: a cookie is only sent to paths the
-/// `Path` prefixes, so app A's script gets nothing back for `/p/appB/...`.
+/// A cookie is only attached to paths the `Path` prefixes, so app A's pages
+/// never see B's cookie. A script in A can still send a request to
+/// `/p/appB/...` and the browser attaches B's cookie to it: scoping by path
+/// on one origin limits reading, not sending.
 fn app_cookie_path(app: &str) -> String {
     format!("/p/{app}/")
 }
@@ -1393,6 +1398,22 @@ mod tests {
         assert!(token_from_cookies(None).is_none());
     }
 
+    #[test]
+    fn a_form_token_cannot_be_worked_out_from_the_account_id() {
+        // A site that signs clients in has no static token; the key must
+        // still be one only the server holds.
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { valid_tokens: Vec::new(), ..Config::local(dir.path().to_path_buf(), "t") };
+        let token = derive_form_token(&config, "user-1");
+        let guessable = URL_SAFE_NO_PAD.encode(Sha256::digest(b"form::user-1"));
+        assert_ne!(token, guessable);
+        // Stable for the same site, different for another.
+        assert_eq!(token, derive_form_token(&config, "user-1"));
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = Config { valid_tokens: Vec::new(), ..Config::local(other.path().to_path_buf(), "t") };
+        assert_ne!(token, derive_form_token(&elsewhere, "user-1"));
+    }
+
     fn deployed_at(base: Option<&str>) -> Config {
         Config {
             base_url: base.map(str::to_string),
@@ -1824,8 +1845,49 @@ pub fn list_grants(config: &Config) -> Result<Vec<(String, String, String)>, Str
 /// the server's own secret, so it is not the session token and cannot be
 /// replayed as one.
 pub fn derive_form_token(config: &Config, user_id: &str) -> String {
-    let secret = config.valid_tokens.first().map(String::as_str).unwrap_or("");
+    let secret = URL_SAFE_NO_PAD.encode(form_secret(config));
     URL_SAFE_NO_PAD.encode(Sha256::digest(format!("form:{secret}:{user_id}").as_bytes()))
+}
+
+/// The key form tokens are derived with: 32 random bytes kept in
+/// `.site/form.key`, made on first use. It used to be the static MCP token,
+/// which a site that signs clients in does not have; then the key was empty
+/// and anyone who knew an account's id could work out its form token. An
+/// app's own code learns ids through `identity`, and every app shares this
+/// origin, so the key has to be one only the server holds.
+fn form_secret(config: &Config) -> [u8; 32] {
+    let path = config.data_dir.join(".site").join("form.key");
+    if let Ok(bytes) = std::fs::read(&path)
+        && let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice())
+    {
+        return key;
+    }
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Written through a temp file so two first requests cannot both win
+    // with different keys and leave pages carrying a token that fails.
+    let temp = path.with_extension(format!("tmp{}", crate::content::slug::random_token(6)));
+    if std::fs::write(&temp, key).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
+        }
+        // Keep whichever key reached the disk first.
+        if std::fs::hard_link(&temp, &path).is_err() {
+            let _ = std::fs::remove_file(&temp);
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(existing) = <[u8; 32]>::try_from(bytes.as_slice())
+            {
+                return existing;
+            }
+        }
+        let _ = std::fs::remove_file(&temp);
+    }
+    key
 }
 
 // --- invitations --------------------------------------------------------

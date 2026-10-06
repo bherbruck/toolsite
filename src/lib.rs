@@ -297,4 +297,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
                 next.run(request).await
             }
         }))
+        // Outermost, so it sees app responses from every router above and
+        // toolsite's own pages before anything else answers them.
+        .layer(middleware::from_fn_with_state(config.clone(), crate::platform::shield::shield))
 }

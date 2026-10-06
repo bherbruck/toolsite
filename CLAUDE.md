@@ -44,6 +44,7 @@ platform/          the site as its owner uses it
   mcp_me.rs        /me/mcp: a regular account's tools over the data apps share
   app_tools.rs     tools an app declares: /p/<app>/mcp, pins, and calls run as the person
   bearer.rs        bearer/x-api-key middleware for /mcp
+  shield.rs        keeps app scripts off toolsite's own pages: fetch metadata, framing, COOP
   client_oauth.rs  the OAuth server MCP clients sign in through — who may PUBLISH
   oauth_store.rs   its clients, codes and tokens, in .site/oauth.db
   upload.rs        upload tickets and the PUT endpoints they authorise

@@ -11,9 +11,11 @@
 //! the person was on, carried across the redirect in a short-lived cookie.
 //!
 //! Every action is a POST carrying a token derived from the caller's own
-//! session. Cookies are `SameSite=Lax`, which already refuses a cross-site
-//! POST; the token is what stops a page on *this* origin from acting as the
-//! admin who happens to be visiting it.
+//! session and a key only the server holds. Cookies are `SameSite=Lax`,
+//! which already refuses a cross-site POST. A page on *this* origin, an
+//! app's script, could fetch an admin page and read the token from it, so
+//! `platform::shield` hands these pages only to a navigation in a tab, or to
+//! a script that already shows the token, and refuses to let them be framed.
 
 use crate::{
     platform::projects,
