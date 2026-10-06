@@ -1,0 +1,17 @@
+slug = "live-board"
+spa = false
+icon = "🗂️"
+# Only the people an admin grants may open the board or its socket. The
+# socket passes the same gate as every request to the app.
+gate = "restricted"
+
+# The browser connects here. A path not declared refuses the upgrade.
+[[socket]]
+path = "/live/ws"
+
+[[tool]]
+name = "add_card"
+title = "Add card"
+description = "Add a card to the shared board. Everyone with the board open sees it at once. Lanes: todo (the default), doing, done."
+path = "/api/tools/add_card"
+input = { type = "object", properties = { title = { type = "string", minLength = 1, maxLength = 200 }, lane = { type = "string", enum = ["todo", "doing", "done"] } }, required = ["title"] }

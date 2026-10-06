@@ -7,7 +7,8 @@
 # a stale fixture cannot pass for the current code.
 #
 # Run it after any change under examples/ or to wit/toolsite.wit. Needs cargo
-# with the wasm32-wasip2 target, and npm.
+# with the wasm32-wasip2 target, and npm. Name examples to rebuild only
+# those: scripts/build-examples.sh live-board orders
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -30,7 +31,13 @@ source_hash() {
     )
 }
 
-for dir in examples/*/; do
+if [ $# -gt 0 ]; then
+    dirs=$(for name in "$@"; do echo "examples/$name/"; done)
+else
+    dirs=$(ls -d examples/*/)
+fi
+
+for dir in $dirs; do
     name=$(basename "$dir")
     [ -f "$dir/toolsite.toml" ] || continue
     echo "== $name"

@@ -25,7 +25,7 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
 const BASE: &str = "https://site.test";
-const EXAMPLES: [&str; 5] = ["kitchen-sink", "orders", "static-report", "blob-gallery", "inventory-policies"];
+const EXAMPLES: [&str; 6] = ["kitchen-sink", "orders", "static-report", "blob-gallery", "inventory-policies", "live-board"];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -295,7 +295,7 @@ async fn every_example_publishes_as_it_ships() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Q3 shipping report"));
     // The rest are not.
-    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies"] {
+    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies", "live-board"] {
         let (status, _) = send_text(&config, get(&format!("/p/{name}/"))).await;
         assert_ne!(status, StatusCode::OK, "{name} opened with no account");
     }
@@ -686,4 +686,235 @@ async fn inventory_policies_hold_as_the_readme_says() {
 
     let (_, out) = run_sql(&config, app, "select quantity from stock_totals where sku = 'PAL-STD'", Some("bob@example.com")).await;
     assert!(out.contains("225"), "totals add both warehouses: {out}");
+}
+
+// --- live-board ----------------------------------------------------------------------
+
+type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The same router on a real port, since a WebSocket needs a connection the
+/// server keeps. Requests through `send` reach the same sockets, because
+/// the connections live in the shared Config.
+async fn listen(config: &Arc<Config>) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(config.clone(), Runtime::new().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    addr
+}
+
+/// Connects to `path` inside the board with an app cookie, or answers the
+/// HTTP status the upgrade was refused with.
+async fn board_socket(addr: std::net::SocketAddr, cookie: Option<&str>, path: &str) -> Result<Socket, u16> {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
+    let mut request = format!("ws://{addr}/p/live-board{path}").into_client_request().unwrap();
+    if let Some(cookie) = cookie {
+        request.headers_mut().insert("cookie", cookie.parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _)) => Ok(socket),
+        Err(Error::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("connect failed: {other}"),
+    }
+}
+
+/// The next JSON message of one type, skipping the others.
+async fn next_of(socket: &mut Socket, kind: &str) -> Option<serde_json::Value> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let frame = tokio::time::timeout_at(deadline, socket.next()).await.ok()??.ok()?;
+        if let Message::Text(text) = frame {
+            let msg: serde_json::Value = serde_json::from_str(&text).ok()?;
+            if msg["type"] == kind {
+                return Some(msg);
+            }
+        }
+    }
+}
+
+/// No message of this type arrives for a short while.
+async fn none_of(socket: &mut Socket, kind: &str) -> bool {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Err(_) => return true,
+            Ok(Some(Ok(Message::Text(text)))) if text.contains(&format!("\"type\":\"{kind}\"")) => return false,
+            Ok(Some(Ok(_))) => continue,
+            Ok(_) => return true,
+        }
+    }
+}
+
+async fn say(socket: &mut Socket, msg: serde_json::Value) {
+    use futures_util::SinkExt;
+    socket.send(tokio_tungstenite::tungstenite::Message::Text(msg.to_string().into())).await.unwrap();
+}
+
+struct Board {
+    config: Arc<Config>,
+    addr: std::net::SocketAddr,
+    _dir: TempDir,
+}
+
+/// The board published, with each of `granted` given access and handed an
+/// app cookie.
+async fn live_board(granted: &[&str]) -> (Board, Vec<(Person, String)>) {
+    let (dir, config) = site();
+    publish(&config, "live-board").await;
+    let addr = listen(&config).await;
+    let mut people = Vec::new();
+    for email in granted {
+        let who = person(&config, email);
+        toolsite::accounts::users::grant(&config, email, "live-board", "viewer").unwrap();
+        let cookie = app_cookie(&config, &who, "live-board").await;
+        people.push((who, cookie));
+    }
+    (Board { config, addr, _dir: dir }, people)
+}
+
+/// Connects and reads the board, which is always the first message.
+async fn join(board: &Board, cookie: &str, query: &str) -> (Socket, serde_json::Value) {
+    use futures_util::StreamExt;
+    let mut socket = board_socket(board.addr, Some(cookie), &format!("/live/ws{query}"))
+        .await
+        .unwrap_or_else(|status| panic!("refused with {status}"));
+    let first = tokio::time::timeout(Duration::from_secs(3), socket.next()).await.unwrap().unwrap().unwrap();
+    let first: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(first["type"], "board", "the first message is the board: {first}");
+    (socket, first)
+}
+
+#[tokio::test]
+async fn live_board_a_card_one_person_adds_reaches_everyone_with_the_board_open() {
+    let (board, people) = live_board(&["alice@example.com", "bob@example.com"]).await;
+    let [(alice, alice_app), (_, bob_app)] = &people[..] else { unreachable!() };
+    let (mut a, first) = join(&board, alice_app, "").await;
+    assert_eq!(first["me"]["email"], "alice@example.com");
+    assert_eq!(first["cards"], serde_json::json!([]));
+    let (mut b, _) = join(&board, bob_app, "").await;
+
+    let (status, card) =
+        call(&board.config, alice_app, "POST", "/p/live-board/api/cards", serde_json::json!({ "title": "Order wrap" })).await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    for socket in [&mut a, &mut b] {
+        let event = next_of(socket, "card").await.expect("the new card was not pushed");
+        assert_eq!(event["card"]["title"], "Order wrap");
+        assert_eq!(event["card"]["lane"], "todo");
+        assert_eq!(event["card"]["author_email"], "alice@example.com");
+    }
+
+    // A move and a delete reach the others the same way.
+    let id = card["id"].as_i64().unwrap();
+    let uri = format!("/p/live-board/api/cards/{id}/move");
+    let (status, _) = call(&board.config, alice_app, "POST", &uri, serde_json::json!({ "lane": "done" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next_of(&mut b, "card").await.unwrap()["card"]["lane"], "done");
+    let uri = format!("/p/live-board/api/cards/{id}");
+    let (status, _) = call(&board.config, alice_app, "DELETE", &uri, serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next_of(&mut b, "deleted").await.unwrap()["id"], id);
+
+    // A card an assistant adds through the app tool arrives the same way.
+    let args = serde_json::json!({ "title": "From the assistant", "lane": "doing" });
+    let result = tool(&board.config, "/p/live-board/mcp", &alice.bearer, "add_card", args).await;
+    assert_ne!(result["isError"], true, "{result}");
+    assert_eq!(next_of(&mut b, "card").await.unwrap()["card"]["title"], "From the assistant");
+
+    // A browser that reconnects gets the board as it is now, first.
+    drop(b);
+    let (_, first) = join(&board, bob_app, "").await;
+    let titles: Vec<_> = first["cards"].as_array().unwrap().iter().map(|c| c["title"].clone()).collect();
+    assert_eq!(titles, vec![serde_json::json!("From the assistant")]);
+}
+
+#[tokio::test]
+async fn live_board_presence_lists_everyone_here_and_drops_a_person_who_leaves() {
+    let (board, people) = live_board(&["alice@example.com", "bob@example.com"]).await;
+    let [(_, alice_app), (_, bob_app)] = &people[..] else { unreachable!() };
+    let (mut a, _) = join(&board, alice_app, "?name=Alice").await;
+    let who = next_of(&mut a, "who").await.unwrap();
+    assert_eq!(who["people"].as_array().unwrap().len(), 1, "{who}");
+
+    let (mut b, first) = join(&board, bob_app, "?name=Bob%20B").await;
+    assert_eq!(first["me"]["name"], "Bob B", "the name from the query is kept in the connection's state");
+    let who = next_of(&mut a, "who").await.unwrap();
+    let names: Vec<_> = who["people"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["Alice", "Bob B"]);
+
+    // A rename over the socket shows on everyone's list.
+    say(&mut b, serde_json::json!({ "type": "name", "name": "Robert" })).await;
+    let who = next_of(&mut a, "who").await.unwrap();
+    assert!(who.to_string().contains("Robert"), "{who}");
+
+    drop(b);
+    let who = next_of(&mut a, "who").await.expect("no presence update after bob left");
+    let names: Vec<_> = who["people"].as_array().unwrap().iter().map(|p| p["name"].clone()).collect();
+    assert_eq!(names, vec![serde_json::json!("Alice")]);
+}
+
+#[tokio::test]
+async fn live_board_a_nudge_reaches_only_the_person_it_names() {
+    let (board, people) = live_board(&["alice@example.com", "bob@example.com", "carol@example.com"]).await;
+    let [(_, alice_app), (_, bob_app), (_, carol_app)] = &people[..] else { unreachable!() };
+    let (mut a, _) = join(&board, alice_app, "?name=Alice").await;
+    let (mut b, bob) = join(&board, bob_app, "").await;
+    let (mut b2, _) = join(&board, bob_app, "").await;
+    let (mut c, _) = join(&board, carol_app, "").await;
+
+    say(&mut a, serde_json::json!({ "type": "nudge", "to": bob["me"]["id"], "text": "standup" })).await;
+    let sent = next_of(&mut a, "nudged").await.unwrap();
+    assert_eq!(sent["reached"], 2, "both of bob's tabs: {sent}");
+    for socket in [&mut b, &mut b2] {
+        let nudge = next_of(socket, "nudge").await.expect("bob was not nudged");
+        assert_eq!(nudge["from"], "Alice");
+        assert_eq!(nudge["text"], "standup");
+    }
+    assert!(none_of(&mut c, "nudge").await, "carol saw bob's nudge");
+    assert!(none_of(&mut a, "nudge").await, "the sender saw their own nudge");
+
+    // Nobody by that id has the board open, so the sender is told.
+    say(&mut a, serde_json::json!({ "type": "nudge", "to": "no-such-person" })).await;
+    let refused = next_of(&mut a, "error").await.unwrap();
+    assert!(refused["error"].as_str().unwrap().contains("does not have the board open"), "{refused}");
+}
+
+#[tokio::test]
+async fn live_board_refuses_the_socket_to_a_stranger_and_to_no_account() {
+    let (board, people) = live_board(&["alice@example.com"]).await;
+    let alice_app = &people[0].1;
+    let (mut a, _) = join(&board, alice_app, "").await;
+    let who = next_of(&mut a, "who").await.unwrap();
+    assert_eq!(who["people"].as_array().unwrap().len(), 1, "{who}");
+
+    // Dave has an account but no grant. The gate in front of the socket is
+    // the gate in front of the app, so he never reaches the handler. He gets
+    // no app session from the hand-off, so try his site session too.
+    let dave = person(&board.config, "dave@example.com");
+    let request = Request::builder()
+        .uri("/auth/handoff?app=live-board&next=/p/live-board/")
+        .header("cookie", format!("ts_session={}", dave.site))
+        .body(Body::empty())
+        .unwrap();
+    let (_, _, headers) = send(&board.config, request).await;
+    let handed = headers.iter().find(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap().to_string());
+    let site_session = format!("ts_session={}", dave.site);
+    for cookie in handed.iter().map(String::as_str).chain([site_session.as_str()]) {
+        let status = board_socket(board.addr, Some(cookie), "/live/ws").await.expect_err("a stranger connected");
+        assert!(status == 401 || status == 403, "stranger with {cookie}: {status}");
+    }
+    let status = board_socket(board.addr, None, "/live/ws").await.expect_err("no account connected");
+    assert!([401, 403, 303].contains(&status), "no account: {status}");
+
+    // Neither reached the handler: nobody joined the presence list.
+    assert!(none_of(&mut a, "who").await, "a refused socket changed the presence list");
+
+    // A path the manifest does not declare takes no socket at all.
+    let status = board_socket(board.addr, Some(alice_app), "/api/board").await.expect_err("an undeclared path upgraded");
+    assert_eq!(status, 404);
 }
