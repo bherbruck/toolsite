@@ -4313,7 +4313,7 @@ fn person(config: &Config, email: &str) -> toolsite::accounts::users::User {
 
 fn bearer_for(config: &Config, user: &toolsite::accounts::users::User) -> String {
     let client = toolsite::platform::oauth_store::register_client(config, Some("t"), &["https://c.test/cb".into()]).unwrap();
-    toolsite::platform::oauth_store::issue_tokens(config, &client.id, &user.id).unwrap().access_token
+    toolsite::platform::oauth_store::issue_tokens(config, &client.id, &user.id, None).unwrap().access_token
 }
 
 #[tokio::test]
@@ -7004,4 +7004,48 @@ async fn a_route_rule_closes_a_tool_on_that_path_to_whoever_it_keeps_out() {
     // Acting as bob, a site admin gets what bob would get.
     let as_bob = mcp_tool_raw(&config, "/mcp", TOKEN, "call_app_tool", serde_json::json!({"app": "farm", "tool": "whoami", "as_user": "bob@example.com"})).await;
     assert_eq!(as_bob["isError"], true, "{as_bob}");
+}
+
+#[tokio::test]
+async fn a_token_signed_in_for_one_apps_tools_stays_bound_to_them_through_a_refresh() {
+    let (_dir, config) = public_server();
+    admin(&config, "owner@example.com", "correct horse");
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+    write_page(&config, "farm/index", "<title>Farm</title>");
+    let client_id = register(&config, CALLBACK).await;
+
+    let resource = format!("{BASE}/p/farm/mcp");
+    let url = authorize_url(&client_id, CALLBACK).replace(
+        &format!("resource={}", urlencoding::encode(&format!("{BASE}/mcp"))),
+        &format!("resource={}", urlencoding::encode(&resource)),
+    );
+    let (status, page, _) = send(&config, get_as(&url, &session)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.contains("tools of the app") && !page.contains("publish and remove apps"), "the screen promised more than the token gets");
+    let body = format!("{}&resource={}", consent_body(&page, &client_id, CALLBACK, "allow"), urlencoding::encode(&resource));
+    let (status, _, headers) = send(&config, form_post("/authorize", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let code = query_param(&location(&headers), "code").unwrap();
+    let (status, tokens) = exchange(&config, &exchange_body(&client_id, &code, CALLBACK, VERIFIER)).await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+
+    let opens = |token: String, path: &'static str| {
+        let config = config.clone();
+        async move {
+            let mut request = mcp_initialize(&token);
+            *request.uri_mut() = path.parse().unwrap();
+            send(&config, request).await.0 == StatusCode::OK
+        }
+    };
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    assert!(opens(access.clone(), "/p/farm/mcp").await);
+    assert!(!opens(access.clone(), "/mcp").await, "an app's token opened the publishing connector");
+    assert!(!opens(access, "/me/mcp").await);
+
+    let refresh = format!("grant_type=refresh_token&client_id={client_id}&refresh_token={}", tokens["refresh_token"].as_str().unwrap());
+    let (status, renewed) = exchange(&config, &refresh).await;
+    assert_eq!(status, StatusCode::OK, "{renewed}");
+    let access = renewed["access_token"].as_str().unwrap().to_string();
+    assert!(opens(access.clone(), "/p/farm/mcp").await);
+    assert!(!opens(access, "/mcp").await, "a refresh widened the token");
 }

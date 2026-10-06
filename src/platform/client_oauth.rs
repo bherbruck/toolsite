@@ -393,6 +393,17 @@ pub(crate) async fn authorize_form(
 }
 
 fn consent(client: &Client, params: &AuthorizeParams, admin: &User, token: &str) -> Markup {
+    // What the token will be good for decides what the screen promises.
+    let resource_path = params
+        .resource
+        .as_deref()
+        .map(normalise_resource)
+        .and_then(|r| r.find("://").and_then(|i| r[i + 3..].find('/').map(|j| r[i + 3 + j..].to_string())));
+    let app_connector = resource_path
+        .as_deref()
+        .and_then(crate::platform::app_tools::connector_app)
+        .map(str::to_string);
+    let for_person = resource_path.as_deref() == Some("/me/mcp");
     let destination = params.redirect_uri.parse::<Uri>().ok();
     let host = destination
         .as_ref()
@@ -416,7 +427,13 @@ fn consent(client: &Client, params: &AuthorizeParams, admin: &User, token: &str)
             @if local {
                 p."muted" { "Warning: Any program on this computer can make this request. Continue only if you started this connection." }
             }
-            @if admin.is_admin {
+            @if let Some(app) = app_connector {
+                p."muted" {
+                    "The client acts as " (admin.email) " and can use the tools of the app " strong { (app) } " only, "
+                    "with the access this account has in that app. It cannot publish or manage anything, "
+                    "and the token does not work on any other connector."
+                }
+            } @else if admin.is_admin && !for_person {
                 p."muted" {
                     "The client acts as " (admin.email) " with all permissions of this account. "
                     "The client can publish and remove apps, run SQL on each app, and manage accounts and access."
@@ -487,6 +504,7 @@ pub(crate) async fn authorize_decide(
         params.redirect_uri.clone(),
         params.code_challenge.clone().unwrap_or_default(),
     );
+    let resource = params.resource.as_deref().map(normalise_resource);
     let code = tokio::task::spawn_blocking(move || {
         store::issue_code(
             &grant_config,
@@ -495,6 +513,7 @@ pub(crate) async fn authorize_decide(
                 user_id: &user_id,
                 redirect_uri: &redirect_uri,
                 code_challenge: &challenge,
+                resource: resource.as_deref(),
             },
         )
     })
@@ -602,8 +621,9 @@ pub(crate) async fn token_endpoint(
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
             };
             let issue_config = config.clone();
+            let resource = redeemed.resource.clone();
             let issued = tokio::task::spawn_blocking(move || {
-                store::issue_tokens(&issue_config, &client_id, &user.id)
+                store::issue_tokens(&issue_config, &client_id, &user.id, resource.as_deref())
             })
             .await;
             match issued {
@@ -659,15 +679,46 @@ pub(crate) async fn token_endpoint(
 /// The account behind an access token, if the token is live and the account
 /// is still active. What the bearer middleware asks for anything that is not
 /// a static token; `/mcp` then insists on an admin, `/me/mcp` does not.
-pub(crate) async fn token_user(config: &Arc<Config>, token: &str) -> Option<User> {
+/// With it, the resource the token was issued for: `None` for a token that
+/// named none. Each endpoint asks `token_fits`
+/// whether that resource lets the token in there.
+pub(crate) async fn token_user_for(config: &Arc<Config>, token: &str) -> Option<(User, Option<String>)> {
     let (lookup, presented) = (config.clone(), token.to_string());
-    let (user_id, _client) = tokio::task::spawn_blocking(move || {
-        store::access_token_holder(&lookup, &presented)
+    let (user_id, _client, resource) = tokio::task::spawn_blocking(move || {
+        store::access_token_grant(&lookup, &presented)
     })
     .await
     .ok()
     .flatten()?;
-    publishing_user(config, &user_id).await
+    publishing_user(config, &user_id).await.map(|user| (user, resource))
+}
+
+/// A resource as a token records it: no trailing slash.
+pub(crate) fn normalise_resource(resource: &str) -> String {
+    resource.trim().trim_end_matches('/').to_string()
+}
+
+/// Where a token may be used, by the resource it was issued for (RFC 8707).
+/// A token for the publishing connector reaches everything a person can; a
+/// token for a person's own connector reaches that and any app's tools,
+/// which it can already call there; a token for one app's tools reaches
+/// that app's connector and nothing else. A token that named no resource
+/// keeps working everywhere, as tokens did before resources were recorded.
+pub(crate) fn token_fits(config: &Config, resource: Option<&str>, endpoint_path: &str) -> bool {
+    let Some(resource) = resource else {
+        return true;
+    };
+    let Some(base) = config.base_url.as_deref() else {
+        return true;
+    };
+    let Some(granted) = resource.strip_prefix(base) else {
+        return false;
+    };
+    match granted {
+        "/mcp" => true,
+        "/me/mcp" => endpoint_path == "/me/mcp" || crate::platform::app_tools::connector_app(endpoint_path).is_some(),
+        other => other == endpoint_path && crate::platform::app_tools::connector_app(other).is_some(),
+    }
 }
 
 #[cfg(test)]

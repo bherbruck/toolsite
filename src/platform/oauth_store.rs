@@ -34,7 +34,10 @@ const TOKEN_LEN: usize = 48;
 
 /// Append only, as with the accounts ladder.
 static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
-    Migrations::new(vec![M::up(include_str!("../../migrations/oauth/001_initial.sql"))])
+    Migrations::new(vec![
+        M::up(include_str!("../../migrations/oauth/001_initial.sql")),
+        M::up(include_str!("../../migrations/oauth/002_resource.sql")),
+    ])
 });
 
 fn path(config: &Config) -> PathBuf {
@@ -117,6 +120,8 @@ pub struct Grant<'a> {
     pub user_id: &'a str,
     pub redirect_uri: &'a str,
     pub code_challenge: &'a str,
+    /// The resource the client asked for, normalised, if it named one.
+    pub resource: Option<&'a str>,
 }
 
 /// Mints a one-time code for the grant.
@@ -124,8 +129,8 @@ pub fn issue_code(config: &Config, grant: &Grant<'_>) -> Result<String, String> 
     let conn = open(config)?;
     let code = random_token(TOKEN_LEN);
     conn.execute(
-        "insert into codes (code_hash, client_id, user_id, redirect_uri, code_challenge, expires_at)
-         values (?, ?, ?, ?, ?, ?)",
+        "insert into codes (code_hash, client_id, user_id, redirect_uri, code_challenge, expires_at, resource)
+         values (?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
             hash(&code),
             grant.client_id,
@@ -133,6 +138,7 @@ pub fn issue_code(config: &Config, grant: &Grant<'_>) -> Result<String, String> 
             grant.redirect_uri,
             grant.code_challenge,
             (now() + CODE_LIFETIME.as_secs()) as i64,
+            grant.resource,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -146,6 +152,7 @@ pub struct Redeemed {
     pub user_id: String,
     pub redirect_uri: String,
     pub code_challenge: String,
+    pub resource: Option<String>,
 }
 
 /// Consumes a code: whatever the outcome of the checks that follow, the same
@@ -155,7 +162,7 @@ pub fn redeem_code(config: &Config, code: &str) -> Option<Redeemed> {
     let tx = conn.transaction().ok()?;
     let found = tx
         .query_row(
-            "select client_id, user_id, redirect_uri, code_challenge, expires_at
+            "select client_id, user_id, redirect_uri, code_challenge, expires_at, resource
                from codes where code_hash = ?",
             [hash(code)],
             |row| {
@@ -165,6 +172,7 @@ pub fn redeem_code(config: &Config, code: &str) -> Option<Redeemed> {
                         user_id: row.get(1)?,
                         redirect_uri: row.get(2)?,
                         code_challenge: row.get(3)?,
+                        resource: row.get(5)?,
                     },
                     row.get::<_, i64>(4)?,
                 ))
@@ -186,12 +194,12 @@ pub struct Issued {
 }
 
 /// A fresh access/refresh pair for this person and client.
-pub fn issue_tokens(config: &Config, client_id: &str, user_id: &str) -> Result<Issued, String> {
+pub fn issue_tokens(config: &Config, client_id: &str, user_id: &str, resource: Option<&str>) -> Result<Issued, String> {
     let conn = open(config)?;
-    issue_tokens_on(&conn, client_id, user_id)
+    issue_tokens_on(&conn, client_id, user_id, resource)
 }
 
-fn issue_tokens_on(conn: &Connection, client_id: &str, user_id: &str) -> Result<Issued, String> {
+fn issue_tokens_on(conn: &Connection, client_id: &str, user_id: &str, resource: Option<&str>) -> Result<Issued, String> {
     let access_token = random_token(TOKEN_LEN);
     let refresh_token = random_token(TOKEN_LEN);
     let issued_at = now();
@@ -200,8 +208,8 @@ fn issue_tokens_on(conn: &Connection, client_id: &str, user_id: &str) -> Result<
         (&refresh_token, "refresh", REFRESH_LIFETIME),
     ] {
         conn.execute(
-            "insert into tokens (token_hash, kind, client_id, user_id, expires_at, created_at)
-             values (?, ?, ?, ?, ?, ?)",
+            "insert into tokens (token_hash, kind, client_id, user_id, expires_at, created_at, resource)
+             values (?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 hash(token),
                 kind,
@@ -209,6 +217,7 @@ fn issue_tokens_on(conn: &Connection, client_id: &str, user_id: &str) -> Result<
                 user_id,
                 (issued_at + lifetime.as_secs()) as i64,
                 issued_at as i64,
+                resource,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -229,22 +238,23 @@ pub fn rotate_refresh(config: &Config, client_id: &str, refresh_token: &str) -> 
     let tx = conn.transaction().ok()?;
     let found = tx
         .query_row(
-            "select user_id, expires_at from tokens
+            "select user_id, expires_at, resource from tokens
               where token_hash = ? and kind = 'refresh' and client_id = ?",
             rusqlite::params![hash(refresh_token), client_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?)),
         )
         .optional()
         .ok()
         .flatten();
-    let (user_id, expires_at) = found?;
+    let (user_id, expires_at, resource) = found?;
     tx.execute("delete from tokens where token_hash = ?", [hash(refresh_token)])
         .ok()?;
     if expires_at < now() as i64 {
         tx.commit().ok()?;
         return None;
     }
-    let issued = issue_tokens_on(&tx, client_id, &user_id).ok()?;
+    // A refreshed pair is for the same resource as the one it replaces.
+    let issued = issue_tokens_on(&tx, client_id, &user_id, resource.as_deref()).ok()?;
     tx.commit().ok()?;
     Some(issued)
 }
@@ -253,13 +263,18 @@ pub fn rotate_refresh(config: &Config, client_id: &str, refresh_token: &str) -> 
 /// which client; whether that account may still act is the accounts API's
 /// answer, not this table's.
 pub fn access_token_holder(config: &Config, token: &str) -> Option<(String, String)> {
+    access_token_grant(config, token).map(|(user, client, _)| (user, client))
+}
+
+/// The holder, the client and the resource the token was issued for.
+pub fn access_token_grant(config: &Config, token: &str) -> Option<(String, String, Option<String>)> {
     let conn = open(config).ok()?;
     sweep(&conn);
     conn.query_row(
-        "select user_id, client_id from tokens
+        "select user_id, client_id, resource from tokens
           where token_hash = ? and kind = 'access' and expires_at >= ?",
         rusqlite::params![hash(token), now() as i64],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
     .ok()
@@ -316,6 +331,7 @@ mod tests {
                 user_id: "u1",
                 redirect_uri: "https://c.test/cb",
                 code_challenge: "ch",
+                resource: None,
             },
         )
         .unwrap();
@@ -336,6 +352,7 @@ mod tests {
                 user_id: "u1",
                 redirect_uri: "https://c.test/cb",
                 code_challenge: "ch",
+                resource: None,
             },
         )
         .unwrap();
@@ -347,7 +364,7 @@ mod tests {
     fn tokens_are_stored_hashed() {
         let (_dir, config) = config();
         let client = register_client(&config, None, &["https://c.test/cb".into()]).unwrap();
-        let issued = issue_tokens(&config, &client.id, "u1").unwrap();
+        let issued = issue_tokens(&config, &client.id, "u1", None).unwrap();
         let conn = open(&config).unwrap();
         let mut statement = conn.prepare("select token_hash from tokens").unwrap();
         let stored: Vec<String> = statement
@@ -368,7 +385,7 @@ mod tests {
     fn an_expired_access_token_stops_working() {
         let (_dir, config) = config();
         let client = register_client(&config, None, &["https://c.test/cb".into()]).unwrap();
-        let issued = issue_tokens(&config, &client.id, "u1").unwrap();
+        let issued = issue_tokens(&config, &client.id, "u1", None).unwrap();
         age(&config, "tokens", ACCESS_LIFETIME + Duration::from_secs(1));
         assert!(access_token_holder(&config, &issued.access_token).is_none());
     }
@@ -378,7 +395,7 @@ mod tests {
         let (_dir, config) = config();
         let client = register_client(&config, None, &["https://c.test/cb".into()]).unwrap();
         let other = register_client(&config, None, &["https://o.test/cb".into()]).unwrap();
-        let issued = issue_tokens(&config, &client.id, "u1").unwrap();
+        let issued = issue_tokens(&config, &client.id, "u1", None).unwrap();
 
         assert!(
             rotate_refresh(&config, &other.id, &issued.refresh_token).is_none(),
@@ -398,7 +415,7 @@ mod tests {
         let (_dir, config) = config();
         let idle = register_client(&config, None, &["https://c.test/cb".into()]).unwrap();
         let live = register_client(&config, None, &["https://c.test/cb".into()]).unwrap();
-        issue_tokens(&config, &live.id, "u1").unwrap();
+        issue_tokens(&config, &live.id, "u1", None).unwrap();
         {
             let conn = open(&config).unwrap();
             conn.execute(

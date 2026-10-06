@@ -51,8 +51,14 @@ pub(crate) async fn require_bearer(
     // That lookup also re-asks accounts whether the person may still publish,
     // so a disabled account is refused on its next request, not at expiry.
     if let Some(token) = presented.filter(|_| config.oauth_enabled())
-        && let Some(user) = client_oauth::token_user(&config, token).await
+        && let Some((user, resource)) = client_oauth::token_user_for(&config, token).await
     {
+        // A token a client asked for one app's tools, or for a person's own
+        // connector, does not open the publishing connector.
+        if !client_oauth::token_fits(&config, resource.as_deref(), "/mcp") {
+            tracing::warn!(email = %user.email, resource = ?resource, "401: the token was issued for another connector");
+            return (StatusCode::UNAUTHORIZED, "this token was issued for another connector; sign in again for /mcp\n").into_response();
+        }
         let (may_publish_config, may_publish_user) = (config.clone(), user.clone());
         let may_publish = tokio::task::spawn_blocking(move || {
             crate::accounts::users::holds_anywhere(&may_publish_config, &may_publish_user, crate::accounts::users::Scope::Editor)
@@ -121,7 +127,8 @@ pub(crate) async fn require_person(
 ) -> impl IntoResponse {
     let presented = presented_token(&headers);
     if let Some(token) = presented.filter(|_| config.oauth_enabled())
-        && let Some(user) = client_oauth::token_user(&config, token).await
+        && let Some((user, resource)) = client_oauth::token_user_for(&config, token).await
+        && client_oauth::token_fits(&config, resource.as_deref(), "/me/mcp")
     {
         tracing::debug!(email = %user.email, "me/mcp request");
         request.extensions_mut().insert(user);
@@ -169,8 +176,10 @@ pub(crate) async fn require_app_caller(
         request.extensions_mut().insert(ToolApp(app));
         return next.run(request).await;
     }
+    let endpoint = format!("/p/{app}/mcp");
     if let Some(token) = presented.filter(|_| config.oauth_enabled())
-        && let Some(user) = client_oauth::token_user(&config, token).await
+        && let Some((user, resource)) = client_oauth::token_user_for(&config, token).await
+        && client_oauth::token_fits(&config, resource.as_deref(), &endpoint)
     {
         tracing::debug!(email = %user.email, %app, "app tools request");
         request.extensions_mut().insert(Caller { user: Some(user) });

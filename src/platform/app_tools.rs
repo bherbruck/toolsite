@@ -123,11 +123,60 @@ pub fn split_name(name: &str) -> Option<(&str, &str)> {
     (!app.is_empty() && !tool.is_empty()).then_some((app, tool))
 }
 
-/// A tool name as an app declares it.
+/// A tool name as an app declares it: starts with a letter, no double
+/// underscore and no trailing one, so `<app>__<tool>` splits one way only.
 pub fn valid_tool_name(name: &str) -> bool {
-    !name.is_empty()
+    name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && !name.ends_with('_')
         && !name.contains("__")
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// An app may offer tools only if its slug cannot blur the split either:
+/// no double underscore in it and no underscore at its end.
+pub fn app_may_offer_tools(app: &str) -> bool {
+    !app.contains("__") && !app.ends_with('_')
+}
+
+/// The most tools one app may declare.
+pub const MAX_TOOLS: usize = 64;
+/// The longest description a model is handed for one tool.
+pub const MAX_DESCRIPTION: usize = 2000;
+/// The longest title.
+pub const MAX_TITLE: usize = 120;
+/// The largest a schema may be, serialised.
+pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+/// The deepest a schema may nest.
+pub const MAX_SCHEMA_DEPTH: usize = 32;
+
+/// How deeply a JSON value nests.
+pub fn depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+        serde_json::Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// A handler route a tool may name: `/api/` and then path segments of
+/// letters, digits, `-`, `_` and `.`, none empty and none starting with a
+/// dot, so no `..`, no `//`, no percent escapes and no query.
+pub fn valid_tool_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.split('/').all(|seg| {
+            !seg.is_empty()
+                && !seg.starts_with('.')
+                && seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+}
+
+/// Text a person or a model reads: no control characters but line breaks
+/// and tabs in a description.
+pub fn clean_text(text: &str, allow_lines: bool) -> bool {
+    text.chars().all(|c| !c.is_control() || (allow_lines && (c == '\n' || c == '\t')))
 }
 
 /// Where a person adds this app as a connector of its own.
@@ -139,6 +188,12 @@ pub fn connector_url(config: &Config, app: &str) -> String {
 /// Checks a schema is an object schema, which is what MCP asks of a tool's
 /// input and output.
 pub fn check_schema(schema: &serde_json::Value, what: &str) -> Result<(), String> {
+    if depth(schema) > MAX_SCHEMA_DEPTH {
+        return Err(format!("{what} nests deeper than {MAX_SCHEMA_DEPTH} levels"));
+    }
+    if serde_json::to_vec(schema).map(|v| v.len()).unwrap_or(usize::MAX) > MAX_SCHEMA_BYTES {
+        return Err(format!("{what} is over {} KB", MAX_SCHEMA_BYTES / 1024));
+    }
     let Some(object) = schema.as_object() else {
         return Err(format!("{what} must be a JSON object schema"));
     };
@@ -162,7 +217,15 @@ pub fn to_mcp(config: &Config, app: &str, app_title: &str, project: &str, tool: 
     let name = if prefixed { full_name(app, &tool.name) } else { tool.name.clone() };
     let title = if prefixed { format!("{app_title}: {}", tool.title()) } else { tool.title() };
     let input = tool.input.as_object().cloned().unwrap_or_default();
-    let mut mcp = Tool::new(name, tool.description.clone(), Arc::new(input))
+    // Beside toolsite's own tools, the app's words are marked as the app's,
+    // so a description that reads like an instruction from the platform is
+    // plainly not one. On the app's own connector everything is the app's.
+    let description = if prefixed {
+        format!("[A tool of the app {app}; the text after this is the app's own.] {}", tool.description)
+    } else {
+        tool.description.clone()
+    };
+    let mut mcp = Tool::new(name, description, Arc::new(input))
         .with_title(title.clone())
         .with_annotations(
             ToolAnnotations::from_raw(

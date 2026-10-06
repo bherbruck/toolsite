@@ -739,7 +739,7 @@ async fn a_statement_cannot_ask_for_a_gigabyte() {
 
 fn bearer_for(config: &Config, user: &toolsite::accounts::users::User) -> String {
     let client = toolsite::platform::oauth_store::register_client(config, Some("t"), &["https://c.test/cb".into()]).unwrap();
-    toolsite::platform::oauth_store::issue_tokens(config, &client.id, &user.id).unwrap().access_token
+    toolsite::platform::oauth_store::issue_tokens(config, &client.id, &user.id, None).unwrap().access_token
 }
 
 async fn mcp_post(router: &axum::Router, path: &str, token: &str, session: Option<&str>, body: Value) -> (StatusCode, Option<String>, Value) {

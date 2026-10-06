@@ -363,9 +363,20 @@ async fn resolve_tools(
     app: &str,
     declared: &[ToolDecl],
 ) -> Result<Vec<crate::platform::app_tools::AppTool>, String> {
-    use crate::platform::app_tools::{check_schema, full_name, valid_tool_name, AppTool, MAX_TOOL_NAME};
+    use crate::platform::app_tools::{
+        app_may_offer_tools, check_schema, clean_text, full_name, valid_tool_name, valid_tool_path, AppTool,
+        MAX_DESCRIPTION, MAX_TITLE, MAX_TOOLS, MAX_TOOL_NAME,
+    };
     if declared.is_empty() {
         return Ok(Vec::new());
+    }
+    if declared.len() > MAX_TOOLS {
+        return Err(format!("{} tools declared; an app may declare at most {MAX_TOOLS}", declared.len()));
+    }
+    if !app_may_offer_tools(app) {
+        return Err(format!(
+            "{app} cannot offer tools: an app slug with a double underscore or a trailing underscore would make its tool names ambiguous"
+        ));
     }
     let mut source: Option<Vec<(String, Vec<u8>)>> = None;
     let mut out = Vec::new();
@@ -373,7 +384,9 @@ async fn resolve_tools(
     for tool in declared {
         let name = tool.name.trim().to_string();
         if !valid_tool_name(&name) {
-            return Err(format!("tool {name:?}: a name is lower-case letters, digits and single underscores"));
+            return Err(format!(
+                "tool {name:?}: a name starts with a letter and is lower-case letters, digits and single underscores, with none at the end"
+            ));
         }
         if !seen.insert(name.clone()) {
             return Err(format!("tool {name}: declared twice"));
@@ -386,11 +399,24 @@ async fn resolve_tools(
             ));
         }
         let path = tool.path.trim().to_string();
-        if !path.starts_with("/api/") || path.contains("..") || path.contains('?') {
-            return Err(format!("tool {name}: path must be a handler route under /api/, got {path}"));
+        if !valid_tool_path(&path) {
+            return Err(format!(
+                "tool {name}: path must be a handler route under /api/ made of letters, digits, '-', '_' and '.', got {path:?}"
+            ));
         }
-        if tool.description.trim().is_empty() {
+        let description = tool.description.trim();
+        if description.is_empty() {
             return Err(format!("tool {name}: description is empty; it is what the model reads"));
+        }
+        if description.chars().count() > MAX_DESCRIPTION || !clean_text(description, true) {
+            return Err(format!(
+                "tool {name}: description must be at most {MAX_DESCRIPTION} characters with no control characters"
+            ));
+        }
+        if let Some(title) = tool.title.as_deref()
+            && (title.chars().count() > MAX_TITLE || !clean_text(title, false))
+        {
+            return Err(format!("tool {name}: title must be at most {MAX_TITLE} characters on one line"));
         }
         let mut schema = |which: &str, reference: &Option<SchemaRef>| -> Result<Option<serde_json::Value>, String> {
             let Some(reference) = reference else { return Ok(None) };

@@ -136,8 +136,12 @@ pub(crate) fn read_all_files(
         if matches!(first, "node_modules" | "target" | "dist") || rel.contains("/node_modules/") {
             continue;
         }
+        // Read no more than the budget left, plus one byte to notice going
+        // over: a small archive can claim a huge entry, and reading it whole
+        // first would hold all of it in memory before the check.
         let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| e.to_string())?;
+        let budget = (max_bytes.saturating_sub(total) as u64).saturating_add(1);
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut entry, budget), &mut bytes).map_err(|e| e.to_string())?;
         total += bytes.len();
         if files.len() >= max_files || total > max_bytes {
             return Err(format!(
