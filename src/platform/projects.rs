@@ -245,13 +245,82 @@ fn parent_of(path: &str) -> String {
     path.rsplit_once('/').map(|(above, _)| above.to_string()).unwrap_or_default()
 }
 
+/// A move in progress, written before the first step and removed after the
+/// last, so a move that stopped halfway is finished on the next start or
+/// the next move rather than left half done.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Relocation {
+    from: String,
+    to: String,
+}
+
+fn journal_path(config: &Config) -> std::path::PathBuf {
+    store::relocation_journal(config)
+}
+
+/// Records that `from` is about to become `to`. Public for the tests that
+/// walk a move one step at a time.
+pub fn begin_relocation(config: &Config, from: &str, to: &str) -> Result<(), String> {
+    let path = journal_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string(&Relocation { from: from.to_string(), to: to.to_string() }).map_err(|e| e.to_string())?;
+    let temp = path.with_extension("json.part");
+    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp, &path).map_err(|e| e.to_string())
+}
+
+/// Finishes a move that stopped halfway, if there is one. Every step finds
+/// nothing to do when it has already run, so running this twice is safe.
+/// Called at start and before every move.
+pub async fn resume_pending(config: &Config) -> Result<(), String> {
+    let Ok(text) = std::fs::read_to_string(journal_path(config)) else {
+        return Ok(());
+    };
+    let Ok(job) = serde_json::from_str::<Relocation>(&text) else {
+        tracing::error!("an unreadable project move record was found and left in place");
+        return Err("a project move record could not be read".into());
+    };
+    tracing::warn!(from = %job.from, to = %job.to, "finishing a project move that stopped halfway");
+    finish(config, &job.from, &job.to).await
+}
+
+/// The steps of a move, in the order that keeps every state in between at
+/// most as open as before and after it:
+/// 1. the apps, so each names its new project (not yet in the tree, so the
+///    gate rule keeps them closed and the rows at the old path cover nothing
+///    they are at);
+/// 2. the tree, so the new project exists with its lock and settings (the
+///    access rows are still at the old path, so they cover nothing yet);
+/// 3. the access rows, in one transaction, which is the step that opens.
+async fn finish(config: &Config, from: &str, to: &str) -> Result<(), String> {
+    for (app, at) in store::apps_with_folders(config).await {
+        if !at.is_empty() && users::prefix_covers(from, &at) {
+            let rest = &at[from.len()..];
+            let mut meta = read_meta(config, &app).await;
+            meta.project = Some(format!("{to}{rest}"));
+            write_meta(config, &app, &meta)
+                .await
+                .map_err(|_| format!("{app} was not moved. Run the same change again to finish it."))?;
+        }
+    }
+    if store::folder_exists(config, from).await && !store::folder_exists(config, to).await {
+        store::relocate_folder(config, from, to).await?;
+    }
+    let (config2, old, new) = (config.clone_for_task(), from.to_string(), to.to_string());
+    tokio::task::spawn_blocking(move || users::move_scope_tree(&config2, &old, &new))
+        .await
+        .map_err(|_| "The project's access rows were not moved.".to_string())??;
+    let _ = std::fs::remove_file(journal_path(config));
+    Ok(())
+}
+
 /// Moves a project and everything keyed by its path to `to`: the tree, the
 /// apps inside it and below, the access rows set there and below, and the
-/// lock (it lives on the project). Access rows move first in one
-/// transaction, the apps next, the tree last, and each step finds nothing
-/// left to do when run again, so a move that stopped halfway can be run
-/// again to finish.
+/// lock (it lives on the project).
 async fn relocate(config: &Arc<Config>, actor: Option<&User>, from: &str, to: &str) -> Result<(), Problem> {
+    resume_pending(config).await.map_err(Problem::Invalid)?;
     if store::folder_exists(config, to).await {
         return Err(Problem::Invalid(format!("There is already a project '{to}'.")));
     }
@@ -280,22 +349,15 @@ async fn relocate(config: &Arc<Config>, actor: Option<&User>, from: &str, to: &s
     if let Some(clash) = produced.iter().find(|path| app_paths.contains(path)) {
         return Err(Problem::Invalid(format!("There is an app at '{clash}'. Choose another name or place.")));
     }
-    let (config2, old, new) = (config.clone(), from.to_string(), to.to_string());
-    tokio::task::spawn_blocking(move || users::move_scope_tree(&config2, &old, &new))
+    // Rows already at the new path belong to nothing (it is neither a
+    // project nor an app), and must not be inherited by what arrives.
+    let (config2, at) = (config.clone(), to.to_string());
+    tokio::task::spawn_blocking(move || users::remove_scope_tree(&config2, &at))
         .await
         .map_err(|_| Problem::Invalid("The project was not moved.".into()))?
         .map_err(Problem::Invalid)?;
-    for (app, at) in store::apps_with_folders(config).await {
-        if users::prefix_covers(from, &at) && !at.is_empty() {
-            let rest = &at[from.len()..];
-            let mut meta = read_meta(config, &app).await;
-            meta.project = Some(format!("{to}{rest}"));
-            write_meta(config, &app, &meta)
-                .await
-                .map_err(|_| Problem::Invalid(format!("{app} was not moved. Run the same change again to finish it.")))?;
-        }
-    }
-    store::relocate_folder(config, from, to).await.map_err(Problem::Invalid)?;
+    begin_relocation(config, from, to).map_err(Problem::Invalid)?;
+    finish(config, from, to).await.map_err(Problem::Invalid)?;
     tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), from, to, "project moved");
     Ok(())
 }

@@ -516,26 +516,66 @@ pub async fn list_folders(config: &Config) -> Vec<Folder> {
     }
 }
 
+/// One writer at a time for the project tree. Every change reads the whole
+/// file, edits it and writes it back; two at once would lose one of them,
+/// and a lost lock or general access setting opens what it closed.
+static FOLDERS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Writes the tree whole, through a temporary file and a rename, so a crash
+/// leaves the old file or the new one and never half of one. A torn file
+/// would read as "no projects": every lock and project setting gone.
 async fn write_folders(config: &Config, folders: &[Folder]) -> std::io::Result<()> {
     let path = projects_path(config);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
     let json = serde_json::to_string_pretty(folders).map_err(std::io::Error::other)?;
-    fs::write(path, json).await
+    let temp = path.with_extension("json.part");
+    fs::write(&temp, json).await?;
+    fs::rename(&temp, &path).await
 }
 
 /// The projects that are locked, for the permission rule. Read in a blocking
 /// context because every scope check runs in one.
 pub fn locked_prefixes_blocking(config: &Config) -> Vec<String> {
-    std::fs::read_to_string(projects_path(config))
+    let mut locked: Vec<String> = std::fs::read_to_string(projects_path(config))
         .ok()
         .and_then(|text| serde_json::from_str::<Vec<Folder>>(&text).ok())
         .unwrap_or_default()
         .into_iter()
         .filter(|folder| folder.locked)
         .map(|folder| folder.path)
-        .collect()
+        .collect();
+    // While a project move is unfinished, its access rows may still sit at
+    // the old path after the tree has moved on. A lock that moved with the
+    // tree is held at the old path too until the move is done, so rows it
+    // ignored stay ignored in between.
+    if let Some((from, to)) = relocation_in_progress(config) {
+        let extra: Vec<String> = locked
+            .iter()
+            .filter_map(|path| {
+                if *path == to {
+                    Some(from.clone())
+                } else {
+                    path.strip_prefix(&format!("{to}/")).map(|rest| format!("{from}/{rest}"))
+                }
+            })
+            .collect();
+        locked.extend(extra);
+    }
+    locked
+}
+
+/// Where the record of an unfinished project move lives.
+pub fn relocation_journal(config: &Config) -> PathBuf {
+    config.data_dir.join(".site").join("relocating.json")
+}
+
+/// The `(from, to)` of an unfinished project move, if one is recorded.
+pub fn relocation_in_progress(config: &Config) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(relocation_journal(config)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some((value.get("from")?.as_str()?.to_string(), value.get("to")?.as_str()?.to_string()))
 }
 
 /// Whether one project is locked.
@@ -545,6 +585,7 @@ pub async fn folder_locked(config: &Config, path: &str) -> bool {
 
 /// Locks or unlocks a project. The top level has no row and cannot be locked.
 pub async fn set_locked(config: &Config, path: &str, locked: bool) -> Result<(), String> {
+    let _one_writer = FOLDERS_WRITE.lock().await;
     let mut folders = list_folders(config).await;
     let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
         return Err(format!("there is no project '{path}'"));
@@ -560,6 +601,7 @@ pub async fn set_folder_gate(config: &Config, path: &str, gate: Option<&str>) ->
         Some(word) => Some(normalise_gate(word).ok_or_else(|| format!("'{word}' is not public, authenticated or restricted"))?.to_string()),
         None => None,
     };
+    let _one_writer = FOLDERS_WRITE.lock().await;
     let mut folders = list_folders(config).await;
     let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
         return Err(format!("there is no project '{path}'"));
@@ -624,6 +666,14 @@ fn resolve_gate(meta: &PageMeta, folders: &[Folder], default: &str, within: &str
     let node = |path: &str| folders.iter().find(|folder| folder.path == path);
     let locked_by = chain.iter().find(|path| node(path).is_some_and(|folder| folder.locked)).cloned();
     let site = || EffectiveGate { gate: normalise_gate(default).unwrap_or("public").to_string(), source: GateSource::Site, locked_by: locked_by.clone() };
+
+    // An app that names a project the tree does not hold is between two
+    // states: a move that stopped halfway, or a hand edit. Whatever locks
+    // and settings belonged to that project are not visible from here, so
+    // the app is closed rather than left to its own say.
+    if !project.is_empty() && node(&project).is_none() {
+        return EffectiveGate { gate: "restricted".to_string(), source: GateSource::Site, locked_by };
+    }
 
     // Under a lock, nothing set inside it counts.
     let projects: Vec<&String> = match &locked_by {
@@ -701,6 +751,7 @@ pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<
     if !(parent.is_empty() || crate::content::slug::valid_slug(parent)) {
         return Err("invalid parent folder".into());
     }
+    let _one_writer = FOLDERS_WRITE.lock().await;
     let mut folders = list_folders(config).await;
     if !parent.is_empty() && !folders.iter().any(|folder| folder.path == parent) {
         return Err(format!("there is no folder '{parent}'"));
@@ -743,6 +794,7 @@ fn drop_alias(folders: &mut [Folder], path: &str) {
 /// Moves the project at `from`, and every project below it, to `to`. Only
 /// the tree changes here; the caller moves what points into it first.
 pub async fn relocate_folder(config: &Config, from: &str, to: &str) -> Result<(), String> {
+    let _one_writer = FOLDERS_WRITE.lock().await;
     let mut folders = list_folders(config).await;
     if !folders.iter().any(|folder| folder.path == from) {
         return Err(format!("there is no project '{from}'"));
@@ -781,6 +833,7 @@ pub async fn relocate_folder(config: &Config, from: &str, to: &str) -> Result<()
 
 /// Removes the project row at `path`. The caller has checked it is empty.
 pub async fn remove_folder(config: &Config, path: &str) -> Result<(), String> {
+    let _one_writer = FOLDERS_WRITE.lock().await;
     let mut folders = list_folders(config).await;
     let before = folders.len();
     folders.retain(|folder| folder.path != path);

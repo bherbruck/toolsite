@@ -918,6 +918,46 @@ pub fn move_scope_tree(config: &Config, from: &str, to: &str) -> Result<usize, S
     Ok(changed)
 }
 
+/// Takes every permission an app held away with it: the access rows at its
+/// path and below, and its old per-app grants. Returns them, so whoever
+/// removes the app can keep a copy with the rest of what was removed. A
+/// later app or project at the same path must start with nobody on it.
+pub fn forget_app(config: &Config, app: &str, path: &str) -> Result<serde_json::Value, String> {
+    let mut conn = open(config)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let rows: Vec<serde_json::Value> = {
+        let mut statement = tx
+            .prepare(
+                "select users.email, scopes.prefix, scopes.scope from scopes join users on users.id = scopes.user_id
+                  where scopes.prefix = ?1 or substr(scopes.prefix, 1, ?2) = ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        let found = statement
+            .query_map(rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")], |row| {
+                Ok(serde_json::json!({ "email": row.get::<_, String>(0)?, "path": row.get::<_, String>(1)?, "scope": row.get::<_, String>(2)? }))
+            })
+            .map_err(|e| e.to_string())?;
+        found.filter_map(Result::ok).collect()
+    };
+    let grants: Vec<serde_json::Value> = {
+        let mut statement = tx
+            .prepare("select users.email, grants.role from grants join users on users.id = grants.user_id where grants.app = ?1")
+            .map_err(|e| e.to_string())?;
+        let found = statement
+            .query_map([app], |row| Ok(serde_json::json!({ "email": row.get::<_, String>(0)?, "role": row.get::<_, String>(1)? })))
+            .map_err(|e| e.to_string())?;
+        found.filter_map(Result::ok).collect()
+    };
+    tx.execute(
+        "delete from scopes where prefix = ?1 or substr(prefix, 1, ?2) = ?3",
+        rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("delete from grants where app = ?1", [app]).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "app": app, "path": path, "access": rows, "grants": grants }))
+}
+
 /// Removes every scope row at `path` or below it.
 pub fn remove_scope_tree(config: &Config, path: &str) -> Result<usize, String> {
     let conn = open(config)?;

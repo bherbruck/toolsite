@@ -31,7 +31,14 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
 
     // Timestamped so removing the same slug twice does not overwrite the
     // first removal, which would be destroying data by another route.
-    let destination = trash_dir(config).join(format!("{at}-{}", slug.replace('/', "-")));
+    let base = format!("{at}-{}", slug.replace('/', "-"));
+    let mut destination = trash_dir(config).join(&base);
+    // Two removals in the same second get a place each.
+    let mut n = 2;
+    while destination.exists() {
+        destination = trash_dir(config).join(format!("{base}-{n}"));
+        n += 1;
+    }
     let mut moved = Vec::new();
 
     let app_dir = config.data_dir.join(slug);
@@ -53,6 +60,29 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
 
     if moved.is_empty() {
         return Err(format!("nothing published at '{slug}'"));
+    }
+
+    // An app's permissions go with it, so the next app or project at this
+    // path starts with nobody on it. A copy stays with the files, so putting
+    // the app back can put its people back too.
+    if !slug.contains('/') {
+        let project = std::fs::read_to_string(destination.join("slug.meta"))
+            .or_else(|_| std::fs::read_to_string(destination.join("app/index.meta")))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|meta| meta.get("project").and_then(|p| p.as_str()).map(str::to_string))
+            .filter(|p| !p.is_empty());
+        let path = match project {
+            Some(project) => format!("{project}/{slug}"),
+            None => slug.to_string(),
+        };
+        let kept = crate::accounts::users::forget_app(config, slug, &path)?;
+        std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
+        std::fs::write(
+            destination.join("permissions.json"),
+            serde_json::to_string_pretty(&kept).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(moved)
 }

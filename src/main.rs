@@ -306,6 +306,12 @@ async fn main() -> anyhow::Result<()> {
     // Per-app grants became View rows on their apps; done once.
     toolsite::platform::permissions::adopt_grants(&config).await;
 
+    // A project move that stopped halfway, say with the process, is finished
+    // before anything is served, so no request sees the state in between.
+    if let Err(why) = toolsite::platform::projects::resume_pending(&config).await {
+        tracing::error!(%why, "a project move could not be finished; check .site/relocating.json");
+    }
+
     let runtime = Runtime::new()?;
     let app = build_router(config.clone(), runtime.clone());
 

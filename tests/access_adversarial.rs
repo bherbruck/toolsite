@@ -280,7 +280,7 @@ async fn removing_a_grant_through_the_grid_cannot_reach_an_app_outside_the_manag
 #[tokio::test]
 async fn only_a_manager_at_the_project_may_lock_it_and_rows_inside_a_lock_stop_counting() {
     let w = world().await;
-    for who in ["ed@x.test", "sub@x.test", "fin@x.test"] {
+    for who in ["ed@x.test", "sub@x.test"] {
         let s = session(&w.config, who);
         let t = form_token(&w.config, who);
         let (status, ..) = send(&w.config, post_as("/admin/permissions/lock", &s, format!("token={t}&path=ops&locked=1"))).await;
@@ -676,4 +676,237 @@ async fn an_app_cannot_be_moved_or_published_onto_the_path_of_a_project() {
     store::create_folder(&w.config, "spare", "inner").await.unwrap();
     let (err, text) = tool(&w.config, "/mcp", &mgr, "push_page", serde_json::json!({"slug":"inner","html":"<p>x</p>","project":"spare"})).await;
     assert!(err, "a new app took the path of the project spare/inner: {text}");
+}
+
+// --- projects renamed, moved, removed, and their general access --------------------
+//
+// Second pass: the rename/move/remove work and project-level general access.
+
+fn location(headers: &[(String, String)]) -> Option<String> {
+    headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.clone())
+}
+
+#[tokio::test]
+async fn an_old_project_link_never_says_where_a_hidden_project_went() {
+    let w = world().await;
+    let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"rename","path":"finance","name":"money"})).await;
+    assert!(!err, "{out}");
+    // A stranger and an account with nothing there get what a missing project
+    // gets: no redirect, no new name.
+    for who in [None, Some("nobody@x.test"), Some("ed@x.test")] {
+        let request = match who {
+            Some(email) => get_as("/browse/finance", &session(&w.config, email)),
+            None => get("/browse/finance"),
+        };
+        let (status, body, headers) = send(&w.config, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{who:?} got {status}");
+        assert!(location(&headers).is_none(), "{who:?} was told where it went");
+        assert!(!body.contains("money"), "{who:?} learned the new name");
+    }
+    // Someone who may see it is still sent on.
+    let (status, _, headers) = send(&w.config, get_as("/browse/finance", &session(&w.config, "fin@x.test"))).await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(location(&headers).as_deref(), Some("/browse/money"));
+}
+
+#[tokio::test]
+async fn an_app_whose_project_is_missing_is_closed_whatever_it_says_itself() {
+    let w = world().await;
+    // ops is locked and restricted; dock's own "public" is ignored under it.
+    store::set_folder_gate(&w.config, "ops", Some("restricted")).await.unwrap();
+    store::set_locked(&w.config, "ops", true).await.unwrap();
+    let mut meta = store::read_meta(&w.config, "dock").await;
+    meta.gate = Some("public".into());
+    store::write_meta(&w.config, "dock", &meta).await.unwrap();
+    let (status, ..) = send(&w.config, get("/p/dock/")).await;
+    assert_ne!(status, StatusCode::OK, "the lock did not hold to begin with");
+
+    // A move that stopped after the apps were rewritten but before the tree:
+    // dock names a project that does not exist yet. It must stay closed.
+    meta.project = Some("ops2".into());
+    store::write_meta(&w.config, "dock", &meta).await.unwrap();
+    let (status, ..) = send(&w.config, get("/p/dock/")).await;
+    assert_ne!(status, StatusCode::OK, "a half-finished move opened an app its lock kept closed");
+    let (_, index, _) = send(&w.config, get("/")).await;
+    assert!(!index.contains("dock title"), "a half-finished move listed the app to a stranger");
+}
+
+#[tokio::test]
+async fn a_move_that_stopped_halfway_never_counts_rows_its_lock_ignored_and_finishes_when_run_again() {
+    let w = world().await;
+    // ops locked and restricted: ed's Edit on ops/warehouse does not count.
+    store::set_folder_gate(&w.config, "ops", Some("restricted")).await.unwrap();
+    store::set_locked(&w.config, "ops", true).await.unwrap();
+    assert_eq!(held(&w.config, "ed@x.test", "ops/warehouse/yard"), None);
+
+    // Every intermediate state of ops -> ops2, in the order a move takes.
+    toolsite::platform::projects::begin_relocation(&w.config, "ops", "ops2").unwrap();
+    // 1. apps rewritten.
+    for (app, at) in store::apps_with_folders(&w.config).await {
+        if at == "ops" || at.starts_with("ops/") {
+            let mut meta = store::read_meta(&w.config, &app).await;
+            meta.project = Some(format!("ops2{}", &at[3..]));
+            store::write_meta(&w.config, &app, &meta).await.unwrap();
+        }
+    }
+    for path in ["ops/warehouse/yard", "ops2/warehouse/yard", "ops/warehouse", "ops2/warehouse"] {
+        assert_eq!(held(&w.config, "ed@x.test", path), None, "after step 1, ed held {path}");
+    }
+    // 2. tree moved.
+    store::relocate_folder(&w.config, "ops", "ops2").await.unwrap();
+    for path in ["ops/warehouse/yard", "ops2/warehouse/yard"] {
+        assert_eq!(held(&w.config, "ed@x.test", path), None, "after step 2, ed held {path}");
+    }
+    let (status, ..) = send(&w.config, get_as("/p/yard/", &session(&w.config, "ed@x.test"))).await;
+    assert_ne!(status, StatusCode::OK, "after step 2, ed opened yard");
+
+    // Running it again finishes the rows; the lock still holds at the end.
+    toolsite::platform::projects::resume_pending(&w.config).await.unwrap();
+    assert_eq!(held(&w.config, "mgr@x.test", "ops2"), Some(Scope::Admin), "the manager's row did not follow");
+    assert_eq!(held(&w.config, "ed@x.test", "ops2/warehouse/yard"), None, "the lock was lost on the way");
+    store::set_locked(&w.config, "ops2", false).await.unwrap();
+    assert_eq!(held(&w.config, "ed@x.test", "ops2/warehouse/yard"), Some(Scope::Editor), "ed's row did not follow");
+    // And a second resume does nothing.
+    toolsite::platform::projects::resume_pending(&w.config).await.unwrap();
+    assert!(store::folder_exists(&w.config, "ops2").await && !store::folder_exists(&w.config, "ops").await);
+}
+
+#[tokio::test]
+async fn a_removed_apps_permissions_do_not_pass_to_the_next_app_or_project_at_its_path() {
+    let w = world().await;
+    users::grant_scope(&w.config, "nobody@x.test", "rootapp", Scope::Viewer, None).unwrap();
+    users::grant(&w.config, "nobody@x.test", "rootapp", "viewer").unwrap();
+    let may_open = |config: &Config| {
+        let locks = store::locked_prefixes_blocking(config);
+        users::app_scope(config, &user(config, "nobody@x.test"), "", "rootapp", &locks).is_some()
+    };
+    assert!(may_open(&w.config), "the grant did not work to begin with");
+
+    let (err, out) = tool(&w.config, "/mcp", TOKEN, "remove_page", serde_json::json!({"slug":"rootapp","confirm":"rootapp"})).await;
+    assert!(!err, "{out}");
+
+    // A new app at the same slug starts with nobody on it.
+    place_app(&w.config, "rootapp", "", "restricted").await;
+    assert!(!may_open(&w.config), "the old app's people opened the new one");
+
+    // Nor does a project that takes the path later.
+    let (err, out) = tool(&w.config, "/mcp", TOKEN, "remove_page", serde_json::json!({"slug":"rootapp","confirm":"rootapp"})).await;
+    assert!(!err, "{out}");
+    store::create_folder(&w.config, "", "rootapp").await.unwrap();
+    assert_eq!(held(&w.config, "nobody@x.test", "rootapp"), None, "the old app's people held the new project");
+
+    // What was removed is kept with the trash, so it can be put back.
+    let trash = std::fs::read_dir(w.config.data_dir.join(".trash")).unwrap();
+    let kept = trash
+        .filter_map(Result::ok)
+        .any(|entry| std::fs::read_to_string(entry.path().join("permissions.json")).is_ok_and(|t| t.contains("nobody@x.test")));
+    assert!(kept, "the removed permissions were not kept with the trash");
+}
+
+#[tokio::test]
+async fn a_search_or_open_list_in_the_address_cannot_put_markup_in_the_page() {
+    let w = world().await;
+    let s = session(&w.config, "boss@x.test");
+    let nasty = "<script>alert(1)</script>\"><img src=x onerror=alert(2)>javascript:alert(3)";
+    let encoded = urlencoding::encode(nasty);
+    for uri in [
+        format!("/?q={encoded}"),
+        format!("/browse/ops?q={encoded}"),
+        format!("/?open={encoded}"),
+        format!("/browse/ops?open={encoded},warehouse"),
+        format!("/admin/apps?q={encoded}"),
+        format!("/admin/accounts?q={encoded}"),
+    ] {
+        let (status, body, _) = send(&w.config, get_as(&uri, &s)).await;
+        assert!(status.is_success(), "{uri}: {status}");
+        assert!(!body.contains("<script>alert(1)"), "{uri} reflected a script tag");
+        assert!(!body.contains("<img src=x"), "{uri} reflected an image tag");
+        assert!(!body.contains("href=\"javascript:"), "{uri} reflected a javascript link");
+    }
+}
+
+#[tokio::test]
+async fn project_access_follows_the_lock_and_only_a_manager_there_may_set_it() {
+    let w = world().await;
+    // An editor and a manager of a subproject cannot set ops's access.
+    for who in ["ed@x.test", "sub@x.test"] {
+        let (err, out) = tool(&w.config, "/mcp", &token_for(&w.config, who), "projects", serde_json::json!({"action":"access","path":"ops","gate":"public"})).await;
+        assert!(err, "{who} set ops's access: {out}");
+    }
+    // ops locked and restricted: nothing inside may be more open.
+    store::set_folder_gate(&w.config, "ops", Some("restricted")).await.unwrap();
+    store::set_locked(&w.config, "ops", true).await.unwrap();
+    let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"access","path":"ops/warehouse","gate":"public"})).await;
+    assert!(err, "a project inside a lock was made public: {out}");
+    // An app's own setting and a route rule inside the lock do not open it.
+    let mut meta = store::read_meta(&w.config, "yard").await;
+    meta.gate = Some("public".into());
+    meta.rules.push(store::PathRule { prefix: "/".into(), gate: "public".into() });
+    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    for uri in ["/p/yard/", "/p/yard/index", "/icon/yard", "/p/yard/favicon.svg", "/p/yard/api/x"] {
+        let (status, ..) = send(&w.config, get(uri)).await;
+        assert_ne!(status, StatusCode::OK, "{uri} opened under a locked restricted project");
+    }
+    let (err, out) = tool(&w.config, "/me/mcp", &token_for(&w.config, "nobody@x.test"), "search", serde_json::json!({"query":"yard"})).await;
+    assert!(err || !out.contains("yard"), "search showed yard under the lock: {out}");
+    // Unlocking restores the app's own say, without anything being lost.
+    store::set_locked(&w.config, "ops", false).await.unwrap();
+    let (status, ..) = send(&w.config, get("/p/yard/")).await;
+    assert_eq!(status, StatusCode::OK, "the app's own setting was lost under the lock");
+}
+
+#[tokio::test]
+async fn a_project_holding_only_a_hidden_app_is_not_removed() {
+    let w = world().await;
+    store::create_folder(&w.config, "", "quiet").await.unwrap();
+    place_app(&w.config, "ghost", "quiet", "restricted").await;
+    let mut meta = store::read_meta(&w.config, "ghost").await;
+    meta.hidden = true;
+    store::write_meta(&w.config, "ghost", &meta).await.unwrap();
+    let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"remove","path":"quiet"})).await;
+    assert!(err, "a project with a hidden app inside was removed: {out}");
+    assert!(store::folder_exists(&w.config, "quiet").await);
+}
+
+#[tokio::test]
+async fn renaming_onto_an_old_name_sends_old_links_to_the_new_owner_only_for_those_who_may_see_it() {
+    let w = world().await;
+    tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"rename","path":"finance","name":"money"})).await;
+    let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"rename","path":"ops","name":"finance"})).await;
+    assert!(!err, "{out}");
+    // fin held View on the old finance, which is money now. The new finance
+    // is ops's contents, which fin may not see.
+    let (status, body, _) = send(&w.config, get_as("/browse/finance", &session(&w.config, "fin@x.test"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "fin saw the project that took its old link: {body}");
+    assert_eq!(held(&w.config, "fin@x.test", "finance"), None, "fin's old rows followed the name, not the project");
+    assert_eq!(held(&w.config, "fin@x.test", "money"), Some(Scope::Viewer));
+    assert_eq!(held(&w.config, "mgr@x.test", "finance"), Some(Scope::Admin));
+}
+
+#[tokio::test]
+async fn a_manager_cannot_rename_or_move_a_project_into_or_over_a_sibling_it_does_not_manage() {
+    let w = world().await;
+    let t = token_for(&w.config, "sub@x.test");
+    // sub manages ops/warehouse only.
+    for args in [
+        serde_json::json!({"action":"rename","path":"ops/warehouse","name":"yard2"}),
+        serde_json::json!({"action":"move_project","path":"ops/warehouse","parent":"finance"}),
+        serde_json::json!({"action":"move_project","path":"ops/warehouse","parent":""}),
+        serde_json::json!({"action":"rename","path":"finance","name":"x"}),
+        serde_json::json!({"action":"remove","path":"finance"}),
+    ] {
+        let (err, out) = tool(&w.config, "/mcp", &t, "projects", args.clone()).await;
+        assert!(err, "{args} went through: {out}");
+    }
+    let t = token_for(&w.config, "mgr@x.test");
+    // mgr manages ops, not finance and not the top.
+    for args in [
+        serde_json::json!({"action":"move_project","path":"ops/warehouse","parent":"finance"}),
+        serde_json::json!({"action":"rename","path":"ops","name":"finance2"}),
+        serde_json::json!({"action":"move_project","path":"finance","parent":"ops"}),
+    ] {
+        let (err, out) = tool(&w.config, "/mcp", &t, "projects", args.clone()).await;
+        assert!(err, "{args} went through: {out}");
+    }
+    assert!(store::folder_exists(&w.config, "ops/warehouse").await && store::folder_exists(&w.config, "finance").await);
 }

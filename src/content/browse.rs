@@ -296,6 +296,12 @@ pub(crate) async fn browse(
     // A project that was renamed or moved still answers at its old path. The
     // query goes along so a shared link opens the same view.
     if let Some(to) = store::renamed_path(&config, &project).await {
+        // Only someone who may see where it went is told where it went; to
+        // anyone else an old name reads like a name that never existed.
+        let viewer = users::current_site_user(&config, &headers).await;
+        if !gather(&config, viewer.as_ref()).await.projects.contains(&to) {
+            return (StatusCode::NOT_FOUND, "There is no such project.").into_response();
+        }
         let rest: Vec<String> = [("q", &query.q), ("tab", &query.tab), ("open", &query.open)]
             .iter()
             .filter_map(|(k, v)| v.as_ref().map(|v| format!("{k}={}", urlencoding::encode(v))))
