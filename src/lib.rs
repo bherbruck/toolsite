@@ -146,6 +146,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/wit/toolsite.wit", get(scaffold::wit))
         .route("/scaffold/handler.tar.gz", get(scaffold::handler_scaffold))
         .route("/scaffold/{app}", get(scaffold::handler_scaffold_named))
+        // Working apps to start from, packed from examples/ at build time.
+        .route("/examples", get(crate::platform::examples::list))
+        .route("/examples/{file}", get(crate::platform::examples::download))
         .route("/auth/login", get(users::login_form).post(users::login_submit))
         // Signing in through a provider: out to it, and back.
         .route("/auth/login/{provider}", get(providers::begin))

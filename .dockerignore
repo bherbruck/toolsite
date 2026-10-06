@@ -6,3 +6,7 @@ target
 .env
 data
 .claude
+
+# Example apps: dependencies and build output.
+**/node_modules
+**/dist

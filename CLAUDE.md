@@ -54,6 +54,7 @@ platform/          the site as its owner uses it
   deploy.rs        PUT /deploy/<app>: what an upload ticket takes, for a per-app token
   github.rs        the GitHub App: a repository per app as a source mirror, push on publish, pull on push
   scaffold.rs      the WIT and a buildable crate, served to agents
+  examples.rs      /examples: the apps in examples/, packed by build.rs, renamed on request
   secrets.rs       per-app settings, sealed at rest, entered by a person
   schedule.rs      cron jobs, run through the same handler a request uses
 
@@ -77,6 +78,7 @@ accounts/          people who USE published apps
 
 wit/               the contract guests compile against
 cli/               the `toolsite` command (standalone crate)
+examples/          working apps, served at /examples and driven by tests/examples.rs
 ```
 
 Pages toolsite serves itself — index, sign-in, admin — go through `ui::page`
@@ -161,3 +163,9 @@ removed. Walk `source()`.
 guest — a stale fixture is how a breaking WIT change slips through. Low-level
 limit tests use the `wat` crate inline instead, which needs no toolchain at
 all.
+
+**Example fixtures.** `tests/fixtures/examples/` holds a build of each app in
+`examples/` (handler and web root) with a digest of its source. Rebuild with
+`scripts/build-examples.sh` after any change under `examples/` or to the WIT;
+`tests/examples.rs` fails, naming the example, when a digest no longer
+matches.

@@ -11,6 +11,7 @@ pub mod bearer;
 pub mod blob_upload;
 pub mod client_oauth;
 pub mod deploy;
+pub mod examples;
 pub mod export;
 pub mod inline_upload;
 pub mod github;

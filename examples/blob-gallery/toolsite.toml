@@ -1,0 +1,7 @@
+slug = "blob-gallery"
+spa = false
+icon = "🖼️"
+gate = "authenticated"
+
+# A curator may remove anyone's photo. Everyone else removes their own.
+roles = ["curator"]

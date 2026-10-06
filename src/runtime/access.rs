@@ -94,6 +94,10 @@ fn columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
 pub struct Keys {
     pub rowid_alias: Option<String>,
     pub unique: Vec<Vec<String>>,
+    /// Each column's declared default, as SQL. An insert through a view
+    /// hands the trigger NULL for every column it left out, so without these
+    /// `status text not null default 'open'` fails on the first insert.
+    pub defaults: Vec<(String, String)>,
 }
 
 fn keys(conn: &Connection, table: &str) -> Result<Keys, String> {
@@ -101,16 +105,22 @@ fn keys(conn: &Connection, table: &str) -> Result<Keys, String> {
     let mut statement = conn
         .prepare(&format!("pragma table_info({})", quote(table)))
         .map_err(|e| e.to_string())?;
-    let info: Vec<(String, String, i64)> = statement
-        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(5)?)))
+    let info: Vec<(String, String, Option<String>, i64)> = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(4)?, row.get::<_, i64>(5)?))
+        })
         .map_err(|e| e.to_string())?
         .filter_map(Result::ok)
         .collect();
-    let pk: Vec<&(String, String, i64)> = info.iter().filter(|(_, _, pk)| *pk > 0).collect();
+    let pk: Vec<&(String, String, Option<String>, i64)> = info.iter().filter(|(.., pk)| *pk > 0).collect();
     let rowid_alias = match pk.as_slice() {
-        [(name, kind, _)] if kind.trim().eq_ignore_ascii_case("integer") => Some(name.clone()),
+        [(name, kind, ..)] if kind.trim().eq_ignore_ascii_case("integer") => Some(name.clone()),
         _ => None,
     };
+    let defaults = info
+        .iter()
+        .filter_map(|(name, _, default, _)| Some((name.clone(), default.clone()?)))
+        .collect();
     let mut unique = Vec::new();
     let mut list = conn
         .prepare(&format!("pragma index_list({})", quote(table)))
@@ -138,7 +148,7 @@ fn keys(conn: &Connection, table: &str) -> Result<Keys, String> {
             unique.push(names);
         }
     }
-    Ok(Keys { rowid_alias, unique })
+    Ok(Keys { rowid_alias, unique, defaults })
 }
 
 fn object_sql(conn: &Connection, kind: &str, name: &str) -> Option<String> {
@@ -422,9 +432,15 @@ pub fn generate(policy: &Policy, salt: &str, table_columns: &[String], keys: &Ke
     if !policy.write {
         return sql;
     }
+    // A column left out of an insert arrives as NULL, so it takes its
+    // declared default here, as it would in a direct insert. The cost: an
+    // explicit NULL into a column with a default gets the default too.
     let value_of = |c: &str| {
+        let default = keys.defaults.iter().find(|(name, _)| name.eq_ignore_ascii_case(c)).map(|(_, d)| d);
         if policy.owner.as_deref().is_some_and(|o| o.eq_ignore_ascii_case(c)) {
             format!("coalesce(new.{}, current_user())", quote(c))
+        } else if let Some(default) = default {
+            format!("coalesce(new.{}, ({default}))", quote(c))
         } else {
             format!("new.{}", quote(c))
         }
@@ -709,6 +725,28 @@ mod tests {
         let k = keys(&conn, "pinned").unwrap();
         assert_eq!(k.rowid_alias, None, "a text primary key is not the rowid");
         assert_eq!(k.unique, vec![vec!["k".to_string()]]);
+    }
+
+    #[test]
+    fn a_column_left_out_of_an_insert_through_the_view_takes_its_declared_default() {
+        let conn = conn();
+        conn.execute_batch(
+            "create table tickets (id integer primary key, title text not null,
+                 status text not null default 'open', opened integer not null default (40 + 2), note text)",
+        )
+        .unwrap();
+        let p = policy("tickets", "1", true);
+        conn.execute_batch(&generate(&p, "abc", &columns(&conn, "tickets").unwrap(), &keys(&conn, "tickets").unwrap()))
+            .unwrap();
+        conn.execute("insert into my_tickets (title) values ('leak')", []).unwrap();
+        let row: (String, i64, Option<String>) = conn
+            .query_row("select status, opened, note from tickets", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(row, ("open".to_string(), 42, None));
+        // A value given is kept.
+        conn.execute("insert into my_tickets (title, status) values ('fixed', 'closed')", []).unwrap();
+        let status: String = conn.query_row("select status from tickets where title = 'fixed'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "closed");
     }
 
     #[test]

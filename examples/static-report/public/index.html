@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Q3 shipping report</title>
+<!--
+  A static page: no build step, no script, no handler. Every path in it is
+  relative, because the app is served from /p/<slug>/ and never the domain
+  root. Edit this file and run `toolsite deploy`.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --ink: #1c1d21; --muted: #6b6f7a; --line: #e3e4e8; --card: #ffffff;
+    --bg: #f6f7f9; --accent: #4f46e5; --good: #059669; --bad: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #ececf1; --muted: #9a9dab; --line: #2c2e36; --card: #17181d; --bg: #0f1013; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 56rem; margin: 0 auto; padding: 3rem 1.25rem 4rem; }
+  header p { color: var(--muted); margin: .25rem 0 0; }
+  h1 { font-size: 1.9rem; letter-spacing: -.01em; margin: 0; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--muted); margin: 0 0 .75rem; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+          gap: .75rem; margin: 2rem 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 1rem 1.1rem; }
+  .kpi b { display: block; font-size: 1.6rem; font-variant-numeric: tabular-nums; }
+  .kpi span { color: var(--muted); font-size: .85rem; }
+  .up, .kpi .up { color: var(--good); } .down, .kpi .down { color: var(--bad); }
+  section { margin-top: 1rem; }
+  svg text { fill: var(--muted); font-size: 11px; }
+  svg .bar { fill: var(--accent); }
+  svg .prev { fill: var(--line); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line); }
+  th { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+  td.n, th.n { text-align: right; }
+  .legend { display: flex; gap: 1rem; font-size: .8rem; color: var(--muted); margin-top: .5rem; }
+  .legend i { display: inline-block; width: .7rem; height: .7rem; border-radius: 2px; margin-right: .35rem;
+              vertical-align: -1px; }
+  footer { margin-top: 2.5rem; color: var(--muted); font-size: .85rem; }
+  @media print { body { background: #fff; } .card { border-color: #ccc; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Q3 shipping report</h1>
+    <p>July to September. Orders shipped from both yards, against the same quarter last year.</p>
+  </header>
+
+  <div class="kpis">
+    <div class="card kpi"><span>Orders shipped</span><b>4,812</b><span class="up">+12.4% on last year</span></div>
+    <div class="card kpi"><span>Units</span><b>61,309</b><span class="up">+8.1%</span></div>
+    <div class="card kpi"><span>On time</span><b>96.2%</b><span class="up">+1.7 points</span></div>
+    <div class="card kpi"><span>Damaged in transit</span><b>0.31%</b><span class="down">+0.04 points</span></div>
+  </div>
+
+  <section class="card">
+    <h2>Orders shipped by month</h2>
+    <svg viewBox="0 0 640 220" role="img" aria-label="Orders shipped by month, this year against last year">
+      <g transform="translate(40,10)">
+        <line x1="0" y1="180" x2="590" y2="180" stroke="currentColor" stroke-opacity=".15"/>
+        <text x="-8" y="184" text-anchor="end">0</text>
+        <text x="-8" y="94" text-anchor="end">1,000</text>
+        <text x="-8" y="4" text-anchor="end">2,000</text>
+        <line x1="0" y1="90" x2="590" y2="90" stroke="currentColor" stroke-opacity=".08"/>
+        <line x1="0" y1="0" x2="590" y2="0" stroke="currentColor" stroke-opacity=".08"/>
+        <!-- One group per month: last year, then this year. Height = orders * 0.09. -->
+        <rect class="prev" x="40"  y="49"  width="60" height="131"/><rect class="bar" x="105" y="38" width="60" height="142"/>
+        <rect class="prev" x="235" y="51"  width="60" height="129"/><rect class="bar" x="300" y="36" width="60" height="144"/>
+        <rect class="prev" x="430" y="47"  width="60" height="133"/><rect class="bar" x="495" y="35" width="60" height="145"/>
+        <text x="102" y="198" text-anchor="middle">July</text>
+        <text x="297" y="198" text-anchor="middle">August</text>
+        <text x="492" y="198" text-anchor="middle">September</text>
+      </g>
+    </svg>
+    <div class="legend"><span><i style="background:var(--line)"></i>Last year</span><span><i style="background:var(--accent)"></i>This year</span></div>
+  </section>
+
+  <section class="card">
+    <h2>By yard</h2>
+    <table>
+      <thead><tr><th>Yard</th><th class="n">Orders</th><th class="n">Units</th><th class="n">On time</th><th class="n">Change</th></tr></thead>
+      <tbody>
+        <tr><td>North yard</td><td class="n">2,690</td><td class="n">33,870</td><td class="n">97.0%</td><td class="n up">+14.2%</td></tr>
+        <tr><td>South yard</td><td class="n">2,122</td><td class="n">27,439</td><td class="n">95.2%</td><td class="n up">+10.2%</td></tr>
+        <tr><th>Total</th><th class="n">4,812</th><th class="n">61,309</th><th class="n">96.2%</th><th class="n up">+12.4%</th></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Notes</h2>
+    <ul>
+      <li>September volume includes a one-time order of 1,100 units for a new customer.</li>
+      <li>Damage in transit rose slightly at the South yard after a carrier change in August.</li>
+      <li>Figures are illustrative. Replace them with your own.</li>
+    </ul>
+  </section>
+
+  <footer>A static example for toolsite. One HTML file, no build step, served at its own path.</footer>
+</main>
+</body>
+</html>

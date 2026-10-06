@@ -51,6 +51,28 @@ Without the CLI, the same thing by hand:
     # src/index.css: replace everything with  @import "tailwindcss";
     npm run build && tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle&spa'
 
+## Start from an example
+
+Working apps live at `<server>/examples`, each with a README that says what
+it shows and where to look. Start from one, or copy the part you need:
+
+    toolsite init <name> --example kitchen-sink
+    curl -fsS '<server>/examples/kitchen-sink.tar.gz?slug=<name>' | tar -xz
+
+Either way the slug, the base path and the package names are set for
+`<name>`, so it deploys as it is.
+
+- `kitchen-sink`: every capability, one screen each. SQL and migrations,
+  row-level policies, files, settings, outbound fetch, identity and roles,
+  a scheduled job, route rules, app tools.
+- `orders`: orders with lines, totals on the server, status rules in the
+  handler, an approval role, four app tools.
+- `static-report`: one HTML file, no build.
+- `blob-gallery`: browser uploads straight to storage, thumbnails, serving
+  with `x-toolsite-blob`.
+- `inventory-policies`: tables and policies only, with the `as_user` steps
+  that prove them.
+
 ## Publishing
 
 An upload URL comes from `create_upload`. It is a capability scoped to one
@@ -378,13 +400,16 @@ must be a view that reads tables directly, since a view it reads through is
 closed unless declared as well. Names starting with `ts_` are the
 platform's.
 
-Three facts to write policies by:
+Four facts to write policies by:
 
 - Against a NULL identity a `where` matches nothing. `current_user()` is
   NULL for a job and for an anonymous visitor, and `owner_id = NULL` is not
   true. Never write `or current_user() is null` to "let the job see
   everything": it lets everyone with no identity see everything.
 - A row with a NULL owner is nobody's.
+- A column left out of an insert through the view takes its declared
+  default, as in a direct insert. An explicit NULL into a column with a
+  default takes the default too: the view cannot tell the two apart.
 - `insert or replace`, upserts and `update or replace` cannot remove a row
   the person cannot see; a colliding key is refused before the write runs.
   Changing a primary key through the view is refused too.

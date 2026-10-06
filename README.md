@@ -177,6 +177,13 @@ given a session id. ChatGPT speaks the newer lifecycle.
 `GET /guide` is a short, current description of the platform written for an
 agent about to build a handler, a schema or a gate.
 
+`GET /examples` lists working example apps, and `GET /examples/<name>.tar.gz`
+hands one over (`?slug=` renames it and sets its base path). They live in
+[`examples/`](examples/): `kitchen-sink` uses every capability, one screen
+each; `orders`, `static-report`, `blob-gallery` and `inventory-policies` are
+smaller and focused. The same apps are test fixtures: `tests/examples.rs`
+publishes each one through the router and checks what its README claims.
+
 ## The CLI
 
 ```
@@ -187,6 +194,7 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<TOOLSITE_MCP_TOKEN>
 | Command | What it does |
 |---|---|
 | `toolsite init <name> [--react] [--spa] [--handler]` | Scaffolds an app with its base path already right. `--react` writes a Vite + React + Tailwind project that builds unmodified; `--handler` adds a wasm handler with its own database. |
+| `toolsite init <name> --example <example>` | Starts from one of the server's example apps, named and with its base path set. `curl <site>/examples` lists them. Needs `--url` or `TOOLSITE_URL`, not a token. |
 | `toolsite deploy [dir] [--slug s]` | Runs the project's build, applies migrations and `toolsite.toml`, uploads the bundle, handler, notes and source, then fetches the page to check it. |
 | `toolsite fetch` | Unpacks the project a previous deploy kept with the app, so a later session carries on. |
 | `toolsite sql <app> "<sql>" [--param v]` | Runs SQL against that app's database. Values are bound. |
@@ -1175,6 +1183,8 @@ to the browser with one line saying what happened.
 | `GET /guide` | public | How the platform works, for an agent about to build on it. |
 | `GET /wit/toolsite.wit` | public | The contract a handler compiles against. |
 | `GET /scaffold/<app>` | public | A gzipped tar of a handler crate ready to build. |
+| `GET /examples` | public | The example apps, one line each. |
+| `GET /examples/<name>.tar.gz?slug=<app>` | public | One example's source, renamed for `<app>`. |
 | `GET /`, `GET /browse/<path>` | public | The app browser: a level of projects and apps, what the viewer may open. |
 | `GET /admin/projects/search?q=` | session | Up to ten projects the caller may move an app into, for a picker. |
 

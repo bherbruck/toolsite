@@ -1,0 +1,63 @@
+slug = "kitchen-sink"
+# Screens switch on the URL hash, so no client-side routing fallback is
+# needed. With a handler, a path with no file reaches the handler anyway.
+spa = false
+icon = "🧰"
+
+# Any signed-in account may open the app. The route rules below open one
+# path wider and close another tighter.
+gate = "authenticated"
+
+# The one host the Fetch screen may reach. Every other host is refused
+# before a connection is made.
+allow_http = ["api.github.com"]
+
+# What the handler checks with current-role. A hint for whoever grants.
+roles = ["viewer", "manager"]
+
+# Health for a monitor that has no account.
+[[route]]
+path = "/status"
+gate = "public"
+
+# Only people with a grant on this app. The handler then asks for "manager".
+[[route]]
+path = "/admin"
+gate = "restricted"
+
+[[route]]
+path = "/api/admin"
+gate = "restricted"
+
+# Six cron fields, seconds first: every five minutes.
+[[job]]
+name = "heartbeat"
+schedule = "0 */5 * * * *"
+path = "/api/heartbeat"
+
+# A hand-written view (migrations/001) a person may read with query-scoped SQL.
+[access]
+views = ["my_locations"]
+
+# Orders by location: a person sees and writes the orders of the locations
+# the members table puts them in. owner_id is filled on insert.
+[[access.table]]
+table = "orders"
+where = "location in (select location from members where email = current_email())"
+owner = "owner_id"
+write = true
+
+[[tool]]
+name = "create_order"
+title = "Create order"
+description = "Create an order at one of your locations. Returns the new order."
+path = "/api/tools/create_order"
+input = { type = "object", properties = { customer = { type = "string" }, item = { type = "string" }, quantity = { type = "integer", minimum = 1 }, location = { type = "string", description = "A location code, for example north. Defaults to your first location." } }, required = ["customer", "item", "quantity"] }
+
+[[tool]]
+name = "list_my_orders"
+title = "List my orders"
+description = "List the orders at the locations you belong to, newest first."
+path = "/api/tools/list_my_orders"
+read_only = true
+input = { type = "object", properties = { status = { type = "string", enum = ["open", "shipped", "cancelled"] } } }

@@ -680,7 +680,7 @@ mod tests {
             write,
         };
         let columns = vec!["id".to_string(), "owner_id".to_string(), "total".to_string()];
-        let keys = crate::runtime::access::Keys { rowid_alias: Some("id".into()), unique: Vec::new() };
+        let keys = crate::runtime::access::Keys { rowid_alias: Some("id".into()), unique: Vec::new(), defaults: Vec::new() };
         run(config, "shop", &crate::runtime::access::generate(&policy, "abc", &columns, &keys), &[]).unwrap();
         // The platform writes these with the authorizer off; the test did the
         // same through run, whose authorizer allows DDL.

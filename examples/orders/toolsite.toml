@@ -1,0 +1,54 @@
+slug = "orders"
+spa = false
+icon = "📦"
+gate = "authenticated"
+
+# An approver decides submitted orders. Everyone else places their own.
+roles = ["approver"]
+
+[access]
+# The price list, readable by everyone who may open the app.
+views = ["catalog"]
+
+# Each person sees and changes their own orders. owner_id is filled on insert.
+[[access.table]]
+table = "orders"
+where = "owner_id = current_user()"
+owner = "owner_id"
+write = true
+
+# Lines follow their order.
+[[access.table]]
+table = "order_lines"
+where = "order_id in (select id from orders where owner_id = current_user())"
+write = true
+
+[[tool]]
+name = "create_order"
+title = "Create order"
+description = "Start a draft order for a customer, with optional lines. Returns the order with its total. Use add_line for more lines and submit_order when it is complete."
+path = "/api/tools/create_order"
+input = { type = "object", properties = { customer = { type = "string" }, lines = { type = "array", items = { type = "object", properties = { sku = { type = "string" }, quantity = { type = "integer", minimum = 1 } }, required = ["sku", "quantity"] } } }, required = ["customer"] }
+
+[[tool]]
+name = "add_line"
+title = "Add line"
+description = "Add a product to one of your draft orders. Products: PAL-STD, PAL-HD, WRAP-18, LBL-4X6, TAPE-48. A submitted order cannot change."
+path = "/api/tools/add_line"
+input = { type = "object", properties = { order_id = { type = "integer" }, sku = { type = "string" }, quantity = { type = "integer", minimum = 1 } }, required = ["order_id", "sku", "quantity"] }
+
+[[tool]]
+name = "submit_order"
+title = "Submit order"
+description = "Send one of your draft orders to an approver. It must have at least one line. After this the order cannot change."
+path = "/api/tools/submit_order"
+idempotent = true
+input = { type = "object", properties = { order_id = { type = "integer" } }, required = ["order_id"] }
+
+[[tool]]
+name = "my_orders"
+title = "My orders"
+description = "List your orders with their status and total, newest first."
+path = "/api/tools/my_orders"
+read_only = true
+input = { type = "object", properties = { status = { type = "string", enum = ["draft", "submitted", "approved", "rejected"] } } }
