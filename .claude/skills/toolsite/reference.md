@@ -207,7 +207,7 @@ A gate decides whether a request arrives:
 |---|---|
 | `public` | anyone |
 | `authenticated` | any signed-in account |
-| `granted` | accounts given access to that app |
+| `restricted` | people given access to that app (`granted` is the old name and still works) |
 | `default` | whatever the site set in `TOOLSITE_DEFAULT_ACCESS` (`public` unless changed) |
 
 An app that names no gate is on `default`. An admin account passes every gate.
@@ -242,7 +242,7 @@ can do here, and some things only happen here.
 | Page | What is there |
 |---|---|
 | `/admin/apps` | Every app with its access and whether it ships a handler. Search and paging. Each row opens the app. |
-| `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility, source download), then tabs: Access (gate, route rules, granted accounts), Exports, Settings, Jobs, Notes, Repo. |
+| `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility, source download), then tabs: Access (who may open it, route rules, people with access), Exports, Settings, Jobs, Notes, Repo. |
 | `/admin/accounts` and `/admin/accounts/<email>` | Accounts with role and status; one account's grants, a fresh setup link, disable or enable. New account: a setup link by default, or a generated or typed password for a shared login. |
 | `/admin/exports` | Every export token, by app and label. |
 | `/admin/github` | The GitHub App: a guided setup when none is configured, the install step, then installations and linked apps. |
@@ -296,7 +296,7 @@ told no.
 | `TOOLSITE_BASE_URL` | if clients sign in | Where the outside world reaches the server, e.g. `https://host.com`. Turns the OAuth server on and is what upload URLs are built from. Without it, URLs come back relative. |
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token for `/mcp` and the CLI. `Authorization: Bearer <token>`; `x-api-key` also accepted. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where everything is stored. |
-| `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `granted`. |
+| `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `restricted` (`granted` still works). |
 | `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME`, `_ALLOW_DOMAIN`. Redirect URI to register: `https://<host>/auth/callback/<slug>`. |
 | `TOOLSITE_MAX_DB_MB` / `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceilings on one SQLite file and one stored file, in MB. `0` means none. |
 | `TOOLSITE_BLOB_S3_ENDPOINT`, `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, `_REGION` | no | Store apps' files in an S3-compatible bucket instead of on the volume. A Railway bucket's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
@@ -314,7 +314,7 @@ Boot logs the effective configuration, so a misconfigured deploy is visible from
 the logs alone:
 
 ```
-INFO toolsite: auth configuration bearer_auth=false oauth_auth=true base_url="https://host.com" default_access=granted
+INFO toolsite: auth configuration bearer_auth=false oauth_auth=true base_url="https://host.com" default_access=restricted
 INFO toolsite: storage configuration (0 MB means no ceiling) blobs="s3" max_db_mb=4096 max_blob_mb=4096
 ```
 
@@ -328,7 +328,7 @@ deploy log.
 |---|---|
 | Page 200s but renders blank | Base path not set at build time; assets 404. Check `curl -I <page-url>/assets/<file>`. |
 | Deep route 404s, app root works | Bundle uploaded without `&spa`, or the router's `basename` is unset. |
-| An app you expected open answers 303 to `/auth/login` | It follows a site default of `granted` or `authenticated`. Set `gate = "public"` if it should be open. |
+| An app you expected open answers 303 to `/auth/login` | It follows a site default of `restricted` or `authenticated`. Set `gate = "public"` if it should be open. |
 | An app is missing from the index | Hidden, unlisted, or gated past the viewer. The admin's `/admin/apps` lists everything. |
 | `curl` to the upload URL hangs or fails to connect | The sandbox can't reach the host; fall back to `push_page` / `push_app`. |
 | Upload rejected wholesale | A tar entry had `..` or a leading `/`. Rebuild the archive from inside `dist`. |

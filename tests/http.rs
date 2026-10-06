@@ -3156,11 +3156,12 @@ async fn saving_a_gate_returns_to_the_tab_with_the_outcome_shown_once() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (status, page) = follow(&config, &boss, &headers).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("Access for reports is granted"), "no flash: {page}");
-    assert!(page.contains(r#"value="granted" checked"#), "the radio does not reflect the save");
+    // The old word still works on the way in, and the page answers in the new one.
+    assert!(page.contains("Access for reports is Restricted"), "no flash: {page}");
+    assert!(page.contains(r#"value="restricted" checked"#), "the radio does not reflect the save");
     // Shown once: the next visit is quiet.
     let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
-    assert!(!page.contains("Access for reports is granted"));
+    assert!(!page.contains("Access for reports is Restricted"));
 
     // A `back` that is not one of ours is ignored, not followed.
     let (_, _, headers) = send(
@@ -3339,7 +3340,7 @@ async fn an_account_page_shows_grants_and_lets_an_admin_change_them() {
 
     let (status, page, _) = send(&config, get_as("/admin/accounts/reader%40example.com", &boss)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("No grants"));
+    assert!(page.contains("No app access yet"));
     assert!(page.contains(r#"data-search="/admin/apps/search""#), "the app picker is not a combobox");
     assert!(page.contains(r#"role="combobox""#), "the picker is not a real combobox");
     assert!(!page.contains("<datalist"), "a native datalist is still in use");
@@ -5555,4 +5556,183 @@ async fn a_stranger_still_gets_the_app_list_on_an_open_site() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Lunch"));
     assert!(!page.contains("data-dialog=\"new-project\""));
+}
+
+// --- the projects tool ---------------------------------------------------------
+
+#[tokio::test]
+async fn the_projects_list_shows_only_what_the_account_can_see() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "warehouse").await;
+    folder(&config, "", "finance").await;
+    app_in(&config, "ledger", "finance").await;
+    account(&config, "ed@example.com", "correct horse");
+    scope(&config, "ed@example.com", "ops/warehouse", "editor");
+    let token = mcp_token_for(&config, "ed@example.com", "correct horse").await;
+    let mut mcp = Mcp::open(&config, &token).await;
+
+    let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "list" })).await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("\"ops/warehouse\""), "{text}");
+    assert!(text.contains("\"editor\""), "the scope held there is not shown: {text}");
+    assert!(!text.contains("finance"), "a project with nothing visible was listed: {text}");
+
+    // A static token sees every project.
+    let mut full = Mcp::open(&config, TOKEN).await;
+    let (_, text) = full.call("projects", serde_json::json!({ "action": "list" })).await;
+    assert!(text.contains("\"finance\"") && text.contains("\"ops/warehouse\""), "{text}");
+}
+
+#[tokio::test]
+async fn creating_a_project_needs_admin_at_the_parent_and_refuses_a_duplicate() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    account(&config, "ann@example.com", "correct horse");
+    account(&config, "ed@example.com", "correct horse");
+    scope(&config, "ann@example.com", "ops", "admin");
+    scope(&config, "ed@example.com", "ops", "editor");
+
+    let token = mcp_token_for(&config, "ed@example.com", "correct horse").await;
+    let mut ed = Mcp::open(&config, &token).await;
+    let (is_error, text) = ed.call("projects", serde_json::json!({ "action": "create", "path": "ops", "name": "yard" })).await;
+    assert!(is_error, "an editor created a project: {text}");
+    assert!(text.contains("admin") && text.contains("ops"), "{text}");
+
+    let token = mcp_token_for(&config, "ann@example.com", "correct horse").await;
+    let mut ann = Mcp::open(&config, &token).await;
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "create", "path": "ops", "name": "yard" })).await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("ops/yard") && text.contains("/browse/ops/yard"), "{text}");
+    assert!(toolsite::content::store::folder_exists(&config, "ops/yard").await);
+
+    let (is_error, _) = ann.call("projects", serde_json::json!({ "action": "create", "path": "ops", "name": "yard" })).await;
+    assert!(is_error, "a duplicate project was created");
+    // Not above its own level.
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "create", "path": "", "name": "labs" })).await;
+    assert!(is_error, "{text}");
+}
+
+#[tokio::test]
+async fn moving_an_app_needs_admin_at_both_ends_and_a_real_target() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    folder(&config, "", "finance").await;
+    app_in(&config, "tracker", "ops").await;
+    account(&config, "ann@example.com", "correct horse");
+    scope(&config, "ann@example.com", "ops", "admin");
+    let token = mcp_token_for(&config, "ann@example.com", "correct horse").await;
+    let mut ann = Mcp::open(&config, &token).await;
+
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "move", "app": "tracker", "path": "ops/nowhere" })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("no project"), "{text}");
+
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "move", "app": "tracker", "path": "finance" })).await;
+    assert!(is_error, "moved into a project without admin there: {text}");
+    assert!(text.contains("admin") && text.contains("finance"), "{text}");
+
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "move", "app": "tracker", "path": "ops/yard" })).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(toolsite::content::store::read_meta(&config, "tracker").await.project.as_deref(), Some("ops/yard"));
+
+    // The browser shows it in its new place.
+    let session = sign_in(&config, "ann@example.com", "correct horse");
+    let (status, page, _) = send(&config, get_as("/browse/ops/yard", &session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("tracker"), "the moved app is not under its new project");
+}
+
+#[tokio::test]
+async fn project_permissions_show_inherited_rows_and_a_grant_never_exceeds_the_giver() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    account(&config, "ann@example.com", "correct horse");
+    account(&config, "bo@example.com", "correct horse");
+    account(&config, "cy@example.com", "correct horse");
+    scope(&config, "ann@example.com", "ops/yard", "admin");
+    scope(&config, "bo@example.com", "ops", "viewer");
+    let token = mcp_token_for(&config, "ann@example.com", "correct horse").await;
+    let mut ann = Mcp::open(&config, &token).await;
+
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "permissions", "path": "ops/yard" })).await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("ann@example.com  admin  set here"), "{text}");
+    assert!(text.contains("bo@example.com  viewer  inherited from ops"), "{text}");
+
+    // Above its level: refused.
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "grant", "path": "ops", "email": "cy@example.com", "scope": "viewer" })).await;
+    assert!(is_error, "granted above its level: {text}");
+    let (is_error, _) = ann.call("projects", serde_json::json!({ "action": "permissions", "path": "ops" })).await;
+    assert!(is_error, "read permissions above its level");
+
+    // At its level: allowed, and revocable.
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "grant", "path": "ops/yard", "email": "cy@example.com", "scope": "editor" })).await;
+    assert!(!is_error, "{text}");
+    let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "revoke", "path": "ops/yard", "email": "cy@example.com" })).await;
+    assert!(!is_error, "{text}");
+
+    // An admin at ops/yard who is only editor elsewhere cannot hand out more
+    // than it holds: give cy editor at ops/yard, cy then cannot give admin.
+    scope(&config, "cy@example.com", "ops/yard", "editor");
+    let token = mcp_token_for(&config, "cy@example.com", "correct horse").await;
+    let mut cy = Mcp::open(&config, &token).await;
+    let (is_error, _) = cy.call("projects", serde_json::json!({ "action": "grant", "path": "ops/yard", "email": "bo@example.com", "scope": "admin" })).await;
+    assert!(is_error, "an editor granted admin");
+}
+
+#[tokio::test]
+async fn a_static_token_runs_every_project_action() {
+    let (_dir, config) = scoped_site();
+    account(&config, "bo@example.com", "correct horse");
+    app_in(&config, "tracker", "").await;
+    let mut full = Mcp::open(&config, TOKEN).await;
+    for (args, what) in [
+        (serde_json::json!({ "action": "create", "path": "", "name": "ops" }), "create"),
+        (serde_json::json!({ "action": "move", "app": "tracker", "path": "ops" }), "move"),
+        (serde_json::json!({ "action": "grant", "path": "ops", "email": "bo@example.com", "scope": "admin" }), "grant"),
+        (serde_json::json!({ "action": "permissions", "path": "ops" }), "permissions"),
+        (serde_json::json!({ "action": "revoke", "path": "ops", "email": "bo@example.com" }), "revoke"),
+    ] {
+        let (is_error, text) = full.call("projects", args).await;
+        assert!(!is_error, "{what}: {text}");
+    }
+    assert_eq!(toolsite::content::store::read_meta(&config, "tracker").await.project.as_deref(), Some("ops"));
+}
+
+#[tokio::test]
+async fn the_old_word_granted_still_closes_an_app_and_is_stored_as_restricted() {
+    let (dir, config) = server();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "in@example.com", "correct horse battery");
+    account(&config, "out@example.com", "correct horse battery");
+
+    // An old meta written before the rename.
+    write_page(&config, "old/index", "<title>Old</title>");
+    std::fs::write(
+        dir.path().join("old/index.meta"),
+        r#"{"listed":true,"hidden":false,"spa":false,"gate":"granted","allow_http":[],"rules":[]}"#,
+    )
+    .unwrap();
+    toolsite::accounts::users::grant(&config, "in@example.com", "old", "viewer").unwrap();
+    let inside = sign_in(&config, "in@example.com", "correct horse battery");
+    let outside = sign_in(&config, "out@example.com", "correct horse battery");
+    let (_, index, _) = send(&config, get_as("/", &inside)).await;
+    assert!(index.contains("Old"), "the person with access lost the app");
+    let (_, index, _) = send(&config, get_as("/", &outside)).await;
+    assert!(!index.contains("Old"), "the old word opened the app to everyone");
+
+    // A manifest that still says granted applies, and what is written says restricted.
+    write_page(&config, "man/index", "<title>Man</title>");
+    toolsite::platform::manifest::apply(&config, "man", "gate = \"granted\"\n").await.unwrap();
+    let meta = toolsite::content::store::read_meta(&config, "man").await;
+    assert_eq!(meta.gate.as_deref(), Some("restricted"));
+    let raw = std::fs::read_to_string(dir.path().join("man/index.meta"))
+        .or_else(|_| std::fs::read_to_string(dir.path().join("man.meta")))
+        .unwrap();
+    assert!(raw.contains("\"restricted\"") && !raw.contains("\"granted\""), "{raw}");
+    let (_, index, _) = send(&config, get_as("/", &outside)).await;
+    assert!(!index.contains("Man"), "the manifest's old word left the app open");
 }

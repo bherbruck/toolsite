@@ -15,6 +15,7 @@ pub mod inline_upload;
 pub mod github;
 pub mod oauth_store;
 pub mod preview;
+pub mod projects;
 pub mod screenshot;
 pub mod knowledge;
 pub mod manifest;

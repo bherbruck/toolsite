@@ -197,8 +197,8 @@ export TOOLSITE_URL=https://yourdomain.com TOOLSITE_TOKEN=<TOOLSITE_MCP_TOKEN>
 | `toolsite secret <app> [NAME --value v] [--link]` | List setting names, set one, or print a link for someone to paste values into. |
 | `toolsite job <app> [name] [--schedule c --path p] [--now] [--remove]` | List, set, run or remove a scheduled job. |
 | `toolsite user add <email> [--password p] [--admin]` | Create an account. Reads `TOOLSITE_PASSWORD` if the flag is omitted. |
-| `toolsite gate <app> <public\|authenticated\|granted\|default> [--path /prefix]` | Decide who may reach an app, or one path within it. |
-| `toolsite grant <app> <email> [--role r]` / `revoke` | Access for a `granted` app. |
+| `toolsite gate <app> <public\|authenticated\|restricted\|default> [--path /prefix]` | Decide who may reach an app, or one path within it. |
+| `toolsite grant <app> <email> [--role r]` / `revoke` | Access for a `restricted` app. |
 | `toolsite user disable <email>` / `enable` | Stop an account signing in and end its live sessions. Reversible. |
 
 `deploy` warns when `index.html` references `/assets/…` from the domain root,
@@ -213,6 +213,7 @@ which is the mistake that ships a blank page while looking like a success.
 | `list_pages(include_all?)` | What already exists: slug, title, URL, last modified, visibility. Newest first. |
 | `set_visibility(slug, hidden?, listed?, gate?, path?)` | Take a page down, hide it from the index, or set its gate. Reversible; nothing is deleted. |
 | `set_icon(slug, icon)` | An emoji, inline `<svg>`, or `data:` URI. Optional. |
+| `projects(action, path?, name?, app?, email?, scope?)` | Projects and who may act in them: `list`, `create` (admin at the parent), `move` an app (admin at both ends, the target must exist), `permissions`, `grant`, `revoke` (admin there, never more than you hold). The same rules as the app browser. |
 | `app_migrations`, `app_jobs`, `app_settings`, `app_notes`, `app_exports` | An app's schema, schedule, settings, notes and export tokens, each described below. |
 | `create_user`, `set_user_active`, `set_access` | Accounts and grants, as on the admin page. |
 | `push_page(html, slug?)` | Fallback for clients with no shell; HTML inline. |
@@ -717,7 +718,7 @@ Or remotely, with the CLI against a running server:
 
 ```
 toolsite user add someone@example.com        # prints the same link
-toolsite gate reports granted
+toolsite gate reports restricted
 toolsite grant reports someone@example.com
 ```
 
@@ -775,7 +776,7 @@ breaking it.
 | Page | What is there |
 |---|---|
 | `/admin/apps` | The apps you manage, with their gate and whether they ship a handler. Each row opens the app's page. Projects and their permissions are run from the app browser. |
-| `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility), then tabs: Access (gate, route rules, granted accounts), Exports, Settings, Jobs, Notes. |
+| `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility), then tabs: Access (who may open it, route rules, people with access), Exports, Settings, Jobs, Notes. |
 | `/admin/accounts/<email>` | One account: the apps they may open (add with a searchable picker, revoke), a fresh setup link shown once, disable or enable. |
 | `/admin/accounts` | Accounts with role and status; disable or re-enable; New account is its own page. |
 | `/admin/exports` | Every export token, by app and label. |
@@ -800,7 +801,8 @@ Apps sit in projects, and projects nest: `ops`, `ops/yard`. The tree is the
 platform's; an app's URL is its slug wherever it sits, so moving an app
 changes who manages it, not where visitors find it. Projects are made, apps
 are moved and permissions are set in the app browser at `/` (see The app
-browser below). The code and the API call a project a folder.
+browser below), or by an agent with the `projects` tool, which follows the
+same rules. The code and the API call a project a folder.
 
 A scope says what an account may do to the platform from a folder down.
 Unlike a grant's role, which only the app reads, the platform acts on it.
@@ -837,14 +839,16 @@ An app's gate is one of:
 |---|---|
 | `public` | anyone |
 | `authenticated` | any signed-in account |
-| `granted` | accounts with a grant on the app, or any scope on it or a folder above it |
+| `restricted` | people given access: a grant on the app, or any scope on it or a project above it |
+
+`restricted` was called `granted` before; the old word still works everywhere a level is typed, and toolsite stores and reports `restricted`. The pages show the three levels as Public, Signed in and Restricted.
 
 An admin passes every gate: they can grant themselves anything from the
 admin page, so asking them to do it app by app would only add a step.
 
 An app that has not chosen follows the site default, `TOOLSITE_DEFAULT_ACCESS`,
 which is `public` unless you set it. An internal deployment sets it to
-`granted` or `authenticated` once, and every app is closed from the moment it
+`restricted` or `authenticated` once, and every app is closed from the moment it
 is published; an app that should be open says `public` itself. The admin
 page marks apps that follow the default, and `toolsite gate <app> default`
 puts one back on it.
@@ -859,7 +863,7 @@ toolsite gate board authenticated --path /api/all
 ```
 
 Longest matching prefix wins, so `/admin` can be closed while `/admin/help`
-stays open. The arrangement works in reverse too: a `granted` app with
+stays open. The arrangement works in reverse too: a `restricted` app with
 `--path / --gate public` has a front page anyone can read.
 
 Beyond that, what a signed-in caller may *do* is the app's decision. A grant
@@ -1090,7 +1094,7 @@ is required to serve HTTP.
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where everything is stored. |
 | `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME` and `_ALLOW_DOMAIN`. See Accounts. |
-| `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `granted`. Set `granted` for an internal site. |
+| `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `restricted` (`granted`, the old name, still works). Set `restricted` for an internal site. |
 | `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
 | `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
 | `TOOLSITE_GITHUB_APP_ID` / `TOOLSITE_GITHUB_APP_PRIVATE_KEY` | no | A GitHub App, so an app's source can live in a repository. The key is the PEM, raw or base64. Both or neither. See GitHub. |

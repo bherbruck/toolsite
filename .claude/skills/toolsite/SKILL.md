@@ -84,8 +84,8 @@ Install with `cargo install --path cli` (binary name `toolsite`).
 | `toolsite fetch [--slug <slug>] [dir]` | Unpack the project a previous deploy kept with the app |
 | `toolsite sql <app> "<sql>" [--param v]` | Run SQL against that app's database. Repeat `--param` per placeholder; digits and `true`/`false`/`null` bind as those types, everything else as text |
 | `toolsite list [--all]` | What is already published |
-| `toolsite gate <app> <public\|authenticated\|granted\|default> [--path /prefix]` | Who may reach an app, or one path within it |
-| `toolsite grant <app> <email> [--role r]` / `toolsite revoke <app> <email>` | Access to an app whose gate is `granted` |
+| `toolsite gate <app> <public\|authenticated\|restricted\|default> [--path /prefix]` | Who may reach an app, or one path within it |
+| `toolsite grant <app> <email> [--role r]` / `toolsite revoke <app> <email>` | Access to an app whose access is `restricted` |
 | `toolsite job <app> [name] [--schedule c] [--path p] [--now] [--remove]` | Scheduled work; omit the name to list |
 | `toolsite secret <app> [name] [--value v] [--link] [--remove]` | Settings the handler reads; `--link` prints a URL for the owner to paste values into |
 | `toolsite notes <slug> [--file notes.md]` | Read or write the notes kept with an app |
@@ -196,7 +196,7 @@ For when the CLI isn't installed, or there is no shell at all.
 |---|---|
 | `create_upload(slug?)` | The default. Returns the upload URL and the base path to build for. |
 | `list_pages(include_all?)` | Slug, title, URL, last modified, visibility. Newest first. |
-| `set_visibility(slug, hidden?, listed?, gate?, path?)` | `hidden: true` 404s the URL. `listed: false` keeps it live but off the index. `gate` is `public`, `authenticated`, `granted`, or `default` (follow the site); with `path` it guards one part of an app. |
+| `set_visibility(slug, hidden?, listed?, gate?, path?)` | `hidden: true` 404s the URL. `listed: false` keeps it live but off the index. `gate` is `public`, `authenticated`, `restricted` (once `granted`), or `default` (follow the site); with `path` it guards one part of an app. |
 | `set_icon(slug, icon)` | Emoji, inline `<svg>`, or `data:` URI. Optional; pages without one get a generated badge. |
 | `run_sql(app, sql, params?)` | Schema and seed work against one app's database. MCP only; never reachable from a published page. |
 | `app_migrations(app, files?)` | The app's schema as numbered `.sql` files, applied once each in order. Omit `files` to see what ran. |
@@ -206,8 +206,9 @@ For when the CLI isn't installed, or there is no shell at all.
 | `app_repo(app, action, repo?, branch?, directory?, installation?, public?)` | `status`, `installations`, `discover`, `create`, `import`, `sync`, `disconnect`. See [A repository](#a-repository). |
 | `app_deploy_tokens(app, action, label?, id?)` | A token that publishes one app only, for a pipeline that is not GitHub: `create`, `list`, `revoke`. |
 | `app_exports(app, action, label?, id?)` | A read-only token for `GET <site>/export/<app>.sqlite`, a snapshot of the whole database for a reporting tool. |
+| `projects(action, path?, name?, app?, email?, scope?)` | Projects and who may act in them: `list`, `create` (admin at the parent), `move` an app (admin at both ends, the target must exist), `permissions`, `grant`, `revoke` (admin there, never more than you hold). The same rules as the app browser. |
 | `create_user(email, password?, admin?)` | An account. Leave the password out and the reply carries a one-time setup link for them. |
-| `set_access(app, email, allow?, role?)` / `set_user_active(email, active)` | Grants on a `granted` app, and disabling an account. |
+| `set_access(app, email, allow?, role?)` / `set_user_active(email, active)` | Access on a `restricted` app, and disabling an account. |
 | `push_page(html, slug?)` / `push_app(app, pages)` | No-shell fallbacks, HTML inline. A page named `index` also serves at the app root. |
 | `upload_begin(slug, kind, …)` / `upload_chunk(id, index, data)` / `upload_finish(id, chunks)` | The upload URL's kinds (`bundle`, `handler`, `migrations`, `manifest`, `source`, `icon`, `blob`, `page`) sent inline as base64 chunks of at most 768 KB decoded, for a sandbox that cannot reach the host. Same rules, same reply. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
@@ -257,7 +258,7 @@ folder you hold, or ask for the scope; `list_pages` shows what you may open.
 
 **Access.** A gate decides whether a request arrives; what it may then do is
 yours to decide. An app that names no gate follows the site's default
-(`TOOLSITE_DEFAULT_ACCESS`), which on an internal site is usually `granted`,
+(`TOOLSITE_DEFAULT_ACCESS`), which on an internal site is usually `restricted`,
 so say `gate = "public"` only when the app really should be open to anyone.
 An admin account passes every gate. Guard part of an app with a `[[route]]`
 or `set_visibility(slug, gate, path)`, longest matching prefix wins, and
@@ -422,7 +423,7 @@ reproduces it.
 ```toml
 slug = "board"
 spa  = true
-gate = "default"               # follow the site; or public, authenticated, granted
+gate = "default"               # follow the site; or public, authenticated, restricted
 icon = "📋"
 allow_http = ["api.example.com"]
 roles = ["viewer", "editor"]   # what the handler checks; a hint for whoever grants
@@ -516,7 +517,7 @@ success; a blank page or a sign-in form is a failure to fix.
 
 A 200 on the HTML with a 404 on the assets is the blank-page failure above; go
 back and fix the base path, rebuild, re-upload. A 303 to `/auth/login` on an
-app you expected open means it follows a site default of `granted` or
+app you expected open means it follows a site default of `restricted` or
 `authenticated`; set `gate = "public"` if it should be open.
 
 See [reference.md](reference.md) for the WIT type surface, storage layout, index

@@ -219,13 +219,14 @@ async fn main() -> anyhow::Result<()> {
 
     // What an app is until it says otherwise. An internal deployment sets
     // this to granted or authenticated once and never thinks about it again.
-    let default_gate = read(&["TOOLSITE_DEFAULT_ACCESS"]).unwrap_or_else(|| "public".into());
-    if !toolsite::content::store::GATES.contains(&default_gate.as_str()) {
-        panic!(
-            "TOOLSITE_DEFAULT_ACCESS must be one of {}, not {default_gate:?}",
+    let asked = read(&["TOOLSITE_DEFAULT_ACCESS"]).unwrap_or_else(|| "public".into());
+    let default_gate = match toolsite::content::store::normalise_gate(&asked) {
+        Some(level) => level.to_string(),
+        None => panic!(
+            "TOOLSITE_DEFAULT_ACCESS must be one of {} (granted is the old name for restricted), not {asked:?}",
             toolsite::content::store::GATES.join(", ")
-        );
-    }
+        ),
+    };
 
     // A GitHub App, when there is one, so apps can live in repositories and
     // deploy from them. The id and key are the App; the rest is optional.

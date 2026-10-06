@@ -200,6 +200,13 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
     Tree { entries, projects: with_parents }
 }
 
+/// The projects `viewer` may see, each with the apps in it or below that it
+/// may see. The rule the browser draws by, for the `projects` tool.
+pub(crate) async fn visible_projects(config: &Arc<Config>, viewer: Option<&User>) -> Vec<(String, usize)> {
+    let tree = gather(config, viewer).await;
+    tree.projects.iter().map(|path| (path.clone(), tree.apps_below(path))).collect()
+}
+
 /// `GET /`: the top level. `?project=` was the old way to name a level and
 /// is sent on to its path.
 pub(crate) async fn index(
@@ -564,19 +571,8 @@ fn results(tree: &Tree, project: &str, q: &str) -> Markup {
 
 /// The Permissions tab: who holds what at this project, set here or above.
 async fn permissions(config: &Arc<Config>, project: &str, token: &str) -> Markup {
-    let scopes = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || users::list_scopes(&config).unwrap_or_default())
-            .await
-            .unwrap_or_default()
-    };
-    let mut direct: Vec<&users::ScopeGrant> = scopes.iter().filter(|row| row.prefix == project).collect();
-    let mut inherited: Vec<&users::ScopeGrant> = scopes
-        .iter()
-        .filter(|row| row.prefix != project && users::prefix_covers(&row.prefix, project))
-        .collect();
-    direct.sort_by(|a, b| a.email.cmp(&b.email));
-    inherited.sort_by(|a, b| (a.prefix.len(), &a.email).cmp(&(b.prefix.len(), &b.email)));
+    let crate::platform::projects::Holders { direct, inherited } =
+        crate::platform::projects::holders_unchecked(config, project).await;
     let back = permissions_url(project);
     let here = if project.is_empty() { "the site".to_string() } else { project.to_string() };
     html! {

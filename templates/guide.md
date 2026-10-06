@@ -170,14 +170,14 @@ rather than a list of commands someone once ran.
 ```toml
 slug = "myapp"
 spa  = false
-gate = "public"            # or authenticated, granted
+gate = "public"            # or authenticated, restricted
 icon = "🧺"
 allow_http = ["api.example.com"]
 roles = ["viewer", "editor"]  # what the handler checks; a hint for whoever grants
 
 [[route]]                  # note the singular; unknown keys are refused
 path = "/admin"
-gate = "granted"
+gate = "restricted"
 
 [[job]]                    # six cron fields, seconds first
 name = "refresh"
@@ -197,16 +197,24 @@ folder and the scope it would take, for example "holds editor at ops/yard;
 this needs admin". Ask the person for the scope, or publish under a folder you
 hold; `list_pages` shows what you may open.
 
+`projects(action: "list")` shows the project tree and what you hold at each
+level. With admin there you can `create` a project, `move` an app into one
+(admin where it is and where it goes; the project must exist), and read or
+change its `permissions` with `grant` and `revoke`. You cannot give more than
+you hold.
+
 A gate decides whether a request arrives:
 
 | Gate | Who |
 |---|---|
 | `public` | anyone |
 | `authenticated` | any signed-in account |
-| `granted` | accounts with a grant on the app, or a scope on it or a folder above it |
+| `restricted` | people given access: a grant on the app, or a scope on it or a project above it |
+
+`restricted` was called `granted` before; the old word still works everywhere a level is typed, and toolsite stores and reports `restricted`. The pages show the three levels as Public, Signed in and Restricted.
 
 An admin account passes every gate. An app that names no gate follows the site's default, which the owner set
-for the whole deployment; on an internal site that is usually `granted`.
+for the whole deployment; on an internal site that is usually `restricted`.
 Say `gate = "public"` only when the app really should be open to anyone.
 
 `[[route]]` applies a gate to a path prefix, longest match winning, so a

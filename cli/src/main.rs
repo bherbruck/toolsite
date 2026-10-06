@@ -100,7 +100,7 @@ enum Command {
     /// Accounts that may sign in to gated apps.
     #[command(subcommand)]
     User(UserCommand),
-    /// Let an account reach an app whose gate is 'granted'.
+    /// Let an account reach an app whose access is 'restricted'.
     Grant {
         app: String,
         email: String,
@@ -114,8 +114,8 @@ enum Command {
     /// Decide who may reach an app, or one path within it.
     Gate {
         app: String,
-        /// public (anyone), authenticated (any account), granted (only
-        /// accounts you have granted), or default (follow the site's
+        /// public (anyone), authenticated (any account), restricted (only
+        /// people given access; 'granted' still works), or default (follow the site's
         /// TOOLSITE_DEFAULT_ACCESS).
         gate: String,
         /// Apply it to paths starting here instead of the whole app, e.g.

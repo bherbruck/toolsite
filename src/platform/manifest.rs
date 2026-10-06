@@ -98,7 +98,7 @@ pub struct Job {
     pub path: String,
 }
 
-use crate::content::store::GATES;
+use crate::content::store::{normalise_gate, GATES};
 
 /// A copy of the meta for a blocking task. PageMeta is not Clone on purpose
 /// (it is read from and written to one file), so this goes through serde.
@@ -122,15 +122,15 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
     // Everything is checked before anything is written: half an applied
     // manifest is worse than a rejected one.
     if let Some(gate) = &manifest.gate {
-        if !GATES.contains(&gate.as_str()) && gate != "default" {
-            return Err(format!("gate must be one of {}, or default", GATES.join(", ")));
+        if normalise_gate(gate).is_none() && gate != "default" {
+            return Err(format!("gate must be one of {}, or default (granted is the old name for restricted)", GATES.join(", ")));
         }
     }
     for route in &manifest.routes {
         if !route.path.starts_with('/') {
             return Err(format!("route path must start with '/', got {}", route.path));
         }
-        if !GATES.contains(&route.gate.as_str()) {
+        if normalise_gate(&route.gate).is_none() {
             return Err(format!(
                 "route {} has gate {}, which is not one of {}",
                 route.path,
@@ -150,7 +150,7 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         }
     }
     if let Some(gate) = manifest.gate {
-        let wanted = (gate != "default").then_some(gate.clone());
+        let wanted = (gate != "default").then(|| normalise_gate(&gate).unwrap_or("restricted").to_string());
         if meta.gate != wanted {
             changed.push(format!("gate = {gate}"));
             meta.gate = wanted;

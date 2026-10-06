@@ -47,7 +47,7 @@ pub(crate) struct FetchRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PushPageRequest {
     #[schemars(
-        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: an app is moved from the admin page."
+        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: move one with projects(action: 'move')."
     )]
     pub(crate) project: Option<String>,
 
@@ -68,7 +68,7 @@ pub(crate) struct PullPageRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PushAppRequest {
     #[schemars(
-        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: an app is moved from the admin page."
+        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: move one with projects(action: 'move')."
     )]
     pub(crate) project: Option<String>,
 
@@ -85,7 +85,7 @@ pub(crate) struct PushAppRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CreateUploadRequest {
     #[schemars(
-        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: an app is moved from the admin page."
+        description = "For a new app: the project folder it goes in, e.g. 'ops/yard'. Needed when the account behind this connection holds editor in more than one folder; left out, the one folder it holds is used. Ignored for an app that exists: move one with projects(action: 'move')."
     )]
     pub(crate) project: Option<String>,
 
@@ -143,6 +143,24 @@ pub(crate) struct SetIconRequest {
         description = "An emoji, a full inline <svg>...</svg>, or a data: URI. For a raster image file, use create_upload and PUT it to <upload-url>?icon instead."
     )]
     pub(crate) icon: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProjectsRequest {
+    #[schemars(
+        description = "'list' the projects you can see with what you hold at each; 'create' a project (path = parent, name); 'move' an app (app, path = target, empty for the top level); 'permissions' of a project (path); 'grant' a scope (path, email, scope); 'revoke' what an account holds at a project (path, email)."
+    )]
+    pub(crate) action: String,
+    #[schemars(description = "A project path like 'ops/yard'. Empty or '/' means the top level. For create it is the parent; for move it is the target.")]
+    pub(crate) path: Option<String>,
+    #[schemars(description = "create only: the new project's name, letters, numbers, '-' or '_'.")]
+    pub(crate) name: Option<String>,
+    #[schemars(description = "move only: the app to move.")]
+    pub(crate) app: Option<String>,
+    #[schemars(description = "grant and revoke: the account's email.")]
+    pub(crate) email: Option<String>,
+    #[schemars(description = "grant only: 'viewer' opens apps, 'editor' also publishes and changes them, 'admin' also sets access. Never more than you hold there.")]
+    pub(crate) scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -234,7 +252,7 @@ pub(crate) struct SetVisibilityRequest {
     )]
     pub(crate) listed: Option<bool>,
     #[schemars(
-        description = "Who may reach the app: 'public' (anyone), 'authenticated' (any signed-in account), 'granted' (only accounts given access with set_access), or 'default' to follow the site's TOOLSITE_DEFAULT_ACCESS, which is what an app does until told otherwise."
+        description = "Who may reach the app: 'public' (anyone), 'authenticated' (any signed-in account), 'restricted' (only people given access, with set_access or projects; 'granted' is the old name and still works), or 'default' to follow the site's TOOLSITE_DEFAULT_ACCESS, which is what an app does until told otherwise."
     )]
     pub(crate) gate: Option<String>,
     #[schemars(
@@ -805,6 +823,92 @@ impl PageHost {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         })
+    }
+
+    // One tool, not five, like app_repo and app_exports: a client lists
+    // fewer tools, and the actions share the project they act on and the
+    // rule that decides who may act there.
+    #[tool(
+        description = "Run projects: groups of apps, nested like folders, where access is given once and applies to everything inside. 'list' shows the projects you can see and what you hold at each. 'create' needs admin at the parent. 'move' puts an existing app in another project and needs admin where it is and where it goes; the project must exist. 'permissions' lists who holds viewer, editor or admin at a project, set there or above (needs admin there). 'grant' and 'revoke' change that (admin there; you cannot give more than you hold). The same rules as the app browser at /browse/<path>.",
+        annotations(title = "Projects", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    pub(crate) async fn projects(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(ProjectsRequest { action, path, name, app, email, scope }): Parameters<ProjectsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::platform::projects as p;
+        let caller = Self::caller(&ctx);
+        let actor = caller.user.as_ref();
+        let path = path.unwrap_or_default();
+        let config = &self.config;
+        let fail = |text: String| Ok(CallToolResult::error(vec![ContentBlock::text(text)]));
+        let need = |value: Option<String>, what: &str| -> Result<String, String> {
+            value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).ok_or_else(|| format!("{action} needs {what}"))
+        };
+        let url = |at: &str| {
+            let base = config.base_url.as_deref().unwrap_or(&config.local_base);
+            format!("{base}{}", crate::content::browse::browser_url(at))
+        };
+        let outcome: Result<String, p::Problem> = match action.as_str() {
+            "list" => {
+                let nodes = p::tree(config, actor).await;
+                if nodes.is_empty() {
+                    Ok("There are no projects you can see. Every app sits at the top level.".to_string())
+                } else {
+                    serde_json::to_string_pretty(&nodes).map_err(|e| p::Problem::Invalid(e.to_string()))
+                }
+            }
+            "create" => match need(name, "a name") {
+                Ok(name) => p::create(config, actor, &path, &name)
+                    .await
+                    .map(|folder| format!("Project {} is created: {}", folder.path, url(&folder.path))),
+                Err(text) => return fail(text),
+            },
+            "move" => match need(app, "an app") {
+                Ok(app) => p::move_app(config, actor, &app, &path)
+                    .await
+                    .map(|to| format!("{app} is at {to}: {}", url(path.trim_matches('/')))),
+                Err(text) => return fail(text),
+            },
+            "permissions" => p::holders(config, actor, &path).await.map(|holders| {
+                let place = p::place(path.trim_matches('/'));
+                let mut out = format!("At {place}:\n");
+                if holders.direct.is_empty() && holders.inherited.is_empty() {
+                    out.push_str("nobody holds access here. Site admins hold admin everywhere.\n");
+                }
+                for row in &holders.direct {
+                    out.push_str(&format!("{}  {}  set here\n", row.email, row.scope));
+                }
+                for row in &holders.inherited {
+                    out.push_str(&format!("{}  {}  inherited from {}\n", row.email, row.scope, p::place(&row.prefix)));
+                }
+                out
+            }),
+            "grant" => {
+                let (email, scope) = match (need(email, "an email"), need(scope, "a scope")) {
+                    (Ok(e), Ok(s)) => (e, s),
+                    (Err(text), _) | (_, Err(text)) => return fail(text),
+                };
+                let Some(level) = Scope::parse(&scope) else {
+                    return fail("scope is viewer, editor or admin".to_string());
+                };
+                p::grant(config, actor, &path, &email, level)
+                    .await
+                    .map(|()| format!("{email} is {level} at {}.", p::place(path.trim_matches('/'))))
+            }
+            "revoke" => match need(email, "an email") {
+                Ok(email) => p::revoke(config, actor, &path, &email)
+                    .await
+                    .map(|()| format!("{email} has no access of its own at {} now.", p::place(path.trim_matches('/')))),
+                Err(text) => return fail(text),
+            },
+            other => return fail(format!("action is list, create, move, permissions, grant or revoke, not '{other}'")),
+        };
+        match outcome {
+            Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
+            Err(problem) => fail(problem.message().to_string()),
+        }
     }
 
     #[tool(
@@ -1602,7 +1706,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Give or take away one account's access to one app. Only matters for apps whose gate is 'granted'.",
+        description = "Give or take away one account's access to one app. Only matters for apps whose access is 'restricted'.",
         annotations(title = "Grant or revoke access", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn set_access(
@@ -1811,15 +1915,18 @@ impl PageHost {
         if let Err(refused) = self.allowed(&ctx, &slug, needed).await {
             return Ok(refused);
         }
-        if let Some(gate) = &gate {
-            let allowed = matches!(gate.as_str(), "public" | "authenticated" | "granted")
-                || (gate == "default" && path.is_none());
-            if !allowed {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "gate must be 'public', 'authenticated' or 'granted' (or 'default' for the whole app, meaning the site's TOOLSITE_DEFAULT_ACCESS)",
-                )]));
-            }
-        }
+        let gate = match gate {
+            Some(word) if word == "default" && path.is_none() => Some(word),
+            Some(word) => match crate::content::store::normalise_gate(&word) {
+                Some(level) => Some(level.to_string()),
+                None => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "gate must be 'public', 'authenticated' or 'restricted' ('granted' is the old name and still works), or 'default' for the whole app, meaning the site's TOOLSITE_DEFAULT_ACCESS",
+                    )]));
+                }
+            },
+            None => None,
+        };
         if page_path(&self.config, &slug).await.is_none() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "no page found for slug '{slug}'"

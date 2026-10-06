@@ -359,7 +359,7 @@ pub(crate) async fn admits(
         // An admin can grant themselves anything from the admin page, so a
         // gate keeps nothing from them; asking them to do it app by app
         // would only add a step. The owner walks in.
-        "granted" => match visitor {
+        "restricted" | "granted" => match visitor {
             Some(user) if user.is_admin => true,
             // Any scope at the app or a folder above it opens the door; the
             // per-app grants of old are viewer scopes on the app now.

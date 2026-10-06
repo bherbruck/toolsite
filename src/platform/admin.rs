@@ -16,6 +16,7 @@
 //! admin who happens to be visiting it.
 
 use crate::{
+    platform::projects,
     accounts::users::{self, Scope, User},
     config::Config,
     content::{
@@ -38,9 +39,9 @@ use std::sync::Arc;
 
 const FLASH_COOKIE: &str = "ts_flash";
 const GATES: [(&str, &str, &str); 3] = [
-    ("public", "Public", "Anyone can open the app."),
-    ("authenticated", "Signed in", "Each signed-in account can open the app."),
-    ("granted", "Granted", "Only accounts with a grant can open the app."),
+    ("public", "Public", "Anyone with the link."),
+    ("authenticated", "Signed in", "Any account on this site."),
+    ("restricted", "Restricted", "Only people given access."),
 ];
 
 /// Resolves an admin from the request, or the response to send instead.
@@ -239,7 +240,7 @@ pub(crate) fn sidebar(active: &str, viewer: Option<&User>, manages: bool) -> Mar
         @if is_admin || manages {
             div."nav-group" {
                 div."label" { "Admin" }
-                a."active"[active == "apps"] href="/admin/apps" { "Apps" }
+                a."active"[active == "apps"] href="/admin/apps" { "App settings" }
                 @if is_admin {
                     a."active"[active == "accounts"] href="/admin/accounts" { "Accounts" }
                     a."active"[active == "exports"] href="/admin/exports" { "Exports" }
@@ -615,8 +616,8 @@ pub async fn apps_page(
         format!("/admin/apps?folder={}", urlencoding::encode(&folder))
     };
 
-    let title = if folder.is_empty() { "Apps".to_string() } else { folder.rsplit('/').next().unwrap_or(&folder).to_string() };
-    let crumbs: Vec<(String, String)> = std::iter::once(("Apps".to_string(), "/admin/apps".to_string()))
+    let title = if folder.is_empty() { "App settings".to_string() } else { folder.rsplit('/').next().unwrap_or(&folder).to_string() };
+    let crumbs: Vec<(String, String)> = std::iter::once(("App settings".to_string(), "/admin/apps".to_string()))
         .chain(store::folder_chain(&format!("{folder}/x")).into_iter().filter(|chain| chain != &folder).map(|chain| {
             let name = chain.rsplit('/').next().unwrap_or(&chain).to_string();
             (name, format!("/admin/apps?folder={}", urlencoding::encode(&chain)))
@@ -712,12 +713,21 @@ pub async fn apps_page(
     )
 }
 
+/// How a person reads an access level: the plain name, never the stored word.
+pub(crate) fn gate_label(gate: &str) -> &'static str {
+    match crate::content::store::normalise_gate(gate) {
+        Some("public") => "Public",
+        Some("authenticated") => "Signed in",
+        _ => "Restricted",
+    }
+}
+
 fn gate_badge(gate: &str) -> Markup {
     html! {
         @match gate {
-            "public" => span."badge" { "public" },
-            "authenticated" => span."badge solid" { "signed in" },
-            _ => span."badge solid" { "granted" },
+            "public" => span."badge" { "Public" },
+            "authenticated" => span."badge solid" { "Signed in" },
+            _ => span."badge solid" { "Restricted" },
         }
     }
 }
@@ -852,7 +862,7 @@ pub(crate) async fn app_tab(
         Page {
             active: "apps",
             title: &title,
-            crumbs: vec![("Apps", "/admin/apps")],
+            crumbs: vec![("App settings", "/admin/apps")],
             subtitle: Some(html! { a href=(url) target="_blank" { (url) } }),
             actions: Some(html! {
                 (gate_badge(meta.gate(&config.default_gate)))
@@ -1074,7 +1084,7 @@ async fn render_access_tab(
                         input type="radio" name="gate" value="default" checked[meta.gate.is_none()];
                         strong { "Site default" }
                         span {
-                            "The site default is " (config.default_gate) ". Set it for the whole site with "
+                            "The site default is " (gate_label(&config.default_gate)) ". Set it for the whole site with "
                             code { "TOOLSITE_DEFAULT_ACCESS" } ". An app without its own setting uses it."
                         }
                     }
@@ -1146,7 +1156,7 @@ async fn render_access_tab(
             }
         }))
 
-        (ui::panel("Granted accounts", Some("A grant applies only when access is granted. The app reads the role."), html! {
+        (ui::panel("People with access", Some("This list applies while access is Restricted. The app reads each person's role."), html! {
             form."row" method="post" action="/admin/access" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))
                 label."small" for="email" { "Add an account" }
@@ -1155,7 +1165,7 @@ async fn render_access_tab(
                 button type="submit" { "Add" }
             }
             @if grants.is_empty() {
-                p."muted" { "No account has a grant. Add an account above." }
+                p."muted" { "Nobody has access yet. Add a person above." }
             } @else {
                 table {
                     thead { tr { th { "Account" } th { "Role" } th {} } }
@@ -1512,16 +1522,16 @@ async fn render_account_page(
                         }
                     }
                 }))
-                (ui::panel("Grants", Some("A grant applies only to an app with access set to granted. The app reads the role. The usual role is viewer."), html! {
+                (ui::panel("Apps with access", Some("This applies to apps whose access is Restricted. The app reads the role. The usual role is viewer."), html! {
                     form."row" method="post" action="/admin/access" {
                         (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("allow", "1"))
-                        label."small" for="app" { "Add a grant" }
+                        label."small" for="app" { "Add to an app" }
                         (ui::combobox("app", "/admin/apps/search", "Type an app name"))
                         (role_input(&declared_roles))
                         button type="submit" { "Add" }
                     }
                     @if grants.is_empty() {
-                        p."muted" { "No grants. Add a grant above." }
+                        p."muted" { "No app access yet. Add an app above." }
                     } @else {
                         table {
                             thead { tr { th { "App" } th { "Role" } th {} } }
@@ -2007,14 +2017,19 @@ pub async fn change_gate(
     if !valid_slug(&form.app) {
         return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
     }
-    if form.gate != "default" && !GATES.iter().any(|(value, ..)| *value == form.gate) {
-        return (StatusCode::BAD_REQUEST, "unknown gate").into_response();
-    }
+    let level = if form.gate == "default" {
+        None
+    } else {
+        match crate::content::store::normalise_gate(&form.gate) {
+            Some(level) => Some(level.to_string()),
+            None => return (StatusCode::BAD_REQUEST, "unknown access level").into_response(),
+        }
+    };
     let mut meta = read_meta(&config, &form.app).await;
-    meta.gate = (form.gate != "default").then(|| form.gate.clone());
+    meta.gate = level;
     let said = match meta.gate.as_deref() {
-        Some(gate) => format!("Access for {} is {gate}.", form.app),
-        None => format!("Access for {} is the site default, {}.", form.app, config.default_gate),
+        Some(gate) => format!("Access for {} is {}.", form.app, gate_label(gate)),
+        None => format!("Access for {} is the site default, {}.", form.app, gate_label(&config.default_gate)),
     };
     match write_meta(&config, &form.app, &meta).await {
         Ok(()) => redirect_flash(&back, true, said),
@@ -2055,15 +2070,14 @@ pub async fn change_rule(
     meta.rules.retain(|rule| rule.prefix != prefix);
     let text = match form.action.as_str() {
         "add" => {
-            let gate = form.gate.unwrap_or_default();
-            if !GATES.iter().any(|(value, ..)| *value == gate) {
-                return (StatusCode::BAD_REQUEST, "unknown gate").into_response();
-            }
+            let Some(gate) = crate::content::store::normalise_gate(&form.gate.unwrap_or_default()).map(str::to_string) else {
+                return (StatusCode::BAD_REQUEST, "unknown access level").into_response();
+            };
             meta.rules.push(PathRule {
                 prefix: prefix.clone(),
                 gate: gate.clone(),
             });
-            format!("Access for {prefix} is {gate}.")
+            format!("Access for {prefix} is {}.", gate_label(&gate))
         }
         "remove" => format!("The rule for {prefix} is removed."),
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
@@ -2273,47 +2287,24 @@ pub async fn change_scope(
     };
     let back = back_or(form.back.as_deref(), "/admin/apps");
     let email = form.email.trim().to_lowercase();
-    let where_ = if prefix.is_empty() { "the site".to_string() } else { prefix.clone() };
-    match form.action.as_str() {
+    let where_ = projects::place(&prefix);
+    let outcome = match form.action.as_str() {
         "grant" => {
             let Some(scope) = form.scope.as_deref().and_then(Scope::parse) else {
                 return redirect_flash(&back, false, "Choose viewer, editor or admin.");
             };
-            // A folder admin cannot hand out more than it holds; a site
-            // admin holds admin everywhere.
-            if !admin.is_admin {
-                let mine = held(&config, &admin, &prefix).await.unwrap_or(Scope::Viewer);
-                if scope > mine {
-                    return redirect_flash(&back, false, format!("You hold {mine} at {where_} and cannot give {scope}."));
-                }
-            }
-            let (config2, who, at, by) = (config.clone(), email.clone(), prefix.clone(), admin.email.clone());
-            let outcome = tokio::task::spawn_blocking(move || {
-                users::grant_scope(&config2, &who, &at, scope, Some(&by))
-            })
-            .await;
-            match outcome {
-                Ok(Ok(())) => {
-                    tracing::info!(admin = %admin.email, account = %email, prefix = %prefix, scope = %scope, "scope granted");
-                    redirect_flash(&back, true, format!("{email} is {scope} at {where_}."))
-                }
-                Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "Access was not changed."),
-            }
+            projects::grant(&config, Some(&admin), &prefix, &email, scope)
+                .await
+                .map(|()| format!("{email} is {scope} at {where_}."))
         }
-        "revoke" => {
-            let (config2, who, at) = (config.clone(), email.clone(), prefix.clone());
-            let outcome = tokio::task::spawn_blocking(move || users::revoke_scope(&config2, &who, &at)).await;
-            match outcome {
-                Ok(Ok(())) => {
-                    tracing::info!(admin = %admin.email, account = %email, prefix = %prefix, "scope revoked");
-                    redirect_flash(&back, true, format!("{email} has no access of its own at {where_} now."))
-                }
-                Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "Access was not changed."),
-            }
-        }
-        _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+        "revoke" => projects::revoke(&config, Some(&admin), &prefix, &email)
+            .await
+            .map(|()| format!("{email} has no access of its own at {where_} now.")),
+        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    };
+    match outcome {
+        Ok(text) => redirect_flash(&back, true, text),
+        Err(problem) => redirect_flash(&back, false, problem.message()),
     }
 }
 
@@ -2339,9 +2330,8 @@ pub async fn new_folder(
         Err(response) => return response,
     };
     let back = back_or(form.back.as_deref(), "/admin/apps");
-    match store::create_folder(&config, &parent, form.name.trim()).await {
+    match projects::create(&config, Some(&admin), &parent, &form.name).await {
         Ok(folder) => {
-            tracing::info!(admin = %admin.email, folder = %folder.path, "folder created");
             // Back where the form was, inside the new project: the browser
             // when it came from there, the admin list otherwise.
             let to = if back.starts_with("/admin") {
@@ -2351,7 +2341,7 @@ pub async fn new_folder(
             };
             redirect_flash(&to, true, format!("Project {} is created.", folder.path))
         }
-        Err(message) => redirect_flash(&back, false, message),
+        Err(problem) => redirect_flash(&back, false, problem.message()),
     }
 }
 
@@ -2377,29 +2367,16 @@ pub async fn move_app(
     if !users::valid_prefix(&target) {
         return (StatusCode::BAD_REQUEST, "invalid folder").into_response();
     }
-    let from = app_path(&config, &form.app).await;
     let admin = match checked_app(&config, &headers, &form.token, &form.app, Scope::Admin).await {
         Ok(user) => user,
         Err(response) => return response,
     };
     let back = back_or(form.back.as_deref(), &format!("/admin/apps/{}", form.app));
-    if !store::folder_exists(&config, &target).await {
-        return redirect_flash(&back, false, format!("There is no folder '{target}'."));
+    let from = app_path(&config, &form.app).await;
+    match projects::move_app(&config, Some(&admin), &form.app, &target).await {
+        Ok(to) if to == from => redirect_flash(&back, true, "The app is already there."),
+        Ok(to) => redirect_flash(&back, true, format!("{} is now at {to}.", form.app)),
+        Err(projects::Problem::Refused(message)) => (StatusCode::FORBIDDEN, message).into_response(),
+        Err(problem) => redirect_flash(&back, false, problem.message()),
     }
-    if let Err(response) = require_scope(&config, &headers, &target, Scope::Admin).await {
-        return response;
-    }
-    let to = if target.is_empty() { form.app.clone() } else { format!("{target}/{}", form.app) };
-    if from == to {
-        return redirect_flash(&back, true, "The app is already there.");
-    }
-    let mut meta = read_meta(&config, &form.app).await;
-    meta.project = (!target.is_empty()).then(|| target.clone());
-    if write_meta(&config, &form.app, &meta).await.is_err() {
-        return redirect_flash(&back, false, "The app was not moved.");
-    }
-    let (config2, old, new) = (config.clone(), from.clone(), to.clone());
-    let _ = tokio::task::spawn_blocking(move || users::move_scopes(&config2, &old, &new)).await;
-    tracing::info!(admin = %admin.email, app = %form.app, from = %from, to = %to, "app moved");
-    redirect_flash(&back, true, format!("{} is now at {to}.", form.app))
 }

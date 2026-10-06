@@ -218,16 +218,19 @@ a.row-link:hover { text-decoration: underline; }
 .badge.solid { background: var(--primary); color: var(--primary-fg); border-color: transparent; }
 
 /* Tabs across the top of a detail page. Links, so each tab is a URL. */
+/* The underline is drawn inside the tab, so the row is exactly its own
+   height and never grows a scrollbar; a narrow screen can still swipe it. */
 .tabs {
   display: flex; gap: .25rem; border-bottom: 1px solid var(--border);
-  margin: 1rem 0 1.5rem; overflow-x: auto;
+  margin: 1rem 0 1.5rem; overflow-x: auto; scrollbar-width: none;
 }
+.tabs::-webkit-scrollbar { display: none; }
 .tabs a {
   padding: .5rem .8rem; color: var(--muted); font-size: .9rem; font-weight: 500;
-  border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
+  white-space: nowrap;
 }
 .tabs a:hover { color: var(--fg); text-decoration: none; }
-.tabs a.active { color: var(--fg); border-bottom-color: var(--primary); }
+.tabs a.active { color: var(--fg); box-shadow: inset 0 -2px 0 var(--primary); }
 
 /* The strip above a page: where you are, and what you can do here. */
 .crumbs { display: flex; gap: .4rem; align-items: center; color: var(--muted); font-size: .85rem; margin: 0 0 .5rem; }

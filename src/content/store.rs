@@ -38,7 +38,7 @@ pub(crate) async fn icon_path(config: &Config, slug: &str) -> Option<PathBuf> {
 
 /// Per-page state kept in a `<slug>.meta` sidecar. Absent means "a normal,
 /// visible page", so nothing has to be written on the common path.
-#[derive(Debug, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct PageMeta {
     /// Shown on the site index.
     #[serde(default = "yes")]
@@ -51,7 +51,8 @@ pub struct PageMeta {
     /// index.html instead of 404ing.
     #[serde(default)]
     pub spa: bool,
-    /// Who may reach this app: "public", "authenticated", or "granted".
+    /// Who may reach this app: "public", "authenticated", or "restricted"
+    /// (once called "granted", still accepted).
     /// Absent means the site's default (`TOOLSITE_DEFAULT_ACCESS`), so an
     /// internal deployment can be gated everywhere without touching apps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,8 +144,36 @@ impl PageMeta {
     }
 }
 
-/// The gates an app, a rule or the site default may name.
-pub const GATES: [&str; 3] = ["public", "authenticated", "granted"];
+/// The access levels an app, a rule or the site default may name, as
+/// toolsite stores and reports them.
+pub const GATES: [&str; 3] = ["public", "authenticated", "restricted"];
+
+/// The stored word for an access level, taking the old and the plain names
+/// too: `granted` is what `restricted` was called before, and `signed-in`
+/// is how a person says `authenticated`. Nothing for a word that is none.
+pub fn normalise_gate(word: &str) -> Option<&'static str> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "public" => Some("public"),
+        "authenticated" | "signed-in" | "signed_in" => Some("authenticated"),
+        "restricted" | "granted" => Some("restricted"),
+        _ => None,
+    }
+}
+
+/// Old metas say `granted`; a meta read from disk speaks the current words,
+/// so the next write stores them. An unknown word is left alone, and the
+/// gate treats it as closed.
+fn current_words(mut meta: PageMeta) -> PageMeta {
+    if let Some(gate) = meta.gate.as_deref().and_then(normalise_gate) {
+        meta.gate = Some(gate.to_string());
+    }
+    for rule in &mut meta.rules {
+        if let Some(gate) = normalise_gate(&rule.gate) {
+            rule.gate = gate.to_string();
+        }
+    }
+    meta
+}
 
 pub(crate) fn yes() -> bool {
     true
@@ -200,7 +229,7 @@ pub fn read_meta_blocking(config: &Config, slug: &str) -> PageMeta {
         config.data_dir.join(format!("{slug}/index.meta")),
     ] {
         if let Ok(text) = std::fs::read_to_string(&candidate) {
-            return serde_json::from_str(&text).unwrap_or_default();
+            return current_words(serde_json::from_str(&text).unwrap_or_default());
         }
     }
     PageMeta::default()
@@ -209,12 +238,13 @@ pub fn read_meta_blocking(config: &Config, slug: &str) -> PageMeta {
 pub async fn read_meta(config: &Config, slug: &str) -> PageMeta {
     let path = meta_path(config, slug).await;
     match fs::read_to_string(&path).await {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Ok(text) => current_words(serde_json::from_str(&text).unwrap_or_default()),
         Err(_) => PageMeta::default(),
     }
 }
 
 pub async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io::Result<()> {
+    let meta = &current_words(meta.clone());
     let path = meta_path(config, slug).await;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
