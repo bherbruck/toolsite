@@ -713,7 +713,14 @@ pub async fn change_cell(
         // Their own row here, and access given on the app, both go.
         let revoked = projects::revoke(&config, Some(&actor), &path, &email).await;
         let mut gone = revoked.is_ok();
-        if let Some(app) = form.app.as_deref() {
+        // The form names an app only to say which app's grid this is. Its
+        // grant is touched only when that app really sits at this path,
+        // which is the path the manager was checked at.
+        let app_here = match form.app.as_deref() {
+            Some(app) if crate::platform::export::valid_app(app) && admin::app_path(&config, app).await == path => Some(app),
+            _ => None,
+        };
+        if let Some(app) = app_here {
             let (config2, who, app) = (config.clone(), email.clone(), app.to_string());
             let had = {
                 let config3 = config2.clone();

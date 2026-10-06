@@ -150,6 +150,13 @@ pub(crate) async fn move_app(config: &Arc<Config>, actor: Option<&User>, app: &s
     if from == to {
         return Ok(to);
     }
+    // The app's own permission rows move with it; landing on a project's
+    // path would turn them into rows on that whole project.
+    if store::project_at_path(config, &to).await {
+        return Err(Problem::Invalid(format!(
+            "{to} is a project. An app cannot sit at a project's path; rename the app or choose another project."
+        )));
+    }
     let mut meta = read_meta(config, app).await;
     meta.project = (!target.is_empty()).then(|| target.clone());
     write_meta(config, app, &meta)
