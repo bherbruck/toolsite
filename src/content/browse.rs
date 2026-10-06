@@ -67,6 +67,8 @@ struct Entry {
     modified: Option<SystemTime>,
     /// What the viewer may do to it beyond opening it.
     scope: Option<Scope>,
+    /// Its general access, wherever that comes from.
+    gate: String,
 }
 
 impl Entry {
@@ -155,7 +157,8 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
         if meta.hidden || !meta.listed {
             continue;
         }
-        if !admits(config, meta.gate_for("/", &config.default_gate), slug, viewer).await {
+        let gate = crate::content::store::effective_gate(config, slug, "/").await.gate;
+        if !admits(config, &gate, slug, viewer).await {
             continue;
         }
         let app = slug.split('/').next().unwrap_or(slug).to_string();
@@ -181,6 +184,7 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
             icon: page_icon(config, slug).await,
             modified,
             scope,
+            gate,
         });
     }
     // Newest first, the way the index always listed them.
@@ -581,6 +585,10 @@ fn app_row(entry: &Entry, show_path: bool, ctx: &Ctx) -> Markup {
                 @if show_path && !entry.project.is_empty() { code { (entry.project) } " · " }
                 @if entry.title.is_some() { (entry.slug) }
                 @if let Some(modified) = entry.modified { span."when" { (relative_time(modified)) } }
+            }
+            // Who may open it, for the people who could change that.
+            @if entry.scope.is_some_and(|scope| scope >= Scope::Editor) {
+                span."badge" title="General access" { (crate::platform::admin::gate_label(&entry.gate)) }
             }
             (app_menu(entry, "row", ctx))
         }

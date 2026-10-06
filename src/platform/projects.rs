@@ -370,3 +370,32 @@ pub(crate) async fn remove(config: &Arc<Config>, actor: Option<&User>, path: &st
     tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), path = %path, "project removed");
     Ok(())
 }
+
+/// Sets or clears a project's general access (`None` follows the project
+/// above). Admin there. Under a locked project above, a setting here would
+/// be ignored, so it is refused.
+pub(crate) async fn set_access(config: &Arc<Config>, actor: Option<&User>, path: &str, gate: Option<&str>) -> Result<String, Problem> {
+    let path = clean(path)?;
+    if path.is_empty() {
+        return Err(Problem::Invalid("The top level's access is the site default, TOOLSITE_DEFAULT_ACCESS.".into()));
+    }
+    if !store::folder_exists(config, &path).await {
+        return Err(Problem::Invalid(format!("There is no project '{path}'.")));
+    }
+    need(config, actor, &path, Scope::Admin).await?;
+    let folders = store::list_folders(config).await;
+    if let Some(lock) = store::folder_chain(&path).iter().find(|above| folders.iter().any(|f| &f.path == *above && f.locked)) {
+        return Err(Problem::Invalid(format!("{lock} is locked: its general access applies to everything inside it.")));
+    }
+    let gate = match gate.map(str::trim).filter(|g| !g.is_empty() && *g != "inherit" && *g != "default") {
+        Some(word) => Some(store::normalise_gate(word).ok_or_else(|| Problem::Invalid(format!("'{word}' is not public, authenticated or restricted")))?),
+        None => None,
+    };
+    store::set_folder_gate(config, &path, gate).await.map_err(Problem::Invalid)?;
+    tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), path = %path, gate = ?gate, "project access set");
+    let (now, source) = store::project_gate(config, &path).await;
+    Ok(match gate {
+        Some(_) => format!("Apps in {path} without their own setting are {}.", admin::gate_label(&now)),
+        None => format!("{path} follows {}: {}.", admin::gate_source_label(&source), admin::gate_label(&now)),
+    })
+}

@@ -496,6 +496,10 @@ pub struct Folder {
     /// project takes that path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renamed_from: Vec<String>,
+    /// General access for everything inside that does not set its own:
+    /// public, authenticated or restricted. Unset follows the project above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
 }
 
 /// Aliases kept per project. Enough for a few renames in a row.
@@ -549,6 +553,120 @@ pub async fn set_locked(config: &Config, path: &str, locked: bool) -> Result<(),
     write_folders(config, &folders).await.map_err(|e| e.to_string())
 }
 
+/// Sets or clears a project's general access. The top level has no row; its
+/// access is the site default.
+pub async fn set_folder_gate(config: &Config, path: &str, gate: Option<&str>) -> Result<(), String> {
+    let gate = match gate {
+        Some(word) => Some(normalise_gate(word).ok_or_else(|| format!("'{word}' is not public, authenticated or restricted"))?.to_string()),
+        None => None,
+    };
+    let mut folders = list_folders(config).await;
+    let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
+        return Err(format!("there is no project '{path}'"));
+    };
+    folder.gate = gate;
+    write_folders(config, &folders).await.map_err(|e| e.to_string())
+}
+
+/// Where an app's general access comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GateSource {
+    /// A route rule in the app, by prefix.
+    Rule(String),
+    /// The app's own setting.
+    App,
+    /// A project at or above the app, by path.
+    Project(String),
+    /// The site default, `TOOLSITE_DEFAULT_ACCESS`.
+    Site,
+}
+
+/// The general access that applies to one path of an app, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveGate {
+    pub gate: String,
+    pub source: GateSource,
+    /// The outermost locked project the app sits in, when there is one: then
+    /// the app's own setting, its route rules and any project inside the
+    /// lock are ignored.
+    pub locked_by: Option<String>,
+}
+
+/// The one rule for general access, used by every place that asks who may
+/// open an app:
+///
+/// 1. A route rule for the path, then the app's own setting.
+/// 2. Else the nearest project at or above the app with a setting.
+/// 3. Else the site default.
+///
+/// Under a locked project, step 1 and every project inside the lock are
+/// skipped: the locked project's setting, or what it inherits, applies.
+pub async fn effective_gate(config: &Config, app: &str, within: &str) -> EffectiveGate {
+    let app = app.split('/').next().unwrap_or(app);
+    let meta = read_meta(config, app).await;
+    let folders = list_folders(config).await;
+    resolve_gate(&meta, &folders, &config.default_gate, within)
+}
+
+/// The resolution itself, for a caller that already holds the meta and the
+/// tree, such as a page showing what an app would get with no setting.
+pub fn resolve_gate_public(meta: &PageMeta, folders: &[Folder], default: &str, within: &str) -> EffectiveGate {
+    resolve_gate(meta, folders, default, within)
+}
+
+fn resolve_gate(meta: &PageMeta, folders: &[Folder], default: &str, within: &str) -> EffectiveGate {
+    let project = meta.project.clone().unwrap_or_default();
+    // Outermost first: `ops`, `ops/yard`.
+    let mut chain = folder_chain(&format!("{project}/x"));
+    if project.is_empty() {
+        chain.clear();
+    }
+    let node = |path: &str| folders.iter().find(|folder| folder.path == path);
+    let locked_by = chain.iter().find(|path| node(path).is_some_and(|folder| folder.locked)).cloned();
+    let site = || EffectiveGate { gate: normalise_gate(default).unwrap_or("public").to_string(), source: GateSource::Site, locked_by: locked_by.clone() };
+
+    // Under a lock, nothing set inside it counts.
+    let projects: Vec<&String> = match &locked_by {
+        Some(lock) => chain.iter().filter(|path| path.len() <= lock.len()).collect(),
+        None => {
+            if let Some(rule) = meta
+                .rules
+                .iter()
+                .filter(|rule| within.starts_with(&rule.prefix))
+                .max_by_key(|rule| rule.prefix.len())
+            {
+                return EffectiveGate { gate: rule.gate.clone(), source: GateSource::Rule(rule.prefix.clone()), locked_by: None };
+            }
+            if let Some(gate) = &meta.gate {
+                return EffectiveGate { gate: gate.clone(), source: GateSource::App, locked_by: None };
+            }
+            chain.iter().collect()
+        }
+    };
+    for path in projects.iter().rev() {
+        if let Some(gate) = node(path).and_then(|folder| folder.gate.as_deref()).and_then(normalise_gate) {
+            return EffectiveGate { gate: gate.to_string(), source: GateSource::Project((*path).clone()), locked_by };
+        }
+    }
+    site()
+}
+
+/// What a project's own apps get when they set nothing: the nearest project
+/// at or above it with a setting, else the site default. For showing.
+pub async fn project_gate(config: &Config, path: &str) -> (String, GateSource) {
+    let folders = list_folders(config).await;
+    let mut chain = folder_chain(&format!("{path}/x"));
+    if path.is_empty() {
+        chain.clear();
+    }
+    for at in chain.iter().rev() {
+        if let Some(gate) = folders.iter().find(|f| &f.path == at).and_then(|f| f.gate.as_deref()).and_then(normalise_gate) {
+            return (gate.to_string(), GateSource::Project(at.clone()));
+        }
+    }
+    (normalise_gate(&config.default_gate).unwrap_or("public").to_string(), GateSource::Site)
+}
+
 /// Whether `path` is a folder. The root always is and has no row.
 pub async fn folder_exists(config: &Config, path: &str) -> bool {
     path.is_empty() || list_folders(config).await.iter().any(|folder| folder.path == path)
@@ -579,6 +697,7 @@ pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<
             .as_secs(),
         locked: false,
         renamed_from: Vec::new(),
+        gate: None,
     };
     drop_alias(&mut folders, &folder.path);
     folders.push(folder.clone());

@@ -161,7 +161,7 @@ pub async fn fetch_page(config: &Config, slug: &str) -> Option<FetchOutput> {
         metadata: serde_json::json!({
             "slug": slug,
             "app": app,
-            "access": meta.gate(&config.default_gate),
+            "access": crate::content::store::effective_gate(config, &app, "/").await.gate,
             "updated": modified,
             "has_handler": config.data_dir.join(&app).join("handler.wasm").is_file(),
             "views": views,

@@ -266,7 +266,16 @@ pub(crate) async fn panel(
     html! {
         div id="perm-grid" {
             @if let Target::Project(project) = target && !project.is_empty() {
+                (project_access(config, project, facts.locked_by.as_deref(), token, &back).await)
                 (lock_setting(project, facts.locked_here, token, &back))
+            }
+            @if let Target::Project(project) = target && project.is_empty() {
+                section."panel" {
+                    div."panel-head" {
+                        h3 { "General access" }
+                        p { "Apps and projects without their own setting: " (crate::platform::admin::gate_label(&config.default_gate)) ". Set it for the whole site with " code { "TOOLSITE_DEFAULT_ACCESS" } "." }
+                    }
+                }
             }
             section."panel" id="perm-people" {
                 div."panel-head" {
@@ -275,9 +284,7 @@ pub(crate) async fn panel(
                         "Add a person above the table, then set their level. Each level includes the ones before it. "
                         "Grey rows come from a project above. Site admins hold Manage everywhere."
                     }
-                    @if let Target::Project(_) = target {
-                        p { "Apps here without their own setting have the site default general access: " (crate::platform::admin::gate_label(&config.default_gate)) "." }
-                    }
+
                 }
                 div."panel-body" {
                     @if let Some(lock) = &facts.locked_by {
@@ -529,6 +536,52 @@ fn cell(
 }
 
 /// Locked or Customizable, on a project's own tab.
+/// A project's general access: its own setting, or "Use the project above",
+/// which shows what that gives. Under a lock above it the control is off,
+/// since a setting here would be ignored.
+async fn project_access(config: &Arc<Config>, project: &str, locked_by: Option<&str>, token: &str, back: &str) -> Markup {
+    let own = store::list_folders(config).await.into_iter().find(|f| f.path == project).and_then(|f| f.gate);
+    let parent = project.rsplit_once('/').map(|(above, _)| above.to_string()).unwrap_or_default();
+    let (above, source) = store::project_gate(config, &parent).await;
+    let label = crate::platform::admin::gate_label;
+    html! {
+        section."panel" {
+            div."panel-head" {
+                h3 { "General access" }
+                p { "Who may open the apps in this project that set nothing of their own. People with access always may." }
+            }
+            div."panel-body" {
+                form method="post" action="/admin/project" {
+                    input type="hidden" name="token" value=(token);
+                    input type="hidden" name="action" value="access";
+                    input type="hidden" name="path" value=(project);
+                    input type="hidden" name="back" value=(back);
+                    span."seg" role="radiogroup" aria-label="General access" {
+                        @for (value, name) in [("public", "Public"), ("authenticated", "Signed in"), ("restricted", "Restricted")] {
+                            button type="submit" name="gate" value=(value) disabled[locked_by.is_some()]
+                                   aria-pressed=(if own.as_deref() == Some(value) && locked_by.is_none() { "true" } else { "false" }) { (name) }
+                        }
+                        button type="submit" name="gate" value="inherit" disabled[locked_by.is_some()]
+                               aria-pressed=(if own.is_none() || locked_by.is_some() { "true" } else { "false" }) { "Use the project above" }
+                    }
+                }
+                p."muted small" {
+                    @if let Some(lock) = locked_by {
+                        "Locked by " a href=(crate::content::browse::browser_url(lock)) { (lock) } ": its general access applies here."
+                    } @else if own.is_none() {
+                        @match &source {
+                            store::GateSource::Project(path) => { "Follows " (path) ": " (label(&above)) "." }
+                            _ => { "Follows the site default: " (label(&above)) "." }
+                        }
+                    } @else {
+                        "Apps here without their own setting are " (label(own.as_deref().unwrap_or("restricted"))) "."
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn lock_setting(project: &str, locked: bool, token: &str, back: &str) -> Markup {
     html! {
         section."panel" {

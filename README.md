@@ -890,12 +890,22 @@ An app's gate is one of:
 An admin passes every gate: they can grant themselves anything from the
 admin page, so asking them to do it app by app would only add a step.
 
-An app that has not chosen follows the site default, `TOOLSITE_DEFAULT_ACCESS`,
-which is `public` unless you set it. An internal deployment sets it to
-`restricted` or `authenticated` once, and every app is closed from the moment it
-is published; an app that should be open says `public` itself. The admin
-page marks apps that follow the default, and `toolsite gate <app> default`
-puts one back on it.
+General access is decided in three steps, the first one that says
+something wins:
+
+1. The app's own setting (and its route rules, for their paths).
+2. The nearest project at or above the app with a setting, set on the
+   project's Permissions tab or with `projects(action: "access")`.
+3. The site default, `TOOLSITE_DEFAULT_ACCESS`, which is `public` unless you
+   set it.
+
+An internal deployment sets the site default to `restricted` once, and every
+app is closed from the moment it is published; a project or an app that
+should be open says `public` itself. Under a locked project, steps 1 and 2
+skip everything inside the lock: the locked project's setting, or what it
+inherits, applies, and route rules inside are ignored. The admin pages say
+where an app's access comes from ("follows ops: Signed in"), and
+`toolsite gate <app> default` puts an app back on what it inherits.
 
 A gate can cover one part of an app instead of all of it, which is how a
 public page and a private one live in the same bundle:

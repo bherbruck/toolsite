@@ -111,7 +111,7 @@ pub(crate) async fn serve_icon(
     // with the site cookie, so that is who is asking here too.
     let app = slug.split('/').next().unwrap_or(slug);
     let meta = read_meta(&config, app).await;
-    let gate = meta.gate_for("/", &config.default_gate).to_string();
+    let gate = crate::content::store::effective_gate(&config, app, "/").await.gate;
     if meta.hidden {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
@@ -303,7 +303,7 @@ async fn gate_check(
         .strip_prefix(&format!("/p/{app}"))
         .unwrap_or(path)
         .to_string();
-    let gate = read_meta(config, app).await.gate_for(&within, &config.default_gate).to_string();
+    let gate = crate::content::store::effective_gate(config, app, &within).await.gate;
     if admits(config, &gate, app, visitor).await {
         return None;
     }
@@ -376,7 +376,7 @@ pub(crate) async fn may_open(config: &Arc<Config>, app: &str, user: &crate::acco
     if meta.hidden {
         return false;
     }
-    admits(config, meta.gate_for("/", &config.default_gate), app, Some(user)).await
+    admits(config, &crate::content::store::effective_gate(config, app, "/").await.gate, app, Some(user)).await
 }
 
 pub(crate) async fn admits(

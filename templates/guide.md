@@ -224,8 +224,10 @@ A gate decides whether a request arrives:
 
 `restricted` was called `granted` before; the old word still works everywhere a level is typed, and toolsite stores and reports `restricted`. The pages show the three levels as Public, Signed in and Restricted.
 
-An admin account passes every gate. An app that names no gate follows the site's default, which the owner set
-for the whole deployment; on an internal site that is usually `restricted`.
+An admin account passes every gate. General access is the first of: the
+app's own gate (and route rules for their paths), the nearest project above
+it with one, the site default the owner set (on an internal site usually
+`restricted`). A locked project's setting overrides everything inside it.
 Say `gate = "public"` only when the app really should be open to anyone.
 
 `[[route]]` applies a gate to a path prefix, longest match winning, so a

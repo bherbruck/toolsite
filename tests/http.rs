@@ -6427,3 +6427,128 @@ async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it() {
     let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "remove", "path": "ops/yard" })).await;
     assert!(is_error && text.contains("not empty"), "{text}");
 }
+
+// --- general access on projects ------------------------------------------------
+
+/// An app in a project that sets no access of its own.
+async fn unset_app_in(config: &Config, app: &str, in_folder: &str) {
+    write_page(config, &format!("{app}/index"), &format!("<title>{app}</title>"));
+    let meta = toolsite::content::store::PageMeta { project: Some(in_folder.to_string()), ..Default::default() };
+    toolsite::content::store::write_meta(config, app, &meta).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_app_without_access_of_its_own_inherits_from_its_projects_then_the_site() {
+    use toolsite::content::store::{effective_gate, set_folder_gate, GateSource};
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    unset_app_in(&config, "forklifts", "ops/yard").await;
+
+    let g = effective_gate(&config, "forklifts", "/").await;
+    assert_eq!((g.gate.as_str(), g.source), ("public", GateSource::Site));
+    set_folder_gate(&config, "ops", Some("restricted")).await.unwrap();
+    let g = effective_gate(&config, "forklifts", "/").await;
+    assert_eq!((g.gate.as_str(), g.source), ("restricted", GateSource::Project("ops".into())), "the grandparent's setting did not reach the app");
+    set_folder_gate(&config, "ops/yard", Some("signed-in")).await.unwrap();
+    let g = effective_gate(&config, "forklifts", "/").await;
+    assert_eq!((g.gate.as_str(), g.source), ("authenticated", GateSource::Project("ops/yard".into())));
+    // The app's own setting wins while nothing is locked.
+    let mut meta = toolsite::content::store::read_meta(&config, "forklifts").await;
+    meta.gate = Some("public".into());
+    toolsite::content::store::write_meta(&config, "forklifts", &meta).await.unwrap();
+    let g = effective_gate(&config, "forklifts", "/").await;
+    assert_eq!((g.gate.as_str(), g.source), ("public", GateSource::App));
+}
+
+#[tokio::test]
+async fn under_a_locked_project_the_apps_own_access_and_route_rules_are_ignored() {
+    use toolsite::content::store::{effective_gate, set_folder_gate, set_locked, GateSource, PathRule};
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    unset_app_in(&config, "forklifts", "ops/yard").await;
+    let mut meta = toolsite::content::store::read_meta(&config, "forklifts").await;
+    meta.gate = Some("public".into());
+    meta.rules = vec![PathRule { prefix: "/open".into(), gate: "public".into() }];
+    toolsite::content::store::write_meta(&config, "forklifts", &meta).await.unwrap();
+    set_folder_gate(&config, "ops/yard", Some("public")).await.unwrap();
+    set_folder_gate(&config, "ops", Some("restricted")).await.unwrap();
+    set_locked(&config, "ops", true).await.unwrap();
+
+    for within in ["/", "/open"] {
+        let g = effective_gate(&config, "forklifts", within).await;
+        assert_eq!(g.gate, "restricted", "{within} escaped the lock");
+        assert_eq!(g.source, GateSource::Project("ops".into()));
+        assert_eq!(g.locked_by.as_deref(), Some("ops"));
+    }
+    let (status, ..) = send(&config, get("/p/forklifts/open")).await;
+    assert_ne!(status, StatusCode::OK, "a route rule inside a lock opened a page");
+}
+
+#[tokio::test]
+async fn a_stranger_is_kept_out_of_an_app_restricted_by_its_project_until_the_project_opens() {
+    let (dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    unset_app_in(&config, "forklifts", "ops").await;
+    publish_handler(&config, "forklifts");
+    let png: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1,
+        8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0, 1, 0, 0,
+        5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    std::fs::write(dir.path().join("forklifts.icon"), png).unwrap();
+    toolsite::content::store::set_folder_gate(&config, "ops", Some("restricted")).await.unwrap();
+
+    for path in ["/p/forklifts/", "/icon/forklifts", "/p/forklifts/favicon.svg", "/p/forklifts/api/echo"] {
+        let (status, ..) = send(&config, get(path)).await;
+        assert_ne!(status, StatusCode::OK, "a stranger reached {path}");
+    }
+    let (_, index, _) = send(&config, get("/")).await;
+    assert!(!index.contains("forklifts"), "the index listed an app closed by its project");
+
+    toolsite::content::store::set_folder_gate(&config, "ops", Some("public")).await.unwrap();
+    for path in ["/p/forklifts/", "/icon/forklifts", "/p/forklifts/favicon.svg", "/p/forklifts/api/echo"] {
+        let (status, ..) = send(&config, get(path)).await;
+        assert_eq!(status, StatusCode::OK, "{path} stayed closed after the project opened");
+    }
+}
+
+#[tokio::test]
+async fn a_project_keeps_its_access_when_renamed_and_the_tab_and_tool_set_it() {
+    use toolsite::content::store::{effective_gate, GateSource};
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    unset_app_in(&config, "forklifts", "ops").await;
+    account(&config, "fa@example.com", "correct horse");
+    scope(&config, "fa@example.com", "", "admin");
+
+    // From the Permissions tab.
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions", &fa)).await;
+    assert!(page.contains("Use the project above"), "no general access control on the project");
+    let token = form_token_from(&page);
+    let (status, ..) = send(
+        &config,
+        post_form("/admin/project", &fa, format!("token={token}&action=access&path=ops&gate=authenticated&back=/browse/ops?tab=permissions")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(effective_gate(&config, "forklifts", "/").await.source, GateSource::Project("ops".into()));
+
+    // Renaming keeps it.
+    let token = mcp_token_for(&config, "fa@example.com", "correct horse").await;
+    let mut mcp = Mcp::open(&config, &token).await;
+    let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "rename", "path": "ops", "name": "site" })).await;
+    assert!(!is_error, "{text}");
+    let g = effective_gate(&config, "forklifts", "/").await;
+    assert_eq!((g.gate.as_str(), g.source), ("authenticated", GateSource::Project("site".into())));
+
+    // The tool sets and clears it.
+    let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "access", "path": "site", "gate": "restricted" })).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(effective_gate(&config, "forklifts", "/").await.gate, "restricted");
+    let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "access", "path": "site" })).await;
+    assert!(!is_error && text.contains("follows"), "{text}");
+    assert_eq!(effective_gate(&config, "forklifts", "/").await.source, GateSource::Site);
+}

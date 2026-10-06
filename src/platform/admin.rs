@@ -547,6 +547,8 @@ struct AppRow {
     title: Option<String>,
     gate: String,
     follows_default: bool,
+    /// Where the access comes from when it is not the app's own.
+    follows: String,
     hidden: bool,
     has_handler: bool,
     modified: Option<std::time::SystemTime>,
@@ -563,11 +565,13 @@ async fn app_row(config: &Config, app: &str) -> AppRow {
         Some(path) => tokio::fs::metadata(path).await.ok().and_then(|m| m.modified().ok()),
         None => None,
     };
+    let effective = crate::content::store::effective_gate(config, app, "/").await;
     AppRow {
         app: app.to_string(),
         title,
-        gate: meta.gate(&config.default_gate).to_string(),
-        follows_default: meta.gate.is_none(),
+        gate: effective.gate.clone(),
+        follows_default: effective.source != crate::content::store::GateSource::App,
+        follows: gate_source_label(&effective.source),
         hidden: meta.hidden,
         has_handler: config.data_dir.join(app).join("handler.wasm").is_file(),
         modified,
@@ -694,7 +698,7 @@ pub async fn apps_page(
                                         }
                                         td {
                                             (gate_badge(&row.gate))
-                                            @if row.follows_default { " " span."muted small" { "site default" } }
+                                            @if row.follows_default { " " span."muted small" { "from " (row.follows) } }
                                             @if row.hidden { " " span."badge warn" { "hidden" } }
                                         }
                                         td { @if row.has_handler { span."badge" { "wasm" } } @else { span."muted small" { "static" } } }
@@ -724,6 +728,18 @@ pub async fn apps_page(
 }
 
 /// How a person reads an access level: the plain name, never the stored word.
+/// Where general access comes from, in a few words: "the site default",
+/// "ops", "a rule for /admin", "its own setting".
+pub(crate) fn gate_source_label(source: &crate::content::store::GateSource) -> String {
+    use crate::content::store::GateSource;
+    match source {
+        GateSource::Site => "the site default".to_string(),
+        GateSource::Project(path) => path.clone(),
+        GateSource::Rule(prefix) => format!("a rule for {prefix}"),
+        GateSource::App => "its own setting".to_string(),
+    }
+}
+
 pub(crate) fn gate_label(gate: &str) -> &'static str {
     match crate::content::store::normalise_gate(gate) {
         Some("public") => "Public",
@@ -887,7 +903,7 @@ async fn app_tab_with(
             crumbs: vec![("App settings", "/admin/apps")],
             subtitle: Some(html! { a href=(url) target="_blank" { (url) } }),
             actions: Some(html! {
-                (gate_badge(meta.gate(&config.default_gate)))
+                (gate_badge(&crate::content::store::effective_gate(&config, &app, "/").await.gate))
                 @if meta.hidden { span."badge warn" { "hidden" } }
                 @if !meta.listed { span."badge" { "unlisted" } }
             }),
@@ -1060,21 +1076,37 @@ async fn render_access_tab(
     let path = app_path(config, app).await;
     let target = crate::platform::permissions::Target::App { app: app.to_string(), path, roles: meta.roles.clone() };
     let current = meta.gate.as_deref();
+    let effective = crate::content::store::effective_gate(config, app, "/").await;
+    let locked = effective.locked_by.clone();
+    let inherited = {
+        let folders = crate::content::store::list_folders(config).await;
+        let without_own = crate::content::store::PageMeta { gate: None, rules: Vec::new(), project: meta.project.clone(), ..Default::default() };
+        crate::content::store::resolve_gate_public(&without_own, &folders, &config.default_gate, "/")
+    };
     html! {
         (ui::panel("General access", Some("Who may open the app at all. People with access below always may, unless it is Public, when anyone may."), html! {
             form method="post" action="/admin/gate" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                 span."seg" role="radiogroup" aria-label="General access" {
                     @for (value, label, _) in GATES {
-                        button type="submit" name="gate" value=(value) aria-pressed=(if current == Some(value) { "true" } else { "false" }) { (label) }
+                        button type="submit" name="gate" value=(value) disabled[locked.is_some()] aria-pressed=(if current == Some(value) && locked.is_none() { "true" } else { "false" }) { (label) }
                     }
-                    button type="submit" name="gate" value="default" aria-pressed=(if current.is_none() { "true" } else { "false" }) { "Site default" }
+                    button type="submit" name="gate" value="default" disabled[locked.is_some()] aria-pressed=(if current.is_none() || locked.is_some() { "true" } else { "false" }) { "Use the project above" }
                 }
             }
             p."muted small" {
-                @match current {
-                    Some(level) => { (gate_label(level)) ": " (GATES.iter().find(|(v, ..)| *v == level).map(|(_, _, help)| *help).unwrap_or("")) }
-                    None => { "Follows the site default (" (gate_label(&config.default_gate)) "). Set it for the whole site with " code { "TOOLSITE_DEFAULT_ACCESS" } "." }
+                @if let Some(lock) = &locked {
+                    "Locked by " a href=(crate::content::browse::browser_url(lock)) { (lock) } ": " (gate_label(&effective.gate)) ", set by " (gate_source_label(&effective.source)) ". The app's own setting and its route rules are ignored."
+                } @else {
+                    @match current {
+                        Some(level) => { (gate_label(level)) ": " (GATES.iter().find(|(v, ..)| *v == level).map(|(_, _, help)| *help).unwrap_or("")) }
+                        None => {
+                            "Follows " (gate_source_label(&inherited.source)) ": " (gate_label(&inherited.gate)) "."
+                            @if inherited.source == crate::content::store::GateSource::Site {
+                                " Set it for the whole site with " code { "TOOLSITE_DEFAULT_ACCESS" } "."
+                            }
+                        }
+                    }
                 }
             }
         }))
@@ -2000,16 +2032,20 @@ pub async fn change_gate(
             None => return (StatusCode::BAD_REQUEST, "unknown access level").into_response(),
         }
     };
+    if let Some(lock) = crate::content::store::effective_gate(&config, &form.app, "/").await.locked_by {
+        return redirect_flash(&back, false, format!("{lock} is locked: its general access applies to everything inside it."));
+    }
     let mut meta = read_meta(&config, &form.app).await;
     meta.gate = level;
+    if write_meta(&config, &form.app, &meta).await.is_err() {
+        return redirect_flash(&back, false, "Access was not saved.");
+    }
+    let now = crate::content::store::effective_gate(&config, &form.app, "/").await;
     let said = match meta.gate.as_deref() {
         Some(gate) => format!("Access for {} is {}.", form.app, gate_label(gate)),
-        None => format!("Access for {} is the site default, {}.", form.app, gate_label(&config.default_gate)),
+        None => format!("Access for {} follows {}: {}.", form.app, gate_source_label(&now.source), gate_label(&now.gate)),
     };
-    match write_meta(&config, &form.app, &meta).await {
-        Ok(()) => redirect_flash(&back, true, said),
-        Err(_) => redirect_flash(&back, false, "Access was not saved."),
-    }
+    redirect_flash(&back, true, said)
 }
 
 #[derive(Deserialize)]
@@ -2328,10 +2364,12 @@ pub struct ProjectChange {
     path: String,
     name: Option<String>,
     parent: Option<String>,
+    /// access only: public, authenticated, restricted, or inherit.
+    gate: Option<String>,
     back: Option<String>,
 }
 
-/// Renames, moves or removes a project. The door is admin at the project;
+/// Renames, moves or removes a project, or sets its general access. The door is admin at the project;
 /// the projects module then asks for what each change needs (the parent for
 /// a rename or removal, all three places for a move).
 pub async fn change_project(
@@ -2355,6 +2393,9 @@ pub async fn change_project(
         "move" => projects::move_project(&config, Some(&admin), &path, form.parent.as_deref().unwrap_or("").trim_matches('/'))
             .await
             .map(|to| (crate::content::browse::browser_url(&to), format!("The project is now at {to}."))),
+        "access" => projects::set_access(&config, Some(&admin), &path, form.gate.as_deref())
+            .await
+            .map(|message| (back.clone(), message)),
         "remove" => {
             let parent = path.rsplit_once('/').map(|(above, _)| above.to_string()).unwrap_or_default();
             projects::remove(&config, Some(&admin), &path)

@@ -148,7 +148,7 @@ pub(crate) struct SetIconRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectsRequest {
     #[schemars(
-        description = "'list' the projects you can see with what you hold at each; 'create' a project (path = parent, name); 'move' an app (app, path = target, empty for the top level); 'rename' a project (path, name); 'move_project' (path, parent, empty for the top level); 'remove' an empty project (path); 'permissions' of a project (path); 'grant' a scope (path, email, scope); 'revoke' what an account holds at a project (path, email)."
+        description = "'list' the projects you can see with what you hold at each; 'create' a project (path = parent, name); 'move' an app (app, path = target, empty for the top level); 'rename' a project (path, name); 'move_project' (path, parent, empty for the top level); 'remove' an empty project (path); 'access' sets a project's general access (path, gate; no gate to follow the project above); 'permissions' of a project (path); 'grant' a scope (path, email, scope); 'revoke' what an account holds at a project (path, email)."
     )]
     pub(crate) action: String,
     #[schemars(description = "A project path like 'ops/yard'. Empty or '/' means the top level. For create it is the parent; for move it is the target.")]
@@ -157,6 +157,8 @@ pub(crate) struct ProjectsRequest {
     pub(crate) name: Option<String>,
     #[schemars(description = "move_project only: the project to move it into. Empty or '/' means the top level.")]
     pub(crate) parent: Option<String>,
+    #[schemars(description = "access only: 'public', 'authenticated' (signed in) or 'restricted'. Leave it out to follow the project above.")]
+    pub(crate) gate: Option<String>,
     #[schemars(description = "move only: the app to move.")]
     pub(crate) app: Option<String>,
     #[schemars(description = "grant and revoke: the account's email.")]
@@ -561,7 +563,7 @@ impl PageHost {
             return true;
         };
         let app = slug.split('/').next().unwrap_or(slug).to_string();
-        let gate = meta.gate_for("/", &self.config.default_gate).to_string();
+        let gate = crate::content::store::effective_gate(&self.config, &app, "/").await.gate;
         matches!(gate.as_str(), "public" | "authenticated") || self.held_on(user, &app).await.is_some()
     }
 
@@ -837,13 +839,13 @@ impl PageHost {
     // fewer tools, and the actions share the project they act on and the
     // rule that decides who may act there.
     #[tool(
-        description = "Run projects: groups of apps, nested like folders, where access is given once and applies to everything inside. 'list' shows the projects you can see and what you hold at each. 'create' needs admin at the parent. 'move' puts an existing app in another project and needs admin where it is and where it goes; the project must exist. 'rename' changes a project's name and needs admin at its parent; 'move_project' moves a project under another and needs admin at the project, where it is and where it goes. Both carry the apps, the access and the lock along, and the old path keeps working as a link. 'remove' takes away an empty project (admin at its parent); a project with anything inside is refused. 'permissions' lists who holds viewer, editor or admin at a project, set there or above (needs admin there). 'grant' and 'revoke' change that (admin there; you cannot give more than you hold). The same rules as the app browser at /browse/<path>.",
+        description = "Run projects: groups of apps, nested like folders, where access is given once and applies to everything inside. 'list' shows the projects you can see and what you hold at each. 'create' needs admin at the parent. 'move' puts an existing app in another project and needs admin where it is and where it goes; the project must exist. 'rename' changes a project's name and needs admin at its parent; 'move_project' moves a project under another and needs admin at the project, where it is and where it goes. Both carry the apps, the access and the lock along, and the old path keeps working as a link. 'remove' takes away an empty project (admin at its parent); a project with anything inside is refused. 'access' sets the general access the apps inside get when they set none (admin there): an app's own setting wins, else the nearest project above with one, else the site default; under a locked project only the locked project's applies. 'permissions' lists who holds viewer, editor or admin at a project, set there or above (needs admin there). 'grant' and 'revoke' change that (admin there; you cannot give more than you hold). The same rules as the app browser at /browse/<path>.",
         annotations(title = "Projects", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     pub(crate) async fn projects(
         &self,
         ctx: RequestContext<RoleServer>,
-        Parameters(ProjectsRequest { action, path, name, parent, app, email, scope }): Parameters<ProjectsRequest>,
+        Parameters(ProjectsRequest { action, path, name, parent, gate, app, email, scope }): Parameters<ProjectsRequest>,
     ) -> Result<CallToolResult, McpError> {
         use crate::platform::projects as p;
         let caller = Self::caller(&ctx);
@@ -888,6 +890,7 @@ impl PageHost {
             "move_project" => p::move_project(config, actor, &path, parent.as_deref().unwrap_or("").trim_matches('/'))
                 .await
                 .map(|to| format!("The project is now at {to}: {}", url(&to))),
+            "access" => p::set_access(config, actor, &path, gate.as_deref()).await,
             "remove" => p::remove(config, actor, &path)
                 .await
                 .map(|()| format!("Project {} is removed.", path.trim_matches('/'))),
@@ -923,7 +926,7 @@ impl PageHost {
                     .map(|()| format!("{email} has no access of its own at {} now.", p::place(path.trim_matches('/')))),
                 Err(text) => return fail(text),
             },
-            other => return fail(format!("action is list, create, move, rename, move_project, remove, permissions, grant or revoke, not '{other}'")),
+            other => return fail(format!("action is list, create, move, rename, move_project, remove, access, permissions, grant or revoke, not '{other}'")),
         };
         match outcome {
             Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
@@ -1810,7 +1813,7 @@ impl PageHost {
             // apps, and the ones it holds a scope on.
             if let Some(user) = &caller.user {
                 let app = slug.split('/').next().unwrap_or(&slug).to_string();
-                let gate = meta.gate_for("/", &self.config.default_gate).to_string();
+                let gate = crate::content::store::effective_gate(&self.config, &app, "/").await.gate;
                 let open = matches!(gate.as_str(), "public" | "authenticated")
                     || self.held_on(user, &app).await.is_some();
                 if !open {
