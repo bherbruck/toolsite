@@ -421,7 +421,7 @@ that already ran it will never run it again. Without the CLI:
 
 ## Configure in the file, not in commands
 
-Put an app's gate, route rules, roles, jobs, icon and outbound hosts in
+Put an app's gate, route rules, roles, jobs, tools, icon and outbound hosts in
 `toolsite.toml` beside its source rather than issuing commands. It travels
 with the project, so the next session sees what was intended, and a redeploy
 reproduces it.
@@ -445,8 +445,39 @@ path = "/api/rollup"
 ```
 
 `toolsite deploy` applies it; otherwise `curl -f -T toolsite.toml
-'<upload-url>?manifest'`. Routes and jobs are replaced wholesale, so removing
+'<upload-url>?manifest'`. Routes, jobs and tools are replaced wholesale, so removing
 a line removes the thing. Anything the file does not mention is left alone.
+
+## App tools
+
+To let people use an app from Claude or ChatGPT, declare tools in
+`toolsite.toml`. Each is a handler route; the platform signs the person in,
+checks they may open the app, and calls the route as them, so
+`current-user` and the row-level policies decide what the call may do.
+Write no auth code for it.
+
+```toml
+[[tool]]
+name = "log_production"             # [a-z0-9_], no double underscore
+description = "Record a day's egg count for a house."
+path = "/api/tools/log_production"  # must start /api/
+read_only = false                   # also destructive, idempotent, open_world
+input = { type = "object", properties = { eggs = { type = "integer" } }, required = ["eggs"] }
+```
+
+The route gets `POST`, JSON body `{"tool": ..., "arguments": {...}}` and
+the host-set header `x-toolsite-tool`. Answer JSON with 2xx; a 4xx or 5xx
+reaches the model as a tool error with the body, so make it readable.
+
+Then:
+
+1. The manifest upload replies "Tools are live at <site>/p/<app>/mcp".
+   Give the person that URL.
+2. Add a "Connect an AI assistant" entry to the app's menu or settings
+   that shows `window.location.origin + <base path> + "mcp"` with a copy
+   button. The guide has a React snippet.
+3. Prove it: `app_tools(app)` lists the tools, and `call_app_tool` with
+   `as_user` for two accounts shows each gets only what they should.
 
 ## Keep the project, and start from it
 

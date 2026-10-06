@@ -49,6 +49,10 @@ pub struct Manifest {
     pub routes: Vec<Route>,
     #[serde(default, rename = "job")]
     pub jobs: Vec<Job>,
+    /// MCP tools the app offers, each a route into its handler. Declared
+    /// wholesale: a tool removed from the file is withdrawn.
+    #[serde(default, rename = "tool")]
+    pub tools: Vec<ToolDecl>,
     /// What a person may query from outside the app, and the row-level
     /// policies the platform turns into views. Present means declared
     /// wholesale: what the block does not name is withdrawn.
@@ -92,6 +96,37 @@ pub struct Route {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ToolDecl {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub description: String,
+    pub path: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub destructive: bool,
+    #[serde(default)]
+    pub idempotent: bool,
+    #[serde(default)]
+    pub open_world: bool,
+    /// A JSON Schema: inline as a table, or the path of a file in the
+    /// project's stored source.
+    #[serde(default)]
+    pub input: Option<SchemaRef>,
+    #[serde(default)]
+    pub output: Option<SchemaRef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SchemaRef {
+    File(String),
+    Inline(toml::Table),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub name: String,
     pub schedule: String,
@@ -115,7 +150,9 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         format!(
             "could not read toolsite.toml: {e}\nKeys it takes: slug, spa, gate, icon, \
              allow_http, roles, [[route]] (path, gate), [[job]] (name, schedule, path), \
-             [access] views, [[access.table]] (table, view, where, owner, write)."
+             [access] views, [[access.table]] (table, view, where, owner, write), \
+             [[tool]] (name, title, description, path, read_only, destructive, idempotent, \
+             open_world, input, output)."
         )
     })?;
 
@@ -139,6 +176,8 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
             ));
         }
     }
+
+    let tools = resolve_tools(config, app, &manifest.tools).await?;
 
     let mut changed = Vec::new();
     let mut meta = read_meta(config, app).await;
@@ -282,6 +321,17 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         changed.push("icon".to_string());
     }
 
+    // Tools are declared wholesale too.
+    let current_tools = crate::platform::app_tools::read(config, app);
+    if current_tools != tools {
+        crate::platform::app_tools::write(config, app, &tools)?;
+        changed.push(if tools.is_empty() {
+            "tools withdrawn".to_string()
+        } else {
+            format!("{} tool(s): {}", tools.len(), tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "))
+        });
+    }
+
     // Jobs too, but their history survives: a schedule that did not change
     // keeps when it last ran and how it went.
     let existing = schedule::read_jobs(config, app);
@@ -304,6 +354,83 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
     }
 
     Ok(changed)
+}
+
+/// Turns declared tools into stored ones, checking everything first: a
+/// manifest with one bad tool applies nothing.
+async fn resolve_tools(
+    config: &Config,
+    app: &str,
+    declared: &[ToolDecl],
+) -> Result<Vec<crate::platform::app_tools::AppTool>, String> {
+    use crate::platform::app_tools::{check_schema, full_name, valid_tool_name, AppTool, MAX_TOOL_NAME};
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut source: Option<Vec<(String, Vec<u8>)>> = None;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tool in declared {
+        let name = tool.name.trim().to_string();
+        if !valid_tool_name(&name) {
+            return Err(format!("tool {name:?}: a name is lower-case letters, digits and single underscores"));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(format!("tool {name}: declared twice"));
+        }
+        let full = full_name(app, &name);
+        if full.len() > MAX_TOOL_NAME {
+            return Err(format!(
+                "tool {name}: its full name {full} is {} characters, over MCP's {MAX_TOOL_NAME}. Use a shorter name.",
+                full.len()
+            ));
+        }
+        let path = tool.path.trim().to_string();
+        if !path.starts_with("/api/") || path.contains("..") || path.contains('?') {
+            return Err(format!("tool {name}: path must be a handler route under /api/, got {path}"));
+        }
+        if tool.description.trim().is_empty() {
+            return Err(format!("tool {name}: description is empty; it is what the model reads"));
+        }
+        let mut schema = |which: &str, reference: &Option<SchemaRef>| -> Result<Option<serde_json::Value>, String> {
+            let Some(reference) = reference else { return Ok(None) };
+            let value = match reference {
+                SchemaRef::Inline(table) => serde_json::to_value(table).map_err(|e| e.to_string())?,
+                SchemaRef::File(file) => {
+                    if source.is_none() {
+                        let archive = std::fs::read(config.data_dir.join(format!("{app}.source"))).map_err(|_| {
+                            format!("tool {name}: {which} names the file {file}, but no source is stored for {app}. Upload the project with ?source first, or put the schema inline.")
+                        })?;
+                        source = Some(crate::content::bundle::read_all_files(&archive, 5000, 64 * 1024 * 1024)?);
+                    }
+                    let wanted = file.trim_start_matches("./");
+                    let bytes = source
+                        .as_ref()
+                        .and_then(|files| files.iter().find(|(p, _)| p.trim_start_matches("./") == wanted))
+                        .map(|(_, b)| b.clone())
+                        .ok_or_else(|| format!("tool {name}: {which} file {file} is not in the stored source"))?;
+                    serde_json::from_slice(&bytes).map_err(|e| format!("tool {name}: {which} file {file} is not JSON: {e}"))?
+                }
+            };
+            check_schema(&value, &format!("tool {name}: {which}"))?;
+            Ok(Some(value))
+        };
+        let input = schema("input", &tool.input)?.unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+        let output = schema("output", &tool.output)?;
+        out.push(AppTool {
+            name,
+            title: tool.title.clone().filter(|t| !t.trim().is_empty()),
+            description: tool.description.trim().to_string(),
+            path,
+            read_only: tool.read_only,
+            destructive: tool.destructive,
+            idempotent: tool.idempotent,
+            open_world: tool.open_world,
+            input,
+            output,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

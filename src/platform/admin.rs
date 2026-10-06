@@ -758,8 +758,9 @@ fn gate_badge(gate: &str) -> Markup {
     }
 }
 
-const TABS: [(&str, &str); 7] = [
+const TABS: [(&str, &str); 8] = [
     ("overview", "Overview"),
+    ("tools", "Tools"),
     ("access", "Access"),
     ("repo", "Repo"),
     ("exports", "Exports"),
@@ -831,6 +832,10 @@ async fn app_tab_with(
         Err(response) => return response,
     };
     let is_admin_here = held_on(&config, &admin, &app).await == Some(Scope::Admin);
+    let tools = crate::platform::app_tools::read(&config, &app);
+    if tab == "tools" && tools.is_empty() {
+        return (StatusCode::NOT_FOUND, "this app declares no tools").into_response();
+    }
 
     let token = form_token(&config, &admin);
     let meta = read_meta(&config, &app).await;
@@ -842,6 +847,7 @@ async fn app_tab_with(
         .iter()
         .zip(hrefs.iter())
         .filter(|((key, _), _)| is_admin_here || !matches!(*key, "access" | "exports" | "repo"))
+        .filter(|((key, _), _)| *key != "tools" || !tools.is_empty())
         .map(|((key, label), (_, href))| (*key, *label, href.as_str()))
         .collect();
     let back = tab_href(&app, &tab);
@@ -876,6 +882,10 @@ async fn app_tab_with(
                 _ => None,
             };
             render_settings_tab(&app, &names, &token, &back, link)
+        }
+        "tools" => {
+            let pinned = crate::platform::app_tools::is_pinned(&config, &admin, &app).await;
+            render_tools_tab(&config, &app, &tools, pinned, &token, &back)
         }
         "jobs" => {
             let jobs = {
@@ -1253,6 +1263,43 @@ fn render_settings_tab(app: &str, names: &[String], token: &str, back: &str, lin
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                 button."quiet" type="submit" { "Get entry link" }
             }
+        }))
+    }
+}
+
+fn render_tools_tab(
+    config: &Config,
+    app: &str,
+    tools: &[crate::platform::app_tools::AppTool],
+    pinned: bool,
+    token: &str,
+    back: &str,
+) -> Markup {
+    let ctx = crate::content::browse::Ctx { token, back };
+    html! {
+        (ui::panel("Connector", Some("Add this as a connector in Claude or ChatGPT; sign in with your toolsite account."), html! {
+            (ui::secret("connector-url", &crate::platform::app_tools::connector_url(config, app)))
+        }))
+        (ui::panel("Tools", Some("The app declares its tools in toolsite.toml. Each one runs the handler as the person who calls it."), html! {
+            table {
+                thead { tr { th { "Tool" } th { "Kind" } th { "Description" } } }
+                tbody {
+                    @for tool in tools {
+                        tr {
+                            td { strong { (tool.title()) } br; code."muted small" { (tool.name) } }
+                            td {
+                                @if tool.read_only { span."badge" { "read" } }
+                                @else if tool.destructive { span."badge warn" { "write, destructive" } }
+                                @else { span."badge" { "write" } }
+                            }
+                            td { (tool.description) }
+                        }
+                    }
+                }
+            }
+        }))
+        (ui::panel("Your connectors", Some("Pinned, the app's tools are listed as typed tools on your toolsite connector. Unpinned, they stay reachable through call_app_tool."), html! {
+            div."tool-pin" { (crate::content::browse::pin_form(app, pinned, &ctx, "button")) }
         }))
     }
 }
@@ -2409,6 +2456,44 @@ pub async fn change_project(
         Err(projects::Problem::Refused(message)) => (StatusCode::FORBIDDEN, message).into_response(),
         Err(problem) => redirect_flash(&back, false, problem.message()),
     }
+}
+
+#[derive(Deserialize)]
+pub struct PinTools {
+    token: String,
+    app: String,
+    pinned: String,
+    back: Option<String>,
+}
+
+/// Pins or unpins an app's tools for the person signed in. Anyone who may
+/// open the app may; it changes nothing but their own tool list.
+pub async fn pin_tools(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<PinTools>,
+) -> Response {
+    if !export::valid_app(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    let Some(user) = users::current_site_user(&config, &headers).await else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    if !check_form_token(&config, &user, &form.token) {
+        return (StatusCode::FORBIDDEN, "The form is out of date. Reload the page and try again.").into_response();
+    }
+    let back = back_or(form.back.as_deref(), "/");
+    let pinned = form.pinned == "1";
+    let result = crate::platform::mcp::pin_for(&config, Some(&user), &form.app, pinned).await;
+    if result.is_error == Some(true) {
+        tracing::warn!(email = %user.email, app = %form.app, "pin refused: no app with tools the account may open");
+        return redirect_flash(&back, false, "There is no such app with tools.");
+    }
+    redirect_flash(&back, true, if pinned {
+        format!("{} is pinned. Its tools are listed on your toolsite connector.", form.app)
+    } else {
+        format!("{} is unpinned.", form.app)
+    })
 }
 
 #[derive(Deserialize)]

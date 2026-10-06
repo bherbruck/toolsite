@@ -6597,3 +6597,411 @@ async fn a_project_cannot_be_renamed_or_moved_onto_an_apps_path() {
     assert!(is_error && text.contains("finance/north"), "{text}");
     assert!(toolsite::content::store::folder_exists(&config, "labs/north").await);
 }
+
+// --- app tools ---------------------------------------------------------------
+
+const FARM_TOOLS: &str = r#"
+[[tool]]
+name = "log"
+title = "Log production"
+description = "Record a day's count."
+path = "/api/tool"
+idempotent = true
+input = { type = "object", properties = { count = { type = "integer" } }, required = ["count"] }
+
+[[tool]]
+name = "whoami"
+description = "Who is calling."
+path = "/api/whoami"
+read_only = true
+"#;
+
+/// A restricted app with a handler and two tools; alice may open it and
+/// bob may not.
+async fn farm(config: &Arc<Config>) -> (String, String) {
+    write_page(config, "farm/index", "<title>Farm</title>");
+    publish_handler(config, "farm");
+    gate(config, "farm", "restricted");
+    toolsite::platform::manifest::apply(config, "farm", FARM_TOOLS).await.unwrap();
+    let alice = person(config, "alice@example.com");
+    let bob = person(config, "bob@example.com");
+    toolsite::accounts::users::grant(config, "alice@example.com", "farm", "viewer").unwrap();
+    (bearer_for(config, &alice), bearer_for(config, &bob))
+}
+
+fn names(tools: &[serde_json::Value]) -> Vec<String> {
+    tools.iter().map(|t| t["name"].as_str().unwrap_or("").to_string()).collect()
+}
+
+#[tokio::test]
+async fn an_apps_own_connector_lists_its_tools_and_calls_them_as_the_person() {
+    let (_dir, config) = scoped_site();
+    let (alice, _) = farm(&config).await;
+
+    let tools = tool_listing(&config, "/p/farm/mcp", &alice).await;
+    assert_eq!(names(&tools), ["log", "whoami"]);
+    let log = &tools[0];
+    assert_eq!(log["title"], "Log production");
+    assert_eq!(log["annotations"]["idempotentHint"], true);
+    assert_eq!(log["annotations"]["readOnlyHint"], false);
+    assert_eq!(tools[1]["annotations"]["readOnlyHint"], true);
+    assert_eq!(log["inputSchema"]["required"][0], "count");
+    assert_eq!(log["_meta"]["io.toolsite/app"], "farm");
+    assert_eq!(log["_meta"]["io.toolsite/tool"], "log");
+    assert!(log["_meta"].get("io.toolsite/project").is_some(), "{log}");
+
+    let result = mcp_tool_raw(&config, "/p/farm/mcp", &alice, "log", serde_json::json!({"count": 3})).await;
+    assert_ne!(result["isError"], true, "{result}");
+    let answer = &result["structuredContent"];
+    assert_eq!(answer["tool"], "log", "the host names the tool: {result}");
+    assert_eq!(answer["user"], "alice@example.com", "the handler sees the caller: {result}");
+    assert_eq!(answer["method"], "POST");
+    let body: serde_json::Value = serde_json::from_str(answer["body"].as_str().unwrap()).unwrap();
+    assert_eq!(body, serde_json::json!({"tool": "log", "arguments": {"count": 3}}));
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("alice@example.com"), "JSON also comes as text: {result}");
+
+    let result = mcp_tool_raw(&config, "/p/farm/mcp", &alice, "whoami", serde_json::json!({})).await;
+    assert!(result["content"][0]["text"].as_str().unwrap().ends_with(":alice@example.com"), "{result}");
+}
+
+#[tokio::test]
+async fn a_person_who_may_not_open_the_app_finds_no_tools_anywhere() {
+    let (_dir, config) = scoped_site();
+    let (_, bob) = farm(&config).await;
+
+    assert!(tool_listing(&config, "/p/farm/mcp", &bob).await.is_empty());
+    let result = mcp_tool_raw(&config, "/p/farm/mcp", &bob, "log", serde_json::json!({"count": 1})).await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("no such tool"), "{result}");
+
+    // The same answer as for an app that does not exist.
+    let ghost = mcp_tool_raw(&config, "/me/mcp", &bob, "call_app_tool", serde_json::json!({"app": "ghost", "tool": "log"})).await;
+    let farm = mcp_tool_raw(&config, "/me/mcp", &bob, "call_app_tool", serde_json::json!({"app": "farm", "tool": "log", "arguments": {"count": 1}})).await;
+    assert_eq!(farm["isError"], true);
+    assert_eq!(
+        farm["content"][0]["text"].as_str().unwrap().replace("farm", "X"),
+        ghost["content"][0]["text"].as_str().unwrap().replace("ghost", "X"),
+    );
+    let listed = mcp_tool_raw(&config, "/me/mcp", &bob, "app_tools", serde_json::json!({})).await;
+    assert_eq!(listed["structuredContent"]["apps"], serde_json::json!([]), "{listed}");
+    let pin = mcp_tool_raw(&config, "/me/mcp", &bob, "pin_app", serde_json::json!({"app": "farm", "pinned": true})).await;
+    assert_eq!(pin["isError"], true, "{pin}");
+    // A typed name is refused as well, pinned or not.
+    let typed = mcp_tool_raw(&config, "/me/mcp", &bob, "farm__log", serde_json::json!({"count": 1})).await;
+    assert_eq!(typed["isError"], true, "{typed}");
+    assert!(!names(&tool_listing(&config, "/me/mcp", &bob).await).iter().any(|n| n.starts_with("farm__")));
+}
+
+#[tokio::test]
+async fn a_pinned_apps_tools_are_typed_on_the_main_connector_and_others_stay_behind_the_pair() {
+    let (_dir, config) = scoped_site();
+    let (alice, _) = farm(&config).await;
+
+    let before = names(&tool_listing(&config, "/me/mcp", &alice).await);
+    assert!(before.contains(&"app_tools".to_string()) && before.contains(&"call_app_tool".to_string()), "{before:?}");
+    assert!(!before.iter().any(|n| n.starts_with("farm__")), "unpinned tools are not typed: {before:?}");
+    let listed = mcp_tool_raw(&config, "/me/mcp", &alice, "app_tools", serde_json::json!({})).await;
+    assert_eq!(listed["structuredContent"]["apps"][0]["app"], "farm", "{listed}");
+    assert_eq!(listed["structuredContent"]["apps"][0]["tools"], 2);
+    let one = mcp_tool_raw(&config, "/me/mcp", &alice, "app_tools", serde_json::json!({"app": "farm"})).await;
+    assert_eq!(one["structuredContent"]["connector"], format!("{BASE}/p/farm/mcp"), "{one}");
+    let called = mcp_tool_raw(&config, "/me/mcp", &alice, "call_app_tool", serde_json::json!({"app": "farm", "tool": "log", "arguments": {"count": 2}})).await;
+    assert_eq!(called["structuredContent"]["user"], "alice@example.com", "{called}");
+
+    let pin = mcp_tool_raw(&config, "/me/mcp", &alice, "pin_app", serde_json::json!({"app": "farm", "pinned": true})).await;
+    assert_ne!(pin["isError"], true, "{pin}");
+    let tools = tool_listing(&config, "/me/mcp", &alice).await;
+    let typed = tools.iter().find(|t| t["name"] == "farm__log").expect("pinned tool is listed");
+    assert_eq!(typed["title"], "Farm: Log production");
+    assert_eq!(typed["annotations"]["idempotentHint"], true);
+    assert_eq!(typed["_meta"]["io.toolsite/app"], "farm");
+    assert!(typed["icons"][0]["src"].as_str().unwrap().ends_with("/p/farm/favicon.svg"), "{typed}");
+    let called = mcp_tool_raw(&config, "/me/mcp", &alice, "farm__log", serde_json::json!({"count": 4})).await;
+    assert_eq!(called["structuredContent"]["tool"], "log", "{called}");
+    assert_eq!(called["structuredContent"]["user"], "alice@example.com");
+
+    // Losing access takes the pinned tools away with it.
+    toolsite::accounts::users::revoke(&config, "alice@example.com", "farm").unwrap();
+    assert!(!names(&tool_listing(&config, "/me/mcp", &alice).await).contains(&"farm__log".to_string()));
+    toolsite::accounts::users::grant(&config, "alice@example.com", "farm", "viewer").unwrap();
+
+    mcp_tool_raw(&config, "/me/mcp", &alice, "pin_app", serde_json::json!({"app": "farm", "pinned": false})).await;
+    assert!(!names(&tool_listing(&config, "/me/mcp", &alice).await).contains(&"farm__log".to_string()));
+
+    // A static token pins nothing, so /mcp lists only its own tools.
+    let platform = names(&tool_listing(&config, "/mcp", TOKEN).await);
+    assert!(platform.contains(&"call_app_tool".to_string()) && !platform.iter().any(|n| n.contains("__")), "{platform:?}");
+}
+
+#[tokio::test]
+async fn a_static_token_calls_as_nobody_unless_it_names_someone() {
+    let (_dir, config) = scoped_site();
+    let (alice, _) = farm(&config).await;
+
+    let anonymous = mcp_tool_raw(&config, "/mcp", TOKEN, "call_app_tool", serde_json::json!({"app": "farm", "tool": "log", "arguments": {}})).await;
+    assert_eq!(anonymous["structuredContent"]["user"], "", "{anonymous}");
+    let as_alice = mcp_tool_raw(&config, "/mcp", TOKEN, "call_app_tool", serde_json::json!({"app": "farm", "tool": "log", "as_user": "alice@example.com"})).await;
+    assert_eq!(as_alice["structuredContent"]["user"], "alice@example.com", "{as_alice}");
+
+    // On /p/<app>/mcp a static token is nobody too.
+    let result = mcp_tool_raw(&config, "/p/farm/mcp", TOKEN, "whoami", serde_json::json!({})).await;
+    assert_eq!(result["isError"], true, "the handler answers 401 for nobody: {result}");
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("anonymous"), "{result}");
+
+    // Only a site admin may name someone else; an editor may not.
+    toolsite::accounts::users::grant_scope(&config, "alice@example.com", "", toolsite::accounts::users::Scope::Editor, None).unwrap();
+    let refused = mcp_tool_raw(&config, "/mcp", &alice, "call_app_tool", serde_json::json!({"app": "farm", "tool": "log", "as_user": "bob@example.com"})).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+}
+
+#[tokio::test]
+async fn a_client_cannot_forge_the_tool_header() {
+    let (_dir, config) = scoped_site();
+    farm(&config).await;
+    gate(&config, "farm", "public");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/p/farm/api/tool")
+        .header("x-toolsite-tool", "log")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, body, _) = send(&config, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(answer["tool"], "", "a forged x-toolsite-tool reached the handler: {body}");
+
+    // Over MCP the host sets it, once.
+    let result = mcp_tool_raw(&config, "/mcp", TOKEN, "call_app_tool", serde_json::json!({"app": "farm", "tool": "log"})).await;
+    assert_eq!(result["structuredContent"]["tool"], "log", "{result}");
+}
+
+#[tokio::test]
+async fn a_bad_tool_declaration_applies_nothing() {
+    let (_dir, config) = scoped_site();
+    farm(&config).await;
+    let before = std::fs::read_to_string(config.data_dir.join("farm.tools")).unwrap();
+
+    let long = format!("[[tool]]\nname = \"{}\"\ndescription = \"x\"\npath = \"/api/tool\"\n", "a".repeat(60));
+    let outside = "[[tool]]\nname = \"t\"\ndescription = \"x\"\npath = \"/admin\"\n";
+    let not_object = "[[tool]]\nname = \"t\"\ndescription = \"x\"\npath = \"/api/tool\"\ninput = { type = \"string\" }\n";
+    let no_source = "[[tool]]\nname = \"t\"\ndescription = \"x\"\npath = \"/api/tool\"\ninput = \"tools/t.json\"\n";
+    let twice = "[[tool]]\nname = \"t\"\ndescription = \"x\"\npath = \"/api/a\"\n[[tool]]\nname = \"t\"\ndescription = \"y\"\npath = \"/api/b\"\n";
+    let prefix = "[[tool]]\nname = \"a__b\"\ndescription = \"x\"\npath = \"/api/a\"\n";
+    for (bad, says) in [
+        (long.as_str(), "over MCP's 64"),
+        (outside, "under /api/"),
+        (not_object, "\"type\": \"object\""),
+        (no_source, "no source is stored"),
+        (twice, "declared twice"),
+        (prefix, "single underscores"),
+    ] {
+        let with_spa = format!("spa = true\n{bad}");
+        let error = toolsite::platform::manifest::apply(&config, "farm", &with_spa).await.unwrap_err();
+        assert!(error.contains(says), "{says}: {error}");
+    }
+    assert_eq!(std::fs::read_to_string(config.data_dir.join("farm.tools")).unwrap(), before);
+    assert!(!toolsite::content::store::read_meta(&config, "farm").await.spa, "a refused manifest changed the app");
+}
+
+#[tokio::test]
+async fn a_schema_can_come_from_the_stored_source() {
+    let (_dir, config) = scoped_site();
+    farm(&config).await;
+    let mut archive = Vec::new();
+    {
+        let encoder = flate2::write::GzEncoder::new(&mut archive, flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        let schema = br#"{"type":"object","properties":{"house":{"type":"string"}}}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(schema.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "tools/count.json", &schema[..]).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+    std::fs::write(config.data_dir.join("farm.source"), &archive).unwrap();
+    let manifest = "[[tool]]\nname = \"count\"\ndescription = \"x\"\npath = \"/api/tool\"\ninput = \"tools/count.json\"\n";
+    toolsite::platform::manifest::apply(&config, "farm", manifest).await.unwrap();
+    let tools = toolsite::platform::app_tools::read(&config, "farm");
+    assert_eq!(tools.len(), 1, "the declaration replaced the old tools wholesale");
+    assert_eq!(tools[0].input["properties"]["house"]["type"], "string");
+}
+
+#[tokio::test]
+async fn the_tools_sidecar_is_never_served() {
+    let (_dir, config) = scoped_site();
+    farm(&config).await;
+    gate(&config, "farm", "public");
+    for path in ["/p/farm.tools", "/p/farm/../farm.tools", "/p/farm/.tools"] {
+        let (status, body, _) = send(&config, get(path)).await;
+        assert_ne!(status, StatusCode::OK, "{path}: {body}");
+        assert!(!body.contains("/api/tool"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn an_apps_connector_names_itself_to_an_oauth_client() {
+    let (_dir, config) = scoped_site();
+    farm(&config).await;
+
+    let (status, body, _) = send(&config, get("/.well-known/oauth-protected-resource/p/farm/mcp")).await;
+    assert_eq!(status, StatusCode::OK);
+    let metadata: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(metadata["resource"], format!("{BASE}/p/farm/mcp"));
+    assert_eq!(metadata["authorization_servers"][0], BASE);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/p/farm/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (status, _, headers) = send(&config, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let challenge = headers.iter().find(|(k, _)| k == "www-authenticate").map(|(_, v)| v.clone()).unwrap_or_default();
+    assert!(challenge.contains("/.well-known/oauth-protected-resource/p/farm/mcp"), "{challenge}");
+}
+
+#[tokio::test]
+async fn a_client_may_ask_for_a_token_for_an_apps_connector_and_nothing_else() {
+    let (_dir, config) = public_server();
+    admin(&config, "root@example.com", "correct horse battery");
+    let session = sign_in(&config, "root@example.com", "correct horse battery");
+    let redirect = "https://client.test/cb";
+    let client = register(&config, redirect).await;
+    for (resource, allowed) in [
+        (format!("{BASE}/p/farm/mcp"), true),
+        (format!("{BASE}/me/mcp"), true),
+        (format!("{BASE}/p/farm/../x/mcp"), false),
+        (format!("{BASE}/p/farm/api/mcp"), false),
+        ("https://elsewhere.test/mcp".to_string(), false),
+    ] {
+        let url = authorize_url(&client, redirect).replace(
+            &format!("resource={}", urlencoding::encode(&format!("{BASE}/mcp"))),
+            &format!("resource={}", urlencoding::encode(&resource)),
+        );
+        let (status, body, headers) = send(&config, get_as(&url, &session)).await;
+        let refused = headers.iter().any(|(k, v)| k == "location" && v.contains("invalid_target"));
+        assert_eq!(!refused, allowed, "{resource}: {status} {body}");
+    }
+}
+
+#[tokio::test]
+async fn mcp_under_an_app_is_reserved_for_its_connector() {
+    let (_dir, config) = scoped_site();
+    farm(&config).await;
+    gate(&config, "farm", "public");
+    write_page(&config, "farm/mcp", "<p>shadow</p>");
+
+    let (status, body, _) = send(&config, get("/p/farm/mcp")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the connector answers, not a page: {body}");
+    for path in ["/p/farm/mcp/", "/p/farm/mcp/x"] {
+        let (status, body, _) = send(&config, get(path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        assert!(!body.contains("shadow"));
+    }
+}
+
+#[tokio::test]
+async fn a_manifest_upload_with_tools_says_where_they_are_live() {
+    let (_dir, config) = scoped_site();
+    write_page(&config, "farm/index", "<title>Farm</title>");
+    publish_handler(&config, "farm");
+    let upload = ticket(&config, "farm", Duration::from_secs(60));
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!("/upload/{upload}?manifest"))
+        .body(Body::from(FARM_TOOLS))
+        .unwrap();
+    let (status, body, _) = send(&config, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(&format!("Tools are live at {BASE}/p/farm/mcp")), "{body}");
+
+    let upload = ticket(&config, "farm", Duration::from_secs(60));
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!("/upload/{upload}?manifest"))
+        .body(Body::from("spa = false\n"))
+        .unwrap();
+    let (_, body, _) = send(&config, request).await;
+    assert!(body.contains("tools withdrawn") && !body.contains("Tools are live"), "{body}");
+}
+
+#[tokio::test]
+async fn the_tools_tab_and_the_connector_link_appear_only_on_an_app_with_tools() {
+    let (_dir, config) = scoped_site();
+    farm(&config).await;
+    write_page(&config, "plain/index", "<title>Plain</title>");
+    gate(&config, "plain", "restricted");
+    toolsite::accounts::users::grant(&config, "alice@example.com", "plain", "viewer").unwrap();
+    admin(&config, "root@example.com", "correct horse battery");
+    let root = sign_in(&config, "root@example.com", "correct horse battery");
+
+    let (status, page, _) = send(&config, get_as("/admin/apps/farm/tools", &root)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.contains(&format!("{BASE}/p/farm/mcp")), "the connector URL is on the tab");
+    assert!(page.contains("Add this as a connector in Claude or ChatGPT"));
+    assert!(page.contains("Log production") && page.contains("Record a day&#39;s count.") || page.contains("Record a day's count."));
+    assert!(page.contains("Pin tools"));
+    let (_, overview, _) = send(&config, get_as("/admin/apps/farm", &root)).await;
+    assert!(overview.contains("/admin/apps/farm/tools"), "the tab is offered");
+
+    let (status, _, _) = send(&config, get_as("/admin/apps/plain/tools", &root)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, overview, _) = send(&config, get_as("/admin/apps/plain", &root)).await;
+    assert!(!overview.contains("/admin/apps/plain/tools"), "no tab without tools");
+
+    // A viewer gets the menu for the app with tools, and only for it.
+    let alice = sign_in(&config, "alice@example.com", "correct horse battery");
+    let (_, browser, _) = send(&config, get_as("/", &alice)).await;
+    assert!(browser.contains(r#"data-copy-link="/p/farm/mcp""#), "{browser}");
+    assert!(browser.contains("Pin tools"));
+    assert!(!browser.contains("/p/plain/mcp"));
+}
+
+#[tokio::test]
+async fn pinning_from_the_browser_changes_only_the_signed_in_persons_list() {
+    let (_dir, config) = scoped_site();
+    let (alice_bearer, bob_bearer) = farm(&config).await;
+    let alice = sign_in(&config, "alice@example.com", "correct horse battery");
+    let (_, browser, _) = send(&config, get_as("/", &alice)).await;
+    let token = form_token_from(&browser);
+
+    let (status, _, _) = send(&config, post_form("/admin/pin", &alice, format!("token={token}&app=farm&pinned=1&back=/"))).await;
+    assert!(status.is_redirection(), "{status}");
+    assert!(names(&tool_listing(&config, "/me/mcp", &alice_bearer).await).contains(&"farm__log".to_string()));
+    assert!(!names(&tool_listing(&config, "/me/mcp", &bob_bearer).await).contains(&"farm__log".to_string()));
+    let (_, browser, _) = send(&config, get_as("/", &alice)).await;
+    assert!(browser.contains("Unpin tools"));
+
+    // Bob cannot pin an app he may not open, even with a valid form.
+    let bob = sign_in(&config, "bob@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/account", &bob)).await;
+    let bob_token = form_token_from(&page);
+    send(&config, post_form("/admin/pin", &bob, format!("token={bob_token}&app=farm&pinned=1&back=/"))).await;
+    assert!(toolsite::accounts::users::pins_for(&config, &toolsite::accounts::users::user_by_email(&config, "bob@example.com").unwrap().id).is_empty());
+    // And a form token from another session is refused.
+    let (status, _, _) = send(&config, post_form("/admin/pin", &bob, format!("token={token}&app=farm&pinned=1&back=/"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_route_rule_closes_a_tool_on_that_path_to_whoever_it_keeps_out() {
+    let (_dir, config) = scoped_site();
+    let (alice, bob) = farm(&config).await;
+    rules(&config, "farm", "authenticated", r#"[{"prefix":"/api/whoami","gate":"restricted"}]"#);
+
+    assert_eq!(names(&tool_listing(&config, "/p/farm/mcp", &alice).await), ["log", "whoami"]);
+    assert_eq!(names(&tool_listing(&config, "/p/farm/mcp", &bob).await), ["log"]);
+    let refused = mcp_tool_raw(&config, "/p/farm/mcp", &bob, "whoami", serde_json::json!({})).await;
+    assert_eq!(refused["isError"], true);
+    assert!(refused["content"][0]["text"].as_str().unwrap().contains("no such tool"), "{refused}");
+    let listed = mcp_tool_raw(&config, "/me/mcp", &bob, "app_tools", serde_json::json!({"app": "farm"})).await;
+    assert_eq!(listed["structuredContent"]["tools"].as_array().unwrap().len(), 1, "{listed}");
+
+    // Acting as bob, a site admin gets what bob would get.
+    let as_bob = mcp_tool_raw(&config, "/mcp", TOKEN, "call_app_tool", serde_json::json!({"app": "farm", "tool": "whoami", "as_user": "bob@example.com"})).await;
+    assert_eq!(as_bob["isError"], true, "{as_bob}");
+}

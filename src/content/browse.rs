@@ -69,6 +69,11 @@ struct Entry {
     scope: Option<Scope>,
     /// Its general access, wherever that comes from.
     gate: String,
+    /// Whether this is an app's own entry and the app declares MCP tools,
+    /// which a signed-in viewer may pin or connect to.
+    tools: bool,
+    /// Whether the viewer pinned those tools.
+    pinned: bool,
 }
 
 impl Entry {
@@ -151,6 +156,13 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
     let mut slugs = Vec::new();
     collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
 
+    let pins = match viewer {
+        Some(user) => {
+            let (config, id) = (config.clone(), user.id.clone());
+            tokio::task::spawn_blocking(move || users::pins_for(&config, &id)).await.unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
     let mut entries = Vec::with_capacity(slugs.len());
     for slug in &slugs {
         let meta = read_meta(config, slug).await;
@@ -186,6 +198,8 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
             Some(user) => admin::held_on(config, user, &app).await,
             None => None,
         };
+        let tools = viewer.is_some() && *slug == app && !crate::platform::app_tools::read(config, &app).is_empty();
+        let pinned = tools && pins.contains(&app);
         entries.push(Entry {
             slug: slug.clone(),
             app,
@@ -195,6 +209,8 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
             modified,
             scope,
             gate,
+            tools,
+            pinned,
         });
     }
     // Newest first, the way the index always listed them.
@@ -451,9 +467,9 @@ const ICON_LIST: &str = r#"<svg viewBox="0 0 16 16" width="15" height="15" aria-
 
 /// What a row's actions menu needs besides the row: the form token and
 /// where a change returns to.
-struct Ctx<'a> {
-    token: &'a str,
-    back: &'a str,
+pub(crate) struct Ctx<'a> {
+    pub(crate) token: &'a str,
+    pub(crate) back: &'a str,
 }
 
 /// An element id from a slug or path, unique per place on the page.
@@ -473,17 +489,27 @@ fn menu_button(id: &str, label: &str) -> Markup {
 }
 
 /// An app's actions: Open, Settings and, for an admin, Permissions and a
-/// move that opens in place. Shown to an editor or more; for anyone else
-/// the row's own link is the only thing to do.
+/// move that opens in place. An app that declares tools adds a pin and its
+/// connector link for anyone signed in who may open it. With neither, the
+/// row's own link is the only thing to do.
 fn app_menu(entry: &Entry, place: &str, ctx: &Ctx) -> Markup {
     let id = menu_id("app", place, &entry.slug);
+    let editor = entry.scope.is_some_and(|scope| scope >= Scope::Editor);
     html! {
-        @if entry.scope.is_some_and(|scope| scope >= Scope::Editor) {
+        @if editor || entry.tools {
             span."row-tools" {
                 (menu_button(&id, &format!("Actions for {}", entry.slug)))
                 div."menu" popover id=(id) role="menu" style={ "position-anchor:--" (id) } {
                     a role="menuitem" href={ "/p/" (entry.slug) "/" } target="_blank" rel="noopener" { "Open" }
-                    a role="menuitem" href={ "/admin/apps/" (entry.app) } { "Settings" }
+                    @if entry.tools {
+                        (pin_form(&entry.app, entry.pinned, ctx, "menuitem"))
+                        button type="button" role="menuitem" data-copy-link={ "/p/" (entry.app) "/mcp" } {
+                            "Copy connector link"
+                        }
+                    }
+                    @if editor {
+                        a role="menuitem" href={ "/admin/apps/" (entry.app) } { "Settings" }
+                    }
                     @if entry.scope == Some(Scope::Admin) {
                         a role="menuitem" href={ "/admin/apps/" (entry.app) "/access" } {
                             "Permissions" span."muted small" { " in Settings" }
@@ -499,6 +525,17 @@ fn app_menu(entry: &Entry, place: &str, ctx: &Ctx) -> Markup {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Pins or unpins an app's tools for the viewer, in one click.
+pub(crate) fn pin_form(app: &str, pinned: bool, ctx: &Ctx, role: &str) -> Markup {
+    html! {
+        form."menu-pin" method="post" action="/admin/pin" {
+            (admin::hidden("token", ctx.token)) (admin::hidden("app", app)) (admin::hidden("back", ctx.back))
+            (admin::hidden("pinned", if pinned { "0" } else { "1" }))
+            button type="submit" role=(role) { @if pinned { "Unpin tools" } @else { "Pin tools" } }
         }
     }
 }

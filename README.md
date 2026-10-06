@@ -560,7 +560,7 @@ app is never briefly public. One deploy does the lot: build, schema, config,
 bundle, handler, notes, source. Without the CLI it is
 `curl -f -T toolsite.toml '<upload-url>?manifest'`.
 
-**What it declares, it owns.** Routes and jobs are replaced wholesale, so
+**What it declares, it owns.** Routes, jobs and tools are replaced wholesale, so
 deleting a line removes the thing; no drift between the file and the server.
 What it does not mention is left alone, so hiding an app by hand survives the
 next deploy. A job whose schedule did not change keeps its history. A manifest
@@ -569,6 +569,47 @@ with a mistake anywhere is rejected whole rather than half-applied.
 Commands still work and are right for a one-off (`toolsite gate`,
 `toolsite job`). The manifest is for anything meant to outlive the session
 that set it.
+
+## App tools
+
+An app offers MCP tools by declaring handler routes in `toolsite.toml`:
+
+```toml
+[[tool]]
+name = "log_production"
+title = "Log production"
+description = "Record a day's egg count for a house."
+path = "/api/tools/log_production"
+idempotent = true
+input = { type = "object", properties = { house = { type = "string" }, eggs = { type = "integer" } }, required = ["house", "eggs"] }
+```
+
+`input` and `output` are JSON Schemas, inline or a file in the stored
+source. The platform does the auth: a person signs in with their toolsite
+account, sees only the tools of apps (and route rules) that admit them, and
+each call runs the route as them, with `x-toolsite-tool` set by the host and
+the body `{"tool", "arguments"}`. The handler's identity and the app's
+row-level policies apply as on any request. Someone without access gets "no
+such tool", the same as for an app that does not exist.
+
+Three ways in, one code path:
+
+- **`/p/<app>/mcp`**: a connector with that app's tools, unprefixed. Any
+  account's OAuth token; a static token calls as nobody. Its
+  protected-resource metadata is at
+  `/.well-known/oauth-protected-resource/p/<app>/mcp`. `mcp` under an app is
+  reserved, like `api`.
+- **`app_tools` and `call_app_tool`** on `/mcp` and `/me/mcp`, for any app.
+  A site admin may pass `as_user` to call as someone.
+- **Pinned apps**: `pin_app`, or Pin tools in the app browser's menu, lists
+  an app's tools on the person's `/mcp` or `/me/mcp` as typed tools named
+  `<app>__<name>`, titled `<App>: <Tool>`, with annotations and `_meta`
+  keys `io.toolsite/app`, `io.toolsite/project` and `io.toolsite/tool`.
+
+The app's admin page has a Tools tab with the connector URL and the
+declared tools, and the app browser's menu has Copy connector link. The
+guide tells an agent building an app with tools to put the same link in the
+app itself.
 
 ## Notes for the next session
 
@@ -1120,7 +1161,8 @@ to the browser with one line saying what happened.
 | Route | Auth | Purpose |
 |---|---|---|
 | `POST /mcp` | admin sign-in or token | The MCP server for publishing. |
-| `POST /me/mcp` | any account's sign-in | A regular account's MCP server: `my_apps` and `query` over the data apps share. |
+| `POST /me/mcp` | any account's sign-in | A regular account's MCP server: `my_apps` and `query` over the data apps share, and app tools. |
+| `POST /p/<app>/mcp` | any account's sign-in or token | That app's declared tools, as a connector of their own. |
 | `GET /.well-known/oauth-authorization-server`, `POST /register`, `GET\|POST /authorize`, `POST /token` | public | The OAuth server MCP clients sign in through. Present when `TOOLSITE_BASE_URL` is set. |
 | `PUT /upload/<ticket>[/<page>]` | ticket | Write a page. `?icon` stores an icon, `?bundle` unpacks a tar, `&spa` marks it client-routed, `?handler` installs a wasm component, `?migrations`, `?manifest`, `?source`, `?blob=<key>`. 64 MB. |
 | `ANY /p/<slug>` | gate | The page, a bundle asset, or the app's handler. An app root redirects to `/p/<slug>/` so relative links resolve. |

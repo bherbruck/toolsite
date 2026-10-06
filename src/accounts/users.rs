@@ -529,6 +529,41 @@ pub fn start_session(config: &Config, user_id: &str) -> Result<String, String> {
     Ok(token)
 }
 
+/// The apps whose tools this account wants listed on its connector.
+pub fn pins_for(config: &Config, user_id: &str) -> Vec<String> {
+    let Ok(conn) = open(config) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = conn.prepare("select app from pins where user_id = ? order by app") else {
+        return Vec::new();
+    };
+    statement
+        .query_map([user_id], |row| row.get::<_, String>(0))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// Pins or unpins an app's tools for this account. Whether the account may
+/// open the app is the caller's question; a pin on an app it cannot open
+/// lists nothing.
+pub fn set_pin(config: &Config, user_id: &str, app: &str, pinned: bool) -> Result<(), String> {
+    if !valid_app_scope(app) {
+        return Err("invalid app name".into());
+    }
+    let conn = open(config)?;
+    if pinned {
+        conn.execute(
+            "insert into pins (user_id, app, created_at) values (?, ?, ?) on conflict(user_id, app) do nothing",
+            rusqlite::params![user_id, app, now() as i64],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        conn.execute("delete from pins where user_id = ? and app = ?", rusqlite::params![user_id, app])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Who a *site* session token belongs to. A token scoped to an app is not
 /// accepted here: it proves the bearer reached one app, not that it may act
 /// site-wide.

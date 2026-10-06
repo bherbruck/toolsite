@@ -41,7 +41,8 @@ platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
   permissions.rs   the permissions rules: an add row, View/Edit/Manage per person, Locked/Customizable
   mcp.rs           MCP tool definitions and the ServerHandler
-  mcp_me.rs        /me/mcp: a regular account's two tools over the data apps share
+  mcp_me.rs        /me/mcp: a regular account's tools over the data apps share
+  app_tools.rs     tools an app declares: /p/<app>/mcp, pins, and calls run as the person
   bearer.rs        bearer/x-api-key middleware for /mcp
   client_oauth.rs  the OAuth server MCP clients sign in through — who may PUBLISH
   oauth_store.rs   its clients, codes and tokens, in .site/oauth.db

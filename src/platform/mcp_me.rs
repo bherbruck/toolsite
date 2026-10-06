@@ -1,7 +1,7 @@
 //! The MCP server for a regular account: `/me/mcp`.
 //!
 //! An admin's client publishes through `/mcp`. Everyone else's client comes
-//! here, where there are two tools and no way to change anything an app did
+//! here, where there are a few tools and no way to change anything an app did
 //! not open up: `my_apps` lists the apps the account may open and what each
 //! shares, and `query` runs one statement inside that, as the account. The
 //! boundary is the scoped authorizer in `runtime::db`, decided per parsed
@@ -50,11 +50,25 @@ pub(crate) struct QueryRequest {
     pub(crate) params: Option<Vec<serde_json::Value>>,
 }
 
+/// call_app_tool here has no as_user: everyone on this endpoint is a person
+/// calling as themselves.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct MeCallAppToolRequest {
+    #[schemars(description = "The app slug.")]
+    pub(crate) app: String,
+    #[schemars(description = "The tool's name as app_tools lists it, without the app prefix.")]
+    pub(crate) tool: String,
+    #[schemars(description = "The tool's input, matching the input schema app_tools shows.")]
+    pub(crate) arguments: Option<serde_json::Value>,
+}
+
 /// The tools come from `Self::tool_router()`, which the handler macro calls;
 /// nothing else is kept per session.
 #[derive(Clone)]
 pub struct MeHost {
     config: Arc<Config>,
+    /// Runs an app's tool, which is the same call a request makes.
+    runtime: Arc<crate::runtime::wasm::Runtime>,
 }
 
 /// The account the middleware verified for this request.
@@ -67,8 +81,8 @@ fn caller(ctx: &RequestContext<RoleServer>) -> Result<User, McpError> {
 
 #[tool_router]
 impl MeHost {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, runtime: Arc<crate::runtime::wasm::Runtime>) -> Self {
+        Self { config, runtime }
     }
 
     /// Apps this account may open, with what each shares.
@@ -277,10 +291,83 @@ impl MeHost {
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }
     }
+
+    #[tool(
+        description = "Tools that apps on this site offer. Without app: the apps you may open that declare tools, with how many and whether you pinned them. With app: its tools, each with its input schema, the typed name it has when pinned, and the app's own connector URL. Call one with call_app_tool.",
+        annotations(title = "App tools", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn app_tools(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(crate::platform::mcp::AppToolsRequest { app }): Parameters<crate::platform::mcp::AppToolsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let user = caller(&ctx)?;
+        Ok(match crate::platform::app_tools::describe(&self.config, app.as_deref(), Some(&user)).await {
+            Ok(value) => CallToolResult::structured(value),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
+    }
+
+    #[tool(
+        description = "Call a tool an app offers. The app's own handler runs it as you, with your access and the app's own rules, so it can only do what the app allows you to do. app_tools lists what each app offers and its input.",
+        annotations(title = "Call app tool", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn call_app_tool(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(request): Parameters<MeCallAppToolRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let user = caller(&ctx)?;
+        let found = match crate::platform::app_tools::find(&self.config, &request.app, &request.tool, Some(&user)).await {
+            Ok(found) => found,
+            Err(refused) => return Ok(refused),
+        };
+        let args = request.arguments.unwrap_or_else(|| serde_json::json!({}));
+        Ok(crate::platform::app_tools::call(&self.config, &self.runtime, &request.app, &found, args, Some(user)).await)
+    }
+
+    #[tool(
+        description = "Pin or unpin an app's tools for your account. A pinned app's tools are listed on this connector as typed tools named <app>__<tool>; every other app's tools stay reachable through call_app_tool.",
+        annotations(title = "Pin app tools", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn pin_app(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(crate::platform::mcp::PinAppRequest { app, pinned }): Parameters<crate::platform::mcp::PinAppRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let user = caller(&ctx)?;
+        Ok(crate::platform::mcp::pin_for(&self.config, Some(&user), &app, pinned).await)
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for MeHost {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        let user = caller(&context)?;
+        Ok(crate::platform::mcp::list_with_pins(&self.config, Self::tool_router().list_all(), Some(&user), &context).await)
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if crate::platform::app_tools::split_name(&request.name).is_some() {
+            let user = caller(&context)?;
+            if let Some(result) =
+                crate::platform::mcp::call_pinned(&self.config, &self.runtime, &request.name, request.arguments.clone(), Some(&user)).await
+            {
+                return Ok(result.into());
+            }
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tcc).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)

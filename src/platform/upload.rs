@@ -351,16 +351,21 @@ pub(crate) async fn store_for_slug(
             return (StatusCode::BAD_REQUEST, "toolsite.toml must be UTF-8\n").into_response();
         };
         return match crate::platform::manifest::apply(config, &app, &text).await {
-            Ok(changed) if changed.is_empty() => {
-                (StatusCode::OK, format!("{app} already matches its manifest\n")).into_response()
-            }
             Ok(changed) => {
-                tracing::info!(app = %app, changed = ?changed, "manifest applied");
-                (
-                    StatusCode::OK,
-                    format!("{app}: applied {}\n", changed.join(", ")),
-                )
-                    .into_response()
+                let mut reply = if changed.is_empty() {
+                    format!("{app} already matches its manifest\n")
+                } else {
+                    tracing::info!(app = %app, changed = ?changed, "manifest applied");
+                    format!("{app}: applied {}\n", changed.join(", "))
+                };
+                // Where people connect to what was just declared.
+                if !crate::platform::app_tools::read(config, &app).is_empty() {
+                    reply.push_str(&format!(
+                        "Tools are live at {}. Add it as a connector in Claude or ChatGPT; people sign in with their toolsite account.\n",
+                        crate::platform::app_tools::connector_url(config, &app)
+                    ));
+                }
+                (StatusCode::OK, reply).into_response()
             }
             Err(message) => (StatusCode::BAD_REQUEST, format!("{message}\n")).into_response(),
         };

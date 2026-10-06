@@ -143,6 +143,11 @@ pub(crate) async fn serve_icon(
 /// be able to shadow its own handler, so this wins before any file lookup.
 const API_PREFIX: &str = "api";
 
+/// Reserved too: `/p/<app>/mcp` is the app's tools as a connector, routed
+/// before this handler runs. Anything under it is refused here, so a file or
+/// handler route cannot sit beside the connector and pass for it.
+const MCP_PATH: &str = "mcp";
+
 /// Serves one request for a published page, in a fixed order:
 ///
 /// 1. `/p/<app>/api/...` — the app's wasm handler, always.
@@ -175,6 +180,10 @@ pub(crate) async fn serve_page(
         None => (slug, ""),
     };
     let is_api = rest == API_PREFIX || rest.starts_with(&format!("{API_PREFIX}/"));
+    if rest == MCP_PATH || rest.starts_with(&format!("{MCP_PATH}/")) {
+        tracing::warn!(path = %uri_path, "404: mcp under an app is reserved for its tools");
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
 
     // Only the cookie scoped to *this* app speaks for the visitor here. The
     // site cookie is sent to every path on the origin, so honouring it would
@@ -215,7 +224,7 @@ pub(crate) async fn serve_page(
     if slug.rsplit('.').next().is_some_and(|extension| {
         matches!(
             extension,
-            "meta" | "notes" | "icon" | "source" | "secrets" | "jobs" | "migrations" | "exports" | "deploys" | "repo"
+            "meta" | "notes" | "icon" | "source" | "secrets" | "jobs" | "migrations" | "exports" | "deploys" | "repo" | "tools"
         )
     }) {
         return (StatusCode::NOT_FOUND, "not found").into_response();

@@ -86,6 +86,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     };
 
     let me_host_config = host_config.clone();
+    let app_tools_host_config = host_config.clone();
     let mcp_config = config.clone();
     let mcp_runtime = runtime.clone();
     let mcp_service = StreamableHttpService::new(
@@ -105,8 +106,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     // The same transport for a regular account, with two tools and the
     // account itself carried on the request by the middleware.
     let me_config = config.clone();
+    let me_runtime = runtime.clone();
     let me_service = StreamableHttpService::new(
-        move || Ok(MeHost::new(me_config.clone())),
+        move || Ok(MeHost::new(me_config.clone(), me_runtime.clone())),
         LocalSessionManager::default().into(),
         me_host_config,
     );
@@ -114,6 +116,22 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .nest_service("/me/mcp", me_service)
         .layer(middleware::from_fn(mcp_log::log_mcp))
         .layer(middleware::from_fn_with_state(config.clone(), require_person));
+
+    // One app's tools as a connector of their own. Its own router, since
+    // `/p/{app}/mcp` cannot sit beside the `/p/{*slug}` wildcard; a layer on
+    // the whole site sends exactly that path here before the site's routes
+    // see it, so an app cannot serve its own page or handler at `mcp`.
+    let app_tools_config = config.clone();
+    let app_tools_runtime = runtime.clone();
+    let app_tools_service = StreamableHttpService::new(
+        move || Ok(crate::platform::app_tools::AppHost::new(app_tools_config.clone(), app_tools_runtime.clone())),
+        LocalSessionManager::default().into(),
+        app_tools_host_config,
+    );
+    let app_tools_router = Router::new()
+        .route_service("/p/{app}/mcp", app_tools_service)
+        .layer(middleware::from_fn(mcp_log::log_mcp))
+        .layer(middleware::from_fn_with_state(config.clone(), crate::platform::bearer::require_app_caller));
 
     let mut public_router = Router::new()
         .route("/", get(index))
@@ -174,6 +192,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/project", post(admin::change_project))
         .route("/admin/projects/search", get(admin::search_projects))
         .route("/admin/move", post(admin::move_app))
+        .route("/admin/pin", post(admin::pin_tools))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
         // An app's repository: a source mirror, pushed on publish and pulled on push.
         .route("/admin/github", get(github::github_page))
@@ -222,6 +241,10 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
                 get(me_protected_resource_metadata),
             )
             .route(
+                "/.well-known/oauth-protected-resource/p/{app}/mcp",
+                get(crate::platform::client_oauth::app_protected_resource_metadata),
+            )
+            .route(
                 "/.well-known/oauth-authorization-server",
                 get(oauth_authorization_server_metadata),
             )
@@ -239,5 +262,21 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     crate::platform::schedule::spawn(state.clone());
     let public_router = public_router.with_state(state);
 
-    Router::new().merge(mcp_router).merge(me_router).merge(public_router)
+    Router::new()
+        .merge(mcp_router)
+        .merge(me_router)
+        .merge(public_router)
+        .layer(middleware::from_fn(move |request: axum::extract::Request, next: middleware::Next| {
+            let app_tools = app_tools_router.clone();
+            async move {
+                if crate::platform::app_tools::connector_app(request.uri().path()).is_some() {
+                    use tower::ServiceExt;
+                    return match app_tools.oneshot(request).await {
+                        Ok(response) => response,
+                        Err(never) => match never {},
+                    };
+                }
+                next.run(request).await
+            }
+        }))
 }

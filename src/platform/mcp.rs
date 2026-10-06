@@ -393,6 +393,32 @@ pub(crate) struct RunSqlRequest {
     pub(crate) as_user: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AppToolsRequest {
+    #[schemars(description = "An app slug. Omit it to list the apps you may open that offer tools.")]
+    pub(crate) app: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CallAppToolRequest {
+    #[schemars(description = "The app slug.")]
+    pub(crate) app: String,
+    #[schemars(description = "The tool's name as app_tools lists it, without the app prefix.")]
+    pub(crate) tool: String,
+    #[schemars(description = "The tool's input, matching the input schema app_tools shows.")]
+    pub(crate) arguments: Option<serde_json::Value>,
+    #[schemars(description = "Site admins only: an account email to call as. Otherwise the call is made as you.")]
+    pub(crate) as_user: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct PinAppRequest {
+    #[schemars(description = "The app slug.")]
+    pub(crate) app: String,
+    #[schemars(description = "true lists the app's tools as typed tools on this connector; false takes them off again.")]
+    pub(crate) pinned: bool,
+}
+
 #[derive(Clone)]
 pub struct PageHost {
     pub(crate) config: Arc<Config>,
@@ -1406,6 +1432,79 @@ impl PageHost {
     }
 
     #[tool(
+        description = "Tools that apps on this site offer. Without app: the apps you may open that declare tools, with how many and whether you pinned them. With app: its tools, each with its input schema, the typed name it has when pinned, and the app's own connector URL. Call one with call_app_tool.",
+        annotations(title = "App tools", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn app_tools(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(AppToolsRequest { app }): Parameters<AppToolsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = Self::caller(&ctx);
+        Ok(match crate::platform::app_tools::describe(&self.config, app.as_deref(), caller.user.as_ref()).await {
+            Ok(value) => CallToolResult::structured(value),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
+    }
+
+    #[tool(
+        description = "Call a tool an app offers. The app's own handler runs it as you, with your access and the app's own rules, so it can only do what the app allows you to do. app_tools lists what each app offers and its input.",
+        annotations(title = "Call app tool", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    pub(crate) async fn call_app_tool(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(CallAppToolRequest { app, tool, arguments, as_user }): Parameters<CallAppToolRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = Self::caller(&ctx);
+        let as_whom = match as_user {
+            Some(email) => {
+                if caller.user.as_ref().is_some_and(|user| !user.is_admin) {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "only a site admin may call an app tool as someone else",
+                    )]));
+                }
+                let (config, wanted) = (self.config.clone(), email.clone());
+                match tokio::task::spawn_blocking(move || crate::accounts::users::user_by_email(&config, &wanted))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    Some(user) => Some(user),
+                    None => {
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                            "no active account {email}"
+                        ))]))
+                    }
+                }
+            }
+            None => caller.user.clone(),
+        };
+        // The tool must be one the person it runs as may reach: the caller,
+        // or the account a site admin named, so acting as someone shows
+        // exactly what they would get.
+        let found = match crate::platform::app_tools::find(&self.config, &app, &tool, as_whom.as_ref()).await {
+            Ok(found) => found,
+            Err(refused) => return Ok(refused),
+        };
+        let args = arguments.unwrap_or_else(|| serde_json::json!({}));
+        Ok(crate::platform::app_tools::call(&self.config, &self.runtime, &app, &found, args, as_whom).await)
+    }
+
+    #[tool(
+        description = "Pin or unpin an app's tools for your account. A pinned app's tools are listed on this connector as typed tools named <app>__<tool>; every other app's tools stay reachable through call_app_tool.",
+        annotations(title = "Pin app tools", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn pin_app(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(PinAppRequest { app, pinned }): Parameters<PinAppRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = Self::caller(&ctx);
+        Ok(pin_for(&self.config, caller.user.as_ref(), &app, pinned).await)
+    }
+
+    #[tool(
         description = "Run SQL against one app's own SQLite database — create tables, seed or inspect data. Only reachable over MCP, never from a published page, so it is safe for schema work but is not how an app reads its own data at runtime.",
         annotations(title = "Run SQL", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
@@ -2159,8 +2258,97 @@ impl PageHost {
     }
 }
 
+/// Pins or unpins an app's tools for a person, shared by both connectors.
+pub(crate) async fn pin_for(config: &Arc<Config>, user: Option<&crate::accounts::users::User>, app: &str, pinned: bool) -> CallToolResult {
+    let Some(user) = user else {
+        return CallToolResult::error(vec![ContentBlock::text(
+            "a static token pins nothing; sign in with an account to pin an app",
+        )]);
+    };
+    if crate::platform::app_tools::reachable(config, app, Some(user)).await.is_empty() {
+        return CallToolResult::error(vec![ContentBlock::text(format!("no such app with tools: {app}"))]);
+    }
+    let (cfg, id, owned) = (config.clone(), user.id.clone(), app.to_string());
+    match tokio::task::spawn_blocking(move || crate::accounts::users::set_pin(&cfg, &id, &owned, pinned)).await {
+        Ok(Ok(())) => CallToolResult::success(vec![ContentBlock::text(if pinned {
+            format!("{app} is pinned: its tools are listed as {app}__<tool>. Your client may need to list tools again to see them.")
+        } else {
+            format!("{app} is unpinned: its tools are reachable through call_app_tool.")
+        })]),
+        _ => CallToolResult::error(vec![ContentBlock::text("the pin was not saved")]),
+    }
+}
+
+/// The main connectors list their own tools, then the typed tools of the
+/// apps this person pinned. The list differs per person, so it is marked
+/// private for clients that cache it.
+pub(crate) async fn list_with_pins(
+    config: &Arc<Config>,
+    own: Vec<rmcp::model::Tool>,
+    user: Option<&crate::accounts::users::User>,
+    context: &RequestContext<RoleServer>,
+) -> rmcp::model::ListToolsResult {
+    let mut tools = own;
+    tools.extend(crate::platform::app_tools::pinned_tools(config, user).await);
+    let supports_cache_hints = context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+    rmcp::model::ListToolsResult {
+        result_type: Some(rmcp::model::ResultType::COMPLETE),
+        tools,
+        meta: None,
+        next_cursor: None,
+        ttl_ms: supports_cache_hints.then_some(0),
+        cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Private),
+    }
+}
+
+/// A typed app tool on a main connector, `<app>__<tool>`: found and called
+/// exactly as call_app_tool would, as the person calling.
+pub(crate) async fn call_pinned(
+    config: &Arc<Config>,
+    runtime: &Arc<crate::runtime::wasm::Runtime>,
+    name: &str,
+    arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    user: Option<&crate::accounts::users::User>,
+) -> Option<CallToolResult> {
+    let (app, tool) = crate::platform::app_tools::split_name(name)?;
+    let found = match crate::platform::app_tools::find(config, app, tool, user).await {
+        Ok(found) => found,
+        Err(refused) => return Some(refused),
+    };
+    let args = serde_json::Value::Object(arguments.unwrap_or_default());
+    Some(crate::platform::app_tools::call(config, runtime, app, &found, args, user.cloned()).await)
+}
+
 #[tool_handler]
 impl ServerHandler for PageHost {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        let caller = Self::caller(&context);
+        Ok(list_with_pins(&self.config, self.tool_router.list_all(), caller.user.as_ref(), &context).await)
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if crate::platform::app_tools::split_name(&request.name).is_some() {
+            let caller = Self::caller(&context);
+            if let Some(result) =
+                call_pinned(&self.config, &self.runtime, &request.name, request.arguments.clone(), caller.user.as_ref()).await
+            {
+                return Ok(result.into());
+            }
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)

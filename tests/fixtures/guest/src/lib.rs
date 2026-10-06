@@ -93,6 +93,34 @@ impl Guest for Handler {
         match route.as_str() {
             "/echo" => respond(200, format!("{} {}?{}", req.method, req.path, req.query)),
 
+            // What an app tool call carries: the tool the host named, the
+            // caller, and the body, answered as JSON. Hand-written JSON keeps
+            // the guest free of a serde dependency.
+            "/tool" => {
+                let tool = req
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("x-toolsite-tool"))
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let user = identity::current_user().map(|u| u.email).unwrap_or_default();
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+                Response {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: format!(
+                        "{{\"tool\":\"{}\",\"user\":\"{}\",\"method\":\"{}\",\"body\":\"{}\"}}",
+                        quote(&tool),
+                        quote(&user),
+                        quote(&req.method),
+                        quote(&body)
+                    )
+                    .into_bytes(),
+                }
+            }
+
             "/myrole" => match identity::current_role() {
                 Some(role) => respond(200, role),
                 None => respond(200, "none".to_string()),

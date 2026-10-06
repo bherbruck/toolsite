@@ -122,8 +122,9 @@ Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
 wall-clock deadline. State must live in the database. A global does not
 survive the request that set it.
 
-The host sets `x-toolsite-scheduled` on a job run. Client copies of any
-`x-toolsite-*` header are stripped, so it means what it says.
+The host sets `x-toolsite-scheduled` on a job run and `x-toolsite-tool` on an
+app tool call. Client copies of any `x-toolsite-*` header are stripped, so
+each means what it says.
 
 ## Files
 
@@ -188,8 +189,108 @@ schedule = "0 */5 * * * *"
 path = "/api/refresh"
 ```
 
-Routes and jobs are replaced wholesale, so deleting a line removes the thing.
-Anything the file does not mention is left alone.
+Routes, jobs and tools are replaced wholesale, so deleting a line removes the
+thing. Anything the file does not mention is left alone. Tools: see App tools.
+
+## App tools
+
+An app can offer MCP tools. Each tool is a handler route you already write;
+the platform signs the person in, decides whether they may open the app (its
+access, its route rules, their permissions) and calls the route as them. So
+`current-user`, `current-role`, `current_user()` in SQL and the app's
+row-level policies apply to a tool call exactly as they apply to a page. The
+app writes no auth code.
+
+Declare them in `toolsite.toml`:
+
+```toml
+[[tool]]
+name = "log_production"              # lower case, digits, single underscores
+title = "Log production"             # optional; made from the name otherwise
+description = "Record a day's egg count for a house."
+path = "/api/tools/log_production"   # a handler route, under /api/
+read_only = false                    # hints: read_only, destructive, idempotent, open_world
+idempotent = true
+input = { type = "object", properties = { house = { type = "string" }, eggs = { type = "integer" } }, required = ["house", "eggs"] }
+# or: input = "tools/log_production.json", a file in the stored source (upload ?source first)
+# output = "tools/log_production.out.json"   # optional output schema
+```
+
+Tools are replaced wholesale, like routes and jobs. `<app>__<name>` must fit
+in 64 characters. A manifest with one bad tool applies nothing.
+
+A call arrives as `POST <path>` with `content-type: application/json`, the
+body `{"tool": "<name>", "arguments": {...}}`, and the header
+`x-toolsite-tool: <name>`, which only the host can set. Answer JSON with a
+2xx status and the model gets it as structured content; any other 2xx body
+arrives as text; a 4xx or 5xx is a tool error carrying the first 2 KB of the
+body, so say what went wrong in words.
+
+A full route, writing through a policy so a person logs only their own rows
+(`serde_json` added to the crate):
+
+```toml
+[[access.table]]
+table = "production"
+where = "logged_by = current_user()"
+owner = "logged_by"
+write = true
+```
+
+```rust
+("POST", "/tools/log_production") => {
+    let Some(_who) = identity::current_user() else {
+        return json(401, r#"{"error":"sign in to log production"}"#.into());
+    };
+    let call: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+    let args = &call["arguments"];
+    let (Some(house), Some(eggs)) = (args["house"].as_str(), args["eggs"].as_i64()) else {
+        return json(400, r#"{"error":"house and eggs are required"}"#.into());
+    };
+    // Through the view: the policy fills logged_by and refuses anyone else's row.
+    match db::query_scoped(
+        "insert into my_production (house, eggs, day) values (?, ?, date('now'))",
+        &[db::Value::Text(house.into()), db::Value::Integer(eggs)],
+    ) {
+        Ok(_) => json(200, format!(r#"{{"logged":{eggs},"house":{house:?}}}"#)),
+        Err(e) => json(403, format!(r#"{{"error":{:?}}}"#, format!("{e:?}"))),
+    }
+}
+```
+
+People reach the tools three ways, all with their toolsite account:
+
+- `<site>/p/<app>/mcp`: a connector with this app's tools alone. Add it in
+  Claude or ChatGPT; it signs in through the same OAuth server. `mcp` under
+  an app is reserved for it, like `api`.
+- `<site>/me/mcp` and `<site>/mcp`: `app_tools` lists apps with tools and
+  their inputs, `call_app_tool` calls one. `pin_app` lists a chosen app's
+  tools there as typed tools named `<app>__<name>`.
+- The app browser's menu: Pin tools, and Copy connector link.
+
+**Put the link in the app.** An app that declares tools gets a "Connect an
+AI assistant" entry in its menu or settings that shows the connector URL
+with a copy button. Build it from the page's own address, so it is right on
+every site the app is deployed to:
+
+```jsx
+function ConnectAssistant() {
+  const url = window.location.origin + import.meta.env.BASE_URL.replace(/\/$/, "") + "/mcp";
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="flex items-center gap-2">
+      <code className="truncate">{url}</code>
+      <button onClick={() => navigator.clipboard.writeText(url).then(() => setCopied(true))}>
+        {copied ? "Copied" : "Copy"}
+      </button>
+      <p className="text-sm">Add this as a connector in Claude or ChatGPT and sign in with your account.</p>
+    </div>
+  );
+}
+```
+
+`BASE_URL` is Vite's `base`, which is `/p/<app>/`. Without Vite, take the
+first two segments of `window.location.pathname`.
 
 ## Access
 

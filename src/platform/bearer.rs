@@ -143,3 +143,52 @@ pub(crate) async fn require_person(
     }
     response
 }
+
+/// The app whose tools a `/p/<app>/mcp` request is for, put on the request
+/// by `require_app_caller` from the path it arrived on.
+#[derive(Clone, Debug)]
+pub struct ToolApp(pub String);
+
+/// `/p/<app>/mcp`: an app's tools as a connector of their own. Any account's
+/// OAuth token, as on `/me/mcp`, or a static token, which calls as nobody.
+/// Whether the person may see this app's tools is the server's question,
+/// asked per call, so a person with no access sees an empty list rather
+/// than a refusal that would confirm the app exists.
+pub(crate) async fn require_app_caller(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    mut request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let Some(app) = crate::platform::app_tools::connector_app(request.uri().path()).map(str::to_string) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let presented = presented_token(&headers);
+    if presented.is_some_and(|token| config.valid_tokens.iter().any(|v| v == token)) {
+        request.extensions_mut().insert(Caller { user: None });
+        request.extensions_mut().insert(ToolApp(app));
+        return next.run(request).await;
+    }
+    if let Some(token) = presented.filter(|_| config.oauth_enabled())
+        && let Some(user) = client_oauth::token_user(&config, token).await
+    {
+        tracing::debug!(email = %user.email, %app, "app tools request");
+        request.extensions_mut().insert(Caller { user: Some(user) });
+        request.extensions_mut().insert(ToolApp(app));
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        method = %request.method(),
+        path = %request.uri().path(),
+        token_presented = presented.is_some(),
+        "401: no account token for an app's tools"
+    );
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    if let Some(base) = config.base_url.as_deref()
+        && let Ok(value) =
+            format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/p/{app}/mcp""#).parse()
+    {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}

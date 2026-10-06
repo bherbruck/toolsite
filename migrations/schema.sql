@@ -28,6 +28,12 @@ CREATE TABLE invites (
     expires_at integer not null
 )
 CREATE INDEX invites_by_user on invites(user_id)
+CREATE TABLE pins (
+    user_id    text not null references users(id),
+    app        text not null,
+    created_at integer not null,
+    primary key (user_id, app)
+)
 CREATE TABLE scopes (
     user_id    text not null references users(id),
     prefix     text not null,

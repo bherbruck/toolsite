@@ -40,9 +40,23 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-/// The one thing every issued token is for.
-pub(crate) fn resource_url(config: &Config) -> Option<String> {
-    config.base_url.as_ref().map(|base| format!("{base}/mcp"))
+/// Whether a client may ask for a token for this resource: the publishing
+/// connector, a person's own, or one app's tools at `/p/<app>/mcp`. They
+/// share one sign-in; what a token may do is decided where it is used.
+pub(crate) fn allowed_resource(config: &Config, resource: &str) -> bool {
+    let Some(base) = config.base_url.as_deref() else {
+        return false;
+    };
+    let Some(path) = resource.trim_end_matches('/').strip_prefix(base) else {
+        return false;
+    };
+    match path {
+        "/mcp" | "/me/mcp" => true,
+        _ => path
+            .strip_prefix("/p/")
+            .and_then(|rest| rest.strip_suffix("/mcp"))
+            .is_some_and(crate::platform::export::valid_app),
+    }
 }
 
 fn issuer(config: &Config) -> &str {
@@ -75,6 +89,23 @@ pub(crate) async fn me_protected_resource_metadata(
         "authorization_servers": [base],
         "bearer_methods_supported": ["header"],
     }))
+}
+
+/// The same for one app's tools at `/p/<app>/mcp`.
+pub(crate) async fn app_protected_resource_metadata(
+    State(config): State<Arc<Config>>,
+    axum::extract::Path(app): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if !crate::platform::export::valid_app(&app) {
+        return (axum::http::StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let base = issuer(&config);
+    Json(serde_json::json!({
+        "resource": format!("{base}/p/{app}/mcp"),
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+    }))
+    .into_response()
 }
 
 pub(crate) async fn oauth_authorization_server_metadata(
@@ -306,7 +337,7 @@ fn validate_request(config: &Config, params: &AuthorizeParams) -> Result<(), Res
         }
     }
     if let Some(resource) = params.resource.as_deref()
-        && resource_url(config).as_deref() != Some(resource.trim_end_matches('/'))
+        && !allowed_resource(config, resource)
     {
         tracing::warn!(client_id = %params.client_id, %resource, "authorize refused: wrong resource");
         return Err(redirect_error(params, "invalid_target"));

@@ -361,6 +361,8 @@ form.row .combo { width: auto; flex: 1 1 14rem; }
   list-style: none;
 }
 .menu [role=menuitem]::-webkit-details-marker { display: none; }
+.menu button[role=menuitem] { background: none; border: 0; font: inherit; text-align: left; }
+form.menu-pin { display: contents; }
 .menu [role=menuitem]:hover, .menu [role=menuitem]:focus-visible { background: var(--soft); outline: none; text-decoration: none; }
 .menu details.menu-sub { margin: 0; }
 .menu .muted { margin: 0; }
@@ -691,6 +693,16 @@ pub const SHELL_SCRIPT: &str = r#"
     document.body.appendChild(note);
     setTimeout(() => note.remove(), 3500);
   };
+  // Copies a link on this site, written as a path so the page needs no
+  // knowledge of the address it is served from.
+  document.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-copy-link]');
+    if (!button) return;
+    const link = window.location.origin + button.dataset.copyLink;
+    try { await navigator.clipboard.writeText(link); toast('Copied', true); }
+    catch { toast(link, true); }
+    button.closest('[popover]')?.hidePopover?.();
+  });
   // The permissions rules save in place: a cell, a level select, a removal
   // and the add row all post with fetch, then the table is redrawn from the
   // server. After an add the search is cleared and keeps the focus, so the
