@@ -248,10 +248,30 @@ async fn relocate(config: &Arc<Config>, actor: Option<&User>, from: &str, to: &s
     if store::folder_exists(config, to).await {
         return Err(Problem::Invalid(format!("There is already a project '{to}'.")));
     }
-    // An app at the top level answers to its own slug as a path, so a
-    // project there may not take an app's name.
-    if !to.contains('/') && store::app_exists(config, to).await {
-        return Err(Problem::Invalid(format!("There is an app called '{to}' at the top level. Choose another name.")));
+    // Permission rows are keyed by path, and an app's path is its project
+    // plus its slug. A project that lands on an app's path would let rows
+    // set on one open the other, so no path the move produces, the project
+    // or any project below it, may be an app's. Apps inside the project move
+    // with it and cannot collide with it.
+    let apps = store::apps_with_folders(config).await;
+    let app_paths: Vec<String> = apps
+        .iter()
+        .filter(|(_, at)| !(!at.is_empty() && users::prefix_covers(from, at)))
+        .map(|(app, at)| if at.is_empty() { app.clone() } else { format!("{at}/{app}") })
+        .collect();
+    let produced: Vec<String> = store::list_folders(config)
+        .await
+        .into_iter()
+        .filter_map(|folder| {
+            if folder.path == from {
+                Some(to.to_string())
+            } else {
+                folder.path.strip_prefix(&format!("{from}/")).map(|rest| format!("{to}/{rest}"))
+            }
+        })
+        .collect();
+    if let Some(clash) = produced.iter().find(|path| app_paths.contains(path)) {
+        return Err(Problem::Invalid(format!("There is an app at '{clash}'. Choose another name or place.")));
     }
     let (config2, old, new) = (config.clone(), from.to_string(), to.to_string());
     tokio::task::spawn_blocking(move || users::move_scope_tree(&config2, &old, &new))

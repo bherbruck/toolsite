@@ -6570,3 +6570,30 @@ async fn every_search_field_has_the_magnifier_clear_button_and_shortcut() {
     let (_, page, _) = send(&config, get_as("/", &fa)).await;
     assert!(page.contains("placeholder=\"Search apps and projects\""));
 }
+
+#[tokio::test]
+async fn a_project_cannot_be_renamed_or_moved_onto_an_apps_path() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    folder(&config, "ops/yard", "north").await;
+    folder(&config, "", "finance").await;
+    write_page(&config, "ledger", "<title>Ledger</title>");
+    unset_app_in(&config, "north", "finance").await;
+    let mut full = Mcp::open(&config, TOKEN).await;
+
+    // Onto a top-level app's slug.
+    let (is_error, text) = full.call("projects", serde_json::json!({ "action": "rename", "path": "ops", "name": "ledger" })).await;
+    assert!(is_error && text.contains("app at 'ledger'"), "{text}");
+    // A descendant landing on an app's path: ops/yard/north would become
+    // finance/north, where the app north lives.
+    let (is_error, text) = full.call("projects", serde_json::json!({ "action": "move_project", "path": "ops/yard", "parent": "finance" })).await;
+    assert!(!is_error, "{text}");
+    let (is_error, text) = full.call("projects", serde_json::json!({ "action": "rename", "path": "finance/yard", "name": "x" })).await;
+    assert!(!is_error, "{text}");
+    folder(&config, "", "labs").await;
+    folder(&config, "labs", "north").await;
+    let (is_error, text) = full.call("projects", serde_json::json!({ "action": "move_project", "path": "labs/north", "parent": "finance" })).await;
+    assert!(is_error && text.contains("finance/north"), "{text}");
+    assert!(toolsite::content::store::folder_exists(&config, "labs/north").await);
+}
