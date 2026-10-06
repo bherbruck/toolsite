@@ -383,8 +383,7 @@ async fn render(config: Arc<Config>, headers: HeaderMap, project: String, query:
             }
         } @else {
             form."search" method="get" action=(browser_url(&project)) {
-                input type="search" id="q" name="q" value=(q) autocomplete="off"
-                      placeholder=(if project.is_empty() { "Search all apps and projects".to_string() } else { format!("Search in {title}") });
+                (ui::search_field("q", &q, &(if project.is_empty() { "Search apps and projects".to_string() } else { format!("Search in {title}") }), Some("q")))
             }
             @if q.is_empty() {
                 (level(&tree, &project, shown, &open, &ctx))

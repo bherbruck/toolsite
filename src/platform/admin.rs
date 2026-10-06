@@ -380,7 +380,7 @@ fn paginate<T>(all: Vec<T>, query: &ListQuery, text: impl Fn(&T) -> String) -> L
 fn search_box(listing: &Listing<impl Sized>, path: &str, placeholder: &str) -> Markup {
     html! {
         form."search" method="get" action=(path) {
-            input type="search" id="q" name="q" value=(listing.q) placeholder=(placeholder) autocomplete="off";
+            (ui::search_field("q", &listing.q, placeholder, Some("q")))
         }
     }
 }

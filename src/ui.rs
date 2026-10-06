@@ -394,6 +394,33 @@ form.inline { display: inline; margin: 0; }
 /* Search above a list: narrows the page as you type, searches on Enter. */
 form.search { margin: 0 0 1rem; }
 form.search input[type=search] { margin: 0; }
+/* Every search field looks alike: a magnifier inside on the left, a clear
+   button on the right once there is text, an input's border and focus ring,
+   no panel background. */
+.searchbox { position: relative; display: block; width: 100%; }
+.searchbox svg.search-icon {
+  position: absolute; left: .7rem; top: 50%; transform: translateY(-50%);
+  width: 1rem; height: 1rem; color: var(--muted); pointer-events: none;
+}
+.searchbox input[type=search] {
+  width: 100%; margin: 0; padding-left: 2.2rem; padding-right: 2.2rem;
+  background: var(--card); border: 1px solid var(--border);
+}
+.searchbox input[type=search]::-webkit-search-cancel-button { display: none; }
+.searchbox input[type=search]::-webkit-search-decoration { display: none; }
+.searchbox .search-clear {
+  position: absolute; right: .35rem; top: 50%; transform: translateY(-50%);
+  padding: .1rem .45rem; border: 0; background: transparent; color: var(--muted);
+  font-size: 1rem; line-height: 1; cursor: pointer;
+}
+.searchbox .search-clear:hover { color: var(--fg); background: var(--soft); }
+.searchbox input:placeholder-shown ~ .search-clear { display: none; }
+.searchbox kbd {
+  position: absolute; right: .6rem; top: 50%; transform: translateY(-50%);
+  font: .75rem ui-monospace, monospace; color: var(--muted);
+  border: 1px solid var(--border); border-radius: .25rem; padding: 0 .3rem; pointer-events: none;
+}
+.searchbox input:not(:placeholder-shown) ~ kbd, .searchbox input:focus ~ kbd { display: none; }
 .pager {
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
   margin: .75rem 0 0; color: var(--muted); font-size: .85rem;
@@ -457,7 +484,8 @@ details.remove-rule > summary:hover { color: var(--danger); background: var(--da
 details.remove-rule[open] > summary { display: none; }
 .remove-ask { display: inline-flex; gap: .35rem; align-items: center; font-size: .85rem; }
 .rules-filter { margin: 0 0 .75rem; }
-.rules-filter input[type=search] { margin: 0; max-width: 20rem; }
+.rules-filter input[type=search] { margin: 0; }
+.rules-filter .searchbox { flex: 1; max-width: 20rem; }
 .pager { margin-top: .75rem; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 h4.group { font-size: .85rem; margin: 1rem 0 .25rem; color: var(--muted); }
@@ -946,6 +974,30 @@ pub const SHELL_SCRIPT: &str = r#"
     if (menu.matches(':popover-open')) menu.hidePopover();
     menu.showPopover();
   });
+  // Search fields: the clear button empties the field and, when the page
+  // was showing results for it, goes back to the unfiltered list; "/"
+  // reaches the first search on the page unless you are typing elsewhere.
+  document.addEventListener('click', (event) => {
+    const clear = event.target.closest('.search-clear');
+    if (!clear) return;
+    const input = clear.parentElement.querySelector('input[type=search]');
+    if (!input) return;
+    const had = new URL(location.href).searchParams.get(input.name);
+    input.value = '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus();
+    if (had && input.form) input.form.requestSubmit();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey) return;
+    const active = document.activeElement;
+    if (active && (active.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName))) return;
+    const field = document.querySelector('input[data-search-field]');
+    if (!field) return;
+    event.preventDefault();
+    field.focus();
+    field.select();
+  });
 })();
 </script>
 "#;
@@ -991,6 +1043,23 @@ pub const FILTER_SCRIPT: &str = r#"
 })();
 </script>
 "#;
+
+/// A search field: magnifier inside on the left, a clear button once it has
+/// text, and `/` to reach it from anywhere on the page. `id` lets the list
+/// filter script find it.
+pub fn search_field(name: &str, value: &str, placeholder: &str, id: Option<&str>) -> Markup {
+    html! {
+        span."searchbox" {
+            svg."search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" {
+                circle cx="11" cy="11" r="7" {}
+                path d="m20 20-3.5-3.5" {}
+            }
+            input type="search" id=[id] name=(name) value=(value) placeholder=(placeholder) aria-label=(placeholder) autocomplete="off" data-search-field;
+            button."search-clear" type="button" aria-label="Clear the search" title="Clear" { "\u{00D7}" }
+            kbd title="Press / to search" { "/" }
+        }
+    }
+}
 
 /// What a browser tab shows: the page, then the site, so a row of tabs reads
 /// "Apps · toolsite", "ops · toolsite". A page already named toolsite is not

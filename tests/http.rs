@@ -6552,3 +6552,21 @@ async fn a_project_keeps_its_access_when_renamed_and_the_tab_and_tool_set_it() {
     assert!(!is_error && text.contains("follows"), "{text}");
     assert_eq!(effective_gate(&config, "forklifts", "/").await.source, GateSource::Site);
 }
+
+#[tokio::test]
+async fn every_search_field_has_the_magnifier_clear_button_and_shortcut() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    write_page(&config, "notes", "<title>Notes</title>");
+    account(&config, "fa@example.com", "correct horse");
+    scope(&config, "fa@example.com", "", "admin");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    for path in ["/", "/admin/apps"] {
+        let (status, page, _) = send(&config, get_as(path, &fa)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(page.contains("class=\"searchbox\""), "{path} has no search box");
+        assert!(page.contains("search-icon") && page.contains("search-clear") && page.contains("data-search-field"), "{path}");
+    }
+    let (_, page, _) = send(&config, get_as("/", &fa)).await;
+    assert!(page.contains("placeholder=\"Search apps and projects\""));
+}

@@ -298,7 +298,7 @@ pub(crate) async fn panel(
                     @if many {
                         form."row rules-filter" method="get" action=(base_of(&back)) {
                             @if back.contains("?tab=permissions") { input type="hidden" name="tab" value="permissions"; }
-                            input type="search" name="rq" value=(filter) placeholder="Filter people" aria-label="Filter people";
+                            (ui::search_field("rq", &filter, "Filter people", None))
                             button."quiet sm" type="submit" { "Filter" }
                         }
                     }
