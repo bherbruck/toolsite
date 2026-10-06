@@ -967,6 +967,17 @@ pub const FILTER_SCRIPT: &str = r#"
 </script>
 "#;
 
+/// What a browser tab shows: the page, then the site, so a row of tabs reads
+/// "Apps · toolsite", "ops · toolsite". A page already named toolsite is not
+/// named twice.
+pub fn tab_title(title: &str) -> String {
+    if title.is_empty() || title.eq_ignore_ascii_case("toolsite") {
+        "toolsite".to_string()
+    } else {
+        format!("{title} · toolsite")
+    }
+}
+
 /// A full document. `script` is emitted verbatim at the end of the body, so
 /// callers keep control of anything interactive.
 pub fn page(title: &str, body: Markup, script: Option<&str>) -> Markup {
@@ -977,7 +988,7 @@ pub fn page(title: &str, body: Markup, script: Option<&str>) -> Markup {
                 meta charset="utf-8";
                 link rel="icon" href="/favicon.svg" type="image/svg+xml";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
+                title { (tab_title(title)) }
                 style { (PreEscaped(STYLE)) }
             }
             body {
@@ -1002,7 +1013,7 @@ pub fn shell(title: &str, sidebar: Markup, body: Markup, script: Option<&str>) -
                 meta charset="utf-8";
                 link rel="icon" href="/favicon.svg" type="image/svg+xml";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
+                title { (tab_title(title)) }
                 style { (PreEscaped(STYLE)) }
             }
             body {
@@ -1041,7 +1052,7 @@ pub fn form_page(title: &str, body: Markup) -> Markup {
                 meta charset="utf-8";
                 link rel="icon" href="/favicon.svg" type="image/svg+xml";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
+                title { (tab_title(title)) }
                 style { (PreEscaped(STYLE)) }
                 style {
                     (PreEscaped(
