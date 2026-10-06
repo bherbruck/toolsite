@@ -133,6 +133,14 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .layer(middleware::from_fn(mcp_log::log_mcp))
         .layer(middleware::from_fn_with_state(config.clone(), crate::platform::bearer::require_app_caller));
 
+    // A browser's live connection to an app: a WebSocket upgrade at one of
+    // the paths the app declared. Taken before the site's routes, so the
+    // upgrade never reaches a file or the handler as a request; a plain
+    // request to the same path is served as always.
+    let sockets_router = Router::new()
+        .route("/p/{*rest}", get(crate::platform::websocket::upgrade))
+        .with_state(AppState { config: config.clone(), runtime: runtime.clone() });
+
     let mut public_router = Router::new()
         .route("/", get(index))
         .route("/favicon.svg", get(crate::content::serve::site_favicon_svg))
@@ -268,7 +276,17 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .merge(public_router)
         .layer(middleware::from_fn(move |request: axum::extract::Request, next: middleware::Next| {
             let app_tools = app_tools_router.clone();
+            let sockets = sockets_router.clone();
             async move {
+                if crate::platform::app_tools::connector_app(request.uri().path()).is_none()
+                    && crate::platform::websocket::is_upgrade(&request)
+                {
+                    use tower::ServiceExt;
+                    return match sockets.oneshot(request).await {
+                        Ok(response) => response,
+                        Err(never) => match never {},
+                    };
+                }
                 if crate::platform::app_tools::connector_app(request.uri().path()).is_some() {
                     use tower::ServiceExt;
                     return match app_tools.oneshot(request).await {

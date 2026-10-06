@@ -560,7 +560,7 @@ app is never briefly public. One deploy does the lot: build, schema, config,
 bundle, handler, notes, source. Without the CLI it is
 `curl -f -T toolsite.toml '<upload-url>?manifest'`.
 
-**What it declares, it owns.** Routes, jobs and tools are replaced wholesale, so
+**What it declares, it owns.** Routes, jobs, tools and sockets are replaced wholesale, so
 deleting a line removes the thing; no drift between the file and the server.
 What it does not mention is left alone, so hiding an app by hand survives the
 next deploy. A job whose schedule did not change keeps its history. A manifest
@@ -610,6 +610,60 @@ The app's admin page has a Tools tab with the connector URL and the
 declared tools, and the app browser's menu has Copy connector link. The
 guide tells an agent building an app with tools to put the same link in the
 app itself.
+
+## Live connections
+
+An app can take WebSockets. Declare where in `toolsite.toml`:
+
+```toml
+[[socket]]
+path = "/live/ws"
+```
+
+A browser connects with `new WebSocket("wss://<host>/p/<app>/live/ws")`.
+Toolsite holds the socket; the app's handler gets what happens on it as
+events, in the same component that answers requests:
+
+- **`connect`**: the socket path, the query, the upgrade's headers and the
+  person, as `identity.current-user()`. Return ok to accept; return an
+  error to refuse, and the browser gets HTTP 403 with that reason.
+- **`message`**: a text or binary frame, at most 64 KB.
+- **`close`**: the connection ended, from either side.
+
+Events for one connection run one at a time, in order. Each runs in a fresh
+instance like a request, with the database, files, settings and identity
+as usual. The `connections` import acts on connections by id: `send`,
+`close`, `subscribe`, `unsubscribe`, `publish` to a topic, and
+`state-get` / `state-set` for up to 64 KB kept per connection between its
+events. These imports work from an ordinary request and from a scheduled
+job too, so an API write can tell the open sockets about it.
+
+The rules:
+
+- Only a declared path takes an upgrade; anywhere else is 404. A plain
+  request to the same path is served as always. At most 16 sockets per
+  app, declared wholesale like routes and tools. `/mcp` cannot be one.
+- The upgrade passes the app's gate for that path, route rules and project
+  locks included, so a route rule opens or closes a socket.
+- Every 30 seconds each connection is pinged and its person's access is
+  decided again. A disabled account, a hidden or removed app, a withdrawn
+  socket or a gate that no longer admits them closes it.
+- A topic is lower-case letters, digits, `-` and `_`, or `user:<id>`. A
+  connection may join `user:<id>` only when it is that person's; the app
+  may publish to any.
+- Limits: open connections per app and per person, and messages per app
+  per second (see Environment variables). A connection that falls more
+  than 64 messages behind is closed, and so is one whose browser sends
+  faster than the handler answers.
+- Nothing is stored or replayed. A page that reconnects asks the app's API
+  for what it missed.
+- A handler opts in by building for the `app-with-connections` world, which
+  adds the `on-connection` export to `app`. A handler built for `app` keeps
+  working, and its app refuses upgrades with 501.
+
+Connections live in one server process. Toolsite runs as one instance, so
+that is all of them; a deployment with several instances would need a shared
+bus first.
 
 ## Notes for the next session
 
@@ -1218,6 +1272,9 @@ is required to serve HTTP.
 | `TOOLSITE_BROWSER` | no | Path to a Chromium or chrome-headless-shell binary in this container. An image built with `WITH_BROWSER=1` sets it. When unset, the usual names on `PATH` are tried; when none is found, screenshots are off and say so. |
 | `TOOLSITE_PREVIEW_BASE` | no | The address a screenshot browser uses to reach this server, e.g. `http://toolsite.railway.internal:8080` for a sidecar. Default: this server's own port on `127.0.0.1`. |
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
+| `TOOLSITE_SOCKETS_PER_APP` | no (default `500`) | Open live connections one app may have at once. See Live connections. |
+| `TOOLSITE_SOCKETS_PER_PERSON` | no (default `20`) | Open live connections one account may hold at once, across apps. |
+| `TOOLSITE_SOCKET_MESSAGES_PER_SECOND` | no (default `100`) | Messages one app may send or publish to its connections each second. The rest are refused, with one warning a second in the log. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |

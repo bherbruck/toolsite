@@ -479,6 +479,28 @@ Then:
 3. Prove it: `app_tools(app)` lists the tools, and `call_app_tool` with
    `as_user` for two accounts shows each gets only what they should.
 
+## Live connections
+
+For live updates, declare a socket and handle it in the same handler:
+
+```toml
+[[socket]]
+path = "/live/ws"   # at most 16; only declared paths take an upgrade
+```
+
+Build for `world: "app-with-connections"` and add
+`fn on_connection(conn: String, event: Event) -> Result<(), String>`:
+`Connect(info)` (return `Err` to refuse with 403; subscribe here), then each
+`Message`, then `Close`. Act with `connections::{send, close, subscribe,
+unsubscribe, publish, state_get, state_set}`; `publish` and `send` also work
+from ordinary API routes and jobs, so a write broadcasts a change.
+
+- Nothing is replayed. The page reconnects with backoff and refetches on
+  every open. The guide has a React hook.
+- The gate for the socket's path applies, and is checked again every 30 s.
+- `user:<id>` topics: a connection joins only its own; publish to anyone's.
+- Prove it: open two browsers, change data in one, see the other update.
+
 ## Keep the project, and start from it
 
 A bundle cannot be turned back into the sources that built it, so publish the

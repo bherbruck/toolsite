@@ -53,6 +53,11 @@ pub struct Manifest {
     /// wholesale: a tool removed from the file is withdrawn.
     #[serde(default, rename = "tool")]
     pub tools: Vec<ToolDecl>,
+    /// Paths that accept a WebSocket, handled by the handler's
+    /// `on-connection`. Declared wholesale: a socket removed from the file
+    /// stops accepting, and its open connections close on their next check.
+    #[serde(default, rename = "socket")]
+    pub sockets: Vec<SocketDecl>,
     /// What a person may query from outside the app, and the row-level
     /// policies the platform turns into views. Present means declared
     /// wholesale: what the block does not name is withdrawn.
@@ -127,6 +132,12 @@ pub enum SchemaRef {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SocketDecl {
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub name: String,
     pub schedule: String,
@@ -152,7 +163,7 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
              allow_http, roles, [[route]] (path, gate), [[job]] (name, schedule, path), \
              [access] views, [[access.table]] (table, view, where, owner, write), \
              [[tool]] (name, title, description, path, read_only, destructive, idempotent, \
-             open_world, input, output)."
+             open_world, input, output), [[socket]] (path)."
         )
     })?;
 
@@ -178,6 +189,25 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
     }
 
     let tools = resolve_tools(config, app, &manifest.tools).await?;
+
+    let sockets: Vec<String> = manifest.sockets.iter().map(|socket| socket.path.trim().to_string()).collect();
+    if sockets.len() > crate::platform::websocket::MAX_SOCKETS {
+        return Err(format!(
+            "{} sockets declared; an app may declare at most {}",
+            sockets.len(),
+            crate::platform::websocket::MAX_SOCKETS
+        ));
+    }
+    for (n, path) in sockets.iter().enumerate() {
+        if !crate::platform::websocket::valid_socket_path(path) {
+            return Err(format!(
+                "socket path must start with '/' and be made of letters, digits, '-', '_' and '.', with no segment starting with '.' and not /mcp, got {path:?}"
+            ));
+        }
+        if sockets[..n].contains(path) {
+            return Err(format!("socket {path}: declared twice"));
+        }
+    }
 
     let mut changed = Vec::new();
     let mut meta = read_meta(config, app).await;
@@ -221,6 +251,15 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
             });
             meta.allow_http = allow;
         }
+    }
+
+    if meta.sockets != sockets {
+        changed.push(if sockets.is_empty() {
+            "sockets withdrawn".to_string()
+        } else {
+            format!("{} socket(s): {}", sockets.len(), sockets.join(", "))
+        });
+        meta.sockets = sockets;
     }
 
     // Declared wholesale: a route removed from the file is removed here.

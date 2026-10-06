@@ -56,6 +56,8 @@ platform/          the site as its owner uses it
   scaffold.rs      the WIT and a buildable crate, served to agents
   secrets.rs       per-app settings, sealed at rest, entered by a person
   schedule.rs      cron jobs, run through the same handler a request uses
+  connections.rs   a live connection's life: connect, events to the handler, re-checks, close
+  websocket.rs     the WebSocket transport: upgrades at an app's declared socket paths
 
 content/           what gets published, and how it is served
   slug.rs          naming rules (what may become a path), tokens, escaping
@@ -70,6 +72,7 @@ runtime/           executing an app's own code and data
   db.rs            per-app SQLite, the identity functions, the authorizers (apps apart; a person inside the views)
   access.rs        row-level policies from toolsite.toml, realised as views and triggers
   blobs.rs         per-app files, on the volume or in a bucket, keyed like paths
+  connections.rs   every open connection by app: topics, state, limits; no HTTP, no transport
 
 accounts/          people who USE published apps
   users.rs         accounts, sessions, grants, sign-in routes
@@ -116,6 +119,11 @@ The same `PageHost` serves two ways: HTTP (`POST /mcp`, token or OAuth) and
 stdio (`--stdio`, for local clients). In stdio mode stdout is the protocol
 channel, so logging must go to stderr — anything printed to stdout corrupts
 the stream.
+
+Live connections are single-instance: the registry is in this process's
+memory. A second instance would need a shared bus before it could take
+sockets. A new transport (TCP, say) implements `platform::connections::
+Transport`; the handler's events do not change.
 
 ## Testing
 

@@ -8,7 +8,7 @@ edition = "2024"
 tower = { version = "0.5.3", features = ["util"] }
 anyhow = "1.0.104"
 argon2 = "0.5.3"
-axum = { version = "0.8.9", features = ["macros"] }
+axum = { version = "0.8.9", features = ["macros", "ws"] }
 base64 = "0.22.1"
 chacha20poly1305 = "0.11.0"
 chrono = "0.4.45"
@@ -50,4 +50,5 @@ usvg = { version = "0.48", default-features = false, features = ["text", "writer
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio-tungstenite = "0.30.0"
 wat = "1.255.0"

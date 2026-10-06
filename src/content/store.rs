@@ -98,6 +98,10 @@ pub struct PageMeta {
     /// guess, so the name they would have to guess is not guessable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_salt: Option<String>,
+    /// Paths inside the app that accept a WebSocket, from `[[socket]]` in
+    /// toolsite.toml. An upgrade anywhere else is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sockets: Vec<String>,
 }
 
 /// One row-level access policy: who may see, and perhaps change, which rows
@@ -195,6 +199,7 @@ impl Default for PageMeta {
             policies: Vec::new(),
             generated: Vec::new(),
             access_salt: None,
+            sockets: Vec::new(),
         }
     }
 }

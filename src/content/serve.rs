@@ -280,7 +280,7 @@ pub(crate) async fn serve_page(
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
-async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
+pub(crate) async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
     if !valid_slug(app) {
         return None;
     }
@@ -297,7 +297,7 @@ async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
 /// instead of either redirect, since sending a fetch to an HTML form only
 /// produces a confusing parse error — and because an automatic handoff on a
 /// background request is precisely the hole the app cookie exists to close.
-async fn gate_check(
+pub(crate) async fn gate_check(
     config: &Arc<Config>,
     app: &str,
     visitor: Option<&crate::accounts::users::User>,

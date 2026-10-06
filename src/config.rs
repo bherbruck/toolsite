@@ -49,6 +49,10 @@ pub struct Config {
     /// own port unless `TOOLSITE_PREVIEW_BASE` names an address a sidecar
     /// can reach.
     pub preview_base: String,
+    /// Live connections: every app's open sockets, one registry per
+    /// process. Shared with every task's copy of this config, so a
+    /// scheduled job's publish reaches the same sockets a request's does.
+    pub connections: std::sync::Arc<crate::runtime::connections::Hub>,
 }
 
 impl Config {
@@ -80,6 +84,7 @@ impl Config {
             previews: Mutex::new(HashMap::new()),
             renderer: self.renderer.clone(),
             preview_base: self.preview_base.clone(),
+            connections: self.connections.clone(),
         }
     }
 
@@ -104,6 +109,7 @@ impl Config {
             previews: Mutex::new(HashMap::new()),
             renderer: None,
             preview_base: "http://127.0.0.1:8080".to_string(),
+            connections: std::sync::Arc::new(crate::runtime::connections::Hub::default()),
         }
     }
 }

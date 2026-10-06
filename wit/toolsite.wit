@@ -58,6 +58,69 @@ interface secrets {
     names: func() -> list<string>;
 }
 
+/// Live connections: WebSockets a browser holds open to the app.
+///
+/// An app declares where its sockets live in toolsite.toml
+/// (`[[socket]] path = "/live/ws"`). Toolsite holds each socket and runs
+/// the handler's `on-connection` export once per event, one at a time per
+/// connection and in order: `connect`, then each `message`, then `close`.
+/// The handler is the same component that answers requests, with the same
+/// database, files, settings and identity; the person on the socket is
+/// `identity.current-user()` for every event.
+///
+/// The functions here work from any call: a connection event, an ordinary
+/// request or a scheduled job, so an API write can tell open sockets about
+/// it. They only ever reach this app's own connections.
+interface connections {
+    /// One open connection. Unique among this app's connections, and never
+    /// reused while the server runs.
+    type connection-id = string;
+
+    record connect-info {
+        /// The declared socket path the browser connected to: "/live/ws".
+        socket: string,
+        /// The path inside the app, as a request would see it.
+        path: string,
+        query: string,
+        /// The upgrade request's headers, without any x-toolsite-* header.
+        headers: list<tuple<string, string>>,
+    }
+
+    variant message {
+        text(string),
+        binary(list<u8>),
+    }
+
+    variant event {
+        /// A browser asks to connect. Return ok to accept it, or an error
+        /// to refuse it; a refused browser gets HTTP 403 with that reason.
+        connect(connect-info),
+        /// A frame from the browser, at most 64 KB.
+        message(message),
+        /// The connection ended, from either side. Its state is gone after.
+        close,
+    }
+
+    /// Sends a message (at most 64 KB) to one connection.
+    send: func(conn: connection-id, message: message) -> result<_, string>;
+    /// Ends one connection. It still gets its `close` event.
+    close: func(conn: connection-id) -> result<_, string>;
+    /// Adds a connection to a topic. Topic names are lower-case letters,
+    /// digits, '-' and '_', at most 64 characters, or `user:<id>`, which a
+    /// connection may join only when it belongs to that account.
+    subscribe: func(conn: connection-id, topic: string) -> result<_, string>;
+    unsubscribe: func(conn: connection-id, topic: string) -> result<_, string>;
+    /// Sends a message to every connection on a topic, and returns how
+    /// many it reached. The app may publish to any `user:<id>` topic.
+    publish: func(topic: string, message: message) -> result<u32, string>;
+    /// A value kept for one connection between its events, so a handler
+    /// needs no database for a session flag. At most 64 KB per connection;
+    /// gone when the connection closes.
+    state-get: func(conn: connection-id, key: string) -> option<string>;
+    /// Sets a value, or removes it when `value` is none.
+    state-set: func(conn: connection-id, key: string, value: option<string>) -> result<_, string>;
+}
+
 /// Reaching other services, for the hosts this app was allowed to reach.
 ///
 /// Off unless the app's toolsite.toml names them under allow_http. Even then
@@ -192,6 +255,17 @@ world app {
     import identity;
     import secrets;
     import fetch;
+    import connections;
 
     export handle: func(req: request) -> response;
+}
+
+/// An app that also takes live connections. A component built for `app`
+/// keeps working unchanged; one built for this world also gets each
+/// connection event on its declared sockets.
+world app-with-connections {
+    include app;
+    use connections.{connection-id, event};
+
+    export on-connection: func(conn: connection-id, event: event) -> result<_, string>;
 }

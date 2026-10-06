@@ -25,6 +25,12 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiVie
 
 // Generates the host side of wit/toolsite.wit: the `App` world's exported
 // `handle`, and traits for every import we grant.
+//
+// `app-with-connections` is the same world plus an `on-connection` export.
+// A component either has that export or it does not, and the component
+// model has no optional exports, so the host looks for it on the compiled
+// component and calls it by name. Binding only `app` is what keeps every
+// handler built before connections existed linking unchanged.
 wasmtime::component::bindgen!({
     path: "wit",
     world: "app",
@@ -33,6 +39,8 @@ wasmtime::component::bindgen!({
 use self::toolsite::app::blobs::{
     Blob as WitBlob, Entry as WitEntry, Error as WitBlobError,
 };
+use self::toolsite::app::connections::Message as WitMessage;
+pub use self::toolsite::app::connections::{ConnectInfo, Event as ConnectionEvent, Message as ConnectionMessage};
 use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Value as WitValue};
 // Request and Response already land at module scope from bindgen; User sits
 // under its interface, so re-export it rather than making callers spell out
@@ -46,6 +54,9 @@ const EPOCH_TICK: Duration = Duration::from_millis(50);
 /// Compiled modules kept in memory. Eviction only costs a recompile, because
 /// the `.wasm` itself stays on disk.
 const MAX_CACHED_MODULES: usize = 32;
+
+/// The export a component built for `app-with-connections` adds.
+const ON_CONNECTION: &str = "on-connection";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Guards {
@@ -235,6 +246,45 @@ impl self::toolsite::app::fetch::Host for StoreState {
     }
 }
 
+fn hub_message(message: WitMessage) -> crate::runtime::connections::Message {
+    match message {
+        WitMessage::Text(text) => crate::runtime::connections::Message::Text(text),
+        WitMessage::Binary(bytes) => crate::runtime::connections::Message::Binary(bytes),
+    }
+}
+
+/// Acts on the running app's connections only: `self.app` comes from the
+/// host, so an id from another app names nothing here.
+impl self::toolsite::app::connections::Host for StoreState {
+    fn send(&mut self, conn: String, message: WitMessage) -> Result<(), String> {
+        self.site.connections.send(&self.app, &conn, hub_message(message))
+    }
+
+    fn close(&mut self, conn: String) -> Result<(), String> {
+        self.site.connections.close(&self.app, &conn)
+    }
+
+    fn subscribe(&mut self, conn: String, topic: String) -> Result<(), String> {
+        self.site.connections.subscribe(&self.app, &conn, &topic)
+    }
+
+    fn unsubscribe(&mut self, conn: String, topic: String) -> Result<(), String> {
+        self.site.connections.unsubscribe(&self.app, &conn, &topic)
+    }
+
+    fn publish(&mut self, topic: String, message: WitMessage) -> Result<u32, String> {
+        self.site.connections.publish(&self.app, &topic, hub_message(message))
+    }
+
+    fn state_get(&mut self, conn: String, key: String) -> Option<String> {
+        self.site.connections.state_get(&self.app, &conn, &key)
+    }
+
+    fn state_set(&mut self, conn: String, key: String, value: Option<String>) -> Result<(), String> {
+        self.site.connections.state_set(&self.app, &conn, &key, value)
+    }
+}
+
 impl self::toolsite::app::secrets::Host for StoreState {
     fn get(&mut self, name: String) -> Option<String> {
         crate::platform::secrets::get(&self.site, &self.app, &name)
@@ -382,6 +432,40 @@ impl Runtime {
         let mut store = self.store(site, app, user, guards);
         let instance = handler.instantiate(&mut store)?;
         Ok(instance.call_handle(&mut store, &request)?)
+    }
+
+    /// Whether an app's handler exports `on-connection`, that is, was built
+    /// for `app-with-connections`.
+    pub fn takes_connections(&self, app: &str, wasm: &[u8]) -> anyhow::Result<bool> {
+        let handler = self.handler(app, wasm)?;
+        Ok(handler.instance_pre().component().get_export_index(None, ON_CONNECTION).is_some())
+    }
+
+    /// Runs one connection event through an app's handler. `Ok(None)` means
+    /// the handler takes no connections; otherwise the handler's answer,
+    /// which for `connect` decides whether the browser is let in. Blocking,
+    /// like `handle`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connection_event(
+        &self,
+        site: Arc<SiteConfig>,
+        app: &str,
+        wasm: &[u8],
+        user: Option<User>,
+        conn: &str,
+        event: ConnectionEvent,
+        guards: Guards,
+    ) -> anyhow::Result<Option<Result<(), String>>> {
+        let handler = self.handler(app, wasm)?;
+        let Some(export) = handler.instance_pre().component().get_export_index(None, ON_CONNECTION) else {
+            return Ok(None);
+        };
+        let mut store = self.store(site, app, user, guards);
+        let instance = handler.instance_pre().instantiate(&mut store)?;
+        let call = instance
+            .get_typed_func::<(String, ConnectionEvent), (Result<(), String>,)>(&mut store, &export)?;
+        let (answer,) = call.call(&mut store, (conn.to_string(), event))?;
+        Ok(Some(answer))
     }
 
     pub fn engine(&self) -> &Engine {

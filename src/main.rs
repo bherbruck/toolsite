@@ -284,6 +284,31 @@ async fn main() -> anyhow::Result<()> {
         "storage configuration (0 MB means no ceiling)"
     );
 
+    // Live connections: how many sockets an app and a person may hold, and
+    // how fast an app may send. Whole numbers; the defaults suit one box.
+    let count = |name: &str, default: u64| -> u64 {
+        match read(&[name]) {
+            Some(value) => value
+                .trim()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{name} must be a whole number, not {value:?}")),
+            None => default,
+        }
+    };
+    let socket_defaults = toolsite::runtime::connections::Limits::default();
+    let socket_limits = toolsite::runtime::connections::Limits {
+        per_app: count("TOOLSITE_SOCKETS_PER_APP", socket_defaults.per_app as u64) as usize,
+        per_person: count("TOOLSITE_SOCKETS_PER_PERSON", socket_defaults.per_person as u64) as usize,
+        rate_per_app: count("TOOLSITE_SOCKET_MESSAGES_PER_SECOND", socket_defaults.rate_per_app as u64) as u32,
+        check_every: socket_defaults.check_every,
+    };
+    tracing::info!(
+        per_app = socket_limits.per_app,
+        per_person = socket_limits.per_person,
+        rate_per_app = socket_limits.rate_per_app,
+        "live connections configuration"
+    );
+
     let config = Arc::new(Config {
         data_dir,
         base_url,
@@ -301,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         previews: Mutex::new(HashMap::new()),
         renderer,
         preview_base,
+        connections: Arc::new(toolsite::runtime::connections::Hub::new(socket_limits)),
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -373,6 +399,7 @@ fn run_user_command(
         previews: Mutex::new(HashMap::new()),
         renderer: None,
         preview_base: "http://127.0.0.1:8080".to_string(),
+        connections: Arc::new(toolsite::runtime::connections::Hub::default()),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

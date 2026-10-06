@@ -292,6 +292,87 @@ function ConnectAssistant() {
 `BASE_URL` is Vite's `base`, which is `/p/<app>/`. Without Vite, take the
 first two segments of `window.location.pathname`.
 
+## Live connections
+
+For anything live (a board that updates, a chat, a progress bar), the app
+takes WebSockets. Toolsite holds the socket; your handler gets `connect`,
+`message` and `close` as events and uses the database, files and settings
+as usual.
+
+1. Declare the path in `toolsite.toml`:
+
+   ```toml
+   [[socket]]
+   path = "/live/ws"
+   ```
+
+2. Build the handler for the `app-with-connections` world and implement
+   `on_connection` beside `handle`. This one puts each browser on the topic
+   it asks for and broadcasts from an ordinary API route:
+
+   ```rust
+   wit_bindgen::generate!({ path: "wit", world: "app-with-connections" });
+
+   use toolsite::app::connections::{self, Message};
+
+   impl Guest for Handler {
+       fn handle(req: Request) -> Response {
+           // POST /api/notes saves a note, then tells everyone on "notes".
+           // ... insert with db::query as usual ...
+           let _ = connections::publish("notes", &Message::Text(r#"{"changed":"notes"}"#.into()));
+           json(200, r#"{"ok":true}"#.into())
+       }
+
+       fn on_connection(conn: String, event: Event) -> Result<(), String> {
+           match event {
+               // ?topic=notes on the URL. Err refuses with HTTP 403.
+               Event::Connect(info) => {
+                   let topic = info.query.strip_prefix("topic=").unwrap_or("notes");
+                   connections::subscribe(&conn, topic)
+               }
+               Event::Message(_) => Ok(()), // changes go through the API
+               Event::Close => Ok(()),
+           }
+       }
+   }
+   ```
+
+   `identity::current_user()` is the person on the socket for every event.
+   `connections::send(conn, ...)` answers one connection;
+   `state_get` / `state_set` keep up to 64 KB per connection between its
+   events; `publish("user:<id>", ...)` reaches one person's connections.
+
+3. Connect from the page, reconnect with backoff, and refetch on every
+   (re)connect, since nothing is replayed:
+
+   ```tsx
+   function useLive(topic: string, onChange: () => void) {
+     useEffect(() => {
+       let socket: WebSocket | undefined;
+       let delay = 1000;
+       let stopped = false;
+       const open = () => {
+         const url = new URL(`live/ws?topic=${topic}`, document.baseURI);
+         url.protocol = url.protocol.replace("http", "ws");
+         socket = new WebSocket(url);
+         socket.onopen = () => { delay = 1000; onChange(); };
+         socket.onmessage = () => onChange();
+         socket.onclose = () => {
+           if (!stopped) setTimeout(open, delay);
+           delay = Math.min(delay * 2, 30000);
+         };
+       };
+       open();
+       return () => { stopped = true; socket?.close(); };
+     }, [topic]);
+   }
+   ```
+
+The socket passes the app's gate for its path, so a `[[route]]` rule can
+open or close it. A signed-in person's connection closes within 30 seconds
+of losing access. Only declared paths take an upgrade; plain requests to
+the same path are served as usual.
+
 ## Access
 
 People are given access in a grid of View, Edit and Manage on a project or an

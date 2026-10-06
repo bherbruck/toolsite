@@ -3,11 +3,12 @@
 
 wit_bindgen::generate!({
     path: "../../../wit",
-    world: "app",
+    world: "app-with-connections",
 });
 
 use toolsite::app::blobs;
 use toolsite::app::db;
+use toolsite::app::connections::{self, Message};
 use toolsite::app::identity;
 use toolsite::app::fetch;
 use toolsite::app::secrets;
@@ -216,6 +217,34 @@ impl Guest for Handler {
             }
 
             // The app's files, through the host's blobs import.
+            // Sends the body to every connection on a topic.
+            "/publish" => {
+                let topic = decode(param(&req.query, "topic"));
+                let data = String::from_utf8_lossy(&req.body).to_string();
+                match connections::publish(&topic, &Message::Text(data)) {
+                    Ok(reached) => respond(200, format!("reached {reached}")),
+                    Err(why) => respond(400, why),
+                }
+            }
+
+            // Sends the body to one connection by id.
+            "/send" => {
+                let conn = param(&req.query, "conn");
+                let data = String::from_utf8_lossy(&req.body).to_string();
+                match connections::send(conn, &Message::Text(data)) {
+                    Ok(()) => respond(200, "sent".to_string()),
+                    Err(why) => respond(400, why),
+                }
+            }
+
+            // One connection's kept state, as a request sees it.
+            "/conn-state" => {
+                match connections::state_get(param(&req.query, "conn"), param(&req.query, "key")) {
+                    Some(value) => respond(200, value),
+                    None => respond(404, "no such state".to_string()),
+                }
+            }
+
             "/blob-put" => {
                 let content_type = req
                     .headers
@@ -321,6 +350,70 @@ impl Guest for Handler {
             }
 
             _ => respond(404, "not found".to_string()),
+        }
+    }
+
+    /// Connections, for the tests. Each event is appended to the
+    /// connection's kept state under "log", so order and state can both be
+    /// seen from outside. Text frames are small commands:
+    /// `echo:<x>`, `log`, `close`, `sub:<topic>`, `unsub:<topic>`,
+    /// `publish:<topic>:<data>`. A binary frame is echoed back.
+    fn on_connection(conn: String, event: Event) -> Result<(), String> {
+        let who = identity::current_user().map(|u| u.email).unwrap_or_else(|| "anonymous".to_string());
+        let mut log = connections::state_get(&conn, "log").unwrap_or_default();
+        let mut note = |entry: &str| {
+            if !log.is_empty() {
+                log.push(',');
+            }
+            log.push_str(entry);
+            connections::state_set(&conn, "log", Some(&log))
+        };
+        match event {
+            Event::Connect(info) => {
+                if param(&info.query, "refuse") == "1" {
+                    return Err("this app refused the connection".to_string());
+                }
+                note(&format!("connect {who} {}", info.socket))?;
+                for pair in info.query.split('&') {
+                    if let Some(("topic", topic)) = pair.split_once('=') {
+                        connections::subscribe(&conn, &decode(topic))?;
+                    }
+                }
+                connections::send(&conn, &Message::Text(format!("id:{conn}")))?;
+                Ok(())
+            }
+            Event::Message(Message::Binary(bytes)) => {
+                note("binary")?;
+                connections::send(&conn, &Message::Binary(bytes))
+            }
+            Event::Message(Message::Text(text)) => {
+                note("message")?;
+                let reply = |text: String| connections::send(&conn, &Message::Text(text));
+                if let Some(rest) = text.strip_prefix("echo:") {
+                    reply(rest.to_string())
+                } else if text == "log" {
+                    reply(connections::state_get(&conn, "log").unwrap_or_default())
+                } else if text == "close" {
+                    connections::close(&conn)
+                } else if let Some(topic) = text.strip_prefix("sub:") {
+                    reply(match connections::subscribe(&conn, topic) {
+                        Ok(()) => "ok".to_string(),
+                        Err(why) => format!("err:{why}"),
+                    })
+                } else if let Some(topic) = text.strip_prefix("unsub:") {
+                    connections::unsubscribe(&conn, topic)?;
+                    reply("ok".to_string())
+                } else if let Some((topic, data)) = text.strip_prefix("publish:").and_then(|r| r.split_once(':')) {
+                    connections::publish(topic, &Message::Text(data.to_string())).map(|_| ())
+                } else {
+                    reply(format!("unknown:{text}"))
+                }
+            }
+            Event::Close => {
+                note("close")?;
+                // Told to anyone watching, since this connection is gone.
+                connections::publish("closed", &Message::Text(format!("{who}:{log}"))).map(|_| ())
+            }
         }
     }
 }
