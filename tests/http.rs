@@ -3434,7 +3434,7 @@ async fn the_pickers_search_the_server_and_never_list_everyone() {
 
     // The Access tab carries the picker, not the directory.
     let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
-    assert!(page.contains("+ Add a person"));
+    assert!(page.contains(">Add a person<"));
     assert!(page.contains(r#"data-search="/admin/permissions/candidates""#));
     for n in 0..15 {
         assert!(!page.contains(&format!("person{n:02}@example.com")), "the page lists every account");
@@ -5425,15 +5425,17 @@ async fn project_controls_show_only_for_the_scope_that_may_use_them() {
 
     let fa = sign_in(&config, "fa@example.com", "correct horse");
     let (_, page, _) = send(&config, get_as("/browse/ops", &fa)).await;
-    assert!(page.contains("data-dialog=\"new-project\""), "an admin has no New project");
-    assert!(page.contains("data-fill-app=\"forklifts\""), "an admin has no Move");
+    assert!(page.contains("popovertarget=\"new-project\""), "an admin has no New project");
+    assert!(page.contains("Move to project"), "an admin has no Move");
+    assert!(page.contains("href=\"/admin/apps/forklifts/access\""), "an admin has no Permissions item");
     assert!(page.contains("?tab=permissions"), "an admin has no Permissions tab");
 
     let ed = sign_in(&config, "ed@example.com", "correct horse");
     let (_, page, _) = send(&config, get_as("/browse/ops", &ed)).await;
-    assert!(page.contains("href=\"/admin/apps/forklifts\""), "an editor has no Manage");
-    assert!(!page.contains("data-dialog=\"new-project\""));
-    assert!(!page.contains("data-fill-app="), "an editor was offered Move");
+    assert!(page.contains("href=\"/admin/apps/forklifts\""), "an editor has no Settings");
+    assert!(!page.contains("popovertarget=\"new-project\""));
+    assert!(!page.contains("Move to project"), "an editor was offered Move");
+    assert!(!page.contains("href=\"/admin/apps/forklifts/access\""), "an editor was offered Permissions");
     assert!(!page.contains("?tab=permissions"));
     // Asking for the tab directly shows the apps instead.
     let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions", &ed)).await;
@@ -5495,7 +5497,7 @@ async fn the_permissions_tab_changes_a_scope_in_place_and_leaves_inherited_rows_
 
     let (status, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &fa)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("+ Add a person"));
+    assert!(page.contains(">Add a person<"));
     assert!(page.contains("worker@example.com"));
     // The inherited row says where it comes from and offers no change.
     let chief = page.find("chief@example.com").expect("the inherited holder is not listed");
@@ -5557,7 +5559,8 @@ async fn a_stranger_still_gets_the_app_list_on_an_open_site() {
     let (status, page, _) = send(&config, get("/")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Lunch"));
-    assert!(!page.contains("data-dialog=\"new-project\""));
+    assert!(!page.contains("popovertarget=\"new-project\""));
+    assert!(!page.contains("class=\"ghost sm menu-btn\""), "a stranger was offered an actions menu");
 }
 
 // --- the projects tool ---------------------------------------------------------
@@ -6199,4 +6202,81 @@ async fn a_restricted_apps_icon_is_hidden_from_someone_who_may_not_open_it() {
     let (status, _, headers) = send(&config, get_as("/icon/secret", &boss)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.iter().any(|(k, v)| k == "cache-control" && v.starts_with("private")), "{headers:?}");
+}
+
+// --- actions menus in the app browser ---------------------------------------------
+
+#[tokio::test]
+async fn each_app_has_one_actions_menu_and_the_browser_opens_no_modal() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    app_in(&config, "forklifts", "ops").await;
+    app_in(&config, "pallets", "ops").await;
+    account(&config, "fa@example.com", "correct horse");
+    scope(&config, "fa@example.com", "ops", "admin");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &fa)).await;
+
+    // One button per app in each view, list and cards, and no Access button.
+    assert_eq!(page.matches("aria-label=\"Actions for forklifts\"").count(), 2, "{page}");
+    assert_eq!(page.matches("aria-label=\"Actions for pallets\"").count(), 2);
+    assert!(!page.contains(">Access<"), "a separate Access button is still on the row");
+    assert!(!page.contains(">Manage<"), "the old Manage button is still on the row");
+    // Menus are popovers; the only dialog is the shell's own confirm.
+    assert_eq!(page.matches("<dialog").count(), 1, "a modal is still on the page");
+    assert!(page.contains("<dialog id=\"confirm\""));
+    assert!(page.contains("popover id=\"menu-app-row-forklifts\""));
+    // Every id a menu uses is unique on the page.
+    assert_eq!(page.matches("id=\"menu-app-row-forklifts\"").count(), 1);
+    assert_eq!(page.matches("id=\"menu-app-tile-forklifts\"").count(), 1);
+    assert_eq!(page.matches("id=\"folder-menu-app-row-forklifts-matches\"").count(), 1);
+    // A right-click finds the same menu through the row.
+    assert!(page.contains("data-menu=\"menu-app-row-forklifts\""));
+    // Move and New project post to the routes they always did.
+    assert!(page.contains("action=\"/admin/move\""));
+    assert!(page.contains("action=\"/admin/folder\""));
+}
+
+#[tokio::test]
+async fn a_projects_menu_is_offered_only_to_an_admin_there() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    app_in(&config, "forklifts", "ops/yard").await;
+    for email in ["fa@example.com", "ed@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops", "admin");
+    scope(&config, "ed@example.com", "ops", "editor");
+
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &fa)).await;
+    assert!(page.contains("aria-label=\"Actions for yard\""), "an admin has no project menu");
+    assert!(page.contains("New project inside"));
+    assert!(page.contains("href=\"/browse/ops/yard?tab=permissions\""));
+
+    let ed = sign_in(&config, "ed@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &ed)).await;
+    assert!(!page.contains("aria-label=\"Actions for yard\""), "an editor was offered a project menu");
+    assert!(!page.contains("New project inside"));
+    // An editor still gets Settings for the app, but not Permissions or Move.
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard", &ed)).await;
+    assert!(page.contains("aria-label=\"Actions for forklifts\""));
+    assert!(page.contains("href=\"/admin/apps/forklifts\""));
+    assert!(!page.contains("Move to project"));
+}
+
+#[tokio::test]
+async fn the_add_control_sits_above_the_table_so_the_headers_label_rules() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    account(&config, "fa@example.com", "correct horse");
+    scope(&config, "fa@example.com", "ops", "admin");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions", &fa)).await;
+    let form = page.find("data-perm-add").expect("no add control");
+    let table = page.find("<table class=\"perm-grid perm-rules\"").expect("no rules table");
+    assert!(form < table, "the add control is not above the table");
+    let tbody = &page[table..page[table..].find("</table>").map(|i| table + i).unwrap()];
+    assert!(!tbody.contains("data-perm-add"), "the add control is still inside the table");
 }

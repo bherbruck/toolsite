@@ -334,6 +334,41 @@ form.row .combo { width: auto; flex: 1 1 14rem; }
   .row .row-tools { visibility: visible; }
   .tile .row-tools { display: inline-flex; }
 }
+/* A row's tools stay shown while its menu is open, even after the pointer
+   leaves the row. */
+.row:has(.menu:popover-open) .row-tools,
+.row:has(.menu-btn[aria-expanded="true"]) .row-tools { visibility: visible; }
+.tile:has(.menu:popover-open) .row-tools { display: inline-flex; }
+.menu-btn { font-size: 1.05rem; line-height: 1; padding: .15rem .45rem; letter-spacing: .05em; }
+
+/* Actions menus: a small panel anchored to its button, no backdrop. */
+.menu[popover] {
+  visibility: visible;
+  position: fixed; inset: auto; margin: 0;
+  position-area: bottom span-left; position-try-fallbacks: flip-block, flip-inline;
+  min-width: 13rem; max-width: min(22rem, calc(100vw - 1rem));
+  padding: .3rem; overflow: visible;
+  background: var(--card); color: var(--fg);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 8px 24px #0002, 0 1px 3px #0001;
+}
+.menu[popover]::backdrop { background: transparent; }
+.menu-wide[popover] { min-width: 18rem; }
+.menu [role=menuitem] {
+  display: flex; align-items: baseline; gap: .35rem; width: 100%;
+  padding: .4rem .6rem; border-radius: .35rem;
+  color: var(--fg); text-decoration: none; font-size: .9rem; cursor: pointer;
+  list-style: none;
+}
+.menu [role=menuitem]::-webkit-details-marker { display: none; }
+.menu [role=menuitem]:hover, .menu [role=menuitem]:focus-visible { background: var(--soft); outline: none; text-decoration: none; }
+.menu details.menu-sub { margin: 0; }
+.menu .muted { margin: 0; }
+.menu-sub[open] > summary { background: var(--soft); }
+.menu-form { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; padding: .4rem .5rem .5rem; }
+.menu-form label { width: 100%; font-weight: 500; }
+.menu-form .combo, .menu-form input[name=name] { flex: 1 1 10rem; min-width: 0; }
+.menu-form .combo input { width: 100%; }
 details.project > summary { list-style: none; cursor: pointer; }
 details.project > summary::-webkit-details-marker { display: none; }
 .chev, .chev-space { flex: 0 0 1rem; width: 1rem; text-align: center; color: var(--muted); }
@@ -397,9 +432,12 @@ button.cell:hover { opacity: 1; }
 .cell:disabled { opacity: .35; cursor: not-allowed; }
 .cell.empty { cursor: default; border-style: dashed; opacity: .5; }
 /* The rules table: an add row on top, then one row per rule. */
-.perm-rules tr.add-rule td { background: var(--soft); }
-.perm-rules tr.add-rule:hover td { background: var(--soft); }
-.add-rule-form { margin: 0; gap: .5rem; }
+/* The add control is its own line above the rules, not a table row. */
+.add-rule-form {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+  margin: 0 0 1rem; padding: .6rem .75rem;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--soft);
+}
 .add-rule-form .combo { flex: 1 1 16rem; min-width: 12rem; }
 .add-rule-form .combo input { width: 100%; }
 .add-rule-label { font-weight: 500; font-size: .85rem; white-space: nowrap; }
@@ -808,6 +846,81 @@ pub const SHELL_SCRIPT: &str = r#"
     });
   }
   document.querySelectorAll('.combo').forEach(initCombo);
+
+  // Actions menus. They open and close with no script (popover); this
+  // places them by the button or at the pointer, keeps them inside the
+  // window, moves focus with the arrow keys, and opens one on right-click.
+  let pointer = null;
+  const invokerOf = (menu) => document.querySelector('[popovertarget="' + menu.id + '"]');
+  const itemsOf = (menu) => Array.from(menu.querySelectorAll('[role=menuitem]'))
+    .filter((item) => item.offsetParent !== null);
+  const place = (menu) => {
+    let x, y;
+    const button = invokerOf(menu);
+    if (pointer) { x = pointer.x; y = pointer.y; }
+    else if (button) {
+      const r = button.getBoundingClientRect();
+      x = r.right - menu.offsetWidth; y = r.bottom + 4;
+    } else { return; }
+    menu.style.positionArea = 'none';
+    const w = menu.offsetWidth, h = menu.offsetHeight;
+    x = Math.max(8, Math.min(x, innerWidth - w - 8));
+    if (y + h > innerHeight - 8) y = Math.max(8, (pointer ? y : (button ? button.getBoundingClientRect().top : y)) - h - 4);
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+  };
+  document.querySelectorAll('.menu[popover]').forEach((menu) => {
+    menu.addEventListener('toggle', (event) => {
+      const button = invokerOf(menu);
+      if (button) button.setAttribute('aria-expanded', event.newState === 'open' ? 'true' : 'false');
+      if (event.newState === 'open') {
+        place(menu);
+        pointer = null;
+        const first = menu.querySelector('input:not([type=hidden])') && menu.classList.contains('menu-wide')
+          ? menu.querySelector('input:not([type=hidden])')
+          : itemsOf(menu)[0];
+        if (first) first.focus();
+      } else {
+        menu.querySelectorAll('details[open]').forEach((d) => { d.open = false; });
+        if (button && (menu.contains(document.activeElement) || document.activeElement === document.body)) button.focus();
+      }
+    });
+    menu.addEventListener('keydown', (event) => {
+      if (event.target.closest('input, select, textarea')) return;
+      const items = itemsOf(menu);
+      const at = items.indexOf(document.activeElement);
+      let next = null;
+      if (event.key === 'ArrowDown') next = items[(at + 1) % items.length];
+      else if (event.key === 'ArrowUp') next = items[(at - 1 + items.length) % items.length];
+      else if (event.key === 'Home') next = items[0];
+      else if (event.key === 'End') next = items[items.length - 1];
+      if (next) { event.preventDefault(); next.focus(); }
+    });
+    menu.addEventListener('click', (event) => {
+      if (event.target.closest('a[role=menuitem]')) menu.hidePopover();
+    });
+    // Opening a move or new-project field moves focus into it.
+    menu.querySelectorAll('details.menu-sub').forEach((d) => {
+      d.addEventListener('toggle', () => {
+        // The menu grew; place it again so it stays by its button.
+        place(menu);
+        if (d.open) { const input = d.querySelector('input:not([type=hidden])'); if (input) input.focus(); }
+      });
+    });
+  });
+  document.addEventListener('contextmenu', (event) => {
+    if (event.target.closest('input, textarea, select, .menu')) return;
+    const row = event.target.closest('[data-menu]');
+    if (!row) return;
+    const menu = document.getElementById(row.dataset.menu);
+    if (!menu || typeof menu.showPopover !== 'function') return;
+    event.preventDefault();
+    // A keyboard context menu (Shift+F10) reports no pointer position; the
+    // menu then opens by its button.
+    pointer = (event.clientX || event.clientY) ? { x: event.clientX, y: event.clientY } : null;
+    if (menu.matches(':popover-open')) menu.hidePopover();
+    menu.showPopover();
+  });
 })();
 </script>
 "#;
@@ -1023,7 +1136,7 @@ pub fn combobox_full(
     let menu_id = format!("{name}{id_suffix}-matches");
     html! {
         div."combo" {
-            input name=(name) placeholder=(placeholder) data-search=(search_url)
+            input name=(name) placeholder=(placeholder) aria-label=(placeholder) data-search=(search_url)
                   data-search-with=[with] value=(value)
                   autocomplete="off" required
                   role="combobox" aria-autocomplete="list" aria-expanded="false"

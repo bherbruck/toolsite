@@ -844,7 +844,8 @@ The table lists only the people who hold a rule here or above, never the whole
 directory, so a site with hundreds of accounts stays readable. Past 50 rules it
 gets a filter and pages.
 
-- **Add a person** is the first row: type a name or email, choose from at most
+- **Add a person** is a line of controls above the table, so the column
+  headers label the rules only: type a name or email, choose from at most
   ten matches, pick a level, press Add. The row appears in place and the search
   keeps the focus, so several people go in one after another. People who
   already hold a rule here are not offered again.
@@ -1073,9 +1074,16 @@ What a person may do depends on the access they hold:
 | Access | Sees |
 |---|---|
 | none | the apps they may open |
-| `editor` on an app | **Manage**, to the app's admin page |
-| `admin` on an app | also **Move**, to another project where they hold admin |
-| `admin` at a project | also **New project** and a **Permissions** tab: one row per holder, the access as a select that saves on change, inherited rows read only with a link to where they are set, and an Add permission row |
+| `editor` on an app | an actions menu on the app: **Open** and **Settings** |
+| `admin` on an app | also **Permissions** (the Access tab in Settings) and **Move to project**, to a project where they hold admin |
+| `admin` at a project | an actions menu on the project (**Open**, **Permissions**, **New project inside**), **New project** by the title, and the **Permissions** tab |
+
+The actions menu opens from the **⋯** button at the end of a row or tile, or
+with a right-click (or Shift+F10) on the row. It is a small panel next to
+the button, with no backdrop; Escape or a click outside closes it, and the
+arrow keys move between its items. Move to project and New project open as
+fields inside the menu, not as a separate window. The menus are HTML
+popovers, so they open and close with no script.
 
 Every action goes to the admin action that checks it again, and comes back
 to the browser with one line saying what happened.

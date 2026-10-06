@@ -80,6 +80,8 @@ struct Tree {
     entries: Vec<Entry>,
     /// Projects the viewer may see, by path.
     projects: BTreeSet<String>,
+    /// What the viewer holds on each project it holds something on.
+    held: std::collections::BTreeMap<String, Scope>,
 }
 
 impl Tree {
@@ -176,11 +178,19 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
     // when the viewer holds access on it or below and so may need to walk
     // there to manage it.
     let mut projects = BTreeSet::new();
+    let mut held = std::collections::BTreeMap::new();
     for folder in store::list_folders(config).await {
         let has_app = entries.iter().any(|entry| users::prefix_covers(&folder.path, &entry.project));
+        let here = match viewer {
+            Some(user) => admin::held(config, user, &folder.path).await,
+            None => None,
+        };
+        if let Some(scope) = here {
+            held.insert(folder.path.clone(), scope);
+        }
         let holds = match viewer {
             Some(user) => {
-                admin::held(config, user, &folder.path).await.is_some() || {
+                here.is_some() || {
                     let (config, user, path) = (config.clone(), user.clone(), folder.path.clone());
                     tokio::task::spawn_blocking(move || users::holds_below(&config, &user, &path))
                         .await
@@ -200,7 +210,7 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
             with_parents.insert(above);
         }
     }
-    Tree { entries, projects: with_parents }
+    Tree { entries, projects: with_parents, held }
 }
 
 /// The projects `viewer` may see, each with the apps in it or below that it
@@ -281,7 +291,7 @@ async fn render(config: Arc<Config>, headers: HeaderMap, project: String, query:
     };
     let token = viewer.as_ref().map(|user| admin::form_token(&config, user)).unwrap_or_default();
     let back = if tab == "permissions" { permissions_url(&project) } else { browser_url(&project) };
-    let may_move = tree.entries.iter().any(|entry| entry.scope == Some(Scope::Admin));
+    let ctx = Ctx { token: &token, back: &back };
 
     let title = if project.is_empty() { "Apps" } else { name_of(&project) };
     let shown = if q.is_empty() { tree.apps_in(&project).len() } else { 0 };
@@ -312,7 +322,7 @@ async fn render(config: Arc<Config>, headers: HeaderMap, project: String, query:
                     }
                 }
                 @if admin_here {
-                    button."quiet" type="button" data-dialog="new-project" { "New project" }
+                    (new_project_control(&project, &token, &back))
                 }
             }
         }
@@ -339,39 +349,11 @@ async fn render(config: Arc<Config>, headers: HeaderMap, project: String, query:
                       placeholder=(if project.is_empty() { "Search all apps and projects".to_string() } else { format!("Search in {title}") });
             }
             @if q.is_empty() {
-                (level(&tree, &project, shown, &open))
+                (level(&tree, &project, shown, &open, &ctx))
             } @else {
-                (results(&tree, &project, &q))
+                (results(&tree, &project, &q, &ctx))
             }
             p."no-match" id="no-match" { "Nothing on this page matches. Press Enter to search below this level." }
-        }
-        @if admin_here {
-            dialog id="new-project" {
-                h3 { "New project" }
-                p { "A project groups apps. Access given on a project applies to everything inside it." }
-                form."column" method="post" action="/admin/folder" {
-                    (admin::hidden("token", &token)) (admin::hidden("parent", &project)) (admin::hidden("back", &back))
-                    input name="name" placeholder="Project name" required pattern="[A-Za-z0-9_-]+" autocomplete="off";
-                    div."actions" {
-                        button."quiet" type="button" data-close { "Cancel" }
-                        button type="submit" { "Create project" }
-                    }
-                }
-            }
-        }
-        @if may_move {
-            dialog id="move-app" {
-                h3 { "Move " span data-show="app" {} }
-                p { "Access from the old project stops and access from the new one starts. The address of the app does not change." }
-                form."column" method="post" action="/admin/move" {
-                    (admin::hidden("token", &token)) (admin::hidden("app", "")) (admin::hidden("back", &back))
-                    (ui::combobox("folder", "/admin/projects/search", "Type a project, or / for the top level"))
-                    div."actions" {
-                        button."quiet" type="button" data-close { "Cancel" }
-                        button type="submit" { "Move app" }
-                    }
-                }
-            }
         }
     };
 
@@ -414,25 +396,111 @@ fn folder_icon(with_open: bool) -> Markup {
 const ICON_CARDS: &str = r#"<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="currentColor"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1.2"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1.2"/><rect x="9" y="9" width="5.5" height="5.5" rx="1.2"/></svg>"#;
 const ICON_LIST: &str = r#"<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" fill="currentColor"><rect x="1.5" y="2.5" width="13" height="2" rx="1"/><rect x="1.5" y="7" width="13" height="2" rx="1"/><rect x="1.5" y="11.5" width="13" height="2" rx="1"/></svg>"#;
 
-/// Small actions at the end of an app's row: Manage for an editor, Move for
-/// an admin. Nothing for anyone else.
-fn row_tools(entry: &Entry) -> Markup {
+/// What a row's actions menu needs besides the row: the form token and
+/// where a change returns to.
+struct Ctx<'a> {
+    token: &'a str,
+    back: &'a str,
+}
+
+/// An element id from a slug or path, unique per place on the page.
+fn menu_id(kind: &str, place: &str, name: &str) -> String {
+    let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    format!("menu-{kind}-{place}-{safe}")
+}
+
+/// The button that opens a menu. Popover is declarative, so the menu opens
+/// and closes with no script; CSS anchors it under the button where the
+/// browser can, and the shared script places it otherwise.
+fn menu_button(id: &str, label: &str) -> Markup {
+    html! {
+        button."ghost sm menu-btn" type="button" popovertarget=(id) aria-haspopup="menu"
+               aria-label=(label) title=(label) style={ "anchor-name:--" (id) } { "\u{22EF}" }
+    }
+}
+
+/// An app's actions: Open, Settings and, for an admin, Permissions and a
+/// move that opens in place. Shown to an editor or more; for anyone else
+/// the row's own link is the only thing to do.
+fn app_menu(entry: &Entry, place: &str, ctx: &Ctx) -> Markup {
+    let id = menu_id("app", place, &entry.slug);
     html! {
         @if entry.scope.is_some_and(|scope| scope >= Scope::Editor) {
             span."row-tools" {
-                a."btn ghost sm" href={ "/admin/apps/" (entry.app) } { "Manage" }
-                @if entry.scope == Some(Scope::Admin) {
-                    a."btn ghost sm" href={ "/admin/apps/" (entry.app) "/access" } { "Access" }
-                    button."ghost sm" type="button" data-dialog="move-app" data-fill-app=(entry.app) { "Move" }
+                (menu_button(&id, &format!("Actions for {}", entry.slug)))
+                div."menu" popover id=(id) role="menu" style={ "position-anchor:--" (id) } {
+                    a role="menuitem" href={ "/p/" (entry.slug) "/" } target="_blank" rel="noopener" { "Open" }
+                    a role="menuitem" href={ "/admin/apps/" (entry.app) } { "Settings" }
+                    @if entry.scope == Some(Scope::Admin) {
+                        a role="menuitem" href={ "/admin/apps/" (entry.app) "/access" } {
+                            "Permissions" span."muted small" { " in Settings" }
+                        }
+                        details."menu-sub" {
+                            summary role="menuitem" { "Move to project\u{2026}" }
+                            form."menu-form" method="post" action="/admin/move" {
+                                (admin::hidden("token", ctx.token)) (admin::hidden("app", &entry.app)) (admin::hidden("back", ctx.back))
+                                (ui::combobox_full("folder", "/admin/projects/search", "Type a project, or / for the top level", "", None, &format!("-{id}")))
+                                button."sm" type="submit" { "Move" }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-fn app_row(entry: &Entry, show_path: bool) -> Markup {
+/// A project's actions, for an admin there: Open, Permissions, and a new
+/// project inside it that opens in place.
+fn project_menu(tree: &Tree, path: &str, place: &str, ctx: &Ctx) -> Markup {
+    let id = menu_id("project", place, path);
     html! {
-        div."row app" data-slug=(entry.slug.to_lowercase()) data-title=(entry.label().to_lowercase()) {
+        @if tree.held.get(path) == Some(&Scope::Admin) {
+            div."menu" popover id=(id) role="menu" style={ "position-anchor:--" (id) } {
+                a role="menuitem" href=(browser_url(path)) { "Open" }
+                a role="menuitem" href=(permissions_url(path)) { "Permissions" }
+                details."menu-sub" {
+                    summary role="menuitem" { "New project inside\u{2026}" }
+                    form."menu-form" method="post" action="/admin/folder" {
+                        (admin::hidden("token", ctx.token)) (admin::hidden("parent", path)) (admin::hidden("back", ctx.back))
+                        input name="name" placeholder="Project name" aria-label="Project name" required pattern="[A-Za-z0-9_-]+" autocomplete="off";
+                        button."sm" type="submit" { "Create" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The button for a project's menu, or nothing when it has none.
+fn project_menu_button(tree: &Tree, path: &str, place: &str) -> Markup {
+    let id = menu_id("project", place, path);
+    html! {
+        @if tree.held.get(path) == Some(&Scope::Admin) {
+            span."row-tools" { (menu_button(&id, &format!("Actions for {}", name_of(path)))) }
+        }
+    }
+}
+
+/// New project in the title row: a small form under the button.
+fn new_project_control(project: &str, token: &str, back: &str) -> Markup {
+    html! {
+        button."quiet" type="button" popovertarget="new-project" style="anchor-name:--new-project" { "New project" }
+        div."menu menu-wide" popover id="new-project" style="position-anchor:--new-project" {
+            form."menu-form" method="post" action="/admin/folder" {
+                (admin::hidden("token", token)) (admin::hidden("parent", project)) (admin::hidden("back", back))
+                label."small" for="new-project-name" { "New project" }
+                input id="new-project-name" name="name" placeholder="Project name" required pattern="[A-Za-z0-9_-]+" autocomplete="off";
+                button."sm" type="submit" { "Create" }
+            }
+        }
+    }
+}
+
+fn app_row(entry: &Entry, show_path: bool, ctx: &Ctx) -> Markup {
+    let menu = entry.scope.is_some_and(|scope| scope >= Scope::Editor).then(|| menu_id("app", "row", &entry.slug));
+    html! {
+        div."row app" data-slug=(entry.slug.to_lowercase()) data-title=(entry.label().to_lowercase()) data-menu=[menu] {
             span."chev-space" {}
             (icon_markup(&entry.icon))
             a."row-name" href={ "/p/" (entry.slug) } { (entry.label()) }
@@ -441,30 +509,36 @@ fn app_row(entry: &Entry, show_path: bool) -> Markup {
                 @if entry.title.is_some() { (entry.slug) }
                 @if let Some(modified) = entry.modified { span."when" { (relative_time(modified)) } }
             }
-            (row_tools(entry))
+            (app_menu(entry, "row", ctx))
         }
     }
 }
 
 /// A project row that opens in place. Its children are rendered inside, so
 /// opening needs no script and no request; depth is as deep as the tree.
-fn project_row(tree: &Tree, level: &str, path: &str, open: &BTreeSet<String>) -> Markup {
+fn project_row(tree: &Tree, level: &str, path: &str, open: &BTreeSet<String>, ctx: &Ctx) -> Markup {
     let children = tree.children(path);
     let apps = tree.apps_in(path);
     // The row's path relative to the level on screen, which is how `?open=`
     // names it.
     let rel = if level.is_empty() { path.to_string() } else { path[level.len() + 1..].to_string() };
+    let menu = (tree.held.get(path) == Some(&Scope::Admin)).then(|| menu_id("project", "row", path));
     html! {
+        // The menu sits beside the row, not inside it: inside a closed
+        // `details` it would not render, and inside `summary` a click on it
+        // would fold the row.
+        (project_menu(tree, path, "row", ctx))
         details."project" data-rel=(rel) open[open.contains(&rel)] data-slug=(name_of(path).to_lowercase()) data-title=(path.to_lowercase()) {
-            summary."row" {
+            summary."row" data-menu=[menu] {
                 span."chev" aria-hidden="true" {}
                 (folder_icon(true))
                 a."row-name" href=(browser_url(path)) { (name_of(path)) }
                 span."row-meta" { (count_label(tree.apps_below(path))) }
+                (project_menu_button(tree, path, "row"))
             }
             div."children" {
-                @for child in &children { (project_row(tree, level, child, open)) }
-                @for entry in &apps { (app_row(entry, false)) }
+                @for child in &children { (project_row(tree, level, child, open, ctx)) }
+                @for entry in &apps { (app_row(entry, false, ctx)) }
                 @if children.is_empty() && apps.is_empty() {
                     p."muted small empty-row" { "Nothing here yet." }
                 }
@@ -473,9 +547,10 @@ fn project_row(tree: &Tree, level: &str, path: &str, open: &BTreeSet<String>) ->
     }
 }
 
-fn app_tile(entry: &Entry, show_path: bool) -> Markup {
+fn app_tile(entry: &Entry, show_path: bool, ctx: &Ctx) -> Markup {
+    let menu = entry.scope.is_some_and(|scope| scope >= Scope::Editor).then(|| menu_id("app", "tile", &entry.slug));
     html! {
-        li."tile" data-slug=(entry.slug.to_lowercase()) data-title=(entry.label().to_lowercase()) {
+        li."tile" data-slug=(entry.slug.to_lowercase()) data-title=(entry.label().to_lowercase()) data-menu=[menu] {
             a."card" href={ "/p/" (entry.slug) } {
                 (icon_markup(&entry.icon))
                 span."meta" {
@@ -487,14 +562,16 @@ fn app_tile(entry: &Entry, show_path: bool) -> Markup {
                     }
                 }
             }
-            (row_tools(entry))
+            (app_menu(entry, "tile", ctx))
         }
     }
 }
 
-fn project_tile(tree: &Tree, path: &str, show_path: bool) -> Markup {
+fn project_tile(tree: &Tree, path: &str, show_path: bool, ctx: &Ctx) -> Markup {
+    let place = if show_path { "hit" } else { "tile" };
+    let menu = (tree.held.get(path) == Some(&Scope::Admin)).then(|| menu_id("project", place, path));
     html! {
-        li."tile" data-slug=(name_of(path).to_lowercase()) data-title=(path.to_lowercase()) {
+        li."tile" data-slug=(name_of(path).to_lowercase()) data-title=(path.to_lowercase()) data-menu=[menu] {
             a."card project-card" href=(browser_url(path)) {
                 (folder_icon(false))
                 span."meta" {
@@ -505,12 +582,14 @@ fn project_tile(tree: &Tree, path: &str, show_path: bool) -> Markup {
                     }
                 }
             }
+            (project_menu_button(tree, path, place))
+            (project_menu(tree, path, place, ctx))
         }
     }
 }
 
 /// The current level, in both views.
-fn level(tree: &Tree, project: &str, shown: usize, open: &BTreeSet<String>) -> Markup {
+fn level(tree: &Tree, project: &str, shown: usize, open: &BTreeSet<String>, ctx: &Ctx) -> Markup {
     let children = tree.children(project);
     let apps = tree.apps_in(project);
     html! {
@@ -522,12 +601,12 @@ fn level(tree: &Tree, project: &str, shown: usize, open: &BTreeSet<String>) -> M
         } @else {
             div id="list" class="browse" data-shown=(shown) {
                 div."rows list-only" {
-                    @for child in &children { (project_row(tree, project, child, open)) }
-                    @for entry in &apps { (app_row(entry, false)) }
+                    @for child in &children { (project_row(tree, project, child, open, ctx)) }
+                    @for entry in &apps { (app_row(entry, false, ctx)) }
                 }
                 ul."tiles cards-only" {
-                    @for child in &children { (project_tile(tree, child, false)) }
-                    @for entry in &apps { (app_tile(entry, false)) }
+                    @for child in &children { (project_tile(tree, child, false, ctx)) }
+                    @for entry in &apps { (app_tile(entry, false, ctx)) }
                 }
             }
         }
@@ -535,7 +614,7 @@ fn level(tree: &Tree, project: &str, shown: usize, open: &BTreeSet<String>) -> M
 }
 
 /// Everything below `project` that matches `q`, flat, each with its path.
-fn results(tree: &Tree, project: &str, q: &str) -> Markup {
+fn results(tree: &Tree, project: &str, q: &str, ctx: &Ctx) -> Markup {
     let needle = q.to_lowercase();
     let projects: Vec<&str> = tree
         .projects
@@ -570,11 +649,11 @@ fn results(tree: &Tree, project: &str, q: &str) -> Markup {
                             span."row-meta" { code { (path) } " · " (count_label(tree.apps_below(path))) }
                         }
                     }
-                    @for entry in &apps { (app_row(entry, true)) }
+                    @for entry in &apps { (app_row(entry, true, ctx)) }
                 }
                 ul."tiles cards-only" {
-                    @for path in &projects { (project_tile(tree, path, true)) }
-                    @for entry in &apps { (app_tile(entry, true)) }
+                    @for path in &projects { (project_tile(tree, path, true, ctx)) }
+                    @for entry in &apps { (app_tile(entry, true, ctx)) }
                 }
             }
         }

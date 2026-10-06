@@ -272,7 +272,7 @@ pub(crate) async fn panel(
                 div."panel-head" {
                     h3 { "People with access" }
                     p {
-                        "Add a person from the first row, then set their level. Each level includes the ones before it. "
+                        "Add a person above the table, then set their level. Each level includes the ones before it. "
                         "Grey rows come from a project above. Site admins hold Manage everywhere."
                     }
                     @if let Target::Project(_) = target {
@@ -295,6 +295,9 @@ pub(crate) async fn panel(
                             button."quiet sm" type="submit" { "Filter" }
                         }
                     }
+                    @if !disabled {
+                        (add_toolbar(&path, app.as_deref(), mine, viewer.is_admin, token, &back))
+                    }
                     div."table-scroll" {
                         table."perm-grid perm-rules" {
                             thead {
@@ -310,12 +313,9 @@ pub(crate) async fn panel(
                                 }
                             }
                             tbody {
-                                @if !disabled {
-                                    (add_row(&path, app.as_deref(), mine, viewer.is_admin, token, &back, columns))
-                                }
                                 @if shown.is_empty() {
                                     tr { td colspan=(columns) class="muted" {
-                                        @if filter.is_empty() { "Nobody has access at " (place(&path)) " yet. Add a person in the row above." }
+                                        @if filter.is_empty() { "Nobody has access at " (place(&path)) " yet. Add a person above the table." }
                                         @else { "Nobody here matches " (filter) "." }
                                     } }
                                 }
@@ -349,38 +349,33 @@ fn base_of(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
-/// The first row of the table: a search for one account and a level. It asks
-/// the server for at most ten matches, leaving out people who already hold a
-/// rule here. Pressing Add keeps the focus in the search, so several people
-/// can be added one after another.
-#[allow(clippy::too_many_arguments)]
-fn add_row(
+/// The line of controls above the table: a search for one account and a
+/// level. It sits outside the table so the column headers label rules, not
+/// the form. The search asks the server for at most ten matches, leaving out
+/// people who already hold a rule here. Pressing Add keeps the focus in the
+/// search, so several people can be added one after another.
+fn add_toolbar(
     path: &str,
     app: Option<&str>,
     mine: Option<Scope>,
     site_admin: bool,
     token: &str,
     back: &str,
-    columns: usize,
 ) -> Markup {
     html! {
-        tr."add-rule" {
-            td colspan=(columns) {
-                form."row add-rule-form" method="post" action="/admin/permissions/add" data-perm-add {
-                    (admin::hidden("token", token)) (admin::hidden("path", path))
-                    @if let Some(app) = app { (admin::hidden("app", app)) } @else { (admin::hidden("app", "")) }
-                    (admin::hidden("back", back))
-                    span."add-rule-label" { "+ Add a person" }
-                    (ui::combobox_full("email", "/admin/permissions/candidates", "Type a name or email", "", Some("path,app"), "-add"))
-                    select name="scope" aria-label="Level for the new person" {
-                        @for level in LEVELS {
-                            @let allowed = site_admin || mine.is_some_and(|mine| level <= mine);
-                            option value=(level.as_str()) selected[level == Scope::Viewer] disabled[!allowed] { (level_word(level)) }
-                        }
-                    }
-                    button type="submit" { "Add" }
+        form."add-rule-form" method="post" action="/admin/permissions/add" data-perm-add {
+            (admin::hidden("token", token)) (admin::hidden("path", path))
+            @if let Some(app) = app { (admin::hidden("app", app)) } @else { (admin::hidden("app", "")) }
+            (admin::hidden("back", back))
+            span."add-rule-label" { "Add a person" }
+            (ui::combobox_full("email", "/admin/permissions/candidates", "Type a name or email", "", Some("path,app"), "-add"))
+            select name="scope" aria-label="Level for the new person" {
+                @for level in LEVELS {
+                    @let allowed = site_admin || mine.is_some_and(|mine| level <= mine);
+                    option value=(level.as_str()) selected[level == Scope::Viewer] disabled[!allowed] { (level_word(level)) }
                 }
             }
+            button type="submit" { "Add" }
         }
     }
 }
