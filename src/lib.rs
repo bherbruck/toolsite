@@ -178,6 +178,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         // Trades the site session for one scoped to a single app; the only
         // way an app ever sees a visitor.
         .route("/auth/handoff", get(users::handoff))
+        // A headless browser's one-time sign-in for a screenshot.
+        .route("/preview/{token}", get(crate::platform::preview::open))
         .route(
             "/upload/{ticket}",
             put(upload_root).post(upload_root).get(upload::download),

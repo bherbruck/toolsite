@@ -164,6 +164,26 @@ enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Render a page in a browser on the server and save the picture, so you
+    /// can look at what you built before you say it works.
+    Shot {
+        slug: String,
+        /// Path within the app, e.g. /reports/2026. Defaults to /.
+        #[arg(long)]
+        path: Option<String>,
+        /// Render signed in as this account. Site admins only.
+        #[arg(long = "as")]
+        as_user: Option<String>,
+        /// Viewport width, 320 to 1600. Defaults to 1280.
+        #[arg(long)]
+        width: Option<u32>,
+        /// Capture a tall viewport so a long page is whole.
+        #[arg(long)]
+        full_page: bool,
+        /// Where to write the image. The extension follows the format.
+        #[arg(short, long, default_value = "shot.png")]
+        out: PathBuf,
+    },
     /// Take a slug down for good. Files are moved aside, not deleted.
     Remove {
         slug: String,
@@ -379,6 +399,47 @@ fn run() -> Result<()> {
                 None => json!({ "slug": slug }),
             };
             println!("{}", mcp.call("app_notes", arguments)?);
+            Ok(())
+        }
+        Command::Shot { slug, path, as_user, width, full_page, out } => {
+            use base64::Engine as _;
+            let mut arguments = json!({ "slug": slug, "full_page": full_page });
+            if let Some(path) = path {
+                arguments["path"] = json!(path);
+            }
+            if let Some(email) = as_user {
+                arguments["as_user"] = json!(email);
+            }
+            if let Some(width) = width {
+                arguments["width"] = json!(width);
+            }
+            let result = mcp.call_result("screenshot", arguments)?;
+            let blocks = result
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let image = blocks
+                .iter()
+                .find(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("image"))
+                .ok_or_else(|| anyhow!("the server returned no image"))?;
+            let data = image.get("data").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let mime = image.get("mimeType").and_then(serde_json::Value::as_str).unwrap_or("image/png");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .context("the image was not valid base64")?;
+            let mut target = out;
+            let wanted = if mime == "image/jpeg" { "jpg" } else { "png" };
+            if target.extension().and_then(|e| e.to_str()) != Some(wanted) {
+                target.set_extension(wanted);
+            }
+            std::fs::write(&target, &bytes)
+                .with_context(|| format!("could not write {}", target.display()))?;
+            let caption = blocks
+                .iter()
+                .find_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                .unwrap_or("");
+            println!("{} ({} bytes) {caption}", target.display(), bytes.len());
             Ok(())
         }
         Command::Remove { slug, page_only } => {

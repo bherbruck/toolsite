@@ -192,6 +192,22 @@ pub(crate) struct ExportRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ScreenshotRequest {
+    #[schemars(description = "App (or page) to render.")]
+    pub(crate) slug: String,
+    #[schemars(description = "Path within the app, e.g. '/reports/2026'. Defaults to '/'.")]
+    pub(crate) path: Option<String>,
+    #[schemars(
+        description = "Render signed in as this account's email, so a gated page shows its data. Site admins only. Omit to render as nobody."
+    )]
+    pub(crate) as_user: Option<String>,
+    #[schemars(description = "Viewport width in pixels, 320 to 1600. Defaults to 1280. The image comes back at most 1280 wide.")]
+    pub(crate) width: Option<u32>,
+    #[schemars(description = "true renders a tall viewport (up to 4000 px) so a long page is captured whole.")]
+    pub(crate) full_page: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct RemoveRequest {
     #[schemars(description = "Slug to take down.")]
     pub(crate) slug: String,
@@ -952,6 +968,84 @@ impl PageHost {
 
         let url = page_url(&self.config, &slug);
         Ok(CallToolResult::success(vec![ContentBlock::text(url)]))
+    }
+
+    #[tool(
+        description = "Look at what you built: renders a page in a real browser on the server and returns the picture, so you can say what you see, with data, before you say it works. Pass as_user (site admins only) to see a gated page as that person. Needs a browser on the server; the error says so when there is none.",
+        annotations(title = "Screenshot a page", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn screenshot(
+        &self,
+        Parameters(ScreenshotRequest { slug, path, as_user, width, full_page }): Parameters<ScreenshotRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_slug(&slug) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+            )]));
+        }
+        if let Err(refused) = self.allowed(&ctx, &slug, Scope::Editor).await {
+            return Ok(refused);
+        }
+        let options = match crate::platform::screenshot::Options::new(width, full_page.unwrap_or(false)) {
+            Ok(options) => options,
+            Err(why) => return Ok(CallToolResult::error(vec![ContentBlock::text(why)])),
+        };
+        // The app is the first segment; a deeper slug is a page within it,
+        // which becomes the path unless one was given.
+        let (app, rest) = match slug.split_once('/') {
+            Some((app, rest)) => (app.to_string(), format!("/{rest}")),
+            None => (slug.clone(), "/".to_string()),
+        };
+        let path = path.unwrap_or(rest);
+        if !crate::platform::preview::valid_path(&path) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "path must start with '/' and stay within the app",
+            )]));
+        }
+
+        // Seeing a page as someone else is impersonation; only a site admin
+        // (or the static token) may, and only of an active account.
+        let mut as_label = "nobody".to_string();
+        let mut user_id = None;
+        if let Some(email) = as_user.map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()) {
+            if let Err(refused) = Self::root_only(&ctx) {
+                return Ok(refused);
+            }
+            let (config, lookup) = (self.config.clone(), email.clone());
+            match tokio::task::spawn_blocking(move || users::account_at_email(&config, &lookup)).await {
+                Ok(Ok(users::AtEmail::Active(user))) => {
+                    as_label = user.email.clone();
+                    user_id = Some(user.id);
+                }
+                Ok(Ok(users::AtEmail::Disabled)) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!("{email} is disabled."))]));
+                }
+                Ok(Ok(users::AtEmail::Nobody)) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!("There is no account {email}."))]));
+                }
+                _ => return Err(McpError::internal_error("account lookup failed", None)),
+            }
+        }
+
+        match crate::platform::screenshot::render(&self.config, &app, &path, user_id.as_deref(), options).await {
+            Ok(shot) => {
+                use base64::Engine as _;
+                let data = base64::engine::general_purpose::STANDARD.encode(&shot.bytes);
+                tracing::info!(app = %app, path = %path, as_user = %as_label, bytes = shot.bytes.len(), "screenshot rendered");
+                Ok(CallToolResult::success(vec![
+                    ContentBlock::image(data, shot.media_type),
+                    ContentBlock::text(format!(
+                        "{}x{} of /p/{app}{path} as {as_label}",
+                        shot.width, shot.height
+                    )),
+                ]))
+            }
+            Err(why) => {
+                tracing::warn!(app = %app, path = %path, %why, "screenshot failed");
+                Ok(CallToolResult::error(vec![ContentBlock::text(why)]))
+            }
+        }
     }
 
     #[tool(description = "Fetch the current HTML source of a previously pushed page by its slug, so it can be edited and pushed back.",
@@ -1896,6 +1990,10 @@ impl ServerHandler for PageHost {
                  upload tools. Without a build tool you can still do everything else: pages \
                  of plain HTML with push_page, SQL with run_sql, accounts, access, exports, \
                  repositories and notes. Say which you have before you start, not after.\n\
+                 \n\
+                 Look at what you built: screenshot(slug) renders the page in a real browser \
+                 on the server and returns the picture. Say what you see, with data, before \
+                 you say it works.\n\
                  \n\
                  How to publish, in order of preference:\n\
                  1. If you can run shell commands: write the HTML to a file, call \

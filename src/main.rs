@@ -253,6 +253,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(app_id = %app.app_id, webhook = app.install_url().is_some(), "github app configured");
     }
 
+    // Screenshots need a browser on the machine. Found once, here, so a
+    // missing one is a boot log line rather than a tool failure later.
+    let browser = toolsite::platform::screenshot::find_browser();
+    match &browser {
+        Some(path) => tracing::info!(browser = %path.display(), "screenshots available"),
+        None => tracing::info!("screenshots unavailable: no browser found (TOOLSITE_BROWSER)"),
+    }
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
 
@@ -286,6 +294,8 @@ async fn main() -> anyhow::Result<()> {
         logins: Mutex::new(HashMap::new()),
         default_gate,
         github,
+        previews: Mutex::new(HashMap::new()),
+        browser,
     });
 
     let runtime = Runtime::new()?;
@@ -346,6 +356,8 @@ fn run_user_command(
         logins: Mutex::new(HashMap::new()),
         default_gate: "public".to_string(),
         github: None,
+        previews: Mutex::new(HashMap::new()),
+        browser: None,
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

@@ -93,7 +93,8 @@ It prints a one-time link to choose a password. Open it, then connect Claude.
 **Docker.**
 
 ```
-docker build -t toolsite .
+docker build -t toolsite .                       # with a browser for screenshots
+docker build --build-arg WITH_BROWSER=0 -t toolsite .   # about 350 MB smaller, no screenshots
 
 docker run -d -p 8080:8080 -v ./data:/data \
   -e TOOLSITE_BASE_URL=https://yourdomain.com \
@@ -217,6 +218,17 @@ which is the mistake that ships a blank page while looking like a success.
 | `push_page(html, slug?)` | Fallback for clients with no shell; HTML inline. |
 | `push_app(app, pages)` | Fallback, multi-page. A page named `index` also serves at the app root. |
 | `upload_begin` / `upload_chunk` / `upload_finish` | Fallback for a sandbox that cannot reach the upload URL: any kind the URL takes, sent inline as base64 chunks of at most 768 KB decoded. Same rules, same reply. |
+| `screenshot(slug, path?, as_user?, width?, full_page?)` | A picture of the page from a real browser on the server, as nobody or as an account (site admins only). Say what you see before you say it works. |
+
+### Looking at what you built
+
+`screenshot` renders a page in Chromium on the server and returns the image,
+at most 1280 pixels wide. A gated page renders as the account you name, with
+its data, through a one-time sign-in that works for one load. The CLI does the
+same with `toolsite shot <slug> -o page.png`. The server needs a browser:
+the Docker image installs one (`WITH_BROWSER=1`, the default), or set
+`TOOLSITE_BROWSER` to a Chromium binary. Without one the tool says so.
+
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
 | `remove_page(slug, confirm)` | Takes a slug down for good. Files move to `.trash/` on the server rather than being deleted. |
 
@@ -1026,6 +1038,7 @@ is required to serve HTTP.
 | `TOOLSITE_GITHUB_APP_SLUG` | no | The App's URL name, for the install link on `/admin/github`. |
 | `TOOLSITE_GITHUB_WEBHOOK_SECRET` | no | Signs the pushes GitHub sends to `/github/webhook`. Without it the webhook is closed. |
 | `TOOLSITE_GITHUB_API` | no | The API base, `https://api.github.com` unless you run GitHub Enterprise. |
+| `TOOLSITE_BROWSER` | no | Path to a Chromium binary for `screenshot`. The Docker image sets it. When unset, the usual names on `PATH` are tried; when none is found, screenshots are off and say so. |
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |

@@ -5015,3 +5015,172 @@ async fn an_editor_whose_scope_went_away_is_refused_at_the_finish() {
     assert!(text.contains("editor access"), "{text}");
     assert!(!config.data_dir.join("late").exists() && !config.data_dir.join("late.html").exists(), "the page landed anyway");
 }
+
+// --- screenshots ----------------------------------------------------------------
+//
+// A render is a browser loading a one-time preview URL that signs it in as
+// the account an admin named. The token is the credential: one load, one
+// minute, one app.
+
+#[tokio::test]
+async fn a_preview_token_signs_a_browser_in_once_with_an_app_cookie() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    toolsite::content::store::write_meta(&config, "members", &{
+        let mut meta = toolsite::content::store::read_meta(&config, "members").await;
+        meta.gate = Some("authenticated".to_string());
+        meta
+    })
+    .await
+    .unwrap();
+    account(&config, "reader@example.com", "correct horse battery");
+    let user = match toolsite::accounts::users::account_at_email(&config, "reader@example.com").unwrap() {
+        toolsite::accounts::users::AtEmail::Active(user) => user,
+        _ => panic!("no account"),
+    };
+
+    let token = toolsite::platform::preview::issue(&config, "members", "/", Some(&user.id)).unwrap();
+    let (status, _, headers) = send(&config, get(&format!("/preview/{token}"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/p/members/");
+    let cookie = headers.iter().find(|(k, _)| k == "set-cookie").map(|(_, v)| v.clone()).expect("no cookie");
+    assert!(cookie.starts_with("ts_app_members="), "not the app cookie: {cookie}");
+    assert!(cookie.contains("Path=/p/members/"), "{cookie}");
+    assert!(!cookie.contains("ts_session"), "a site session was handed out: {cookie}");
+
+    // The cookie opens the gated app, as the handoff's would.
+    let app_token = cookie.split(';').next().unwrap().trim_start_matches("ts_app_members=").to_string();
+    let (status, body, _) = send(&config, get_as_app("/p/members/", "members", &app_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("members"));
+
+    // Once.
+    let (status, ..) = send(&config, get(&format!("/preview/{token}"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a preview token was used twice");
+    let (status, ..) = send(&config, get("/preview/made-up")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // With no account it only redirects, and sets nothing.
+    let token = toolsite::platform::preview::issue(&config, "members", "/x?y=1", None).unwrap();
+    let (status, _, headers) = send(&config, get(&format!("/preview/{token}"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), "/p/members/x?y=1");
+    assert!(!headers.iter().any(|(k, _)| k == "set-cookie"));
+
+    // Expired is gone.
+    let token = toolsite::platform::preview::issue(&config, "members", "/", None).unwrap();
+    config.previews.lock().unwrap().get_mut(&token).unwrap().expires_at = Instant::now() - Duration::from_secs(1);
+    let (status, ..) = send(&config, get(&format!("/preview/{token}"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn without_a_browser_the_screenshot_tool_says_what_to_set() {
+    let (dir, config) = server();
+    let config = Arc::new(Config { browser: None, ..Config::local(dir.path().to_path_buf(), TOKEN) });
+    write_page(&config, "app/index", "<h1>app</h1>");
+    let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app"})).await;
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("TOOLSITE_BROWSER") && text.contains("WITH_BROWSER"), "{text}");
+    // No preview token is left behind by a refused render.
+    assert!(config.previews.lock().unwrap().is_empty());
+
+    // Options are checked before anything runs.
+    let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app", "width": 100})).await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("320"));
+    let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app", "path": "../x"})).await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("within the app"));
+}
+
+#[tokio::test]
+async fn only_a_site_admin_may_screenshot_as_someone_else() {
+    // OAuth tokens are only read when the site knows its address.
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        base_url: Some(BASE.to_string()),
+        browser: None,
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    write_page(&config, "app/index", "<h1>app</h1>");
+    toolsite::content::store::create_folder(&config, "", "ops").await.unwrap();
+    toolsite::accounts::users::sign_up_as(&config, "editor@example.com", "correct horse battery", false).unwrap();
+    toolsite::accounts::users::grant_scope(&config, "editor@example.com", "", toolsite::accounts::users::Scope::Editor, None).unwrap();
+    account(&config, "reader@example.com", "correct horse battery");
+    let editor = match toolsite::accounts::users::account_at_email(&config, "editor@example.com").unwrap() {
+        toolsite::accounts::users::AtEmail::Active(user) => user,
+        _ => panic!(),
+    };
+    let token = bearer_for(&config, &editor);
+
+    // The editor may render as nobody: the refusal is the missing browser,
+    // not their standing.
+    let result = mcp_tool_raw(&config, "/mcp", &token, "screenshot", serde_json::json!({"slug": "app"})).await;
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("TOOLSITE_BROWSER"));
+    // As someone else is impersonation and is refused before any render.
+    let result = mcp_tool_raw(&config, "/mcp", &token, "screenshot", serde_json::json!({"slug": "app", "as_user": "reader@example.com"})).await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("site admin"));
+    // A static token may, but only of an account that exists and is active.
+    let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app", "as_user": "nobody@example.com"})).await;
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("no account"));
+}
+
+/// The real thing: Chromium renders a published page, and a gated page
+/// renders as the account named. Needs a browser on PATH or in
+/// TOOLSITE_BROWSER, and a listening socket, so it runs on request. A snap
+/// Chromium cannot write into dot-directories, which the spool is, so run
+/// this with a deb or the container's browser.
+#[tokio::test]
+#[ignore = "needs a browser"]
+async fn a_browser_renders_the_page_as_the_named_account() {
+    let Some(browser) = toolsite::platform::screenshot::find_browser() else {
+        panic!("no browser found; set TOOLSITE_BROWSER");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = Arc::new(Config {
+        browser: Some(browser),
+        local_base: format!("http://127.0.0.1:{port}"),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    // A page with a big red block, and a gated copy of it.
+    let page = "<!doctype html><html><body style='margin:0;background:#fff'><div style='width:100vw;height:100vh;background:#d62828'></div></body></html>";
+    write_page(&config, "open/index", page);
+    write_page(&config, "gated/index", page);
+    let mut meta = toolsite::content::store::read_meta(&config, "gated").await;
+    meta.gate = Some("authenticated".to_string());
+    toolsite::content::store::write_meta(&config, "gated", &meta).await.unwrap();
+    account(&config, "reader@example.com", "correct horse battery");
+    let reader = match toolsite::accounts::users::account_at_email(&config, "reader@example.com").unwrap() {
+        toolsite::accounts::users::AtEmail::Active(user) => user,
+        _ => panic!(),
+    };
+
+    let router = build_router(config.clone(), Runtime::new().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    fn red_share(bytes: &[u8]) -> f64 {
+        let img = image::load_from_memory(bytes).unwrap().to_rgb8();
+        let total = (img.width() * img.height()) as f64;
+        let red = img.pixels().filter(|p| p[0] > 180 && p[1] < 90 && p[2] < 90).count() as f64;
+        red / total
+    }
+
+    let options = toolsite::platform::screenshot::Options::new(Some(800), false).unwrap();
+    let open = toolsite::platform::screenshot::render(&config, "open", "/", None, options).await.unwrap();
+    assert!(red_share(&open.bytes) > 0.9, "the open page did not render red: {:.2}", red_share(&open.bytes));
+
+    let as_nobody = toolsite::platform::screenshot::render(&config, "gated", "/", None, options).await.unwrap();
+    assert!(red_share(&as_nobody.bytes) < 0.1, "a stranger saw the gated page");
+
+    let as_reader = toolsite::platform::screenshot::render(&config, "gated", "/", Some(&reader.id), options).await.unwrap();
+    assert!(red_share(&as_reader.bytes) > 0.9, "the named account did not see the gated page: {:.2}", red_share(&as_reader.bytes));
+    assert!(as_reader.width <= 1280);
+    // Nothing left in the spool.
+    let leftovers = std::fs::read_dir(dir.path().join(".tmp/shots")).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(leftovers, 0);
+}

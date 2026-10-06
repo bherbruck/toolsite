@@ -1,6 +1,6 @@
 use crate::{
     accounts::providers::{PendingLogin, Provider},
-    platform::{github, inline_upload::InlineUpload, upload::UploadTicket},
+    platform::{github, inline_upload::InlineUpload, preview::PreviewTicket, upload::UploadTicket},
     runtime::blobs::{self, Blobs},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
@@ -39,6 +39,11 @@ pub struct Config {
     /// The GitHub App this site speaks as, when one is configured. Lets an
     /// app live in a repository and deploy from it.
     pub github: Option<github::App>,
+    /// One-time sign-ins a headless browser uses to render a page as an
+    /// account, minted only by the screenshot path.
+    pub previews: Mutex<HashMap<String, PreviewTicket>>,
+    /// A browser binary for screenshots, when one was found at boot.
+    pub browser: Option<PathBuf>,
 }
 
 impl Config {
@@ -67,6 +72,8 @@ impl Config {
             providers: Vec::new(),
             logins: Mutex::new(HashMap::new()),
             github: None,
+            previews: Mutex::new(HashMap::new()),
+            browser: self.browser.clone(),
         }
     }
 
@@ -88,6 +95,8 @@ impl Config {
             logins: Mutex::new(HashMap::new()),
             default_gate: "public".to_string(),
             github: None,
+            previews: Mutex::new(HashMap::new()),
+            browser: None,
         }
     }
 }

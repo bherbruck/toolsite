@@ -321,3 +321,9 @@ and looks like a success. The usual cause is a build whose base path is not
 
     curl -I <page-url>/assets/<a-built-file>
     curl <page-url>/api/<a-route>
+
+Then look at it. `screenshot(slug)` renders the page in a real browser on the
+server and returns the picture; pass `as_user` to see a gated page as that
+person, with their data. Describe what you see, with the data in it, before
+you say the page works. A blank image or a sign-in page is a finding, not a
+success.

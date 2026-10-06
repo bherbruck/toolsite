@@ -252,6 +252,43 @@ pub fn create_app_session(
     Ok((User { id, email, is_admin }, token, expires.saturating_sub(now)))
 }
 
+/// An app session for an account with no site session behind it: what a
+/// preview render signs in with. Short-lived by the caller's choice and
+/// scoped to one app, so the cookie it becomes opens that app and nothing
+/// else. Nothing on the request side can mint one; only the screenshot path
+/// does, for an account an admin named.
+pub fn create_app_session_for(
+    config: &Config,
+    user_id: &str,
+    app: &str,
+    lifetime: Duration,
+) -> Result<(String, u64), String> {
+    if !valid_app_scope(app) {
+        return Err("invalid app name".into());
+    }
+    let conn = open(config)?;
+    let active: bool = conn
+        .query_row(
+            "select count(*) from users where id = ? and disabled_at is null",
+            [user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(|e| e.to_string())?;
+    if !active {
+        return Err("no such active account".into());
+    }
+    let now = now();
+    let max_age = lifetime.as_secs().min(APP_SESSION_LIFETIME.as_secs()).max(1);
+    let token = crate::content::slug::random_token(48);
+    conn.execute(
+        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, ?)",
+        rusqlite::params![hash_token(&token), user_id, (now + max_age) as i64, app],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((token, max_age))
+}
+
 pub fn log_out(config: &Config, token: &str) -> Result<(), String> {
     let conn = open(config)?;
     let hash = hash_token(token);

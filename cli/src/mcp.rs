@@ -77,6 +77,45 @@ impl Mcp {
 
     /// Calls a tool and returns its text content, or the error the tool
     /// reported.
+    /// A tool call whose result is wanted whole: content blocks of any
+    /// kind, not only the first text. `shot` reads an image block from it.
+    pub fn call_result(&self, tool: &str, arguments: Value) -> Result<Value> {
+        let response = self
+            .client
+            .post(&self.url)
+            .bearer_auth(&self.token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .headers(session_header(&self.session))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            }))
+            .send()?;
+        let body = response.text()?;
+        let payload = parse_sse(&body)
+            .ok_or_else(|| anyhow!("could not parse a response from {tool}: {body}"))?;
+        if let Some(error) = payload.get("error") {
+            bail!("{tool} failed: {error}");
+        }
+        let result = payload
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("{tool} returned no result: {body}"))?;
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            let text = result
+                .get("content")
+                .and_then(|content| content.get(0))
+                .and_then(|first| first.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            bail!("{text}");
+        }
+        Ok(result)
+    }
+
     pub fn call(&self, tool: &str, arguments: Value) -> Result<String> {
         let response = self
             .client

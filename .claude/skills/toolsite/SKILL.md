@@ -509,6 +509,11 @@ curl -I <page-url>/assets/<a-built-file>                      # bundles: expect 
 curl -sS <page-url>/api/<route>                               # handlers: expect the handler's answer
 ```
 
+Then look at it: `screenshot(slug)` over MCP, or `toolsite shot <slug> -o page.png`,
+renders the page in a browser on the server. Pass `as_user` to see a gated
+page as that account. Describe what the picture shows before you report
+success; a blank page or a sign-in form is a failure to fix.
+
 A 200 on the HTML with a 404 on the assets is the blank-page failure above; go
 back and fix the base path, rebuild, re-upload. A 303 to `/auth/login` on an
 app you expected open means it follows a site default of `granted` or

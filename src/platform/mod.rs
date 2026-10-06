@@ -14,6 +14,8 @@ pub mod export;
 pub mod inline_upload;
 pub mod github;
 pub mod oauth_store;
+pub mod preview;
+pub mod screenshot;
 pub mod knowledge;
 pub mod manifest;
 pub mod mcp_log;
