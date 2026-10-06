@@ -41,6 +41,8 @@ tokio-util = { version = "0.7.19", features = ["io"] }
 jsonwebtoken = "9"
 url = "2.5.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+chromiumoxide = "0.9.1"
+async-trait = "0.1.92"
 
 [dev-dependencies]
 tempfile = "3.27.0"

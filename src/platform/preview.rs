@@ -94,10 +94,7 @@ pub(crate) async fn open(State(config): State<Arc<Config>>, Path(token): Path<St
     .await;
     match outcome {
         Ok(Ok((session, max_age))) => (
-            [(
-                header::SET_COOKIE,
-                users::set_app_cookie_header(&config, &ticket.app, &session, max_age),
-            )],
+            [(header::SET_COOKIE, preview_cookie(&config, &ticket.app, &session, max_age))],
             Redirect::to(&target),
         )
             .into_response(),
@@ -109,9 +106,38 @@ pub(crate) async fn open(State(config): State<Arc<Config>>, Path(token): Path<St
     }
 }
 
+
+/// The app cookie for the renderer's browser. It arrives on the preview
+/// base, which for a sidecar is a plain-http private address: a browser
+/// drops a `Secure` cookie set over http from anywhere but localhost, and
+/// the render would show the sign-in page. Over an http preview base the flag
+/// is left off; the session is an app session that lives a day at most and
+/// is only ever handed to the renderer's own browser.
+fn preview_cookie(config: &Config, app: &str, session: &str, max_age: u64) -> String {
+    let cookie = users::set_app_cookie_header(config, app, session, max_age);
+    if config.preview_base.starts_with("http://") {
+        cookie.replace(" Secure;", "")
+    } else {
+        cookie
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sidecar_on_plain_http_gets_a_cookie_it_will_keep_and_everything_else_keeps_secure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::local(dir.path().to_path_buf(), "t");
+        config.base_url = Some("https://site.test".to_string());
+        config.preview_base = "http://toolsite.railway.internal:8080".to_string();
+        let cookie = preview_cookie(&config, "app", "s", 60);
+        assert!(!cookie.contains("Secure"), "{cookie}");
+        assert!(cookie.contains("HttpOnly") && cookie.contains("Path=/p/app/"), "{cookie}");
+        config.preview_base = "https://site.test".to_string();
+        assert!(preview_cookie(&config, "app", "s", 60).contains("Secure"));
+    }
 
     #[test]
     fn a_preview_path_stays_inside_the_app() {

@@ -5077,7 +5077,7 @@ async fn a_preview_token_signs_a_browser_in_once_with_an_app_cookie() {
 #[tokio::test]
 async fn without_a_browser_the_screenshot_tool_says_what_to_set() {
     let (dir, config) = server();
-    let config = Arc::new(Config { browser: None, ..Config::local(dir.path().to_path_buf(), TOKEN) });
+    let config = Arc::new(Config { renderer: None, ..Config::local(dir.path().to_path_buf(), TOKEN) });
     write_page(&config, "app/index", "<h1>app</h1>");
     let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app"})).await;
     assert_eq!(result["isError"], true);
@@ -5101,7 +5101,7 @@ async fn only_a_site_admin_may_screenshot_as_someone_else() {
     let dir = tempfile::tempdir().unwrap();
     let config = Arc::new(Config {
         base_url: Some(BASE.to_string()),
-        browser: None,
+        renderer: None,
         ..Config::local(dir.path().to_path_buf(), TOKEN)
     });
     write_page(&config, "app/index", "<h1>app</h1>");
@@ -5128,22 +5128,97 @@ async fn only_a_site_admin_may_screenshot_as_someone_else() {
     assert!(result["content"][0]["text"].as_str().unwrap().contains("no account"));
 }
 
-/// The real thing: Chromium renders a published page, and a gated page
-/// renders as the account named. Needs a browser on PATH or in
-/// TOOLSITE_BROWSER, and a listening socket, so it runs on request. A snap
-/// Chromium cannot write into dot-directories, which the spool is, so run
-/// this with a deb or the container's browser.
+/// A renderer that records what it was asked to open and answers with a
+/// red picture, so the tool's path is tested without a browser.
+struct FakeRenderer {
+    asked: std::sync::Mutex<Vec<(String, u32, bool)>>,
+    fail: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl toolsite::platform::screenshot::Renderer for FakeRenderer {
+    fn describe(&self) -> String {
+        "fake".to_string()
+    }
+    async fn render(&self, url: &str, options: &toolsite::platform::screenshot::Options) -> Result<Vec<u8>, String> {
+        self.asked.lock().unwrap().push((url.to_string(), options.width, options.full_page));
+        if let Some(why) = &self.fail {
+            return Err(why.clone());
+        }
+        let img = image::RgbImage::from_pixel(options.width, 600, image::Rgb([214, 40, 40]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        Ok(out.into_inner())
+    }
+}
+
+#[tokio::test]
+async fn the_screenshot_tool_hands_the_renderer_a_preview_url_on_the_preview_base_and_returns_its_picture() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeRenderer { asked: std::sync::Mutex::new(Vec::new()), fail: None });
+    let config = Arc::new(Config {
+        renderer: Some(fake.clone()),
+        preview_base: "http://toolsite.railway.internal:8080".to_string(),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    write_page(&config, "app/index", "<h1>app</h1>");
+
+    let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app", "path": "/reports", "width": 1600, "full_page": true})).await;
+    assert_ne!(result["isError"], true, "{result}");
+    let asked = fake.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    let (url, width, full_page) = &asked[0];
+    assert!(url.starts_with("http://toolsite.railway.internal:8080/preview/"), "{url}");
+    assert_eq!((*width, *full_page), (1600, true));
+    // The token in that URL is a live one-time sign-in for this app and path.
+    let token = url.rsplit('/').next().unwrap();
+    let ticket = config.previews.lock().unwrap().get(token).map(|t| (t.app.clone(), t.path.clone()));
+    assert_eq!(ticket, Some(("app".to_string(), "/reports".to_string())));
+
+    // An image block, scaled to the output width, and a line that says what it is.
+    let blocks = result["content"].as_array().unwrap();
+    let image = blocks.iter().find(|b| b["type"] == "image").expect("no image block");
+    assert_eq!(image["mimeType"], "image/png");
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(image["data"].as_str().unwrap()).unwrap();
+    let decoded = image::load_from_memory(&bytes).unwrap();
+    assert_eq!(decoded.width(), 1280);
+    assert!(blocks.iter().any(|b| b["type"] == "text" && b["text"].as_str().unwrap_or("").contains("/p/app")));
+}
+
+#[tokio::test]
+async fn a_renderer_failure_reaches_the_agent_as_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeRenderer {
+        asked: std::sync::Mutex::new(Vec::new()),
+        fail: Some("could not reach the browser sidecar at ws://browser:3000: connection refused".to_string()),
+    });
+    let config = Arc::new(Config { renderer: Some(fake), ..Config::local(dir.path().to_path_buf(), TOKEN) });
+    write_page(&config, "app/index", "<h1>app</h1>");
+    let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app"})).await;
+    assert_eq!(result["isError"], true);
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("browser sidecar"), "{result}");
+}
+
+/// The real thing: a browser renders a published page, a gated page as the
+/// account named, and a page that draws only after its data arrives. Needs a
+/// browser (TOOLSITE_BROWSER_URL for a sidecar that can reach this test's
+/// port, or TOOLSITE_BROWSER / PATH for a local one) and a listening socket,
+/// so it runs on request. A snap Chromium cannot read the profile it is
+/// handed in some setups; use the container's or a deb.
 #[tokio::test]
 #[ignore = "needs a browser"]
 async fn a_browser_renders_the_page_as_the_named_account() {
-    let Some(browser) = toolsite::platform::screenshot::find_browser() else {
-        panic!("no browser found; set TOOLSITE_BROWSER");
-    };
+    let renderer = toolsite::platform::screenshot::from_env().unwrap().expect("no browser found; set TOOLSITE_BROWSER or TOOLSITE_BROWSER_URL");
     let dir = tempfile::tempdir().unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let preview_base = std::env::var("TOOLSITE_PREVIEW_BASE")
+        .map(|base| base.replace("{port}", &port.to_string()))
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{port}"));
     let config = Arc::new(Config {
-        browser: Some(browser),
+        renderer: Some(renderer),
+        preview_base,
         local_base: format!("http://127.0.0.1:{port}"),
         ..Config::local(dir.path().to_path_buf(), TOKEN)
     });
@@ -5154,6 +5229,11 @@ async fn a_browser_renders_the_page_as_the_named_account() {
     let mut meta = toolsite::content::store::read_meta(&config, "gated").await;
     meta.gate = Some("authenticated".to_string());
     toolsite::content::store::write_meta(&config, "gated", &meta).await.unwrap();
+    // A page that draws red only once its handler has answered, after a delay.
+    write_page(&config, "late/index", "<!doctype html><html><body style='margin:0;background:#fff'><div id=b style='width:100vw;height:100vh'></div><script>setTimeout(()=>fetch('api/echo').then(r=>r.text()).then(()=>{document.getElementById('b').style.background='#d62828'}),300)</script></body></html>");
+    std::fs::write(dir.path().join("late/handler.wasm"), HANDLER).unwrap();
+    // A tall page for the full-page capture.
+    write_page(&config, "tall/index", "<!doctype html><html><body style='margin:0'><div style='height:2600px;background:#d62828'></div></body></html>");
     account(&config, "reader@example.com", "correct horse battery");
     let reader = match toolsite::accounts::users::account_at_email(&config, "reader@example.com").unwrap() {
         toolsite::accounts::users::AtEmail::Active(user) => user,
@@ -5180,7 +5260,11 @@ async fn a_browser_renders_the_page_as_the_named_account() {
     let as_reader = toolsite::platform::screenshot::render(&config, "gated", "/", Some(&reader.id), options).await.unwrap();
     assert!(red_share(&as_reader.bytes) > 0.9, "the named account did not see the gated page: {:.2}", red_share(&as_reader.bytes));
     assert!(as_reader.width <= 1280);
-    // Nothing left in the spool.
-    let leftovers = std::fs::read_dir(dir.path().join(".tmp/shots")).map(|d| d.count()).unwrap_or(0);
-    assert_eq!(leftovers, 0);
+
+    let late = toolsite::platform::screenshot::render(&config, "late", "/", None, options).await.unwrap();
+    assert!(red_share(&late.bytes) > 0.9, "the picture was taken before the data arrived: {:.2}", red_share(&late.bytes));
+
+    let full = toolsite::platform::screenshot::Options::new(Some(800), true).unwrap();
+    let tall = toolsite::platform::screenshot::render(&config, "tall", "/", None, full).await.unwrap();
+    assert_eq!((tall.width, tall.height), (800, 2600), "the full page was not captured at its own height");
 }

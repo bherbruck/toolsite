@@ -48,7 +48,7 @@ platform/          the site as its owner uses it
   blob_upload.rs   PUT /blob/<ticket>: a browser's file, streamed to storage
   export.rs        GET /export/<app>.sqlite: one app's database for a per-app token
   preview.rs       GET /preview/<token>: a headless browser's one-time sign-in for a render
-  screenshot.rs    runs the browser against a page and returns the picture
+  screenshot.rs    the Renderer seam: a local browser or a DevTools sidecar takes the picture
   deploy.rs        PUT /deploy/<app>: what an upload ticket takes, for a per-app token
   github.rs        the GitHub App: a repository per app as a source mirror, push on publish, pull on push
   scaffold.rs      the WIT and a buildable crate, served to agents

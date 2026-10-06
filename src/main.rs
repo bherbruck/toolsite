@@ -253,16 +253,19 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(app_id = %app.app_id, webhook = app.install_url().is_some(), "github app configured");
     }
 
-    // Screenshots need a browser on the machine. Found once, here, so a
-    // missing one is a boot log line rather than a tool failure later.
-    let browser = toolsite::platform::screenshot::find_browser();
-    match &browser {
-        Some(path) => tracing::info!(browser = %path.display(), "screenshots available"),
-        None => tracing::info!("screenshots unavailable: no browser found (TOOLSITE_BROWSER)"),
-    }
-
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
+
+    // Screenshots: a sidecar named by TOOLSITE_BROWSER_URL, else a browser in
+    // this container, else none. Chosen once, here, so a missing one is a
+    // boot log line rather than a tool failure later.
+    let renderer = toolsite::platform::screenshot::from_env().unwrap_or_else(|why| panic!("{why}"));
+    let preview_base = toolsite::platform::screenshot::preview_base_from_env(&format!("http://127.0.0.1:{port}"))
+        .unwrap_or_else(|why| panic!("{why}"));
+    match &renderer {
+        Some(renderer) => tracing::info!(renderer = %renderer.describe(), preview_base = %preview_base, "screenshots available"),
+        None => tracing::info!("screenshots unavailable: set TOOLSITE_BROWSER_URL for a sidecar or TOOLSITE_BROWSER for a local browser"),
+    }
 
     // Printed at boot so a misconfigured deploy is obvious from the logs
     // rather than only from a client's opaque "can't connect".
@@ -295,7 +298,8 @@ async fn main() -> anyhow::Result<()> {
         default_gate,
         github,
         previews: Mutex::new(HashMap::new()),
-        browser,
+        renderer,
+        preview_base,
     });
 
     let runtime = Runtime::new()?;
@@ -357,7 +361,8 @@ fn run_user_command(
         default_gate: "public".to_string(),
         github: None,
         previews: Mutex::new(HashMap::new()),
-        browser: None,
+        renderer: None,
+        preview_base: "http://127.0.0.1:8080".to_string(),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

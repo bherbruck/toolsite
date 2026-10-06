@@ -42,8 +42,13 @@ pub struct Config {
     /// One-time sign-ins a headless browser uses to render a page as an
     /// account, minted only by the screenshot path.
     pub previews: Mutex<HashMap<String, PreviewTicket>>,
-    /// A browser binary for screenshots, when one was found at boot.
-    pub browser: Option<PathBuf>,
+    /// What takes screenshots, when anything does: a local browser or a
+    /// sidecar. Chosen once at boot.
+    pub renderer: Option<std::sync::Arc<dyn crate::platform::screenshot::Renderer>>,
+    /// The base a renderer opens the one-time preview URL on. This server's
+    /// own port unless `TOOLSITE_PREVIEW_BASE` names an address a sidecar
+    /// can reach.
+    pub preview_base: String,
 }
 
 impl Config {
@@ -73,7 +78,8 @@ impl Config {
             logins: Mutex::new(HashMap::new()),
             github: None,
             previews: Mutex::new(HashMap::new()),
-            browser: self.browser.clone(),
+            renderer: self.renderer.clone(),
+            preview_base: self.preview_base.clone(),
         }
     }
 
@@ -96,7 +102,8 @@ impl Config {
             default_gate: "public".to_string(),
             github: None,
             previews: Mutex::new(HashMap::new()),
-            browser: None,
+            renderer: None,
+            preview_base: "http://127.0.0.1:8080".to_string(),
         }
     }
 }

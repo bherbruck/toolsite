@@ -93,8 +93,8 @@ It prints a one-time link to choose a password. Open it, then connect Claude.
 **Docker.**
 
 ```
-docker build -t toolsite .                       # with a browser for screenshots
-docker build --build-arg WITH_BROWSER=0 -t toolsite .   # about 350 MB smaller, no screenshots
+docker build -t toolsite .                              # about 220 MB, screenshots off
+docker build --build-arg WITH_BROWSER=1 -t toolsite .   # about 660 MB, with a browser for screenshots
 
 docker run -d -p 8080:8080 -v ./data:/data \
   -e TOOLSITE_BASE_URL=https://yourdomain.com \
@@ -219,16 +219,6 @@ which is the mistake that ships a blank page while looking like a success.
 | `push_app(app, pages)` | Fallback, multi-page. A page named `index` also serves at the app root. |
 | `upload_begin` / `upload_chunk` / `upload_finish` | Fallback for a sandbox that cannot reach the upload URL: any kind the URL takes, sent inline as base64 chunks of at most 768 KB decoded. Same rules, same reply. |
 | `screenshot(slug, path?, as_user?, width?, full_page?)` | A picture of the page from a real browser on the server, as nobody or as an account (site admins only). Say what you see before you say it works. |
-
-### Looking at what you built
-
-`screenshot` renders a page in Chromium on the server and returns the image,
-at most 1280 pixels wide. A gated page renders as the account you name, with
-its data, through a one-time sign-in that works for one load. The CLI does the
-same with `toolsite shot <slug> -o page.png`. The server needs a browser:
-the Docker image installs one (`WITH_BROWSER=1`, the default), or set
-`TOOLSITE_BROWSER` to a Chromium binary. Without one the tool says so.
-
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
 | `remove_page(slug, confirm)` | Takes a slug down for good. Files move to `.trash/` on the server rather than being deleted. |
 
@@ -236,6 +226,42 @@ Prefer `set_visibility`; it retracts without removing anything. `remove_page`
 is for junk: a probe published as a page, an app nobody wants. Pass
 `page_only` to clear a single page that is shadowing an app of the same name,
 which is what an accidental upload leaves behind.
+
+### Looking at what you built
+
+`screenshot` loads a page in a real browser and returns the image, at most
+1280 pixels wide. A gated page renders as the account you name, with its
+data, through a one-time sign-in that works for one load. The picture is
+taken after the page has loaded and its requests have finished, so a page
+that fetches its data on load shows the data, not a spinner. `toolsite shot
+<slug> -o page.png` does the same from a shell.
+
+Screenshots are off unless the deployment turns them on. There are two ways,
+and the tool works the same with either:
+
+- **A browser in the image.** Build with `WITH_BROWSER=1`. The image then
+  carries Google's chrome-headless-shell, about 440 MB more than without.
+  On Railway, add a service variable `WITH_BROWSER=1`; Railway passes it
+  into the build.
+- **A browser sidecar.** Keep the small image and run the browser as a second
+  service. On Railway:
+  1. Add a service from the Docker image `ghcr.io/browserless/chromium`. Its
+     private address is then `<name>.railway.internal`, port 3000.
+  2. On the toolsite service, set
+     `TOOLSITE_BROWSER_URL=ws://<browser-service>.railway.internal:3000` and
+     `TOOLSITE_PREVIEW_BASE=http://<toolsite-service>.railway.internal:8080`,
+     so the browser opens the one-time link over the private network, not
+     the internet.
+  3. Redeploy. The boot log says `screenshots available renderer=browser
+     sidecar at ...`.
+
+  Any browser that speaks the Chrome DevTools Protocol works as the sidecar:
+  Browserless, a chrome-headless-shell container started with
+  `--remote-debugging-address=0.0.0.0`, or Playwright's Chromium with remote
+  debugging. With a token in the URL (`?token=...`), the log shows the
+  address without it.
+
+With neither, the tool says what to set.
 
 ### Upload tickets
 
@@ -1038,7 +1064,9 @@ is required to serve HTTP.
 | `TOOLSITE_GITHUB_APP_SLUG` | no | The App's URL name, for the install link on `/admin/github`. |
 | `TOOLSITE_GITHUB_WEBHOOK_SECRET` | no | Signs the pushes GitHub sends to `/github/webhook`. Without it the webhook is closed. |
 | `TOOLSITE_GITHUB_API` | no | The API base, `https://api.github.com` unless you run GitHub Enterprise. |
-| `TOOLSITE_BROWSER` | no | Path to a Chromium binary for `screenshot`. The Docker image sets it. When unset, the usual names on `PATH` are tried; when none is found, screenshots are off and say so. |
+| `TOOLSITE_BROWSER_URL` | no | A browser sidecar for `screenshot`: the `ws://` or `http://` address of its DevTools endpoint, e.g. `ws://browser.railway.internal:3000`. Wins over `TOOLSITE_BROWSER`. |
+| `TOOLSITE_BROWSER` | no | Path to a Chromium or chrome-headless-shell binary in this container. An image built with `WITH_BROWSER=1` sets it. When unset, the usual names on `PATH` are tried; when none is found, screenshots are off and say so. |
+| `TOOLSITE_PREVIEW_BASE` | no | The address a screenshot browser uses to reach this server, e.g. `http://toolsite.railway.internal:8080` for a sidecar. Default: this server's own port on `127.0.0.1`. |
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
