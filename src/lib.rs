@@ -205,6 +205,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/move", post(admin::move_app))
         .route("/admin/pin", post(admin::pin_tools))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
+        // Tokens a device presents over TCP or UDP, checked by the app.
+        .route("/admin/devices", post(admin::change_devices))
         // An app's repository: a source mirror, pushed on publish and pulled on push.
         .route("/admin/github", get(github::github_page))
         .route("/admin/github/repos/search", get(github::repos_search))

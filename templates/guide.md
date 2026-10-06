@@ -395,6 +395,32 @@ open or close it. A signed-in person's connection closes within 30 seconds
 of losing access. Only declared paths take an upgrade; plain requests to
 the same path are served as usual.
 
+TCP and UDP work the same way for devices that do not speak HTTP. Declare
+`[[socket]] protocol = "tcp"` (or `"udp"`) with `port = 1883`; the site's
+owner makes it live by mapping the port to the app with `TOOLSITE_PORTS`.
+TCP bytes arrive as `Event::Message(Message::Binary(..))` in order, in reads
+of up to 64 KB that need not match the sender's writes, so frame them
+yourself. UDP gives one message per datagram, under one connection per
+remote address that closes after it is quiet for a minute.
+`connections::remote(&conn)` returns `"ip:port"`. No gate stands in front
+of a port: create a token per device with `app_device_tokens`, have the
+device send it first, and check it with `auth::check_token(&token)`, which
+returns the token's label or `None`:
+
+```rust
+Event::Message(Message::Binary(bytes)) => {
+    if connections::state_get(&conn, "device").is_none() {
+        let line = String::from_utf8_lossy(&bytes);
+        let Some(label) = auth::check_token(line.trim()) else {
+            return connections::close(&conn);
+        };
+        return connections::state_set(&conn, "device", Some(&label));
+    }
+    // ... a reading from a known device: store it, publish it ...
+    Ok(())
+}
+```
+
 ## Access
 
 People are given access in a grid of View, Edit and Manage on a project or an

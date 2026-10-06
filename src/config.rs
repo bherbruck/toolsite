@@ -53,6 +53,9 @@ pub struct Config {
     /// process. Shared with every task's copy of this config, so a
     /// scheduled job's publish reaches the same sockets a request's does.
     pub connections: std::sync::Arc<crate::runtime::connections::Hub>,
+    /// TCP and UDP ports the site's owner mapped to apps, from
+    /// `TOOLSITE_PORTS`. Empty means no port beyond HTTP is opened.
+    pub ports: crate::platform::ports::PortMap,
 }
 
 impl Config {
@@ -85,6 +88,7 @@ impl Config {
             renderer: self.renderer.clone(),
             preview_base: self.preview_base.clone(),
             connections: self.connections.clone(),
+            ports: self.ports.clone(),
         }
     }
 
@@ -110,6 +114,7 @@ impl Config {
             renderer: None,
             preview_base: "http://127.0.0.1:8080".to_string(),
             connections: std::sync::Arc::new(crate::runtime::connections::Hub::default()),
+            ports: Default::default(),
         }
     }
 }

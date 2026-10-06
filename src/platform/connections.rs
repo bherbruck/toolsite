@@ -1,30 +1,32 @@
 //! A live connection's life, whatever carries it: open, events to the
 //! handler, re-checks, close.
 //!
-//! The transport (a WebSocket today) only moves frames. Everything else is
-//! here, once: the handler is asked whether to accept, gets each frame as an
-//! event, one at a time and in order, and gets `close` however the
-//! connection ended. Every `check_every` the connection is pinged and its
-//! person's access decided again, as if they opened the socket's path now;
-//! a disabled account, a hidden app, a withdrawn socket or a gate that no
-//! longer admits them closes it.
+//! The transport (a WebSocket, a TCP connection, a UDP remote) only moves
+//! frames. Everything else is here, once: the handler is asked whether to
+//! accept, gets each frame as an event, one at a time and in order, and gets
+//! `close` however the connection ended. Every `check_every` the connection
+//! is pinged and its access decided again, as if it opened its door now; a
+//! disabled account, a hidden app, a withdrawn socket, a port no longer
+//! mapped or a gate that no longer admits the person closes it.
 //!
 //! A new transport implements `Transport` and calls `open` and `run`; the
 //! handler cannot tell which one carried the bytes.
 
 use crate::{
     accounts::users::{self, User},
+    content::store::PortSocket,
     runtime::{
         connections::{Message, Outgoing, Registration},
         wasm::{ConnectInfo, ConnectionEvent, ConnectionMessage, Guards, User as GuestUser},
     },
     AppState,
 };
-use std::{future::Future, time::Instant};
+use std::{future::Future, net::SocketAddr, time::Instant};
 use tokio::sync::mpsc;
 
-/// Frames from the browser waiting for the handler before the connection
-/// is closed for sending faster than the app can answer.
+/// Frames waiting for the handler. A WebSocket that fills this is closed for
+/// sending faster than the app can answer; a transport that holds back stops
+/// reading instead.
 const EVENT_QUEUE: usize = 64;
 
 /// What a transport hands up.
@@ -43,6 +45,31 @@ pub trait Transport: Send + 'static {
     fn send(&mut self, message: Message) -> impl Future<Output = Result<(), ()>> + Send;
     fn ping(&mut self) -> impl Future<Output = Result<(), ()>> + Send;
     fn close(&mut self) -> impl Future<Output = ()> + Send;
+
+    /// Whether the other side answers `ping` with `Incoming::Pong`. One that
+    /// does not keeps itself honest another way, such as an idle timeout in
+    /// `recv`.
+    fn answers_pings(&self) -> bool {
+        true
+    }
+
+    /// Whether frames wait in the transport while the handler is behind,
+    /// rather than the connection closing. TCP's own flow control, or a
+    /// dropped datagram, is the right answer to a fast sender there.
+    fn holds_back(&self) -> bool {
+        false
+    }
+}
+
+/// What a connection came in through, and so what decides whether it may
+/// stay.
+#[derive(Debug, Clone)]
+pub enum Door {
+    /// A declared socket path, behind the app's gate for that path.
+    Path(String),
+    /// A port the site's owner mapped to the app. No gate: the app decides
+    /// with `auth.check-token`.
+    Port(PortSocket),
 }
 
 /// Why a connection was not opened.
@@ -61,7 +88,7 @@ pub enum Refusal {
 pub struct Session {
     state: AppState,
     app: String,
-    socket: String,
+    door: Door,
     visitor: Option<User>,
     registration: Registration,
     outgoing: mpsc::Receiver<Outgoing>,
@@ -100,8 +127,9 @@ async fn deliver(
 pub async fn open(
     state: AppState,
     app: String,
-    socket: String,
+    door: Door,
     visitor: Option<User>,
+    remote: Option<SocketAddr>,
     info: ConnectInfo,
 ) -> Result<Session, Refusal> {
     let Some(wasm) = crate::content::serve::handler_wasm(&state.config, &app).await else {
@@ -121,13 +149,13 @@ pub async fn open(
     let (registration, outgoing) = state
         .config
         .connections
-        .register(&app, visitor.as_ref().map(|user| user.id.as_str()))
+        .register_from(&app, visitor.as_ref().map(|user| user.id.as_str()), remote)
         .map_err(Refusal::Full)?;
     match deliver(&state, &app, &visitor, &registration.id, ConnectionEvent::Connect(info)).await {
         Ok(Some(Ok(()))) => Ok(Session {
             state,
             app,
-            socket,
+            door,
             visitor,
             registration,
             outgoing,
@@ -140,9 +168,14 @@ pub async fn open(
 
 /// Whether `user` (or nobody) may still hold this socket: the app exists,
 /// is not hidden, still declares the socket, and its access for the
-/// socket's path admits them.
-async fn may_stay(state: &AppState, app: &str, socket: &str, user: Option<&User>) -> bool {
+/// socket's path admits them. A port asks only that it is still mapped to
+/// the app and declared by it.
+async fn may_stay(state: &AppState, app: &str, door: &Door, user: Option<&User>) -> bool {
     let config = &state.config;
+    let socket = match door {
+        Door::Path(socket) => socket,
+        Door::Port(port) => return crate::platform::ports::admits(config, app, *port).await,
+    };
     if crate::content::store::is_hidden(config, app).await || !crate::content::store::app_exists(config, app).await {
         return false;
     }
@@ -158,7 +191,7 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
     let Session {
         state,
         app,
-        socket,
+        door,
         visitor,
         registration,
         mut outgoing,
@@ -193,6 +226,10 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
     let mut last_pong = Instant::now();
     let mut pinged_at: Option<Instant> = None;
     let user_id = visitor.as_ref().map(|user| user.id.clone());
+    let (answers_pings, holds_back) = (transport.answers_pings(), transport.holds_back());
+    // The other side stopped sending. A TCP peer that half-closed still
+    // reads, so replies to what it sent last are still delivered.
+    let mut sender_done = false;
 
     loop {
         tokio::select! {
@@ -214,7 +251,9 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
                     }
                 }
             }
-            incoming = transport.recv() => {
+            // A transport that holds back is not read while the handler is
+            // behind, so its frames wait where they are.
+            incoming = transport.recv(), if !holds_back || events.capacity() > 0 => {
                 match incoming {
                     Incoming::Message(message) => {
                         let message = match message {
@@ -228,12 +267,16 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
                         }
                     }
                     Incoming::Pong => last_pong = Instant::now(),
-                    Incoming::Ended => break,
+                    Incoming::Ended => {
+                        sender_done = true;
+                        break;
+                    }
                 }
             }
             _ = checks.tick() => {
                 // A connection that did not answer the last ping is gone.
-                if let Some(at) = pinged_at
+                if answers_pings
+                    && let Some(at) = pinged_at
                     && last_pong < at
                 {
                     break;
@@ -252,14 +295,16 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
                     }
                     None => None,
                 };
-                if !may_stay(&state, &app, &socket, current.as_ref()).await {
-                    tracing::info!(app = %app, socket = %socket, "connection closed: the person may no longer open this socket");
+                if !may_stay(&state, &app, &door, current.as_ref()).await {
+                    tracing::info!(app = %app, door = ?door, "connection closed: it may no longer come in this way");
                     transport.close().await;
                     break;
                 }
-                pinged_at = Some(Instant::now());
-                if transport.ping().await.is_err() {
-                    break;
+                if answers_pings {
+                    pinged_at = Some(Instant::now());
+                    if transport.ping().await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -267,7 +312,26 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
 
     let _ = events.send(ConnectionEvent::Close).await;
     drop(events);
-    let _ = worker.await;
+    if sender_done {
+        let mut worker = worker;
+        let mut open = true;
+        loop {
+            tokio::select! {
+                _ = &mut worker => break,
+                out = outgoing.recv(), if open => match out {
+                    Some(Outgoing::Message(message)) => open = transport.send(message).await.is_ok(),
+                    _ => open = false,
+                },
+            }
+        }
+        while let Ok(Outgoing::Message(message)) = outgoing.try_recv() {
+            if !open || transport.send(message).await.is_err() {
+                break;
+            }
+        }
+    } else {
+        let _ = worker.await;
+    }
     // Held until the close event ran, so a send during it does not count
     // as falling behind.
     drop(outgoing);

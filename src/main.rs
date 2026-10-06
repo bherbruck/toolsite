@@ -302,14 +302,40 @@ async fn main() -> anyhow::Result<()> {
         total: count("TOOLSITE_SOCKETS_TOTAL", socket_defaults.total as u64) as usize,
         rate_per_app: count("TOOLSITE_SOCKET_MESSAGES_PER_SECOND", socket_defaults.rate_per_app as u64) as u32,
         check_every: socket_defaults.check_every,
+        raw_per_app: count("TOOLSITE_TCP_PER_APP", socket_defaults.raw_per_app as u64) as usize,
+        per_ip: count("TOOLSITE_TCP_PER_IP", socket_defaults.per_ip as u64) as usize,
+        tcp_idle: std::time::Duration::from_secs(count("TOOLSITE_TCP_IDLE_SECONDS", socket_defaults.tcp_idle.as_secs())),
+        udp_idle: std::time::Duration::from_secs(count("TOOLSITE_UDP_IDLE_SECONDS", socket_defaults.udp_idle.as_secs())),
+        udp_per_second: count("TOOLSITE_UDP_PER_SECOND", socket_defaults.udp_per_second as u64) as u32,
     };
     tracing::info!(
         per_app = socket_limits.per_app,
         per_person = socket_limits.per_person,
         total = socket_limits.total,
         rate_per_app = socket_limits.rate_per_app,
+        tcp_per_app = socket_limits.raw_per_app,
+        tcp_per_ip = socket_limits.per_ip,
+        tcp_idle_seconds = socket_limits.tcp_idle.as_secs(),
+        udp_idle_seconds = socket_limits.udp_idle.as_secs(),
+        udp_per_second = socket_limits.udp_per_second,
         "live connections configuration"
     );
+
+    // TCP and UDP ports beyond HTTP, each given to one app by the site's
+    // owner: `1883=mqtt-broker,5514/udp=syslog`. A bad map is a startup
+    // error, not a device that cannot connect.
+    let port_map = toolsite::platform::ports::PortMap {
+        mappings: toolsite::platform::ports::parse(&read(&["TOOLSITE_PORTS"]).unwrap_or_default())
+            .unwrap_or_else(|why| panic!("{why}")),
+        ..Default::default()
+    };
+    if let Some(clash) = port_map
+        .mappings
+        .iter()
+        .find(|m| m.socket.protocol == toolsite::content::store::PortProtocol::Tcp && m.socket.port.to_string() == port)
+    {
+        panic!("TOOLSITE_PORTS maps {} to {}, but that is PORT, where HTTP is served", clash.socket, clash.app);
+    }
 
     let config = Arc::new(Config {
         data_dir,
@@ -329,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
         renderer,
         preview_base,
         connections: Arc::new(toolsite::runtime::connections::Hub::new(socket_limits)),
+        ports: port_map,
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -345,6 +372,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
+    toolsite::platform::ports::listen(config.clone(), runtime.clone())
+        .await
+        .unwrap_or_else(|why| panic!("a port in TOOLSITE_PORTS could not be opened: {why}"));
 
     if !stdio {
         axum::serve(listener, app).await?;
@@ -402,6 +432,7 @@ fn run_user_command(
         renderer: None,
         preview_base: "http://127.0.0.1:8080".to_string(),
         connections: Arc::new(toolsite::runtime::connections::Hub::default()),
+        ports: Default::default(),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

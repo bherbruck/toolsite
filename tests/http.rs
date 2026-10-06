@@ -2755,6 +2755,54 @@ async fn an_admin_mints_a_token_on_the_exports_page_and_sees_it_once() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn an_admin_mints_a_device_token_on_the_connections_tab_and_sees_it_once() {
+    let (_dir, config) = server();
+    write_page(&config, "broker/index", "<h1>broker</h1>");
+    toolsite::accounts::users::sign_up_as(&config, "owner@example.com", "correct horse", true).unwrap();
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+
+    let (status, page, _) = send(&config, get_as("/admin/apps/broker/connections", &session)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.contains("No device tokens"));
+    let form_token = page
+        .split("name=\"token\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_string();
+
+    let body = format!("token={form_token}&action=create&app=broker&label=boiler");
+    let (status, page, _) = send(&config, form_post("/admin/devices", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let token = page
+        .split("id=\"fresh-token\">tsv_")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .map(|rest| format!("tsv_{rest}"))
+        .expect("the new token is shown");
+    assert_eq!(toolsite::platform::devices::check(&config, "broker", &token).as_deref(), Some("boiler"));
+
+    let (_, page, _) = send(&config, get_as("/admin/apps/broker/connections", &session)).await;
+    assert!(page.contains("boiler"));
+    assert!(!page.contains(&token), "the token is shown again on a later visit");
+    let id = toolsite::platform::devices::list(&config, "broker")[0].id.clone();
+    let body = format!("token={form_token}&action=revoke&app=broker&id={id}");
+    let (status, ..) = send(&config, form_post("/admin/devices", &body, Some(&session))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(toolsite::platform::devices::check(&config, "broker", &token), None);
+
+    // A visitor account can neither see the tab nor mint a token.
+    account(&config, "reader@example.com", "correct horse");
+    let reader = sign_in(&config, "reader@example.com", "correct horse");
+    let (status, ..) = send(&config, get_as("/admin/apps/broker/connections", &reader)).await;
+    assert_ne!(status, StatusCode::OK);
+    let body = format!("token={form_token}&action=create&app=broker&label=intruder");
+    let (status, ..) = send(&config, form_post("/admin/devices", &body, Some(&reader))).await;
+    assert_ne!(status, StatusCode::OK);
+    assert!(toolsite::platform::devices::list(&config, "broker").is_empty());
+}
+
 // --- signing in through a provider ----------------------------------------
 //
 // The provider proves an email; toolsite decides which account that is. These

@@ -224,7 +224,7 @@ pub(crate) async fn serve_page(
     if slug.rsplit('.').next().is_some_and(|extension| {
         matches!(
             extension,
-            "meta" | "notes" | "icon" | "source" | "secrets" | "jobs" | "migrations" | "exports" | "deploys" | "repo" | "tools"
+            "meta" | "notes" | "icon" | "source" | "secrets" | "jobs" | "migrations" | "exports" | "deploys" | "devices" | "repo" | "tools"
         )
     }) {
         return (StatusCode::NOT_FOUND, "not found").into_response();

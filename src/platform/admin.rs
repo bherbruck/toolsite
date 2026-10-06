@@ -760,12 +760,13 @@ fn gate_badge(gate: &str) -> Markup {
     }
 }
 
-const TABS: [(&str, &str); 8] = [
+const TABS: [(&str, &str); 9] = [
     ("overview", "Overview"),
     ("tools", "Tools"),
     ("access", "Access"),
     ("repo", "Repo"),
     ("exports", "Exports"),
+    ("connections", "Connections"),
     ("settings", "Settings"),
     ("jobs", "Jobs"),
     ("notes", "Notes"),
@@ -799,6 +800,7 @@ pub async fn app_tab_page(
 /// Something minted by the request that rendered this page, shown this once.
 pub(crate) enum Fresh {
     ExportToken(String),
+    DeviceToken(String),
     SettingsLink(String),
     DeployToken(String),
 }
@@ -828,7 +830,7 @@ async fn app_tab_with(
     if !exists {
         return (StatusCode::NOT_FOUND, "no such app").into_response();
     }
-    let needed = if matches!(tab.as_str(), "access" | "exports" | "repo") { Scope::Admin } else { Scope::Editor };
+    let needed = if matches!(tab.as_str(), "access" | "exports" | "connections" | "repo") { Scope::Admin } else { Scope::Editor };
     let admin = match require_app(&config, &headers, &app, needed).await {
         Ok(user) => user,
         Err(response) => return response,
@@ -848,7 +850,7 @@ async fn app_tab_with(
     let tab_items: Vec<(&str, &str, &str)> = TABS
         .iter()
         .zip(hrefs.iter())
-        .filter(|((key, _), _)| is_admin_here || !matches!(*key, "access" | "exports" | "repo"))
+        .filter(|((key, _), _)| is_admin_here || !matches!(*key, "access" | "exports" | "connections" | "repo"))
         .filter(|((key, _), _)| *key != "tools" || !tools.is_empty())
         .map(|((key, label), (_, href))| (*key, *label, href.as_str()))
         .collect();
@@ -876,6 +878,19 @@ async fn app_tab_with(
                 _ => None,
             };
             render_exports_tab(&config, &app, &tokens, &token, &back, fresh_token)
+        }
+        "connections" => {
+            let tokens = {
+                let (config, app) = (config.clone(), app.clone());
+                tokio::task::spawn_blocking(move || crate::platform::devices::list(&config, &app))
+                    .await
+                    .unwrap_or_default()
+            };
+            let fresh_token = match &fresh {
+                Some(Fresh::DeviceToken(value)) => Some(value.as_str()),
+                _ => None,
+            };
+            render_connections_tab(&config, &app, &meta, &tokens, &token, &back, fresh_token)
         }
         "settings" => {
             let names = crate::platform::secrets::names(&config, &app);
@@ -1244,6 +1259,84 @@ fn render_exports_tab(
                 button."quiet" type="submit" { "Create token" }
             }
             p."muted small" { "URL: " code { (url) } }
+        }))
+    }
+}
+
+fn render_connections_tab(
+    config: &Config,
+    app: &str,
+    meta: &crate::content::store::PageMeta,
+    tokens: &[crate::platform::devices::DeviceToken],
+    token: &str,
+    back: &str,
+    fresh: Option<&str>,
+) -> Markup {
+    html! {
+        @if let Some(fresh) = fresh {
+            (ui::panel("New device token", Some("Copy the token now. The token is shown one time only."), html! {
+                (ui::secret("fresh-token", fresh))
+                p."muted small" {
+                    "The device sends this token as the protocol of the app says. The handler checks it with auth.check-token."
+                }
+            }))
+        }
+        (ui::panel("Sockets and ports", Some("Where the app takes live connections. A port is live only when TOOLSITE_PORTS maps it to this app."), html! {
+            @if meta.sockets.is_empty() && meta.ports.is_empty() {
+                p."muted" { "This app declares no sockets. Declare them with [[socket]] in toolsite.toml." }
+            } @else {
+                table {
+                    thead { tr { th { "Socket" } th { "State" } } }
+                    tbody {
+                        @for path in &meta.sockets {
+                            tr { td { code { "websocket " (path) } } td."muted small" { "behind the access of this path" } }
+                        }
+                        @for port in &meta.ports {
+                            tr {
+                                td { code { (port) } }
+                                td."muted small" {
+                                    @if config.ports.maps(app, *port) { "live, no gate: the app checks device tokens" }
+                                    @else { "not live: TOOLSITE_PORTS does not map this port to this app" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            p."muted small" { "Open connections now: " (config.connections.open(app)) }
+        }))
+        (ui::panel("Device tokens", Some("A device token lets a device connect over TCP or UDP. One token names one app. The token opens nothing over HTTP."), html! {
+            @if tokens.is_empty() {
+                p."muted" { "No device tokens. Create one below." }
+            } @else {
+                table {
+                    thead { tr { th { "Label" } th { "Created" } th { "Last used" } th {} } }
+                    tbody {
+                        @for entry in tokens {
+                            tr {
+                                td { (entry.label) " " span."muted small" { (entry.id) } }
+                                td."muted small" { (ago(entry.created_at)) }
+                                td."muted small" { @match entry.last_used { Some(at) => (ago(at)), None => "never" } }
+                                td."actions-cell" {
+                                    form method="post" action="/admin/devices"
+                                         data-confirm={ "Revoke " (entry.label) "?" }
+                                         data-confirm-detail="The app no longer accepts this token. A connection open now stays open until the app closes it."
+                                         data-confirm-label="Revoke token" data-confirm-danger="1" {
+                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                                        (hidden("action", "revoke")) (hidden("id", &entry.id))
+                                        button."danger quiet sm" type="submit" { "Revoke token" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            form."row" method="post" action="/admin/devices" {
+                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("action", "create"))
+                input name="label" placeholder="Label, for example boiler sensor" required;
+                button."quiet" type="submit" { "Create token" }
+            }
         }))
     }
 }
@@ -2307,6 +2400,52 @@ pub async fn change_export(
             match outcome {
                 Ok(Ok(())) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "export token revoked");
+                    redirect_flash(&back, true, "The token is revoked.")
+                }
+                Ok(Err(message)) => redirect_flash(&back, false, message),
+                Err(_) => redirect_flash(&back, false, "The token was not revoked."),
+            }
+        }
+        _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    }
+}
+
+pub async fn change_devices(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<ExportChange>,
+) -> Response {
+    if !export::valid_app(&form.app) {
+        return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
+    }
+    let admin = match checked_app(&config, &headers, &form.token, &form.app, Scope::Admin).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), &format!("/admin/apps/{}/connections", form.app));
+    match form.action.as_str() {
+        "create" => {
+            let label = form.label.unwrap_or_default();
+            let (config2, app) = (config.clone(), form.app.clone());
+            let outcome = tokio::task::spawn_blocking(move || crate::platform::devices::create(&config2, &app, &label)).await;
+            match outcome {
+                Ok(Ok((_, token))) => {
+                    tracing::info!(admin = %admin.email, app = %form.app, "device token created");
+                    // Rendered, not redirected: the token exists in this
+                    // response and nowhere else.
+                    app_tab(config, headers, form.app, "connections".into(), Some(Fresh::DeviceToken(token))).await
+                }
+                Ok(Err(message)) => redirect_flash(&back, false, message),
+                Err(_) => redirect_flash(&back, false, "The token was not created."),
+            }
+        }
+        "revoke" => {
+            let id = form.id.unwrap_or_default();
+            let (config2, app) = (config.clone(), form.app.clone());
+            let outcome = tokio::task::spawn_blocking(move || crate::platform::devices::revoke(&config2, &app, &id)).await;
+            match outcome {
+                Ok(Ok(())) => {
+                    tracing::info!(admin = %admin.email, app = %form.app, "device token revoked");
                     redirect_flash(&back, true, "The token is revoked.")
                 }
                 Ok(Err(message)) => redirect_flash(&back, false, message),

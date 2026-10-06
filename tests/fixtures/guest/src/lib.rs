@@ -6,6 +6,7 @@ wit_bindgen::generate!({
     world: "app-with-connections",
 });
 
+use toolsite::app::auth;
 use toolsite::app::blobs;
 use toolsite::app::db;
 use toolsite::app::connections::{self, Message};
@@ -378,7 +379,16 @@ impl Guest for Handler {
     /// seen from outside. Text frames are small commands:
     /// `echo:<x>`, `log`, `cookie`, `close`, `sub:<topic>`, `unsub:<topic>`,
     /// `publish:<topic>:<data>`. A binary frame is echoed back.
+    ///
+    /// A TCP connection or UDP remote (one with a `remote`) gets
+    /// `id:<conn>\n` on connect, and its bytes are commands only when one
+    /// whole read is `token <t>\n` (checked with auth.check-token: `ok
+    /// <label>\n`, or `denied\n` and a close), `remote\n`, `log\n` or
+    /// `close\n`. Anything else is echoed back as it came.
     fn on_connection(conn: String, event: Event) -> Result<(), String> {
+        if let Some(remote) = connections::remote(&conn) {
+            return on_device(conn, remote, event);
+        }
         let who = identity::current_user().map(|u| u.email).unwrap_or_else(|| "anonymous".to_string());
         let mut log = connections::state_get(&conn, "log").unwrap_or_default();
         let mut note = |entry: &str| {
@@ -444,6 +454,55 @@ impl Guest for Handler {
                 // Told to anyone watching, since this connection is gone.
                 connections::publish("closed", &Message::Text(format!("{who}:{log}"))).map(|_| ())
             }
+        }
+    }
+}
+
+/// A connection from a port rather than a browser. Same log as a socket's,
+/// so order and state can be seen from outside the same way.
+fn on_device(conn: String, remote: String, event: Event) -> Result<(), String> {
+    let mut log = connections::state_get(&conn, "log").unwrap_or_default();
+    let mut note = |entry: &str| {
+        if !log.is_empty() {
+            log.push(',');
+        }
+        log.push_str(entry);
+        connections::state_set(&conn, "log", Some(&log))
+    };
+    let reply = |text: String| connections::send(&conn, &Message::Binary(text.into_bytes()));
+    match event {
+        Event::Connect(info) => {
+            note(&format!("connect {}", info.socket))?;
+            reply(format!("id:{conn}\n"))
+        }
+        Event::Message(message) => {
+            note("message")?;
+            let bytes = match message {
+                Message::Binary(bytes) => bytes,
+                Message::Text(text) => text.into_bytes(),
+            };
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            if let Some(token) = text.strip_prefix("token ").and_then(|t| t.strip_suffix('\n')) {
+                match auth::check_token(token) {
+                    Some(label) => reply(format!("ok {label}\n")),
+                    None => {
+                        reply("denied\n".to_string())?;
+                        connections::close(&conn)
+                    }
+                }
+            } else if text == "remote\n" {
+                reply(format!("{remote}\n"))
+            } else if text == "log\n" {
+                reply(format!("{}\n", connections::state_get(&conn, "log").unwrap_or_default()))
+            } else if text == "close\n" {
+                connections::close(&conn)
+            } else {
+                connections::send(&conn, &Message::Binary(bytes))
+            }
+        }
+        Event::Close => {
+            note("close")?;
+            connections::publish("closed", &Message::Text(format!("{remote}:{log}"))).map(|_| ())
         }
     }
 }

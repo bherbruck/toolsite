@@ -18,6 +18,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -49,6 +50,19 @@ pub struct Limits {
     /// How often each connection is pinged and its person's access checked
     /// again.
     pub check_every: Duration,
+    /// TCP and UDP connections on one app at once. A device has no account
+    /// to count against, so this and `per_ip` are what bound it.
+    pub raw_per_app: usize,
+    /// TCP and UDP connections from one IP address at once, across apps.
+    pub per_ip: usize,
+    /// A TCP connection that sends nothing for this long is closed.
+    pub tcp_idle: Duration,
+    /// A UDP remote that sends nothing for this long is forgotten: its
+    /// connection closes, and its next datagram opens a new one.
+    pub udp_idle: Duration,
+    /// Datagrams one IP address may send to a port in a second. The rest
+    /// are dropped.
+    pub udp_per_second: u32,
 }
 
 impl Default for Limits {
@@ -59,6 +73,11 @@ impl Default for Limits {
             total: 5000,
             rate_per_app: 100,
             check_every: Duration::from_secs(30),
+            raw_per_app: 500,
+            per_ip: 50,
+            tcp_idle: Duration::from_secs(300),
+            udp_idle: Duration::from_secs(60),
+            udp_per_second: 100,
         }
     }
 }
@@ -92,6 +111,8 @@ pub enum Outgoing {
 
 struct Connection {
     user: Option<String>,
+    /// Where a TCP or UDP connection comes from. None for a WebSocket.
+    remote: Option<SocketAddr>,
     topics: HashSet<String>,
     tx: mpsc::Sender<Outgoing>,
     state: HashMap<String, String>,
@@ -144,15 +165,24 @@ impl AppEntry {
 struct Inner {
     apps: HashMap<String, AppEntry>,
     per_person: HashMap<String, usize>,
+    per_ip: HashMap<IpAddr, usize>,
     total: usize,
 }
 
 impl Inner {
-    /// Frees what one removed connection held: its place in the total and
-    /// in its person's count.
-    fn release(&mut self, user: Option<String>) {
+    /// Frees what one removed connection held: its place in the total, in
+    /// its person's count and in its address's count.
+    fn release(&mut self, connection: Connection) {
         self.total = self.total.saturating_sub(1);
-        self.release_person(user);
+        if let Some(remote) = connection.remote
+            && let Some(count) = self.per_ip.get_mut(&remote.ip())
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_ip.remove(&remote.ip());
+            }
+        }
+        self.release_person(connection.user);
     }
 
     fn release_person(&mut self, user: Option<String>) {
@@ -245,6 +275,18 @@ impl Hub {
         app: &str,
         user: Option<&str>,
     ) -> Result<(Registration, mpsc::Receiver<Outgoing>), String> {
+        self.register_from(app, user, None)
+    }
+
+    /// `register` for a connection that comes from an address rather than a
+    /// browser: a TCP connection or a UDP remote. It counts against the
+    /// app's TCP and UDP ceiling and its address's.
+    pub fn register_from(
+        self: &Arc<Self>,
+        app: &str,
+        user: Option<&str>,
+        remote: Option<SocketAddr>,
+    ) -> Result<(Registration, mpsc::Receiver<Outgoing>), String> {
         let mut inner = self.inner.lock().unwrap();
         if inner.total >= self.limits.total {
             return Err(format!("the server has its maximum of {} open connections", self.limits.total));
@@ -253,12 +295,30 @@ impl Hub {
         if open_here >= self.limits.per_app {
             return Err(format!("this app has its maximum of {} open connections", self.limits.per_app));
         }
+        if let Some(remote) = remote {
+            let raw_here = inner
+                .apps
+                .get(app)
+                .map_or(0, |entry| entry.connections.values().filter(|c| c.remote.is_some()).count());
+            if raw_here >= self.limits.raw_per_app {
+                return Err(format!(
+                    "this app has its maximum of {} open TCP and UDP connections",
+                    self.limits.raw_per_app
+                ));
+            }
+            if inner.per_ip.get(&remote.ip()).copied().unwrap_or(0) >= self.limits.per_ip {
+                return Err(format!("{} has its maximum of {} open connections", remote.ip(), self.limits.per_ip));
+            }
+        }
         if let Some(user) = user {
             let held = inner.per_person.get(user).copied().unwrap_or(0);
             if held >= self.limits.per_person {
                 return Err(format!("this account has its maximum of {} open connections", self.limits.per_person));
             }
             *inner.per_person.entry(user.to_string()).or_default() += 1;
+        }
+        if let Some(remote) = remote {
+            *inner.per_ip.entry(remote.ip()).or_default() += 1;
         }
         inner.total += 1;
         let id = crate::content::slug::random_token(24);
@@ -267,6 +327,7 @@ impl Hub {
             id.clone(),
             Connection {
                 user: user.map(str::to_string),
+                remote,
                 topics: HashSet::new(),
                 tx,
                 state: HashMap::new(),
@@ -286,7 +347,7 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         let removed = inner.apps.get_mut(app).and_then(|entry| entry.connections.remove(id));
         if let Some(connection) = removed {
-            inner.release(connection.user);
+            inner.release(connection);
         }
         if inner.apps.get(app).is_some_and(|entry| entry.connections.is_empty()) {
             inner.apps.remove(app);
@@ -309,15 +370,15 @@ impl Hub {
                 }
             }
         }
-        let mut users = Vec::new();
+        let mut removed = Vec::new();
         for id in cut {
             if let Some(connection) = entry.connections.remove(&id) {
                 tracing::warn!(app, "a connection fell behind and was closed");
-                users.push(connection.user);
+                removed.push(connection);
             }
         }
-        for user in users {
-            inner.release(user);
+        for connection in removed {
+            inner.release(connection);
         }
         reached
     }
@@ -403,6 +464,13 @@ impl Hub {
             .map(|(id, _)| id.clone())
             .collect();
         Ok(Self::deliver(&mut inner, app, &ids, &Outgoing::Message(message)))
+    }
+
+    /// Where one of `app`'s connections comes from, as "ip:port", when it is
+    /// a TCP connection or a UDP remote.
+    pub fn remote(&self, app: &str, id: &str) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.apps.get(app)?.connections.get(id)?.remote.map(|addr| addr.to_string())
     }
 
     pub fn state_get(&self, app: &str, id: &str, key: &str) -> Option<String> {
@@ -511,6 +579,25 @@ mod tests {
         assert!(hub.register("shop", Some("u3")).is_err(), "per app");
         drop(first);
         assert!(hub.register("shop", Some("u1")).is_ok());
+    }
+
+    #[test]
+    fn the_address_and_tcp_ceilings_hold_and_free_up_when_one_closes() {
+        let hub = Arc::new(Hub::new(Limits { per_ip: 2, raw_per_app: 3, ..Limits::default() }));
+        let near: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let other: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        let first = hub.register_from("broker", None, Some(near)).unwrap();
+        // The address counts across apps, whatever its port.
+        let _second = hub.register_from("syslog", None, Some("10.0.0.1:4001".parse().unwrap())).unwrap();
+        assert!(hub.register_from("broker", None, Some(near)).err().unwrap().contains("10.0.0.1"));
+        let _third = hub.register_from("broker", None, Some(other)).unwrap();
+        // A browser does not count against the TCP and UDP ceiling.
+        let _browser = hub.register("broker", None).unwrap();
+        assert_eq!(hub.remote("broker", &first.0.id).as_deref(), Some("10.0.0.1:4000"));
+        drop(first);
+        let _again = hub.register_from("broker", None, Some(near)).unwrap();
+        let _fourth = hub.register_from("broker", None, Some("10.0.0.3:1".parse().unwrap())).unwrap();
+        assert!(hub.register_from("broker", None, Some("10.0.0.4:1".parse().unwrap())).err().unwrap().contains("TCP"));
     }
 
     #[test]

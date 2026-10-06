@@ -102,6 +102,41 @@ pub struct PageMeta {
     /// toolsite.toml. An upgrade anywhere else is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sockets: Vec<String>,
+    /// TCP and UDP ports the app takes, from `[[socket]] protocol = "tcp"`.
+    /// A declaration alone opens nothing: the site's owner maps the port to
+    /// the app with `TOOLSITE_PORTS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortSocket>,
+}
+
+/// How a port carries bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    Tcp,
+    Udp,
+}
+
+impl PortProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortProtocol::Tcp => "tcp",
+            PortProtocol::Udp => "udp",
+        }
+    }
+}
+
+/// One TCP or UDP port an app declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, Deserialize)]
+pub struct PortSocket {
+    pub protocol: PortProtocol,
+    pub port: u16,
+}
+
+impl std::fmt::Display for PortSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.protocol.as_str(), self.port)
+    }
 }
 
 /// One row-level access policy: who may see, and perhaps change, which rows
@@ -200,6 +235,7 @@ impl Default for PageMeta {
             generated: Vec::new(),
             access_salt: None,
             sockets: Vec::new(),
+            ports: Vec::new(),
         }
     }
 }

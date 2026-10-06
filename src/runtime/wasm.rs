@@ -283,6 +283,18 @@ impl self::toolsite::app::connections::Host for StoreState {
     fn state_set(&mut self, conn: String, key: String, value: Option<String>) -> Result<(), String> {
         self.site.connections.state_set(&self.app, &conn, &key, value)
     }
+
+    fn remote(&mut self, conn: String) -> Option<String> {
+        self.site.connections.remote(&self.app, &conn)
+    }
+}
+
+/// Checks a token against this app's device tokens only: `self.app` comes
+/// from the host, so another app's token is no token here.
+impl self::toolsite::app::auth::Host for StoreState {
+    fn check_token(&mut self, token: String) -> Option<String> {
+        crate::platform::devices::check(&self.site, &self.app, &token)
+    }
 }
 
 impl self::toolsite::app::secrets::Host for StoreState {

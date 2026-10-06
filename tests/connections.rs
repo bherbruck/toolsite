@@ -496,3 +496,471 @@ async fn the_server_wide_ceiling_holds_across_apps() {
     let _b = open(&site, "/p/two/ws", None).await;
     assert_eq!(connect(&site, "/p/one/ws", None).await.err(), Some(429));
 }
+
+// --- TCP and UDP ------------------------------------------------------------
+
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+};
+use toolsite::content::store::{PortProtocol, PortSocket};
+
+/// A port nothing listens on now. Bound and let go, so the site can take it.
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn tcp(port: u16) -> PortSocket {
+    PortSocket { protocol: PortProtocol::Tcp, port }
+}
+
+fn udp(port: u16) -> PortSocket {
+    PortSocket { protocol: PortProtocol::Udp, port }
+}
+
+/// A site whose owner mapped ports with `map`, as `TOOLSITE_PORTS` would.
+async fn site_with_ports(limits: connections::Limits, map: &str) -> Site {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        connections: Arc::new(connections::Hub::new(limits)),
+        ports: toolsite::platform::ports::PortMap {
+            bind: "127.0.0.1".parse().unwrap(),
+            mappings: toolsite::platform::ports::parse(map).unwrap(),
+        },
+        ..Config::local(dir.path().to_path_buf(), "test-token")
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let runtime = Runtime::new().unwrap();
+    let router = build_router(config.clone(), runtime.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    toolsite::platform::ports::listen(config.clone(), runtime).await.unwrap();
+    Site { _dir: dir, config, addr }
+}
+
+/// An app with the test handler, a WebSocket at `/ws` for watching, and
+/// `ports` declared.
+fn app_on(config: &Config, name: &str, ports: &[PortSocket]) {
+    app(config, name);
+    edit_meta(config, name, |meta| meta.ports = ports.to_vec());
+}
+
+/// One device's TCP connection.
+struct Device {
+    stream: TcpStream,
+    read: Vec<u8>,
+}
+
+impl Device {
+    async fn connect(port: u16) -> Device {
+        Device { stream: TcpStream::connect(("127.0.0.1", port)).await.unwrap(), read: Vec::new() }
+    }
+
+    /// Connects and reads the `id:<conn>` the fixture sends on connect.
+    async fn open(port: u16) -> (Device, String) {
+        let mut device = Device::connect(port).await;
+        let hello = device.line().await.expect("no id after connect");
+        let id = hello.strip_prefix("id:").expect("the first line names the connection").to_string();
+        (device, id)
+    }
+
+    async fn say(&mut self, text: &str) {
+        self.stream.write_all(text.as_bytes()).await.unwrap();
+    }
+
+    /// The next line, without its newline. None when the server ends the
+    /// connection or says nothing for a while. The while is long: the first
+    /// event compiles the handler, which in a debug build takes most of a
+    /// minute while every other test compiles its own.
+    async fn line(&mut self) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(at) = self.read.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.read.drain(..=at).collect();
+                return Some(String::from_utf8_lossy(&line[..at]).to_string());
+            }
+            let mut chunk = [0u8; 4096];
+            match tokio::time::timeout_at(deadline, self.stream.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
+                Ok(Ok(n)) => self.read.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// Waits for the server to end the connection, with nothing more said.
+    async fn ends(&mut self) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut chunk = [0u8; 4096];
+            match tokio::time::timeout_at(deadline, self.stream.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return true,
+                Ok(Ok(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+/// A connection the site accepts at the TCP level and closes before the
+/// app says anything.
+async fn turned_away(port: u16) -> bool {
+    let mut device = Device::connect(port).await;
+    device.line().await.is_none()
+}
+
+/// Waits until `app` holds `open` connections.
+async fn settles_at(config: &Config, app: &str, open: usize) -> bool {
+    for _ in 0..30 {
+        if config.connections.open(app) == open {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn tcp_bytes_reach_the_handler_in_order_and_its_reply_returns() {
+    let port = free_tcp_port();
+    let site = site_with_ports(connections::Limits::default(), &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let (device, _) = Device::open(port).await;
+
+    // More than one read's worth, written while the echo comes back, so the
+    // order holds across chunks of up to 64 KB.
+    let sent: Vec<u8> = (0..150_000u32).map(|n| (n % 251) as u8).collect();
+    let Device { stream, read } = device;
+    let (mut reader, mut writer) = stream.into_split();
+    let writing = {
+        let sent = sent.clone();
+        tokio::spawn(async move { writer.write_all(&sent).await.unwrap(); writer })
+    };
+    let mut echoed = read;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while echoed.len() < sent.len() {
+        let mut chunk = vec![0u8; 64 * 1024];
+        match tokio::time::timeout_at(deadline, reader.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => echoed.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+    }
+    assert_eq!(echoed.len(), sent.len(), "the echo came back short");
+    assert!(echoed == sent, "the bytes came back out of order");
+
+    let writer = writing.await.unwrap();
+    let mut device = Device { stream: reader.reunite(writer).unwrap(), read: Vec::new() };
+    let local = device.stream.local_addr().unwrap();
+    device.say("remote\n").await;
+    assert_eq!(device.line().await, Some(local.to_string()), "the handler did not see where the device is");
+    device.say("log\n").await;
+    let log = device.line().await.unwrap();
+    assert!(log.starts_with(&format!("connect tcp:{port},message")), "{log}");
+}
+
+#[tokio::test]
+async fn either_side_closing_a_tcp_connection_delivers_close_and_frees_it() {
+    let port = free_tcp_port();
+    let site = site_with_ports(connections::Limits::default(), &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let (mut watcher, _) = open(&site, "/p/broker/ws?topic=closed", None).await;
+
+    // The device goes away.
+    let (device, _) = Device::open(port).await;
+    let local = device.stream.local_addr().unwrap();
+    drop(device);
+    assert_eq!(next_text(&mut watcher).await, Some(format!("{local}:connect tcp:{port},close")));
+    assert!(settles_at(&site.config, "broker", 1).await, "the closed connection stayed registered");
+
+    // The app ends it.
+    let (mut device, _) = Device::open(port).await;
+    let local = device.stream.local_addr().unwrap();
+    device.say("close\n").await;
+    assert!(device.ends().await, "the handler's close left the connection open");
+    assert_eq!(next_text(&mut watcher).await, Some(format!("{local}:connect tcp:{port},message,close")));
+    assert!(settles_at(&site.config, "broker", 1).await, "the closed connection stayed registered");
+}
+
+#[tokio::test]
+async fn a_device_that_stops_sending_still_gets_the_reply_to_what_it_sent_last() {
+    let port = free_tcp_port();
+    let site = site_with_ports(connections::Limits::default(), &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let (mut device, _) = Device::open(port).await;
+    // `printf reading | nc host port`: write, then close the sending half.
+    device.say("reading 21.5").await;
+    device.stream.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(10), device.stream.read_to_end(&mut rest)).await;
+    assert!(read.is_ok(), "the connection stayed open after the device stopped sending");
+    assert_eq!(String::from_utf8_lossy(&rest), "reading 21.5");
+    assert!(settles_at(&site.config, "broker", 0).await);
+}
+
+#[tokio::test]
+async fn a_tcp_connection_that_sends_nothing_is_closed_after_the_idle_timeout() {
+    let port = free_tcp_port();
+    let limits = connections::Limits { tcp_idle: Duration::from_millis(300), ..connections::Limits::default() };
+    let site = site_with_ports(limits, &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let (mut device, _) = Device::open(port).await;
+    assert!(device.ends().await, "an idle connection stayed open");
+    assert!(settles_at(&site.config, "broker", 0).await);
+}
+
+#[tokio::test]
+async fn a_port_is_live_only_where_the_owner_mapped_it_to_the_app_that_declares_it() {
+    let (unmapped, theirs) = (free_tcp_port(), free_tcp_port());
+    let site = site_with_ports(connections::Limits::default(), &format!("{theirs}=other")).await;
+    app_on(&site.config, "mine", &[tcp(unmapped), tcp(theirs)]);
+
+    // A port nobody mapped opens no listener at all.
+    assert!(TcpStream::connect(("127.0.0.1", unmapped)).await.is_err(), "an unmapped port took a connection");
+    // A port mapped to another app never reaches this one, and the other
+    // app takes nothing on it until it declares it.
+    assert!(turned_away(theirs).await, "a port mapped to another app reached this one");
+    app_on(&site.config, "other", &[tcp(theirs)]);
+    Device::open(theirs).await;
+    assert_eq!(site.config.connections.open("mine"), 0);
+
+    // Deploying says which declared ports are not live.
+    let said = toolsite::platform::manifest::apply(
+        &site.config,
+        "mine",
+        &format!("[[socket]]\nprotocol = \"tcp\"\nport = {unmapped}\n"),
+    )
+    .await
+    .unwrap();
+    assert!(said.iter().any(|line| line.contains("not live")), "{said:?}");
+
+    // Two apps can never be given one port.
+    assert!(toolsite::platform::ports::parse(&format!("{theirs}=mine,{theirs}=other")).is_err());
+}
+
+#[tokio::test]
+async fn toolsite_toml_declares_tcp_and_udp_ports_and_refuses_malformed_ones() {
+    let site = site(connections::Limits::default()).await;
+    app_with(&site.config, "decl", HANDLER, &[]);
+    let apply = |text: &str| {
+        let (config, text) = (site.config.clone(), text.to_string());
+        async move { toolsite::platform::manifest::apply(&config, "decl", &text).await }
+    };
+    apply("[[socket]]\npath = \"/ws\"\n\n[[socket]]\nprotocol = \"tcp\"\nport = 1883\n\n[[socket]]\nprotocol = \"udp\"\nport = 5514\n")
+        .await
+        .unwrap();
+    let meta = store::read_meta_blocking(&site.config, "decl");
+    assert_eq!(meta.sockets, vec!["/ws"]);
+    assert_eq!(meta.ports, vec![tcp(1883), udp(5514)]);
+    for bad in [
+        "[[socket]]\nprotocol = \"tcp\"\n",
+        "[[socket]]\nprotocol = \"tcp\"\nport = 80\n",
+        "[[socket]]\nprotocol = \"tcp\"\nport = 1883\npath = \"/x\"\n",
+        "[[socket]]\npath = \"/x\"\nport = 1883\n",
+        "[[socket]]\nprotocol = \"sctp\"\nport = 1883\n",
+        "[[socket]]\nprotocol = \"tcp\"\nport = 1883\n\n[[socket]]\nprotocol = \"tcp\"\nport = 1883\n",
+        "[[socket]]\nprotocol = \"tcp\"\nport = 70000\n",
+    ] {
+        assert!(apply(bad).await.is_err(), "{bad} was taken");
+    }
+    assert_eq!(store::read_meta_blocking(&site.config, "decl").ports, vec![tcp(1883), udp(5514)]);
+    // Withdrawn wholesale.
+    apply("").await.unwrap();
+    assert!(store::read_meta_blocking(&site.config, "decl").ports.is_empty());
+}
+
+#[tokio::test]
+async fn a_device_token_lets_a_device_in_and_a_revoked_or_another_apps_token_does_not() {
+    let port = free_tcp_port();
+    let site = site_with_ports(connections::Limits::default(), &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let (entry, token) = toolsite::platform::devices::create(&site.config, "broker", "boiler").unwrap();
+    let (_, elsewhere) = toolsite::platform::devices::create(&site.config, "syslog", "boiler").unwrap();
+    let (_, export) = toolsite::platform::export::create(&site.config, "broker", "reporting").unwrap();
+
+    let (mut device, _) = Device::open(port).await;
+    device.say(&format!("token {token}\n")).await;
+    assert_eq!(device.line().await.as_deref(), Some("ok boiler"));
+
+    for wrong in [elsewhere.as_str(), export.as_str(), "test-token", "tsv_guess"] {
+        let (mut device, _) = Device::open(port).await;
+        device.say(&format!("token {wrong}\n")).await;
+        assert_eq!(device.line().await.as_deref(), Some("denied"), "{wrong} let a device in");
+        assert!(device.ends().await);
+    }
+
+    toolsite::platform::devices::revoke(&site.config, "broker", &entry.id).unwrap();
+    let (mut device, _) = Device::open(port).await;
+    device.say(&format!("token {token}\n")).await;
+    assert_eq!(device.line().await.as_deref(), Some("denied"), "a revoked token let a device in");
+}
+
+#[tokio::test]
+async fn tcp_connections_are_capped_per_address_and_per_app() {
+    let port = free_tcp_port();
+    let limits = connections::Limits { per_ip: 2, ..connections::Limits::default() };
+    let site = site_with_ports(limits, &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let _a = Device::open(port).await;
+    let _b = Device::open(port).await;
+    assert!(turned_away(port).await, "a third connection from one address was taken");
+    drop(_a);
+    assert!(settles_at(&site.config, "broker", 1).await);
+    let _c = Device::open(port).await;
+
+    let port = free_tcp_port();
+    let limits = connections::Limits { raw_per_app: 2, ..connections::Limits::default() };
+    let site = site_with_ports(limits, &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let _a = Device::open(port).await;
+    let _b = Device::open(port).await;
+    assert!(turned_away(port).await, "a third connection to the app was taken");
+    // A browser's socket is not a device and is not counted against them.
+    open(&site, "/p/broker/ws", None).await;
+}
+
+#[tokio::test]
+async fn hiding_an_app_closes_its_tcp_connections_and_turns_new_ones_away() {
+    let port = free_tcp_port();
+    let site = site_with_ports(quick(), &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let (mut device, _) = Device::open(port).await;
+    edit_meta(&site.config, "broker", |meta| meta.hidden = true);
+    assert!(device.ends().await, "the hidden app's connection stayed open");
+    assert!(turned_away(port).await, "the hidden app took a new connection");
+
+    // Withdrawing the port from toolsite.toml closes its connections on
+    // the next check.
+    edit_meta(&site.config, "broker", |meta| meta.hidden = false);
+    let (mut device, _) = Device::open(port).await;
+    toolsite::platform::manifest::apply(&site.config, "broker", "[[socket]]\npath = \"/ws\"\n").await.unwrap();
+    assert!(device.ends().await, "the connection stayed open after its port was withdrawn");
+    assert!(turned_away(port).await);
+}
+
+#[tokio::test]
+async fn a_handler_without_on_connection_turns_a_tcp_connection_away() {
+    let port = free_tcp_port();
+    let site = site_with_ports(connections::Limits::default(), &format!("{port}=older")).await;
+    app_with(&site.config, "older", LEGACY_HANDLER, &[]);
+    edit_meta(&site.config, "older", |meta| meta.ports = vec![tcp(port)]);
+    assert!(turned_away(port).await);
+    assert_eq!(site.config.connections.open("older"), 0);
+}
+
+/// The next datagram. The first one waits long, as `Device::line` does.
+async fn datagram(socket: &UdpSocket) -> Option<String> {
+    datagram_within(socket, Duration::from_secs(60)).await
+}
+
+async fn datagram_within(socket: &UdpSocket, wait: Duration) -> Option<String> {
+    let mut buffer = vec![0u8; 70_000];
+    match tokio::time::timeout(wait, socket.recv(&mut buffer)).await {
+        Ok(Ok(n)) => Some(String::from_utf8_lossy(&buffer[..n]).to_string()),
+        _ => None,
+    }
+}
+
+async fn udp_device(port: u16) -> UdpSocket {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(("127.0.0.1", port)).await.unwrap();
+    socket
+}
+
+#[tokio::test]
+async fn a_udp_datagram_reaches_the_handler_with_its_remote_and_the_reply_reaches_the_sender() {
+    let port = free_udp_port();
+    let site = site_with_ports(connections::Limits::default(), &format!("{port}/udp=syslog")).await;
+    app_on(&site.config, "syslog", &[udp(port)]);
+
+    let device = udp_device(port).await;
+    device.send(b"<13>boot").await.unwrap();
+    let id = datagram(&device).await.expect("no id after the first datagram");
+    assert!(id.starts_with("id:"), "{id}");
+    assert_eq!(datagram(&device).await.as_deref(), Some("<13>boot"));
+    device.send(b"remote\n").await.unwrap();
+    assert_eq!(datagram(&device).await, Some(format!("{}\n", device.local_addr().unwrap())));
+    // One connection per address: the same one, with its state.
+    device.send(b"log\n").await.unwrap();
+    assert_eq!(datagram(&device).await, Some(format!("connect udp:{port},message,message,message\n")));
+
+    // Another address is another connection.
+    let other = udp_device(port).await;
+    other.send(b"x").await.unwrap();
+    let other_id = datagram(&other).await.unwrap();
+    assert_ne!(other_id, id);
+    assert_eq!(site.config.connections.open("syslog"), 2);
+}
+
+#[tokio::test]
+async fn a_quiet_udp_remote_is_closed_and_its_next_datagram_opens_a_new_connection() {
+    let port = free_udp_port();
+    let limits = connections::Limits { udp_idle: Duration::from_millis(300), ..connections::Limits::default() };
+    let site = site_with_ports(limits, &format!("{port}/udp=syslog")).await;
+    app_on(&site.config, "syslog", &[udp(port)]);
+    let (mut watcher, _) = open(&site, "/p/syslog/ws?topic=closed", None).await;
+
+    let device = udp_device(port).await;
+    device.send(b"a").await.unwrap();
+    let first = datagram(&device).await.unwrap();
+    datagram(&device).await;
+    assert_eq!(next_text(&mut watcher).await, Some(format!("{}:connect udp:{port},message,close", device.local_addr().unwrap())));
+    device.send(b"b").await.unwrap();
+    let second = datagram(&device).await.unwrap();
+    assert!(second.starts_with("id:"));
+    assert_ne!(first, second, "the quiet remote kept its connection");
+}
+
+#[tokio::test]
+async fn udp_datagrams_past_an_addresss_rate_are_dropped() {
+    let port = free_udp_port();
+    let limits = connections::Limits { udp_per_second: 5, ..connections::Limits::default() };
+    let site = site_with_ports(limits, &format!("{port}/udp=syslog")).await;
+    app_on(&site.config, "syslog", &[udp(port)]);
+    let device = udp_device(port).await;
+    for n in 0..20 {
+        device.send(format!("burst {n}").as_bytes()).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Drain the echoes, then ask how many arrived.
+    while datagram_within(&device, Duration::from_millis(500)).await.is_some() {}
+    device.send(b"log\n").await.unwrap();
+    let log = loop {
+        let got = datagram(&device).await.expect("no log");
+        if got.starts_with("connect") {
+            break got;
+        }
+    };
+    let messages = log.matches("message").count();
+    assert_eq!(messages, 6, "five of the burst and the log request, got {log}");
+}
+
+#[tokio::test]
+async fn a_hidden_apps_udp_port_takes_nothing() {
+    let port = free_udp_port();
+    let site = site_with_ports(connections::Limits::default(), &format!("{port}/udp=syslog")).await;
+    app_on(&site.config, "syslog", &[udp(port)]);
+    edit_meta(&site.config, "syslog", |meta| meta.hidden = true);
+    let device = udp_device(port).await;
+    device.send(b"x").await.unwrap();
+    assert_eq!(datagram_within(&device, Duration::from_secs(1)).await, None);
+    assert_eq!(site.config.connections.open("syslog"), 0);
+}
+
+#[tokio::test]
+async fn the_device_tokens_sidecar_is_never_served_and_goes_to_the_trash_with_the_app() {
+    let site = site(connections::Limits::default()).await;
+    app(&site.config, "broker");
+    toolsite::platform::devices::create(&site.config, "broker", "boiler").unwrap();
+    assert!(site.config.data_dir.join("broker.devices").is_file());
+    for path in ["/p/broker.devices", "/p/broker/../broker.devices"] {
+        let status = reqwest::get(format!("http://{}{path}", site.addr)).await.unwrap().status().as_u16();
+        assert_eq!(status, 404, "{path} was served");
+    }
+    toolsite::platform::trash::remove(&site.config, "broker", 1).unwrap();
+    assert!(!site.config.data_dir.join("broker.devices").exists(), "the tokens outlived the app");
+}

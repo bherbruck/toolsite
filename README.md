@@ -223,6 +223,7 @@ which is the mistake that ships a blank page while looking like a success.
 | `set_icon(slug, icon)` | An emoji, inline `<svg>`, or `data:` URI. Optional. |
 | `projects(action, path?, name?, parent?, app?, email?, scope?)` | Projects and who may act in them: `list`, `create` (admin at the parent), `move` an app (admin at both ends, the target must exist), `rename` a project (admin at its parent), `move_project` (admin at the project, where it is and where it goes), `remove` an empty project (admin at its parent), `permissions`, `grant`, `revoke` (admin there, never more than you hold). The same rules as the app browser. |
 | `app_migrations`, `app_jobs`, `app_settings`, `app_notes`, `app_exports` | An app's schema, schedule, settings, notes and export tokens, each described below. |
+| `app_device_tokens` | Tokens for devices that connect to an app over TCP or UDP, checked by the app with `auth.check-token`. See TCP and UDP. |
 | `create_user`, `set_user_active`, `set_access` | Accounts and grants, as on the admin page. |
 | `push_page(html, slug?)` | Fallback for clients with no shell; HTML inline. |
 | `push_app(app, pages)` | Fallback, multi-page. A page named `index` also serves at the app root. |
@@ -680,6 +681,75 @@ Connections live in one server process. Toolsite runs as one instance, so
 that is all of them; a deployment with several instances would need a shared
 bus first.
 
+### TCP and UDP
+
+An app can also take raw TCP connections and UDP datagrams, for devices
+that do not speak HTTP: an MQTT broker, a syslog sink, a sensor protocol.
+Declare the port with a protocol:
+
+```toml
+[[socket]]
+protocol = "tcp"     # or "udp"; "websocket" is the default
+port = 1883          # 1024 to 65535
+```
+
+A declaration opens nothing. A port belongs to the server, so the site's
+owner gives it to one app with `TOOLSITE_PORTS`:
+
+```
+TOOLSITE_PORTS=1883=mqtt-broker,5514/udp=syslog
+```
+
+The protocol suffix is optional and defaults to tcp. A port is live only
+while it is mapped to an app that declares it, and two apps can never be
+given one port: the server refuses to start. Every mapped port is bound at
+boot, so publishing the app later needs no restart. A deploy that declares
+a port nobody mapped says so in its output.
+
+The same handler gets the same events:
+
+- **TCP**: each accepted connection is `connect` (socket `"tcp:1883"`, no
+  person), then a `message` with the bytes for each read, at most 64 KB,
+  in order and one at a time, then `close` when either side ends it. A read
+  is not a boundary the sender chose; framing is the app's protocol. While
+  the handler is behind, toolsite stops reading, so a fast sender meets
+  TCP's own flow control.
+- **UDP**: one `message` per datagram. Toolsite keeps one connection per
+  remote address, opened by its first datagram (`connect` then that
+  `message`) and closed after it is quiet for the idle timeout. So
+  `send(conn, data)` replies to that address and per-connection state works.
+  A datagram over 64 KB, past its address's rate, or arriving while its
+  connection's queue is full is dropped.
+- `connections.remote(conn)` says where a TCP connection or UDP remote comes
+  from, as `"ip:port"`. `send`, `close`, `subscribe`, `publish` and the
+  state functions work as for a WebSocket, so a device's reading can be
+  published straight to the browsers watching it.
+
+There is no gate in front of a port. A device carries no cookie, so the
+platform cannot decide who it is: the app does. Mint a **device token**
+(`tsv_...`) for each device with `app_device_tokens(app, "create",
+label)` or on the app's Connections tab on `/admin`, and have the device
+present it however the protocol carries one: a first line, an MQTT
+password, a field in each datagram. The handler calls
+`auth.check-token(token)`, which returns the token's label for a live token
+of this app and nothing for anything else, another app's token included.
+Tokens are stored hashed in `<app>.devices`, which is never served and goes
+to the trash with the app. A revoked token stops passing the check at once;
+a connection the app already let in stays open until the app closes it.
+
+Hiding or removing the app closes its TCP connections at once and turns new
+ones away; withdrawing the port from `toolsite.toml` or unmapping it closes
+them at the next 30-second check. Limits are per app and per address (see
+Environment variables): open TCP and UDP connections per app and per IP
+address, the TCP idle timeout, and UDP datagrams per second per address.
+
+On Railway a service has one public HTTP port. Each TCP port needs a TCP
+proxy of its own (service settings, Networking, TCP Proxy, pointing at the
+container port), which hands out a `host:port` of Railway's choosing for the
+devices to use. Railway does not route UDP from outside, so a UDP port is
+reachable only from inside its private network, or on a host that routes
+UDP.
+
 ## Notes for the next session
 
 A published app is a rendered page; its source does not come back out of it.
@@ -717,7 +787,7 @@ same ticket, both directions, scoped to the same slug. `node_modules`,
 no build step has nothing else.
 
 Nothing stored beside an app is reachable under `/p/`: not `.source`, not
-`.notes`, not `.meta`, not `.exports`, not `.blobs/`. If a visitor should be
+`.notes`, not `.meta`, not `.exports`, not `.devices`, not `.blobs/`. If a visitor should be
 able to read a file, put it in the bundle; that is the whole rule.
 
 ## GitHub
@@ -1317,6 +1387,12 @@ is required to serve HTTP.
 | `TOOLSITE_SOCKETS_PER_PERSON` | no (default `20`) | Open live connections one account may hold at once, across apps. |
 | `TOOLSITE_SOCKETS_TOTAL` | no (default `5000`) | Open live connections across every app at once. Stops a flood of anonymous visitors spread over many public apps. |
 | `TOOLSITE_SOCKET_MESSAGES_PER_SECOND` | no (default `100`) | Messages one app may send or publish to its connections each second. The rest are refused, with one warning a second in the log. |
+| `TOOLSITE_PORTS` | no | TCP and UDP ports given to apps: `1883=mqtt-broker,5514/udp=syslog`. Protocol defaults to tcp; 1024 to 65535; one app per port. See TCP and UDP. |
+| `TOOLSITE_TCP_PER_APP` | no (default `500`) | Open TCP and UDP connections one app may have at once. |
+| `TOOLSITE_TCP_PER_IP` | no (default `50`) | Open TCP and UDP connections from one IP address at once, across apps. |
+| `TOOLSITE_TCP_IDLE_SECONDS` | no (default `300`) | A TCP connection that sends nothing for this long is closed. |
+| `TOOLSITE_UDP_IDLE_SECONDS` | no (default `60`) | A UDP remote that sends nothing for this long is closed; its next datagram opens a new connection. |
+| `TOOLSITE_UDP_PER_SECOND` | no (default `100`) | Datagrams one IP address may send to a port each second. The rest are dropped. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |

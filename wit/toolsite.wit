@@ -58,15 +58,19 @@ interface secrets {
     names: func() -> list<string>;
 }
 
-/// Live connections: WebSockets a browser holds open to the app.
+/// Live connections: WebSockets a browser holds open to the app, and TCP
+/// connections and UDP remotes on the ports the site's owner mapped to it.
 ///
 /// An app declares where its sockets live in toolsite.toml
-/// (`[[socket]] path = "/live/ws"`). Toolsite holds each socket and runs
+/// (`[[socket]] path = "/live/ws"`, or `[[socket]] protocol = "tcp"` with a
+/// `port`). Toolsite holds each socket and runs
 /// the handler's `on-connection` export once per event, one at a time per
 /// connection and in order: `connect`, then each `message`, then `close`.
 /// The handler is the same component that answers requests, with the same
 /// database, files, settings and identity; the person on the socket is
-/// `identity.current-user()` for every event.
+/// `identity.current-user()` for every event. A TCP or UDP connection has
+/// no person: `remote` says where it comes from, and `auth.check-token`
+/// decides whether the device may stay.
 ///
 /// The functions here work from any call: a connection event, an ordinary
 /// request or a scheduled job, so an API write can tell open sockets about
@@ -78,6 +82,7 @@ interface connections {
 
     record connect-info {
         /// The declared socket path the browser connected to: "/live/ws".
+        /// For a port, the protocol and port: "tcp:1883", "udp:5514".
         socket: string,
         /// The path inside the app, as a request would see it.
         path: string,
@@ -94,8 +99,12 @@ interface connections {
     variant event {
         /// A browser asks to connect. Return ok to accept it, or an error
         /// to refuse it; a refused browser gets HTTP 403 with that reason.
+        /// A TCP connection or a UDP remote's first datagram arrives the
+        /// same way, and a refused one is closed or dropped.
         connect(connect-info),
-        /// A frame from the browser, at most 64 KB.
+        /// A frame from the browser, at most 64 KB. From TCP, the bytes as
+        /// they were read, in order, in chunks of at most 64 KB that need not
+        /// follow the sender's writes. From UDP, one datagram.
         message(message),
         /// The connection ended, from either side. Its state is gone after.
         close,
@@ -119,6 +128,21 @@ interface connections {
     state-get: func(conn: connection-id, key: string) -> option<string>;
     /// Sets a value, or removes it when `value` is none.
     state-set: func(conn: connection-id, key: string, value: option<string>) -> result<_, string>;
+    /// Where a TCP connection or UDP remote comes from, as "ip:port". None
+    /// for a WebSocket, and for a connection that is gone.
+    remote: func(conn: connection-id) -> option<string>;
+}
+
+/// Tokens the site's owner minted for this app's devices (`tsv_...`), for a
+/// TCP or UDP connection to present however its protocol carries one: a
+/// first line, an MQTT password, a field in a datagram.
+///
+/// No gate stands in front of a port, since a device carries no cookie. The
+/// app decides who stays, and this is how it checks.
+interface auth {
+    /// The token's label when it is a live device token of this app. None
+    /// for anything else, another app's token included.
+    check-token: func(token: string) -> option<string>;
 }
 
 /// Reaching other services, for the hosts this app was allowed to reach.
@@ -256,6 +280,7 @@ world app {
     import secrets;
     import fetch;
     import connections;
+    import auth;
 
     export handle: func(req: request) -> response;
 }

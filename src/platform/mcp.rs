@@ -200,6 +200,20 @@ pub(crate) struct DeployTokenRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DeviceTokenRequest {
+    #[schemars(description = "App whose handler checks the token with auth.check-token.")]
+    pub(crate) app: String,
+    #[schemars(
+        description = "'create' mints a token and returns it once; 'list' shows the tokens that exist (never their values); 'revoke' ends the one named by id."
+    )]
+    pub(crate) action: String,
+    #[schemars(description = "For create: which device will hold the token, e.g. 'boiler sensor'. Required. auth.check-token returns it.")]
+    pub(crate) label: Option<String>,
+    #[schemars(description = "For revoke: the token's id, as list shows it.")]
+    pub(crate) id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExportRequest {
     #[schemars(description = "App whose database the token reads.")]
     pub(crate) app: String,
@@ -888,6 +902,66 @@ impl PageHost {
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        Ok(match outcome {
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
+    }
+
+    #[tool(
+        description = "Tokens for devices that connect to an app over TCP or UDP (tsv_...). A port has no gate: the app's handler checks what a device presents with auth.check-token, which returns the token's label for a live token of this app and nothing for any other, another app's included. The token opens nothing over HTTP. Returned once, by this call, and stored only as a hash. Ports are declared in toolsite.toml ([[socket]] protocol = \"tcp\", port = 1883) and live only where the site's owner maps them with TOOLSITE_PORTS.",
+        annotations(title = "Device tokens", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    pub(crate) async fn app_device_tokens(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(DeviceTokenRequest { app, action, label, id }): Parameters<DeviceTokenRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(refused) = self.allowed(&ctx, &app, Scope::Admin).await {
+            return Ok(refused);
+        }
+        use crate::platform::{devices, export::seconds_since};
+        if !crate::platform::export::valid_app(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be one path segment of letters, numbers, '-' or '_'",
+            )]));
+        }
+        let config = self.config.clone();
+        let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
+            "create" => devices::create(&config, &app, &label.unwrap_or_default()).map(|(entry, token)| {
+                format!(
+                    "Token {} for {app} ({}). Shown once:\n\n{token}\n\nThe device presents it however the app's protocol says (a first line, a password field); the handler calls auth.check-token(token), which returns \"{}\".",
+                    entry.id, entry.label, entry.label
+                )
+            }),
+            "list" => {
+                let tokens = devices::list(&config, &app);
+                if tokens.is_empty() {
+                    return Ok(format!("no device tokens for {app}"));
+                }
+                Ok(tokens
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{}  {}  created {} days ago, last used {}",
+                            t.id,
+                            t.label,
+                            seconds_since(t.created_at) / 86_400,
+                            match t.last_used {
+                                Some(at) => format!("{} h ago", seconds_since(at) / 3600),
+                                None => "never".to_string(),
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            "revoke" => devices::revoke(&config, &app, &id.unwrap_or_default())
+                .map(|()| "revoked; auth.check-token returns nothing for it from now on".to_string()),
+            other => Err(format!("action must be create, list or revoke, not '{other}'")),
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(match outcome {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),

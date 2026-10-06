@@ -441,6 +441,7 @@ async fn an_editor_over_mcp_is_refused_every_tool_on_an_app_outside_its_project(
         ("app_exports", serde_json::json!({"app":"ledger","action":"list"})),
         ("app_repo", serde_json::json!({"app":"ledger","action":"status"})),
         ("app_deploy_tokens", serde_json::json!({"app":"ledger","action":"list"})),
+        ("app_device_tokens", serde_json::json!({"app":"ledger","action":"list"})),
         ("remove_page", serde_json::json!({"slug":"ledger","confirm":"ledger"})),
         ("screenshot", serde_json::json!({"slug":"ledger"})),
         ("pull_page", serde_json::json!({"slug":"ledger"})),

@@ -15,7 +15,7 @@
 
 use crate::{
     accounts::users,
-    platform::connections::{self, Incoming, Refusal, Transport},
+    platform::connections::{self, Door, Incoming, Refusal, Transport},
     runtime::{connections::Message, connections::MAX_MESSAGE_BYTES, wasm::ConnectInfo},
     AppState,
 };
@@ -172,7 +172,7 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
             .collect(),
     };
 
-    match connections::open(state, app.clone(), within.clone(), visitor, info).await {
+    match connections::open(state, app.clone(), Door::Path(within.clone()), visitor, None, info).await {
         Ok(session) => upgrade
             .max_message_size(MAX_MESSAGE_BYTES)
             .on_upgrade(move |socket| connections::run(WsTransport(socket), session)),

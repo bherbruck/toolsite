@@ -12,7 +12,7 @@
 
 use crate::{
     config::Config,
-    content::store::{read_meta, write_meta, PageMeta, PathRule, Policy},
+    content::store::{read_meta, write_meta, PageMeta, PathRule, Policy, PortProtocol, PortSocket},
     platform::schedule,
 };
 use serde::Deserialize;
@@ -53,9 +53,10 @@ pub struct Manifest {
     /// wholesale: a tool removed from the file is withdrawn.
     #[serde(default, rename = "tool")]
     pub tools: Vec<ToolDecl>,
-    /// Paths that accept a WebSocket, handled by the handler's
-    /// `on-connection`. Declared wholesale: a socket removed from the file
-    /// stops accepting, and its open connections close on their next check.
+    /// Paths that accept a WebSocket, and TCP and UDP ports, handled by the
+    /// handler's `on-connection`. Declared wholesale: a socket removed from
+    /// the file stops accepting, and its open connections close on their
+    /// next check.
     #[serde(default, rename = "socket")]
     pub sockets: Vec<SocketDecl>,
     /// What a person may query from outside the app, and the row-level
@@ -133,7 +134,15 @@ pub enum SchemaRef {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SocketDecl {
-    pub path: String,
+    /// For a WebSocket: where in the app it is accepted.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// "websocket" (the default), "tcp" or "udp".
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// For tcp and udp: the port, which the site's owner maps to this app.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,7 +172,7 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
              allow_http, roles, [[route]] (path, gate), [[job]] (name, schedule, path), \
              [access] views, [[access.table]] (table, view, where, owner, write), \
              [[tool]] (name, title, description, path, read_only, destructive, idempotent, \
-             open_world, input, output), [[socket]] (path)."
+             open_world, input, output), [[socket]] (path, or protocol = \"tcp\" | \"udp\" and port)."
         )
     })?;
 
@@ -190,13 +199,46 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
 
     let tools = resolve_tools(config, app, &manifest.tools).await?;
 
-    let sockets: Vec<String> = manifest.sockets.iter().map(|socket| socket.path.trim().to_string()).collect();
-    if sockets.len() > crate::platform::websocket::MAX_SOCKETS {
+    if manifest.sockets.len() > crate::platform::websocket::MAX_SOCKETS {
         return Err(format!(
             "{} sockets declared; an app may declare at most {}",
-            sockets.len(),
+            manifest.sockets.len(),
             crate::platform::websocket::MAX_SOCKETS
         ));
+    }
+    let mut sockets: Vec<String> = Vec::new();
+    let mut ports: Vec<PortSocket> = Vec::new();
+    for socket in &manifest.sockets {
+        let protocol = match socket.protocol.as_deref().map(str::trim) {
+            None | Some("websocket") => None,
+            Some("tcp") => Some(PortProtocol::Tcp),
+            Some("udp") => Some(PortProtocol::Udp),
+            Some(other) => return Err(format!("socket protocol must be websocket, tcp or udp, not {other:?}")),
+        };
+        match (protocol, &socket.path, socket.port) {
+            (None, Some(path), None) => sockets.push(path.trim().to_string()),
+            (None, None, _) => return Err("a websocket [[socket]] needs a path".to_string()),
+            (None, Some(path), Some(_)) => {
+                return Err(format!("socket {path}: a websocket takes a path, not a port; say protocol = \"tcp\" or \"udp\" for a port"))
+            }
+            (Some(protocol), None, Some(port)) => {
+                if port < crate::platform::ports::MIN_PORT {
+                    return Err(format!(
+                        "socket port must be {} to 65535, got {port}",
+                        crate::platform::ports::MIN_PORT
+                    ));
+                }
+                let declared = PortSocket { protocol, port };
+                if ports.contains(&declared) {
+                    return Err(format!("socket {declared}: declared twice"));
+                }
+                ports.push(declared);
+            }
+            (Some(protocol), _, None) => return Err(format!("a {} [[socket]] needs a port", protocol.as_str())),
+            (Some(protocol), Some(_), Some(port)) => {
+                return Err(format!("socket {}:{port}: a port takes no path", protocol.as_str()))
+            }
+        }
     }
     for (n, path) in sockets.iter().enumerate() {
         if !crate::platform::websocket::valid_socket_path(path) {
@@ -260,6 +302,26 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
             format!("{} socket(s): {}", sockets.len(), sockets.join(", "))
         });
         meta.sockets = sockets;
+    }
+    if meta.ports != ports {
+        changed.push(if ports.is_empty() {
+            "ports withdrawn".to_string()
+        } else {
+            let described: Vec<String> = ports
+                .iter()
+                .map(|port| {
+                    if config.ports.maps(app, *port) {
+                        port.to_string()
+                    } else {
+                        // Said here, at deploy, rather than discovered when a
+                        // device cannot connect.
+                        format!("{port} (not live: TOOLSITE_PORTS does not map it to this app)")
+                    }
+                })
+                .collect();
+            format!("{} port(s): {}", ports.len(), described.join(", "))
+        });
+        meta.ports = ports;
     }
 
     // Declared wholesale: a route removed from the file is removed here.
