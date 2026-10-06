@@ -61,13 +61,14 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     // localhost only. Deployed behind a real domain, that must include the
     // public host or every request 403s before auth even runs.
     //
-    // Stateless, because not every client keeps a session: ChatGPT's connector
-    // sends its first request with no session id and it is not `initialize`,
-    // and a stateful transport answers 422 and the connector gives up. The
-    // spec allows a server to hold no session, every request here stands on
-    // its own (a fresh PageHost is cheap), and a client that does initialize
-    // first loses nothing.
-    let transport = StreamableHttpServerConfig::default().with_stateful_mode(false);
+    // No sessions. MCP 2026-07-28 has none: a client sends `server/discover`
+    // and then whatever it needs, each request naming its protocol version,
+    // which is what ChatGPT does. Older clients that still `initialize` are
+    // answered too, and are not made to keep a session id either, since a
+    // fresh PageHost per request is cheap and nothing here lives between
+    // calls. The legacy session mode would hand a 2025-era client that
+    // skipped `initialize` a 422, which is how ChatGPT first failed.
+    let transport = StreamableHttpServerConfig::default().with_legacy_session_mode(false);
     let host_config = match config
         .base_url
         .as_deref()

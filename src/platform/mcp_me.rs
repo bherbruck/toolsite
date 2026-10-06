@@ -17,7 +17,7 @@ use crate::{
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{
-        CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
     },
     service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
@@ -198,9 +198,9 @@ impl MeHost {
 
 #[tool_handler]
 impl ServerHandler for MeHost {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2025_03_26)
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             .with_server_info(Implementation::new("toolsite (me)", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Reads the data that apps on this site share with the signed-in account. \

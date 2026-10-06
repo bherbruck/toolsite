@@ -159,9 +159,10 @@ Signing in needs `TOOLSITE_BASE_URL` set, and an admin account to sign in
 with (see Accounts). A visitor account is told no: a connected client
 publishes with the account's full standing, which is an admin's.
 
-The transport is stateless: no session id is issued and none is needed, so a
-client that sends `tools/list` before `initialize` is answered rather than
-refused. ChatGPT's connector does exactly that.
+The transport holds no session. A client on MCP 2026-07-28 asks
+`server/discover` and then calls what it needs, each request naming its
+protocol version; an older client may still `initialize` first. Neither is
+given a session id. ChatGPT speaks the newer lifecycle.
 
 `GET /guide` is a short, current description of the platform written for an
 agent about to build a handler, a schema or a gate.

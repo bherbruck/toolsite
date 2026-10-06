@@ -268,9 +268,10 @@ can do here, and some things only happen here.
 | `GET /wit/toolsite.wit`, `GET /scaffold/<app>` | public | The contract, and a handler crate ready to build. |
 | `GET /` | public | The index. |
 
-The transport is stateless: no session id is issued and none is needed, so a
-client that sends `tools/list` before `initialize` is answered rather than
-refused. ChatGPT's connector does exactly that.
+The transport holds no session. A client on MCP 2026-07-28 asks
+`server/discover` and then calls what it needs, each request naming its
+protocol version; an older client may still `initialize` first. Neither is
+given a session id. ChatGPT speaks the newer lifecycle.
 
 ## Connecting a client
 

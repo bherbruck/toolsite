@@ -4519,3 +4519,80 @@ async fn a_handler_sees_the_visitor_in_sql_and_can_query_inside_the_policy() {
     let (_, body, _) = send(&config, get("/p/ledger/api/scoped?q=select+count(*)+from+my_orders")).await;
     assert_eq!(body, "0:0");
 }
+
+// --- the sessionless lifecycle ---------------------------------------------------
+//
+// MCP 2026-07-28 has no initialize and no session: a client asks
+// `server/discover`, then calls what it needs, each request naming its
+// protocol version. ChatGPT speaks this; so does the transport now.
+
+fn draft_meta() -> serde_json::Value {
+    serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { "name": "t", "version": "1" },
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+async fn draft_post(config: &Arc<Config>, path: &str, token: &str, method: &str, params: serde_json::Value) -> (StatusCode, Option<String>, serde_json::Value) {
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", "localhost")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", method);
+    // A tool call also names its tool in a header, so a proxy can route on it.
+    if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
+        builder = builder.header("Mcp-Name", name);
+    }
+    let request = builder.body(Body::from(body.to_string())).unwrap();
+    let response = build_router(config.clone(), Runtime::new().unwrap()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let session = response.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let json = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
+        .last()
+        .or_else(|| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, session, json)
+}
+
+#[tokio::test]
+async fn a_client_discovers_the_server_and_lists_tools_with_no_initialize_and_no_session() {
+    let (_dir, config) = server();
+    write_page(&config, "one", "<title>One</title>");
+
+    let (status, session, json) = draft_post(&config, "/mcp", TOKEN, "server/discover", serde_json::json!({ "_meta": draft_meta() })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(session.is_none(), "a session id was issued on a sessionless lifecycle");
+    let versions = json["result"]["supportedVersions"].as_array().expect("supportedVersions");
+    assert!(versions.iter().any(|v| v == "2026-07-28"), "{versions:?}");
+    assert!(versions.iter().any(|v| v == "2025-03-26"), "older clients still initialize: {versions:?}");
+    assert!(json["result"]["capabilities"]["tools"].is_object(), "{json}");
+    assert_eq!(json["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "toolsite");
+
+    let (status, session, json) = draft_post(&config, "/mcp", TOKEN, "tools/list", serde_json::json!({ "_meta": draft_meta() })).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(session.is_none());
+    let names: Vec<&str> = json["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"list_pages"), "{names:?}");
+
+    let (status, _, json) = draft_post(
+        &config,
+        "/mcp",
+        TOKEN,
+        "tools/call",
+        serde_json::json!({ "_meta": draft_meta(), "name": "list_pages", "arguments": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json["result"]["content"][0]["text"].as_str().unwrap_or("").contains("\"one\""), "{json}");
+}

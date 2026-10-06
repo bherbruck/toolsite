@@ -17,7 +17,7 @@ use rmcp::{
     RoleServer,
     model::{
         CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
-        ServerInfo,
+        ServerConfig,
     },
     tool, tool_handler, tool_router,
     ErrorData as McpError, ServerHandler,
@@ -1603,9 +1603,9 @@ impl PageHost {
 
 #[tool_handler]
 impl ServerHandler for PageHost {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2025_03_26)
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
             .with_server_info(Implementation::new("toolsite", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Publishes self-contained HTML pages at public URLs.\n\
