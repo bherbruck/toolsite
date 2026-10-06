@@ -179,7 +179,13 @@ pub fn no_store() -> (header::HeaderName, &'static str) {
 /// Where a form sends the person back to, if it is one of ours.
 pub(crate) fn back_or(back: Option<&str>, default: &str) -> String {
     match back {
-        Some(path) if path.starts_with("/admin") && !path.contains("//") => path.to_string(),
+        // Ours: an admin page, or a level of the app browser.
+        Some(path)
+            if (path.starts_with("/admin") || path == "/" || path.starts_with("/?") || path.starts_with("/browse/"))
+                && !path.contains("//") =>
+        {
+            path.to_string()
+        }
         _ => default.to_string(),
     }
 }
@@ -476,6 +482,40 @@ pub async fn search_apps(
     ([no_store()], Json(found)).into_response()
 }
 
+/// `GET /admin/projects/search?q=`: at most ten projects the caller may move
+/// an app into, which is where it holds admin. `/` is the top level.
+pub async fn search_projects(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let viewer = match require_entry(&config, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let q = query.q.as_deref().unwrap_or("").trim().to_lowercase();
+    if q.is_empty() {
+        return ([no_store()], Json(Vec::<Match>::new())).into_response();
+    }
+    let mut found = Vec::new();
+    if (q == "/" || "top level".contains(&q)) && held(&config, &viewer, "").await == Some(Scope::Admin) {
+        found.push(Match { value: "/".to_string(), label: "Top level".to_string() });
+    }
+    for folder in store::list_folders(&config).await {
+        if found.len() == MAX_MATCHES {
+            break;
+        }
+        if !folder.path.to_lowercase().contains(&q) {
+            continue;
+        }
+        if held(&config, &viewer, &folder.path).await != Some(Scope::Admin) {
+            continue;
+        }
+        found.push(Match { value: folder.path.clone(), label: folder.path });
+    }
+    ([no_store()], Json(found)).into_response()
+}
+
 // --- apps ----------------------------------------------------------------------
 
 /// The apps that exist, by their top-level directory.
@@ -575,20 +615,6 @@ pub async fn apps_page(
         format!("/admin/apps?folder={}", urlencoding::encode(&folder))
     };
 
-    // Who holds what here: rows on this folder, and rows from above.
-    let scopes = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || users::list_scopes(&config).unwrap_or_default())
-            .await
-            .unwrap_or_default()
-    };
-    let direct: Vec<&users::ScopeGrant> = scopes.iter().filter(|row| row.prefix == folder).collect();
-    let inherited: Vec<&users::ScopeGrant> = scopes
-        .iter()
-        .filter(|row| row.prefix != folder && users::prefix_covers(&row.prefix, &folder))
-        .collect();
-
-    let token = form_token(&config, &viewer);
     let title = if folder.is_empty() { "Apps".to_string() } else { folder.rsplit('/').next().unwrap_or(&folder).to_string() };
     let crumbs: Vec<(String, String)> = std::iter::once(("Apps".to_string(), "/admin/apps".to_string()))
         .chain(store::folder_chain(&format!("{folder}/x")).into_iter().filter(|chain| chain != &folder).map(|chain| {
@@ -601,7 +627,6 @@ pub async fn apps_page(
     } else {
         crumbs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
     };
-    let folder_label = if folder.is_empty() { "the site".to_string() } else { folder.clone() };
     let subtitle = if folder.is_empty() {
         html! { (count) " apps at the root" }
     } else {
@@ -675,64 +700,11 @@ pub async fn apps_page(
                     (pager(&listing, &list_path))
                 }
 
-                @if is_admin_here {
-                    (ui::panel("New folder", Some("A folder groups apps. Access given on a folder applies to every folder and app inside it."), html! {
-                        form."row" method="post" action="/admin/folder" {
-                            (hidden("token", &token)) (hidden("parent", &folder)) (hidden("back", &list_path))
-                            input name="name" placeholder="Folder name" required pattern="[A-Za-z0-9_-]+";
-                            button."quiet" type="submit" { "Create folder" }
-                        }
-                    }))
-                }
-
-                (ui::panel("Access to this folder", Some("Viewer opens the apps here. Editor also publishes and changes apps here. Admin also sets access here. Access on a folder applies to everything inside it."), html! {
+                (ui::panel("Projects and permissions", Some("New projects and who may do what in each are set in the app browser, where the apps are."), html! {
+                    a."btn quiet" href=(crate::content::browse::browser_url(&folder)) { "Open in the app browser" }
                     @if is_admin_here {
-                        form."row" method="post" action="/admin/scope" {
-                            (hidden("token", &token)) (hidden("prefix", &folder)) (hidden("back", &list_path)) (hidden("action", "grant"))
-                            (ui::combobox("email", "/admin/accounts/search", "Type an email"))
-                            (scope_choice("editor"))
-                            button type="submit" { "Give access" }
-                        }
-                    }
-                    @if direct.is_empty() && inherited.is_empty() {
-                        p."muted" { "Nobody holds access at " (folder_label) ". Site admins hold admin everywhere." }
-                    } @else {
-                        table {
-                            thead { tr { th { "Account" } th { "Scope" } th { "From" } th {} } }
-                            tbody {
-                                @for row in &direct {
-                                    tr {
-                                        td { (row.email) }
-                                        td { span."badge solid" { (row.scope) } }
-                                        td."muted small" { "here" }
-                                        td."actions-cell" {
-                                            @if is_admin_here {
-                                                form method="post" action="/admin/scope"
-                                                     data-confirm={ "Revoke " (row.scope) " for " (row.email) "?" }
-                                                     data-confirm-detail="The account keeps every other scope it holds."
-                                                     data-confirm-label="Revoke access" data-confirm-danger="1" {
-                                                    (hidden("token", &token)) (hidden("prefix", &row.prefix)) (hidden("email", &row.email))
-                                                    (hidden("back", &list_path)) (hidden("action", "revoke"))
-                                                    button."danger quiet sm" type="submit" { "Revoke access" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                @for row in &inherited {
-                                    tr {
-                                        td { (row.email) }
-                                        td { span."badge" { (row.scope) } }
-                                        td."muted small" {
-                                            @if row.prefix.is_empty() { "the site" } @else {
-                                                a href={ "/admin/apps?folder=" (urlencoding::encode(&row.prefix)) } { (row.prefix) }
-                                            }
-                                        }
-                                        td {}
-                                    }
-                                }
-                            }
-                        }
+                        " "
+                        a."btn quiet" href={ (crate::content::browse::browser_url(&folder)) "?tab=permissions" } { "Permissions" }
                     }
                 }))
             },
@@ -926,10 +898,10 @@ async fn render_overview(
         div."grid-2" {
             (ui::panel("About", None, html! {
                 dl."kv" {
-                    dt { "Folder" }
+                    dt { "Project" }
                     dd {
-                        @if folder.is_empty() { "the root" } @else {
-                            a href={ "/admin/apps?folder=" (urlencoding::encode(&folder)) } { (folder) }
+                        @if folder.is_empty() { a href="/" { "the top level" } } @else {
+                            a href=(crate::content::browse::browser_url(&folder)) { (folder) }
                         }
                     }
                     dt { "Title" } dd { (title.as_deref().unwrap_or("—")) }
@@ -2370,11 +2342,14 @@ pub async fn new_folder(
     match store::create_folder(&config, &parent, form.name.trim()).await {
         Ok(folder) => {
             tracing::info!(admin = %admin.email, folder = %folder.path, "folder created");
-            redirect_flash(
-                &format!("/admin/apps?folder={}", urlencoding::encode(&folder.path)),
-                true,
-                format!("Folder {} is created.", folder.path),
-            )
+            // Back where the form was, inside the new project: the browser
+            // when it came from there, the admin list otherwise.
+            let to = if back.starts_with("/admin") {
+                format!("/admin/apps?folder={}", urlencoding::encode(&folder.path))
+            } else {
+                crate::content::browse::browser_url(&folder.path)
+            };
+            redirect_flash(&to, true, format!("Project {} is created.", folder.path))
         }
         Err(message) => redirect_flash(&back, false, message),
     }

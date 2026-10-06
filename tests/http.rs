@@ -56,6 +56,13 @@ fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
+/// The Cards view of the app browser, which names each entry once. The page
+/// also carries the List view, so a count over the whole page doubles.
+fn tiles_of(page: &str) -> &str {
+    let start = page.find("class=\"tiles cards-only\"").expect("no cards view on the page");
+    &page[start..]
+}
+
 fn write_page(config: &Config, slug: &str, html: &str) {
     let path = config.data_dir.join(format!("{slug}.html"));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -303,7 +310,8 @@ async fn the_index_lists_an_app_once_at_its_root() {
 
     let (status, body, _) = send(&config, get("/")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.matches("/p/app\"").count(), 1);
+    // Each view names it once; the page carries both views.
+    assert_eq!(tiles_of(&body).matches("/p/app\"").count(), 1);
     assert!(!body.contains("/p/app/about"), "inner page was listed");
     assert!(body.contains("My App"), "title was not picked up");
     assert!(body.contains("Loose Page"));
@@ -1926,7 +1934,7 @@ async fn publishing_an_app_replaces_a_page_of_the_same_name() {
     let (_, page, _) = send(&config, get("/p/releases/")).await;
     assert!(page.contains("Release watcher"), "the page still shadows the app");
     let (_, index, _) = send(&config, get("/")).await;
-    assert_eq!(index.matches("/p/releases\"").count(), 1, "listed twice");
+    assert_eq!(tiles_of(&index).matches("/p/releases\"").count(), 1, "listed twice");
 }
 
 #[tokio::test]
@@ -4059,7 +4067,9 @@ async fn a_folder_admin_sees_its_subtree_and_nothing_else() {
     let (status, page, _) = send(&config, get_as("/admin/apps?folder=ops/yard", &fa)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("forklifts"));
-    assert!(page.contains("Create folder"), "a folder admin cannot make folders in its subtree");
+    let (status, browser, _) = send(&config, get_as("/browse/ops/yard", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(browser.contains("New project"), "a folder admin cannot make projects in its subtree");
     let (status, ..) = send(&config, get_as("/admin/apps?folder=finance", &fa)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a direct URL to another folder opened");
     let (status, ..) = send(&config, get_as("/admin/apps/ledger", &fa)).await;
@@ -4086,7 +4096,7 @@ async fn a_folder_admin_grants_at_or_below_its_folder_and_never_above() {
     scope(&config, "fa@example.com", "ops/yard", "admin");
     scope(&config, "ed@example.com", "ops/yard", "editor");
     let fa = sign_in(&config, "fa@example.com", "correct horse");
-    let (_, page, _) = send(&config, get_as("/admin/apps?folder=ops/yard", &fa)).await;
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &fa)).await;
     let token = form_token_from(&page);
 
     // Above its folder: refused.
@@ -4104,8 +4114,8 @@ async fn a_folder_admin_grants_at_or_below_its_folder_and_never_above() {
     // form; the token it does hold, from an app page, buys nothing here.
     app_in(&config, "forklifts", "ops/yard").await;
     let ed = sign_in(&config, "ed@example.com", "correct horse");
-    let (_, page, _) = send(&config, get_as("/admin/apps?folder=ops/yard", &ed)).await;
-    assert!(!page.contains("Give access"), "an editor was offered the access form");
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &ed)).await;
+    assert!(!page.contains("Add permission"), "an editor was offered the access form");
     let (_, page, _) = send(&config, get_as("/admin/apps/forklifts", &ed)).await;
     let ed_token = form_token_from(&page);
     let (status, ..) = send(&config, post_form("/admin/scope", &ed, format!("token={ed_token}&action=grant&prefix=ops/yard&email=new@example.com&scope=viewer"))).await;
@@ -5267,4 +5277,282 @@ async fn a_browser_renders_the_page_as_the_named_account() {
     let full = toolsite::platform::screenshot::Options::new(Some(800), true).unwrap();
     let tall = toolsite::platform::screenshot::render(&config, "tall", "/", None, full).await.unwrap();
     assert_eq!((tall.width, tall.height), (800, 2600), "the full page was not captured at its own height");
+}
+
+// --- the app browser ------------------------------------------------------------
+
+/// An app in a project that anyone may open.
+async fn open_app_in(config: &Config, app: &str, in_folder: &str) {
+    write_page(config, &format!("{app}/index"), &format!("<title>{app} app</title>"));
+    let meta = toolsite::content::store::PageMeta {
+        project: (!in_folder.is_empty()).then(|| in_folder.to_string()),
+        gate: Some("public".to_string()),
+        ..Default::default()
+    };
+    toolsite::content::store::write_meta(config, app, &meta).await.unwrap();
+}
+
+/// The List view of the app browser.
+fn list_view_of(page: &str) -> &str {
+    let start = page.find("class=\"rows list-only\"").expect("no list view on the page");
+    let end = page[start..].find("class=\"tiles cards-only\"").map(|i| start + i).unwrap_or(page.len());
+    &page[start..end]
+}
+
+#[tokio::test]
+async fn the_top_level_lists_top_projects_and_loose_apps_and_nothing_deeper() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    open_app_in(&config, "forklifts", "ops/yard").await;
+    open_app_in(&config, "lunch", "").await;
+
+    let (status, page, _) = send(&config, get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tiles = tiles_of(&page);
+    assert!(tiles.contains("href=\"/browse/ops\""), "the top project is missing");
+    assert!(tiles.contains("/p/lunch\""), "a loose app is missing");
+    assert!(!tiles.contains("/p/forklifts\""), "an app two levels down was listed at the top");
+    assert!(!tiles.contains("href=\"/browse/ops/yard\""), "a subproject was listed at the top");
+    // The project shows before the app.
+    assert!(tiles.find("/browse/ops").unwrap() < tiles.find("/p/lunch").unwrap());
+}
+
+#[tokio::test]
+async fn a_project_level_lists_its_subprojects_and_its_apps_under_its_own_path() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    open_app_in(&config, "forklifts", "ops/yard").await;
+    open_app_in(&config, "rota", "ops").await;
+
+    let (status, page, _) = send(&config, get("/browse/ops")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let tiles = tiles_of(&page);
+    assert!(tiles.contains("href=\"/browse/ops/yard\""));
+    assert!(tiles.contains("/p/rota\""));
+    assert!(!tiles.contains("/p/forklifts\""));
+    assert!(page.contains("<nav class=\"crumbs\"><span><a href=\"/\">Apps</a></span>"), "no breadcrumbs");
+}
+
+#[tokio::test]
+async fn a_project_opens_in_place_with_its_children_indented_inside_it() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    open_app_in(&config, "forklifts", "ops/yard").await;
+
+    let (_, page, _) = send(&config, get("/")).await;
+    let rows = list_view_of(&page);
+    let ops = rows.find("data-rel=\"ops\"").expect("no row for ops");
+    let yard = rows.find("data-rel=\"ops/yard\"").expect("the subproject is not inside its parent");
+    let forklifts = rows.find("/p/forklifts\"").expect("the app is not inside its project");
+    assert!(ops < yard && yard < forklifts, "children are not nested under their parent");
+    assert!(!rows[..yard].contains("data-rel=\"ops\" open"), "a row was open with nothing asking for it");
+
+    // ?open= renders those rows open, so a shared link opens the same way.
+    let (_, page, _) = send(&config, get("/?open=ops,ops/yard")).await;
+    let rows = list_view_of(&page);
+    assert!(rows.contains("data-rel=\"ops\" open"), "?open= did not open the row");
+    assert!(rows.contains("data-rel=\"ops/yard\" open"));
+    // Relative to the level on screen.
+    let (_, page, _) = send(&config, get("/browse/ops?open=yard")).await;
+    assert!(list_view_of(&page).contains("data-rel=\"yard\" open"));
+}
+
+#[tokio::test]
+async fn a_project_with_nothing_the_viewer_may_open_is_not_there_for_them() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "", "finance").await;
+    open_app_in(&config, "rota", "ops").await;
+    app_in(&config, "ledger", "finance").await;
+    account(&config, "reader@example.com", "correct horse");
+    let reader = sign_in(&config, "reader@example.com", "correct horse");
+
+    let (_, page, _) = send(&config, get_as("/", &reader)).await;
+    assert!(page.contains("/browse/ops\""));
+    assert!(!page.contains("/browse/finance"), "a project with nothing visible was listed");
+    assert!(!page.contains("ledger"));
+    let (status, ..) = send(&config, get_as("/browse/finance", &reader)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "an invisible project opened");
+    let (status, ..) = send(&config, get_as("/browse/nothing-here", &reader)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = send(&config, get_as("/browse/..%2F.site", &reader)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn search_under_a_project_finds_an_app_two_levels_down_with_its_path() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    open_app_in(&config, "forklifts", "ops/yard").await;
+    open_app_in(&config, "forms", "").await;
+
+    let (_, page, _) = send(&config, get("/browse/ops?q=fork")).await;
+    let rows = list_view_of(&page);
+    assert!(rows.contains("/p/forklifts\""), "the deep app was not found");
+    assert!(rows.contains("<code>ops/yard</code>"), "the result does not show its path");
+    assert!(!rows.contains("/p/forms\""), "a result from outside the project leaked in");
+}
+
+#[tokio::test]
+async fn the_old_project_link_goes_to_the_level_path() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    open_app_in(&config, "rota", "ops").await;
+    let (status, _, headers) = send(&config, get("/?project=ops&open=yard")).await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap().1.clone();
+    assert_eq!(location, "/browse/ops?open=yard");
+}
+
+#[tokio::test]
+async fn project_controls_show_only_for_the_scope_that_may_use_them() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    app_in(&config, "forklifts", "ops").await;
+    for email in ["fa@example.com", "ed@example.com", "vi@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops", "admin");
+    scope(&config, "ed@example.com", "ops", "editor");
+    scope(&config, "vi@example.com", "ops", "viewer");
+
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &fa)).await;
+    assert!(page.contains("data-dialog=\"new-project\""), "an admin has no New project");
+    assert!(page.contains("data-fill-app=\"forklifts\""), "an admin has no Move");
+    assert!(page.contains("?tab=permissions"), "an admin has no Permissions tab");
+
+    let ed = sign_in(&config, "ed@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &ed)).await;
+    assert!(page.contains("href=\"/admin/apps/forklifts\""), "an editor has no Manage");
+    assert!(!page.contains("data-dialog=\"new-project\""));
+    assert!(!page.contains("data-fill-app="), "an editor was offered Move");
+    assert!(!page.contains("?tab=permissions"));
+    // Asking for the tab directly shows the apps instead.
+    let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions", &ed)).await;
+    assert!(!page.contains("Add permission"));
+
+    let vi = sign_in(&config, "vi@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &vi)).await;
+    assert!(page.contains("/p/forklifts\""));
+    assert!(!page.contains("/admin/apps/forklifts"), "a viewer was offered Manage");
+}
+
+#[tokio::test]
+async fn actions_from_the_browser_come_back_to_it_with_the_outcome() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "", "archive").await;
+    app_in(&config, "forklifts", "ops").await;
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &boss)).await;
+    let token = form_token_from(&page);
+
+    // New project: lands inside it, in the browser.
+    let (status, _, headers) = send(
+        &config,
+        post_form("/admin/folder", &boss, format!("token={token}&parent=ops&name=yard&back=/browse/ops")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, page) = follow(&config, &boss, &headers).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Project ops/yard is created."), "no outcome shown");
+    assert!(page.contains("<h1>yard</h1>"), "not taken into the new project");
+
+    // Move: back to where it started.
+    let (status, _, headers) = send(
+        &config,
+        post_form("/admin/move", &boss, format!("token={token}&app=forklifts&folder=archive&back=/browse/ops")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page) = follow(&config, &boss, &headers).await;
+    assert!(page.contains("forklifts is now at archive/forklifts."), "no outcome shown");
+    assert!(!tiles_of(&page).contains("/p/forklifts\""), "the app is still listed where it was");
+}
+
+#[tokio::test]
+async fn the_permissions_tab_changes_a_scope_in_place_and_leaves_inherited_rows_alone() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    for email in ["fa@example.com", "worker@example.com", "chief@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops/yard", "admin");
+    scope(&config, "worker@example.com", "ops/yard", "viewer");
+    scope(&config, "chief@example.com", "ops", "editor");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+
+    let (status, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Add permission"));
+    assert!(page.contains("worker@example.com"));
+    // The inherited row says where it comes from and offers no change.
+    let chief = page.find("chief@example.com").expect("the inherited holder is not listed");
+    let row_end = chief + page[chief..].find("</tr>").unwrap();
+    let row = &page[chief..row_end];
+    assert!(row.contains("inherited from"), "{row}");
+    assert!(row.contains("href=\"/browse/ops?tab=permissions\""), "{row}");
+    assert!(!row.contains("<select"), "an inherited row can be changed here");
+    assert!(!row.contains("Remove"), "an inherited row can be removed here");
+
+    // The select on a direct row saves through the scope action, back to the tab.
+    let token = form_token_from(&page);
+    let (status, _, headers) = send(
+        &config,
+        post_form(
+            "/admin/scope",
+            &fa,
+            format!("token={token}&action=grant&prefix=ops/yard&email=worker@example.com&scope=editor&back=/browse/ops/yard?tab%3Dpermissions"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap().1.clone();
+    assert_eq!(location, "/browse/ops/yard?tab=permissions");
+    let held: Vec<_> = toolsite::accounts::users::list_scopes(&config)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.email == "worker@example.com")
+        .collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].scope.as_str(), "editor");
+}
+
+#[tokio::test]
+async fn the_project_picker_is_for_managers_and_stops_at_ten() {
+    let (_dir, config) = scoped_site();
+    for n in 0..14 {
+        folder(&config, "", &format!("team{n}")).await;
+    }
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let reader = sign_in(&config, "reader@example.com", "correct horse");
+
+    let (status, body, _) = send(&config, get_as("/admin/projects/search?q=team", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    let found: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(found.len(), 10);
+    let (status, ..) = send(&config, get_as("/admin/projects/search?q=team", &reader)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, body, _) = send(&config, get_as("/admin/projects/search?q=", &boss)).await;
+    assert_eq!(body, "[]");
+}
+
+#[tokio::test]
+async fn a_stranger_still_gets_the_app_list_on_an_open_site() {
+    let (_dir, config) = server();
+    write_page(&config, "lunch/index", "<title>Lunch</title>");
+    let (status, page, _) = send(&config, get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Lunch"));
+    assert!(!page.contains("data-dialog=\"new-project\""));
 }

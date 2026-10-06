@@ -295,6 +295,64 @@ form.row .combo { width: auto; flex: 1 1 14rem; }
 .stack.view-list .meta { flex-direction: row; align-items: baseline; gap: .6rem; flex: 1; min-width: 0; }
 .stack.view-list .meta .slug { margin-left: auto; white-space: nowrap; }
 
+/* The app browser: one level at a time, as rows or as tiles. Both are in
+   the page; the toggle shows one. */
+.seg.icons button { display: inline-flex; align-items: center; padding: .35rem .55rem; }
+#list.browse:not(.view-list) .list-only { display: none; }
+#list.browse.view-list .cards-only { display: none; }
+.tiles {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: .75rem;
+}
+.tile { position: relative; }
+.tile .card { align-items: center; gap: .75rem; padding: .85rem 1rem; height: 100%; }
+.tile .meta { min-width: 0; flex: 1; }
+.tile .meta .slug { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .row-tools { position: absolute; top: .35rem; right: .35rem; display: none; background: var(--card); border-radius: .4rem; }
+.tile:hover .row-tools, .tile:focus-within .row-tools { display: inline-flex; }
+.rows {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--card); overflow: hidden;
+}
+.row {
+  display: flex; align-items: center; gap: .6rem;
+  padding: .45rem .75rem; border-bottom: 1px solid var(--border); min-height: 2.6rem;
+}
+.rows > :last-child, .rows > :last-child > summary.row { border-bottom: 0; }
+.row:hover { background: var(--soft); }
+.row .icon { flex: 0 0 1.6rem; width: 1.6rem; height: 1.6rem; border-radius: .35rem; }
+.row .icon-text { font-size: .95rem; }
+.row-name { color: var(--fg); font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-meta { margin-left: auto; color: var(--muted); font-size: .8rem; white-space: nowrap; }
+.row-tools { display: inline-flex; gap: .2rem; margin-left: .5rem; }
+.row .row-tools { visibility: hidden; }
+.row:hover .row-tools, .row:focus-within .row-tools { visibility: visible; }
+@media (hover: none) {
+  .row .row-tools { visibility: visible; }
+  .tile .row-tools { display: inline-flex; }
+}
+details.project > summary { list-style: none; cursor: pointer; }
+details.project > summary::-webkit-details-marker { display: none; }
+.chev, .chev-space { flex: 0 0 1rem; width: 1rem; text-align: center; color: var(--muted); }
+.chev::before { content: "\25B8"; display: inline-block; transition: transform .15s ease; }
+details[open] > summary .chev::before { transform: rotate(90deg); }
+details.project > .children { border-bottom: 1px solid var(--border); }
+details.project > .children > .row, details.project > .children > details > summary.row { padding-left: 2.25rem; }
+details.project > .children .children > .row, details.project > .children .children > details > summary.row { padding-left: 3.75rem; }
+details.project > .children .children .children > .row, details.project > .children .children .children > details > summary.row { padding-left: 5.25rem; }
+.children .empty-row { margin: 0; padding: .5rem 2.25rem; }
+/* A project marker: the same box as an app's icon, muted, outline only. */
+.icon.folder-icon { color: var(--muted); background: var(--soft); border-color: var(--border); }
+.folder-icon .folder-open { display: none; }
+details[open] > summary .folder-icon .folder-open { display: inline; }
+details[open] > summary .folder-icon .folder-closed { display: none; }
+@media (prefers-reduced-motion: reduce) { .chev::before { transition: none; } }
+table.permissions select { padding: .2rem .5rem; font-size: .85rem; }
+table.permissions tr.inherited td { color: var(--muted); }
+table.permissions .add-row td { background: var(--soft); }
+table.permissions .add-row form.row { margin: 0; }
+form.inline { display: inline; margin: 0; }
+
 /* Search above a list: narrows the page as you type, searches on Enter. */
 form.search { margin: 0 0 1rem; }
 form.search input[type=search] { margin: 0; }
@@ -468,6 +526,38 @@ pub const SHELL_SCRIPT: &str = r#"
   document.querySelectorAll('.flash [data-dismiss]').forEach((button) => {
     button.addEventListener('click', () => button.closest('.flash').remove());
   });
+  // A button that opens a dialog, filling named fields from its data-fill-*.
+  document.querySelectorAll('[data-dialog]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const target = document.getElementById(button.dataset.dialog);
+      if (!target) return;
+      Object.keys(button.dataset).filter((k) => k.startsWith('fill') && k.length > 4).forEach((k) => {
+        const name = k.charAt(4).toLowerCase() + k.slice(5);
+        target.querySelectorAll('[name="' + name + '"]').forEach((f) => { f.value = button.dataset[k]; });
+        target.querySelectorAll('[data-show="' + name + '"]').forEach((e) => { e.textContent = button.dataset[k]; });
+      });
+      target.showModal();
+    });
+  });
+  document.querySelectorAll('dialog [data-close]').forEach((button) => {
+    button.addEventListener('click', () => button.closest('dialog').close());
+  });
+  // A select that saves as soon as it changes.
+  document.querySelectorAll('select[data-autosubmit]').forEach((select) => {
+    select.addEventListener('change', () => select.form.requestSubmit());
+  });
+  // Rows opened in place are kept in the address, so a shared link opens the
+  // same way. The server renders them open from ?open=.
+  const rows = document.querySelectorAll('details[data-rel]');
+  if (rows.length) {
+    const keep = () => {
+      const open = Array.from(document.querySelectorAll('details[data-rel][open]')).map((d) => d.dataset.rel);
+      const url = new URL(location.href);
+      if (open.length) url.searchParams.set('open', open.join(',')); else url.searchParams.delete('open');
+      history.replaceState(null, '', url.pathname + url.search + url.hash);
+    };
+    rows.forEach((d) => d.addEventListener('toggle', keep));
+  }
   // A combobox: the input fetches matches as the person types and shows
   // them in a menu under itself. Without script it is a text input.
   document.querySelectorAll('.combo').forEach((combo) => {

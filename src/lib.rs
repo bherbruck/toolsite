@@ -9,7 +9,7 @@ pub use config::Config;
 
 use crate::{
     accounts::{providers, users},
-    content::serve::{index, serve_icon, serve_page},
+    content::{browse::{browse, index}, serve::{serve_icon, serve_page}},
     platform::{
         admin, blob_upload,
         bearer::{require_bearer, require_person},
@@ -117,6 +117,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
 
     let mut public_router = Router::new()
         .route("/", get(index))
+        .route("/browse/{*path}", get(browse))
         .route("/p/{*slug}", any(serve_page))
         .route("/icon/{*slug}", get(serve_icon))
         // What an agent needs to build a handler: the contract, and a crate
@@ -163,6 +164,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/job-run", post(admin::run_job))
         .route("/admin/scope", post(admin::change_scope))
         .route("/admin/folder", post(admin::new_folder))
+        .route("/admin/projects/search", get(admin::search_projects))
         .route("/admin/move", post(admin::move_app))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))
         // An app's repository: a source mirror, pushed on publish and pulled on push.

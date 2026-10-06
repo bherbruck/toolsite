@@ -59,7 +59,8 @@ content/           what gets published, and how it is served
   slug.rs          naming rules (what may become a path), tokens, escaping
   store.rs         page/icon/meta paths, titles, visibility, listing
   bundle.rs        tar unpacking, entry classification, traversal defence
-  serve.rs         the public site: pages, assets, handler dispatch, index
+  serve.rs         the public site: pages, assets, handler dispatch
+  browse.rs        the app browser at / and /browse/<path>: projects and apps, and running projects
 
 runtime/           executing an app's own code and data
   wasm.rs          engine, guards, host imports

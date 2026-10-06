@@ -3,14 +3,13 @@ use crate::{
     content::{
         slug::{valid_asset_path, valid_slug},
         store::{
-            collect_slugs, icon_path, is_hidden, page_icon, page_path, page_title, read_meta,
-            relative_time, Icon,
+            icon_path, is_hidden, read_meta, Icon,
         },
     },
     runtime::wasm::{Guards, Request as WasmRequest},
     AppState,
 };
-use maud::{html, Markup, PreEscaped};
+use maud::{html, Markup};
 
 use axum::{
     body::Body,
@@ -21,7 +20,7 @@ use axum::{
 
 /// Ceiling on a request body handed to a guest.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-use std::{sync::Arc, time::SystemTime};
+use std::sync::Arc;
 use tokio::fs;
 
 pub(crate) fn content_type_for(path: &str) -> &'static str {
@@ -348,7 +347,7 @@ pub(crate) async fn may_open(config: &Arc<Config>, app: &str, user: &crate::acco
     admits(config, meta.gate_for("/", &config.default_gate), app, Some(user)).await
 }
 
-async fn admits(
+pub(crate) async fn admits(
     config: &Arc<Config>,
     gate: &str,
     app: &str,
@@ -550,120 +549,6 @@ pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> 
 
 
 
-pub(crate) struct PageCard {
-    pub(crate) slug: String,
-    pub(crate) title: Option<String>,
-    pub(crate) icon: Icon,
-    pub(crate) modified: Option<SystemTime>,
-}
-
-pub(crate) async fn index(
-    State(config): State<Arc<Config>>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    // Listing an app the viewer cannot open would leak its name and title,
-    // and a title is exactly the sort of thing worth gating — "Salary Review
-    // 2026" says plenty on its own.
-    let viewer = crate::accounts::users::current_site_user(&config, &headers).await;
-    let mut slugs = Vec::new();
-    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
-
-    let mut cards = Vec::with_capacity(slugs.len());
-    for slug in &slugs {
-        let meta = read_meta(&config, slug).await;
-        if meta.hidden || !meta.listed {
-            continue;
-        }
-        if !admits(&config, meta.gate_for("/", &config.default_gate), slug, viewer.as_ref()).await {
-            continue;
-        }
-        let path = page_path(&config, slug).await;
-        let title = match &path {
-            Some(path) => page_title(path).await,
-            None => None,
-        };
-        let modified = match &path {
-            Some(path) => fs::metadata(path).await.ok().and_then(|m| m.modified().ok()),
-            None => None,
-        };
-        cards.push(PageCard {
-            slug: slug.clone(),
-            title,
-            icon: page_icon(&config, slug).await,
-            modified,
-        });
-    }
-    // Newest first — the page you just pushed should be at the top.
-    cards.sort_by(|a, b| {
-        b.modified
-            .cmp(&a.modified)
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
-
-    let count_label = match cards.len() {
-        0 => "No apps".to_string(),
-        1 => "1 app".to_string(),
-        n => format!("{n} apps"),
-    };
-
-    let body = html! {
-        div."title-row" {
-            div {
-                h1 { "Apps" }
-                p."muted" { (count_label) }
-            }
-            @if !cards.is_empty() {
-                div."actions" {
-                    div."seg" role="group" aria-label="View" {
-                        button type="button" data-view="cards" aria-pressed="true" { "Cards" }
-                        button type="button" data-view="list" aria-pressed="false" { "List" }
-                    }
-                }
-            }
-        }
-
-        @if cards.is_empty() {
-            p."empty" { "There are no apps. Publish an app to show it here." }
-        } @else {
-            input type="search" id="q" placeholder="Search apps" autocomplete="off";
-            ul."stack" id="list" {
-                @for card in &cards {
-                    li data-slug=(card.slug.to_lowercase())
-                       data-title=(card.title.as_deref().unwrap_or_default().to_lowercase()) {
-                        a."card" href={ "/p/" (card.slug) } {
-                            (icon_markup(&card.icon))
-                            span."meta" {
-                                // With a title the slug becomes the subtitle;
-                                // without one it is all there is to show.
-                                span."title" { (card.title.as_deref().unwrap_or(&card.slug)) }
-                                span."slug" {
-                                    @if card.title.is_some() { (card.slug) }
-                                    @if let Some(modified) = card.modified {
-                                        span."when" { (relative_time(modified)) }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            p."no-match" id="no-match" { "No app matches." }
-        }
-    };
-    // The same shell as the admin pages, so the one person who may go there
-    // sees the door, and everyone else sees the apps and a way to sign in.
-    let manages = match &viewer {
-        Some(user) => crate::platform::admin::manages_something(&config, user).await,
-        None => false,
-    };
-    let markup = crate::ui::shell(
-        "Apps",
-        crate::platform::admin::sidebar("site", viewer.as_ref(), manages),
-        body,
-        (!cards.is_empty()).then_some(crate::ui::FILTER_SCRIPT),
-    );
-    Html(markup.into_string())
-}
 
 // --- Minimal OAuth 2.1 shim (only mounted when OAuth is configured) -----
 //

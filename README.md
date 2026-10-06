@@ -774,7 +774,7 @@ breaking it.
 
 | Page | What is there |
 |---|---|
-| `/admin/apps` | Every app, with its gate and whether it ships a handler. Each row opens the app's page. |
+| `/admin/apps` | The apps you manage, with their gate and whether they ship a handler. Each row opens the app's page. Projects and their permissions are run from the app browser. |
 | `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility), then tabs: Access (gate, route rules, granted accounts), Exports, Settings, Jobs, Notes. |
 | `/admin/accounts/<email>` | One account: the apps they may open (add with a searchable picker, revoke), a fresh setup link shown once, disable or enable. |
 | `/admin/accounts` | Accounts with role and status; disable or re-enable; New account is its own page. |
@@ -796,10 +796,11 @@ the account's page in the admin.
 
 ### Projects and scopes
 
-Apps sit in folders, and folders nest: `ops`, `ops/yard`. The tree is the
+Apps sit in projects, and projects nest: `ops`, `ops/yard`. The tree is the
 platform's; an app's URL is its slug wherever it sits, so moving an app
-changes who manages it, not where visitors find it. Folders are made on
-`/admin/apps`, and an app is moved from its Overview tab.
+changes who manages it, not where visitors find it. Projects are made, apps
+are moved and permissions are set in the app browser at `/` (see The app
+browser below). The code and the API call a project a folder.
 
 A scope says what an account may do to the platform from a folder down.
 Unlike a grant's role, which only the app reads, the platform acts on it.
@@ -822,9 +823,9 @@ else refuses and names the folder and the scope it would take. A static
 `TOOLSITE_MCP_TOKEN` keeps every power, as the CLI relies on it. An account
 with only viewer scopes is turned away at the consent page.
 
-A folder's page lists who holds what there, with inherited rows marked by
-the folder they come from, and an admin of the folder gives access with an
-account picker. A folder admin never grants above its folder, and never a
+A project's Permissions tab in the app browser lists who holds what there,
+with inherited rows marked by the project they come from, and an admin of
+the project adds or changes access there. A folder admin never grants above its folder, and never a
 scope stronger than its own. An admin who is not a site admin opens the
 admin pages and sees only the folders and apps it holds scope on.
 
@@ -994,19 +995,50 @@ and the tool gets 401 on its next pull. Tokens live hashed in
 In the reporting tool: a connection of type `sqlite` with that URL and the token as its
 bearer token. It downloads the file on each sync.
 
-## The index
+## The app browser
 
-`GET /` lists published pages, newest first, each with an icon and title.
-Multi-page apps and bundles appear once, as their root. Hidden and unlisted
-pages do not appear, and neither does anything the viewer could not open; a
-gated app's title is as sensitive as its contents, so signing in changes what
-the index shows. There is a client-side filter over slugs and titles.
+`GET /` is the top level of a browser over projects and apps, like a file
+browser over folders and files. `GET /browse/<project path>`, for example
+`/browse/ops/yard`, is one project's level, with breadcrumbs back up. Old
+links of the form `/?project=ops` are redirected to the path.
+
+Each level lists its projects first, then its apps. Two views, chosen with
+the icon buttons by the title and kept in the browser for every level:
+
+- **List**: one row per project and app. The chevron on a project row opens
+  it in place, so its subprojects and apps show indented beneath it; the
+  name goes into the project. Open rows are kept in the address as
+  `?open=yard,yard/north`, relative to the level, so a shared link opens the
+  same way.
+- **Cards**: the current level as tiles, project tiles first.
+
+A search covers everything below the current level and shows each result
+with its project path.
+
+Nothing is listed that the viewer could not open. A gated app's title is as
+sensitive as its contents, so signing in changes what the browser shows. A
+project appears only when the viewer may open something in it, or holds
+access on it or below. A project that is not there for the viewer answers
+404, the same as one that does not exist.
+
+What a person may do depends on the access they hold:
+
+| Access | Sees |
+|---|---|
+| none | the apps they may open |
+| `editor` on an app | **Manage**, to the app's admin page |
+| `admin` on an app | also **Move**, to another project where they hold admin |
+| `admin` at a project | also **New project** and a **Permissions** tab: one row per holder, the access as a select that saves on change, inherited rows read only with a link to where they are set, and an Add permission row |
+
+Every action goes to the admin action that checks it again, and comes back
+to the browser with one line saying what happened.
 
 - **Title**: from the page's own `<title>` (first 8 KB scanned). Pages
   without one are listed by slug.
 - **Icon**: in priority order, an uploaded image (`?icon`), an emoji, inline
   SVG or `data:` URI from `set_icon`, or a generated badge of the slug's
-  initials on a hash-derived colour, stable forever.
+  initials on a hash-derived colour, stable forever. Projects have a muted
+  folder in the same place.
 
 ## Endpoints
 
@@ -1026,7 +1058,8 @@ the index shows. There is a client-side filter over slugs and titles.
 | `GET /guide` | public | How the platform works, for an agent about to build on it. |
 | `GET /wit/toolsite.wit` | public | The contract a handler compiles against. |
 | `GET /scaffold/<app>` | public | A gzipped tar of a handler crate ready to build. |
-| `GET /` | public | The index. |
+| `GET /`, `GET /browse/<path>` | public | The app browser: a level of projects and apps, what the viewer may open. |
+| `GET /admin/projects/search?q=` | session | Up to ten projects the caller may move an app into, for a picker. |
 
 ## Auth
 
