@@ -1890,6 +1890,13 @@ impl ServerHandler for PageHost {
             .with_instructions(
                 "Publishes self-contained HTML pages at public URLs.\n\
                  \n\
+                 Check your environment before you promise an app. Run `npm --version`, \
+                 `cargo --version` and `curl -sI <site>/guide`. A React or wasm build needs \
+                 npm or cargo, and uploading needs either a route to this host or the inline \
+                 upload tools. Without a build tool you can still do everything else: pages \
+                 of plain HTML with push_page, SQL with run_sql, accounts, access, exports, \
+                 repositories and notes. Say which you have before you start, not after.\n\
+                 \n\
                  How to publish, in order of preference:\n\
                  1. If you can run shell commands: write the HTML to a file, call \
                  create_upload, then `curl -fT <file> <upload-url>`. Never read the file back \

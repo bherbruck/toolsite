@@ -13,6 +13,18 @@ something working. Written there it goes stale the moment the platform
 changes, and the next session reads a fixed bug as a live one. That is this
 document, and this document stays current.
 
+## Check your environment first
+
+Before you promise an app, find out what you can run and reach:
+
+    npm --version; cargo --version; curl -sI <server>/guide
+
+A React or wasm build needs npm or cargo. Uploading needs a route to this
+host, or the inline upload tools when there is none. Some sandboxes have
+neither; ChatGPT's regular chat is one today. Without a build tool you can
+still publish plain HTML with `push_page`, run SQL, and manage accounts,
+access, exports, repositories and notes. Say what you have before you start.
+
 ## Choosing how to build it
 
 If the thing has state, forms, or more than one screen, build it as a real

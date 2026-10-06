@@ -59,6 +59,11 @@ back into the conversation either; `curl` it to a file and edit that.
 
 ## Before you start
 
+- Check the environment: `npm --version; cargo --version; curl -sI <server>/guide`.
+  A React or wasm build needs npm or cargo; uploading needs a route to the
+  host or the inline upload tools. Without a build tool, do what still works:
+  plain HTML with `push_page`, SQL, accounts, access, exports, repositories,
+  notes. Say what you have before promising an app.
 - `list_pages` first, so you do not reuse a slug by accident.
 - `app_notes(slug)` for the app you are about to change. A bundle cannot be
   turned back into its source, so the notes may be the only record of why it
