@@ -369,20 +369,45 @@ pub(crate) async fn page_icon(config: &Config, slug: &str) -> Icon {
         }
     }
 
-    let initials: String = slug
-        .rsplit('/')
-        .next()
-        .unwrap_or(slug)
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+    generated_icon(config, slug).await
+}
+
+/// The badge an app without an icon gets, from its name. One rule for the
+/// index, the browser and the favicon, so the tab and the list match.
+pub(crate) async fn generated_icon(config: &Config, slug: &str) -> Icon {
+    let title = match page_path(config, slug).await {
+        Some(path) => page_title(&path).await,
+        None => None,
+    };
+    Icon::Generated(badge_initials(slug, title.as_deref()), slug_hue(slug))
+}
+
+/// Two letters for a badge: the first letters of the title's first two
+/// words when there is a title, else the first two letters or digits of the
+/// slug's last segment. Uppercase; "?" when there is nothing to use.
+pub(crate) fn badge_initials(slug: &str, title: Option<&str>) -> String {
+    let from_title: String = title
+        .unwrap_or("")
+        .split_whitespace()
+        .filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
         .take(2)
         .collect();
-    let initials = if initials.is_empty() {
+    let initials = if from_title.is_empty() {
+        slug.rsplit('/')
+            .next()
+            .unwrap_or(slug)
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(2)
+            .collect()
+    } else {
+        from_title
+    };
+    if initials.is_empty() {
         "?".to_string()
     } else {
         initials.to_uppercase()
-    };
-    Icon::Generated(initials, slug_hue(slug))
+    }
 }
 
 /// True if the page or any app above it has been hidden.

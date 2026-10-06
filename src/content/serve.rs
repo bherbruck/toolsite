@@ -209,9 +209,21 @@ pub(crate) async fn serve_page(
         }
     }
 
+    // The app's favicon, drawn from its icon, when the bundle ships none.
+    // Past the gate and the hidden check above, like any of its assets.
+    if crate::content::favicon::NAMES.contains(&rest)
+        && let Some((media_type, bytes)) = crate::content::favicon::for_app(config, app, rest).await
+    {
+        return (
+            [(header::CONTENT_TYPE, media_type), (header::CACHE_CONTROL, "public, max-age=300")],
+            bytes.as_ref().clone(),
+        )
+            .into_response();
+    }
+
     let direct = config.data_dir.join(format!("{slug}.html"));
     if let Ok(html) = fs::read_to_string(&direct).await {
-        return Html(html).into_response();
+        return Html(crate::content::favicon::add_links(app, html)).into_response();
     }
     // App root without a filename: serve that app's 'index' page. Redirect to
     // the trailing-slash form first so relative links inside the app resolve
@@ -221,7 +233,7 @@ pub(crate) async fn serve_page(
         if !had_trailing_slash {
             return Redirect::permanent(&format!("/p/{slug}/")).into_response();
         }
-        return Html(html).into_response();
+        return Html(crate::content::favicon::add_links(app, html)).into_response();
     }
 
     // Nothing on disk, but the app ships code: let it answer for its own
@@ -233,7 +245,7 @@ pub(crate) async fn serve_page(
     // Client-routed bundle: /p/app/some/route is the app's own concern, so
     // hand back its index and let the router sort it out.
     if let Some(html) = spa_fallback(config, slug).await {
-        return Html(html).into_response();
+        return Html(crate::content::favicon::add_links(app, html)).into_response();
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
@@ -467,12 +479,22 @@ async fn run_handler(
             if let Some(key) = blob_key {
                 return serve_blob(&state.config, app, &key, status, &response.headers).await;
             }
+            // A handler that renders HTML gets the same favicon links a
+            // static page does; its own length header would then be wrong,
+            // so it is dropped and the server counts the new body.
+            let is_html = response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().starts_with("text/html")
+            });
+            let injected = is_html.then(|| crate::content::favicon::with_links(app, &response.body)).flatten();
             let mut builder = axum::response::Response::builder().status(status);
             for (name, value) in &response.headers {
+                if injected.is_some() && name.eq_ignore_ascii_case("content-length") {
+                    continue;
+                }
                 builder = builder.header(name, value);
             }
             builder
-                .body(Body::from(response.body))
+                .body(Body::from(injected.unwrap_or(response.body)))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         // A trap is the app's bug, not the site's: report it without leaking
@@ -549,6 +571,24 @@ pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> 
 
 
 
+
+/// Toolsite's own favicon, the sidebar's mark, for its own pages.
+pub(crate) async fn site_favicon_svg() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "public, max-age=86400")],
+        crate::content::favicon::site_svg(),
+    )
+        .into_response()
+}
+
+pub(crate) async fn site_favicon_ico() -> Response {
+    static ICO: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(crate::content::favicon::site_ico);
+    (
+        [(header::CONTENT_TYPE, "image/x-icon"), (header::CACHE_CONTROL, "public, max-age=86400")],
+        ICO.clone(),
+    )
+        .into_response()
+}
 
 // --- Minimal OAuth 2.1 shim (only mounted when OAuth is configured) -----
 //

@@ -5736,3 +5736,123 @@ async fn the_old_word_granted_still_closes_an_app_and_is_stored_as_restricted() 
     let (_, index, _) = send(&config, get_as("/", &outside)).await;
     assert!(!index.contains("Man"), "the manifest's old word left the app open");
 }
+
+// --- favicons ---------------------------------------------------------------
+
+fn png_of(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([200, 30, 30, 255]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+#[tokio::test]
+async fn a_bundle_that_ships_its_own_favicon_keeps_it() {
+    let (dir, config) = server();
+    write_page(&config, "shop/index", "<html><head></head><body>shop</body></html>");
+    std::fs::write(dir.path().join("shop/favicon.ico"), b"the app's own icon").unwrap();
+    let (status, body) = send_bytes(&config, get("/p/shop/favicon.ico")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"the app's own icon");
+}
+
+#[tokio::test]
+async fn an_app_without_an_icon_gets_a_badge_of_its_name_in_the_tab_and_the_list() {
+    let (_dir, config) = server();
+    write_page(&config, "reports/index", "<html><head><title>Quarterly Reports</title></head><body></body></html>");
+    let (status, body, headers) = send(&config, get("/p/reports/favicon.svg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.iter().any(|(k, v)| k == "content-type" && v == "image/svg+xml"));
+    assert!(body.contains(">QR<"), "the badge does not use the title's initials: {body}");
+
+    // The index draws the same letters, so the tab and the list match.
+    let (_, index, _) = send(&config, get("/")).await;
+    assert!(index.contains(">QR<"), "the index badge differs from the favicon");
+
+    // An app with no title falls back to its name.
+    write_page(&config, "ledger/index", "<html><head></head><body></body></html>");
+    let (_, body, _) = send(&config, get("/p/ledger/favicon.svg")).await;
+    assert!(body.contains(">LE<"), "{body}");
+}
+
+#[tokio::test]
+async fn an_emoji_icon_becomes_the_favicon() {
+    let (dir, config) = server();
+    write_page(&config, "coop/index", "<html><head></head><body></body></html>");
+    std::fs::write(dir.path().join("coop/index.icon"), "🐔").unwrap();
+    let (status, body, _) = send(&config, get("/p/coop/favicon.svg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("🐔"), "{body}");
+    let (status, ico) = send_bytes(&config, get("/p/coop/favicon.ico")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&ico[..4], &[0, 0, 1, 0], "not an ICO");
+}
+
+#[tokio::test]
+async fn an_uploaded_image_icon_is_resized_into_the_ico_and_the_touch_icon() {
+    let (dir, config) = server();
+    write_page(&config, "photos/index", "<html><head></head><body></body></html>");
+    std::fs::write(dir.path().join("photos/index.icon"), png_of(400, 200)).unwrap();
+
+    let (status, ico) = send_bytes(&config, get("/p/photos/favicon.ico")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&ico[..4], &[0, 0, 1, 0]);
+    // The second entry is the 32 by 32 image, a PNG inside the ICO.
+    assert_eq!(ico[22], 32);
+    let size = u32::from_le_bytes(ico[30..34].try_into().unwrap()) as usize;
+    let offset = u32::from_le_bytes(ico[34..38].try_into().unwrap()) as usize;
+    let inner = image::load_from_memory(&ico[offset..offset + size]).unwrap();
+    assert_eq!((inner.width(), inner.height()), (32, 32));
+
+    let (status, touch) = send_bytes(&config, get("/p/photos/apple-touch-icon.png")).await;
+    assert_eq!(status, StatusCode::OK);
+    let touch = image::load_from_memory(&touch).unwrap();
+    assert_eq!((touch.width(), touch.height()), (180, 180));
+}
+
+#[tokio::test]
+async fn a_page_gets_favicon_links_unless_it_names_its_own() {
+    let (_dir, config) = server();
+    write_page(&config, "plain/index", "<!doctype html><html><head><title>p</title></head><body>x</body></html>");
+    let own = r#"<!doctype html><html><head><link rel="icon" href="mine.png"></head><body>y</body></html>"#;
+    write_page(&config, "own/index", own);
+
+    let (status, body, headers) = send(&config, get("/p/plain/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"<head><link rel="icon" href="/p/plain/favicon.svg""#), "{body}");
+    assert!(body.contains("/p/plain/apple-touch-icon.png"));
+    if let Some((_, length)) = headers.iter().find(|(k, _)| k == "content-length") {
+        assert_eq!(length.parse::<usize>().unwrap(), body.len(), "the length header counts the old body");
+    }
+
+    let (_, body, _) = send(&config, get("/p/own/")).await;
+    assert_eq!(body, own, "a page with its own icon was changed");
+}
+
+#[tokio::test]
+async fn a_restricted_apps_favicon_is_behind_the_same_door_as_the_app() {
+    let (dir, config) = server();
+    write_page(&config, "secret/index", "<html><head><title>Payroll</title></head><body></body></html>");
+    std::fs::write(
+        dir.path().join("secret/index.meta"),
+        r#"{"listed":true,"hidden":false,"spa":false,"gate":"restricted","allow_http":[],"rules":[]}"#,
+    )
+    .unwrap();
+    let (status, ..) = send(&config, get("/p/secret/favicon.svg")).await;
+    assert_ne!(status, StatusCode::OK, "a stranger got a restricted app's favicon");
+    let (status, ..) = send(&config, get("/p/secret/")).await;
+    assert_ne!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn toolsites_own_pages_have_a_favicon() {
+    let (_dir, config) = server();
+    let (status, body, _) = send(&config, get("/favicon.svg")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<svg") && body.contains(">t<"));
+    let (status, ico) = send_bytes(&config, get("/favicon.ico")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&ico[..4], &[0, 0, 1, 0]);
+    let (_, index, _) = send(&config, get("/")).await;
+    assert!(index.contains(r#"<link rel="icon" href="/favicon.svg""#));
+}

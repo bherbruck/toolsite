@@ -66,6 +66,9 @@ slug, good for 15 minutes, and it takes flags:
 | `?icon` | an image |
 | `?source` | gzipped tar of the project; also `GET` to fetch it back |
 
+Every app gets a favicon from its icon unless the bundle ships its own
+`favicon.ico`, `favicon.svg` or links one in its `<head>`.
+
 Any other flag is refused rather than guessed at. Order matters: migrations
 and the manifest first, so an app is never briefly live without its tables or
 its gate.
