@@ -383,8 +383,10 @@ impl Guest for Handler {
     /// A TCP connection or UDP remote (one with a `remote`) gets
     /// `id:<conn>\n` on connect, and its bytes are commands only when one
     /// whole read is `token <t>\n` (checked with auth.check-token: `ok
-    /// <label>\n`, or `denied\n` and a close), `remote\n`, `log\n` or
-    /// `close\n`. Anything else is echoed back as it came.
+    /// <label>\n`, or `denied\n` and a close), `remote\n`, `log\n`,
+    /// `close\n`, `amplify <count> <bytes>\n` (that many replies of that
+    /// size), `poke <conn>\n` (every connection call aimed at another id),
+    /// `trap\n` or `spin\n`. Anything else is echoed back as it came.
     fn on_connection(conn: String, event: Event) -> Result<(), String> {
         if let Some(remote) = connections::remote(&conn) {
             return on_device(conn, remote, event);
@@ -496,6 +498,33 @@ fn on_device(conn: String, remote: String, event: Event) -> Result<(), String> {
                 reply(format!("{}\n", connections::state_get(&conn, "log").unwrap_or_default()))
             } else if text == "close\n" {
                 connections::close(&conn)
+            } else if let Some(args) = text.strip_prefix("amplify ").and_then(|t| t.strip_suffix('\n')) {
+                // An app that answers a small request with a lot: what a
+                // forged source address would turn on a victim.
+                let (count, size) = args.split_once(' ').unwrap_or(("0", "0"));
+                let (count, size): (u32, usize) = (count.parse().unwrap_or(0), size.parse().unwrap_or(0));
+                for _ in 0..count {
+                    let _ = connections::send(&conn, &Message::Binary(vec![b'a'; size]));
+                }
+                Ok(())
+            } else if let Some(other) = text.strip_prefix("poke ").and_then(|t| t.strip_suffix('\n')) {
+                // Everything a handler can do to a connection, aimed at an id
+                // that is not one of this app's.
+                let sent = connections::send(other, &Message::Text("hijack".to_string())).is_ok();
+                let state = connections::state_get(other, "log").is_some();
+                let set = connections::state_set(other, "log", Some("hijacked")).is_ok();
+                let remote = connections::remote(other).is_some();
+                let joined = connections::subscribe(other, "hijack").is_ok();
+                let closed = connections::close(other).is_ok();
+                reply(format!("send={sent} state={state} set={set} remote={remote} subscribe={joined} close={closed}\n"))
+            } else if text == "trap\n" {
+                panic!("the handler trapped on purpose")
+            } else if text == "spin\n" {
+                let mut n: u64 = 0;
+                loop {
+                    n = n.wrapping_add(1);
+                    std::hint::black_box(n);
+                }
             } else {
                 connections::send(&conn, &Message::Binary(bytes))
             }

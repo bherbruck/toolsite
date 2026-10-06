@@ -58,9 +58,9 @@ async fn accept(state: AppState, stream: TcpStream, peer: SocketAddr, app: Strin
         query: String::new(),
         headers: Vec::new(),
     };
-    let idle = state.config.connections.limits.tcp_idle;
+    let (idle, send_timeout) = (state.config.connections.limits.tcp_idle, state.config.connections.limits.tcp_send_timeout);
     match connections::open(state, app.clone(), Door::Port(socket), None, Some(peer), info).await {
-        Ok(session) => connections::run(TcpTransport::new(stream, idle), session).await,
+        Ok(session) => connections::run(TcpTransport::new(stream, idle, send_timeout), session).await,
         Err(Refusal::NotOffered) => {
             tracing::warn!(app = %app, port = %socket, peer = %peer, "tcp connection refused: the app's handler does not export on-connection")
         }
@@ -79,6 +79,7 @@ struct TcpTransport {
     write: OwnedWriteHalf,
     buffer: Vec<u8>,
     idle: Duration,
+    send_timeout: Duration,
     /// When the other side last sent anything. Kept here rather than as a
     /// timer per read, since `recv` is dropped and called again whenever
     /// anything else happens on the connection.
@@ -86,13 +87,14 @@ struct TcpTransport {
 }
 
 impl TcpTransport {
-    fn new(stream: TcpStream, idle: Duration) -> Self {
+    fn new(stream: TcpStream, idle: Duration, send_timeout: Duration) -> Self {
         let (read, write) = stream.into_split();
         Self {
             read,
             write,
             buffer: vec![0; MAX_MESSAGE_BYTES],
             idle,
+            send_timeout,
             last_heard: Instant::now(),
         }
     }
@@ -120,8 +122,8 @@ impl Transport for TcpTransport {
             Message::Binary(bytes) => bytes,
         };
         // A peer that stops reading would otherwise hold this connection's
-        // loop forever.
-        match tokio::time::timeout(self.idle, self.write.write_all(&bytes)).await {
+        // loop, and its place under the ceilings, for as long as it liked.
+        match tokio::time::timeout(self.send_timeout, self.write.write_all(&bytes)).await {
             Ok(Ok(())) => Ok(()),
             _ => Err(()),
         }

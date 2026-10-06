@@ -25,9 +25,12 @@ use std::{future::Future, net::SocketAddr, time::Instant};
 use tokio::sync::mpsc;
 
 /// Frames waiting for the handler. A WebSocket that fills this is closed for
-/// sending faster than the app can answer; a transport that holds back stops
-/// reading instead.
+/// sending faster than the app can answer.
 const EVENT_QUEUE: usize = 64;
+/// The same for a transport that holds back, which stops reading instead.
+/// Kept short: each frame may be 64 KB, and a device behind a slow handler
+/// should wait in its own kernel buffers, not in this process's memory.
+const HELD_QUEUE: usize = 2;
 
 /// What a transport hands up.
 pub enum Incoming {
@@ -135,6 +138,13 @@ pub async fn open(
     let Some(wasm) = crate::content::serve::handler_wasm(&state.config, &app).await else {
         return Err(Refusal::NotOffered);
     };
+    // The ceilings first: they cost a lock, where asking the handler costs
+    // an instance, and a flood should be turned away for the cheap reason.
+    let (registration, outgoing) = state
+        .config
+        .connections
+        .register_from(&app, visitor.as_ref().map(|user| user.id.as_str()), remote)
+        .map_err(Refusal::Full)?;
     let takes = {
         let (runtime, app) = (state.runtime.clone(), app.clone());
         tokio::task::spawn_blocking(move || runtime.takes_connections(&app, &wasm)).await
@@ -145,12 +155,6 @@ pub async fn open(
         Ok(Err(e)) => return Err(Refusal::Failed(format!("{e:#}"))),
         Err(e) => return Err(Refusal::Failed(e.to_string())),
     }
-
-    let (registration, outgoing) = state
-        .config
-        .connections
-        .register_from(&app, visitor.as_ref().map(|user| user.id.as_str()), remote)
-        .map_err(Refusal::Full)?;
     match deliver(&state, &app, &visitor, &registration.id, ConnectionEvent::Connect(info)).await {
         Ok(Some(Ok(()))) => Ok(Session {
             state,
@@ -200,7 +204,8 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
 
     // Events run in their own task, one at a time, so a slow handler never
     // stops this loop from sending, pinging or noticing the browser left.
-    let (events, mut queue) = mpsc::channel::<ConnectionEvent>(EVENT_QUEUE);
+    let holds_back = transport.holds_back();
+    let (events, mut queue) = mpsc::channel::<ConnectionEvent>(if holds_back { HELD_QUEUE } else { EVENT_QUEUE });
     let worker = {
         let (state, app, visitor, conn) = (state.clone(), app.clone(), visitor.clone(), conn.clone());
         tokio::spawn(async move {
@@ -208,7 +213,15 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
                 let closing = matches!(event, ConnectionEvent::Close);
                 match deliver(&state, &app, &visitor, &conn, event).await {
                     Ok(Some(Err(why))) => tracing::info!(app = %app, "connection handler answered an error: {why}"),
-                    Err(why) => tracing::warn!(app = %app, "connection handler failed: {why}"),
+                    // A trap, or a handler stopped at its time or fuel: what
+                    // it meant to do with this connection is unknown, so the
+                    // connection ends rather than carry on half handled.
+                    Err(why) => {
+                        tracing::warn!(app = %app, "connection closed: the handler failed: {why}");
+                        if !closing {
+                            let _ = state.config.connections.close(&app, &conn);
+                        }
+                    }
                     _ => {}
                 }
                 if closing {
@@ -226,7 +239,7 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
     let mut last_pong = Instant::now();
     let mut pinged_at: Option<Instant> = None;
     let user_id = visitor.as_ref().map(|user| user.id.clone());
-    let (answers_pings, holds_back) = (transport.answers_pings(), transport.holds_back());
+    let answers_pings = transport.answers_pings();
     // The other side stopped sending. A TCP peer that half-closed still
     // reads, so replies to what it sent last are still delivered.
     let mut sender_done = false;
@@ -235,6 +248,12 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
         tokio::select! {
             out = outgoing.recv() => {
                 match out {
+                    // Cut off for falling behind: what is still queued is
+                    // not worth waiting on a peer that does not read.
+                    Some(_) if outgoing.is_closed() => {
+                        transport.close().await;
+                        break;
+                    }
                     Some(Outgoing::Message(message)) => {
                         if transport.send(message).await.is_err() {
                             break;
@@ -252,8 +271,14 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
                 }
             }
             // A transport that holds back is not read while the handler is
-            // behind, so its frames wait where they are.
-            incoming = transport.recv(), if !holds_back || events.capacity() > 0 => {
+            // behind, so its frames wait where they are; reading resumes as
+            // soon as the handler takes one.
+            incoming = async {
+                if holds_back {
+                    let _ = events.reserve().await;
+                }
+                transport.recv().await
+            } => {
                 match incoming {
                     Incoming::Message(message) => {
                         let message = match message {

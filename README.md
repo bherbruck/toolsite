@@ -723,8 +723,16 @@ The same handler gets the same events:
   remote address, opened by its first datagram (`connect` then that
   `message`) and closed after it is quiet for the idle timeout. So
   `send(conn, data)` replies to that address and per-connection state works.
-  A datagram over 64 KB, past its address's rate, or arriving while its
-  connection's queue is full is dropped.
+  A datagram over 64 KB, past its address's rate, arriving while its
+  connection's queue or the port's is full, or opening a new remote while
+  the app already holds its most TCP and UDP connections is dropped. A UDP
+  source address can be forged, so replies to a remote are capped by what it
+  sent: a 128-byte allowance, then three bytes out per byte in; past that a
+  reply is dropped. A device that keeps talking keeps getting answers.
+- A handler that traps, or runs out of time or fuel, on an event ends that
+  connection; the others carry on. A TCP peer that takes none of a reply for
+  `TOOLSITE_TCP_SEND_SECONDS` is closed, and it counts against the limits
+  until it is.
 - `connections.remote(conn)` says where a TCP connection or UDP remote comes
   from, as `"ip:port"`. `send`, `close`, `subscribe`, `publish` and the
   state functions work as for a WebSocket, so a device's reading can be
@@ -1398,6 +1406,8 @@ is required to serve HTTP.
 | `TOOLSITE_TCP_IDLE_SECONDS` | no (default `300`) | A TCP connection that sends nothing for this long is closed. |
 | `TOOLSITE_UDP_IDLE_SECONDS` | no (default `60`) | A UDP remote that sends nothing for this long is closed; its next datagram opens a new connection. |
 | `TOOLSITE_UDP_PER_SECOND` | no (default `100`) | Datagrams one IP address may send to a port each second. The rest are dropped. |
+| `TOOLSITE_UDP_QUEUED_BYTES` | no (default `8388608`) | Bytes of datagrams waiting for the handler on one UDP port, across its remotes. The rest are dropped. |
+| `TOOLSITE_TCP_SEND_SECONDS` | no (default `10`) | A TCP peer that takes none of a reply for this long is closed. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |

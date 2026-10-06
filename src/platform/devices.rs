@@ -22,12 +22,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Recognisable in a device's config, and in a leak.
 pub const PREFIX: &str = "tsv_";
 const MAX_LABEL: usize = 60;
+/// Longer than any token this mints; anything past it is not one, and is
+/// refused before it is hashed.
+const MAX_TOKEN: usize = 256;
+/// How stale `last_used` may be before a check writes it again. A device
+/// that checks its token on every message would otherwise rewrite the file
+/// on every message.
+const USE_RESOLUTION: u64 = 60;
+
+/// Every change to a `.devices` file is read, changed and written under
+/// this, so a check recording use can never write back a token that a
+/// revocation running beside it just removed, nor drop one just minted.
+static WRITING: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeviceToken {
@@ -74,7 +87,19 @@ fn write(config: &Config, app: &str, tokens: &[DeviceToken]) -> Result<(), Strin
         return Ok(());
     }
     let text = serde_json::to_string_pretty(tokens).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| e.to_string())
+    // Through a rename, so a check reading at the same moment sees the old
+    // list or the new one and never half of one, which would read as none.
+    // Under `.tmp/`, which no URL can name, while it is half written.
+    let spool = config.data_dir.join(".tmp");
+    std::fs::create_dir_all(&spool).map_err(|e| e.to_string())?;
+    let partial = spool.join(format!("{app}.devices.{}", random_token(8)));
+    std::fs::write(&partial, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, &path).map_err(|e| e.to_string())
+}
+
+/// Equal without saying, by how long it took, how much of it was.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Mints a token for `app`. The plain token is returned exactly once, here;
@@ -95,6 +120,7 @@ pub fn create(config: &Config, app: &str, label: &str) -> Result<(DeviceToken, S
         created_at: now(),
         hash: hash(&token),
     };
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let mut tokens = read(config, app);
     tokens.push(entry.clone());
     write(config, app, &tokens)?;
@@ -106,6 +132,7 @@ pub fn list(config: &Config, app: &str) -> Vec<DeviceToken> {
 }
 
 pub fn revoke(config: &Config, app: &str, id: &str) -> Result<(), String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let mut tokens = read(config, app);
     let before = tokens.len();
     tokens.retain(|token| token.id != id);
@@ -120,15 +147,25 @@ pub fn revoke(config: &Config, app: &str, id: &str) -> Result<(), String> {
 /// still connect.
 pub fn check(config: &Config, app: &str, presented: &str) -> Option<String> {
     let presented = presented.trim();
-    if !presented.starts_with(PREFIX) {
+    if !presented.starts_with(PREFIX) || presented.len() > MAX_TOKEN {
         return None;
     }
     let wanted = hash(presented);
-    let mut tokens = read(config, app);
-    let token = tokens.iter_mut().find(|token| token.hash == wanted)?;
-    token.last_used = Some(now());
-    let label = token.label.clone();
-    let _ = write(config, app, &tokens);
+    // Every entry is compared, so the time taken says nothing about which.
+    let tokens = read(config, app);
+    let found = tokens
+        .iter()
+        .enumerate()
+        .fold(None, |found, (at, token)| if same(&token.hash, &wanted) { Some(at) } else { found })?;
+    let label = tokens[found].label.clone();
+    if tokens[found].last_used.is_none_or(|at| now().saturating_sub(at) >= USE_RESOLUTION) {
+        // Read again under the lock: the token may have been revoked since.
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tokens = read(config, app);
+        let token = tokens.iter_mut().find(|token| same(&token.hash, &wanted))?;
+        token.last_used = Some(now());
+        let _ = write(config, app, &tokens);
+    }
     Some(label)
 }
 
@@ -176,5 +213,78 @@ mod tests {
         for app in ["../x", "a/b", ".site", ""] {
             assert!(create(&config, app, "x").is_err(), "{app:?} accepted");
         }
+    }
+
+    #[test]
+    fn a_check_recording_use_never_brings_back_a_token_revoked_beside_it() {
+        let (_dir, config) = config();
+        let config = std::sync::Arc::new(config);
+        for _ in 0..200 {
+            let (_, keep) = create(&config, "broker", "keep").unwrap();
+            let (doomed, doomed_token) = create(&config, "broker", "doomed").unwrap();
+            // A fresh token's first check writes its use; the revocation
+            // writes at the same moment.
+            let checking = {
+                let (config, keep) = (config.clone(), keep.clone());
+                std::thread::spawn(move || check(&config, "broker", &keep))
+            };
+            revoke(&config, "broker", &doomed.id).unwrap();
+            assert!(checking.join().unwrap().is_some());
+            assert_eq!(check(&config, "broker", &doomed_token), None, "a revoked token came back");
+        }
+    }
+
+    #[test]
+    fn a_token_minted_while_devices_check_is_never_lost() {
+        let (_dir, config) = config();
+        let config = std::sync::Arc::new(config);
+        let (_, first) = create(&config, "broker", "first").unwrap();
+        let minting: Vec<_> = (0..8)
+            .map(|n| {
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    (0..20).map(|m| create(&config, "broker", &format!("d{n}-{m}")).unwrap().1).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let checking: Vec<_> = (0..4)
+            .map(|_| {
+                let (config, first) = (config.clone(), first.clone());
+                std::thread::spawn(move || (0..100).all(|_| check(&config, "broker", &first).is_some()))
+            })
+            .collect();
+        let minted: Vec<String> = minting.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        assert!(checking.into_iter().all(|t| t.join().unwrap()), "a check missed a live token mid-write");
+        for token in &minted {
+            assert!(check(&config, "broker", token).is_some(), "a minted token was lost");
+        }
+        assert_eq!(list(&config, "broker").len(), minted.len() + 1);
+    }
+
+    #[test]
+    fn checking_a_token_on_every_message_does_not_rewrite_the_file_every_time() {
+        let (dir, config) = config();
+        let (_, token) = create(&config, "broker", "chatty").unwrap();
+        check(&config, "broker", &token).unwrap();
+        let path = dir.path().join("broker.devices");
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for _ in 0..50 {
+            check(&config, "broker", &token).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), written);
+    }
+
+    #[test]
+    fn a_token_that_is_too_long_or_off_by_one_is_refused() {
+        let (_dir, config) = config();
+        let (_, token) = create(&config, "broker", "x").unwrap();
+        let mut near = token.clone().into_bytes();
+        let last = near.len() - 1;
+        near[last] = if near[last] == b'a' { b'b' } else { b'a' };
+        assert_eq!(check(&config, "broker", &String::from_utf8(near).unwrap()), None);
+        assert_eq!(check(&config, "broker", &format!("{token}{}", " ".repeat(10))).as_deref(), Some("x"));
+        assert_eq!(check(&config, "broker", &format!("{token}{}", "a".repeat(MAX_TOKEN))), None);
+        assert!(!same("abc", "abd") && !same("abc", "ab") && same("abc", "abc"));
     }
 }

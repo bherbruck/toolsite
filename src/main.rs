@@ -307,6 +307,11 @@ async fn main() -> anyhow::Result<()> {
         tcp_idle: std::time::Duration::from_secs(count("TOOLSITE_TCP_IDLE_SECONDS", socket_defaults.tcp_idle.as_secs())),
         udp_idle: std::time::Duration::from_secs(count("TOOLSITE_UDP_IDLE_SECONDS", socket_defaults.udp_idle.as_secs())),
         udp_per_second: count("TOOLSITE_UDP_PER_SECOND", socket_defaults.udp_per_second as u64) as u32,
+        udp_queued_bytes: count("TOOLSITE_UDP_QUEUED_BYTES", socket_defaults.udp_queued_bytes as u64) as usize,
+        tcp_send_timeout: std::time::Duration::from_secs(count(
+            "TOOLSITE_TCP_SEND_SECONDS",
+            socket_defaults.tcp_send_timeout.as_secs(),
+        )),
     };
     tracing::info!(
         per_app = socket_limits.per_app,
@@ -318,6 +323,8 @@ async fn main() -> anyhow::Result<()> {
         tcp_idle_seconds = socket_limits.tcp_idle.as_secs(),
         udp_idle_seconds = socket_limits.udp_idle.as_secs(),
         udp_per_second = socket_limits.udp_per_second,
+        udp_queued_bytes = socket_limits.udp_queued_bytes,
+        tcp_send_seconds = socket_limits.tcp_send_timeout.as_secs(),
         "live connections configuration"
     );
 

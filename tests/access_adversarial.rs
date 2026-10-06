@@ -1414,3 +1414,104 @@ async fn the_tools_sidecar_never_leaves_through_a_download_pull_or_export() {
     let (_, text) = tool(&w.config, "/mcp", TOKEN, "pull_page", serde_json::json!({"slug":"yard.tools"})).await;
     assert!(!text.contains("/api/staff/tool"), "pull_page: {text}");
 }
+
+// --- device tokens -----------------------------------------------------------------
+
+#[tokio::test]
+async fn only_a_manager_of_the_app_mints_lists_or_revokes_its_device_tokens_over_mcp_or_the_form() {
+    let w = world().await;
+    let (entry, token) = toolsite::platform::devices::create(&w.config, "yard", "boiler").unwrap();
+
+    // A viewer, or an account with nothing, never reaches the tools at all.
+    for who in ["fin@x.test", "nobody@x.test"] {
+        let init = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+        let (status, _) = mcp_post(&w.config, "/mcp", &token_for(&w.config, who), init).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{who} reached the publishing tools");
+    }
+    // An editor of the app's project is refused every action.
+    for who in ["ed@x.test"] {
+        let bearer = token_for(&w.config, who);
+        for args in [
+            serde_json::json!({"app":"yard","action":"create","label":"intruder"}),
+            serde_json::json!({"app":"yard","action":"list"}),
+            serde_json::json!({"app":"yard","action":"revoke","id":entry.id}),
+        ] {
+            let (err, text) = tool(&w.config, "/mcp", &bearer, "app_device_tokens", args.clone()).await;
+            assert!(err, "{who} {args} went through: {text}");
+            assert!(!text.contains("boiler"), "{who} saw the token list: {text}");
+        }
+    }
+
+    // The form: an editor with its own form token, the editor holding a
+    // manager's form token, and a manager with a forged one.
+    let ed = session(&w.config, "ed@x.test");
+    let sub = session(&w.config, "sub@x.test");
+    let (ed_token, sub_token) = (form_token(&w.config, "ed@x.test"), form_token(&w.config, "sub@x.test"));
+    let attempts = [
+        (&ed, ed_token.as_str()),
+        (&ed, sub_token.as_str()),
+        (&sub, ""),
+        (&sub, "guessed"),
+        (&sub, ed_token.as_str()),
+    ];
+    for (who, form) in attempts {
+        for body in [
+            format!("token={form}&action=create&app=yard&label=intruder"),
+            format!("token={form}&action=revoke&app=yard&id={}", entry.id),
+        ] {
+            let (status, page, _) = send(&w.config, post_as("/admin/devices", who, body.clone())).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body} answered {status}: {page}");
+        }
+    }
+    let (status, page, _) = send(&w.config, get_as("/admin/apps/yard/connections", &ed)).await;
+    assert!(!page.contains("boiler"), "an editor saw the device tokens ({status})");
+    let tokens = toolsite::platform::devices::list(&w.config, "yard");
+    assert_eq!(tokens.len(), 1, "a token was minted");
+    assert_eq!(toolsite::platform::devices::check(&w.config, "yard", &token).as_deref(), Some("boiler"));
+
+    // A manager of the project may, and a listing never shows the token or
+    // its hash.
+    let sub_bearer = token_for(&w.config, "sub@x.test");
+    let (err, text) = tool(&w.config, "/mcp", &sub_bearer, "app_device_tokens", serde_json::json!({"app":"yard","action":"list"})).await;
+    assert!(!err, "{text}");
+    let stored = std::fs::read_to_string(w.config.data_dir.join("yard.devices")).unwrap();
+    let hash = stored.split("\"hash\": \"").nth(1).and_then(|rest| rest.split('"').next()).unwrap().to_string();
+    assert!(text.contains("boiler") && !text.contains(&token) && !text.contains(&hash), "{text}");
+    let (status, page, _) = send(&w.config, get_as("/admin/apps/yard/connections", &sub)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("boiler") && !page.contains(&token) && !page.contains(&hash));
+}
+
+#[tokio::test]
+async fn the_devices_sidecar_never_leaves_through_a_url_a_pull_or_an_export() {
+    let w = world().await;
+    let (_, token) = toolsite::platform::devices::create(&w.config, "yard", "boiler").unwrap();
+    let mut meta = store::read_meta(&w.config, "yard").await;
+    meta.gate = Some("public".to_string());
+    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    let stored = std::fs::read_to_string(w.config.data_dir.join("yard.devices")).unwrap();
+    let hash = stored.split("\"hash\": \"").nth(1).and_then(|rest| rest.split('"').next()).unwrap().to_string();
+    let leaks = |body: &str| body.contains(&hash) || body.contains(&token) || body.contains("boiler");
+    for path in [
+        "/p/yard.devices",
+        "/p/yard/.devices",
+        "/p/yard/../yard.devices",
+        "/p/yard%2Edevices",
+        "/p/yard/%2e%2e/yard.devices",
+        "/icon/yard.devices",
+        "/export/yard.devices",
+        "/p/.tmp/yard.devices",
+        "/examples/yard.devices",
+        "/examples/..%2Fyard.devices",
+        "/admin/apps/yard.devices/source",
+    ] {
+        let (_, body, _) = send(&w.config, get(path)).await;
+        assert!(!leaks(&body), "{path}");
+    }
+    let (_, text) = tool(&w.config, "/mcp", TOKEN, "pull_app", serde_json::json!({"app":"yard"})).await;
+    assert!(!leaks(&text), "pull_app: {text}");
+    let (_, text) = tool(&w.config, "/mcp", TOKEN, "pull_page", serde_json::json!({"slug":"yard.devices"})).await;
+    assert!(!leaks(&text), "pull_page: {text}");
+    let (_, text) = tool(&w.config, "/mcp", TOKEN, "fetch", serde_json::json!({"id":"yard.devices"})).await;
+    assert!(!leaks(&text), "fetch: {text}");
+}

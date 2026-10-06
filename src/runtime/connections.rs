@@ -63,6 +63,12 @@ pub struct Limits {
     /// Datagrams one IP address may send to a port in a second. The rest
     /// are dropped.
     pub udp_per_second: u32,
+    /// Bytes of datagrams waiting for the handler on one UDP port, across
+    /// its remotes. Past it, datagrams are dropped.
+    pub udp_queued_bytes: usize,
+    /// A TCP peer that takes none of a reply for this long is closed, and
+    /// its place freed, rather than holding its connection open unread.
+    pub tcp_send_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -78,6 +84,8 @@ impl Default for Limits {
             tcp_idle: Duration::from_secs(300),
             udp_idle: Duration::from_secs(60),
             udp_per_second: 100,
+            udp_queued_bytes: 8 * 1024 * 1024,
+            tcp_send_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -114,7 +122,11 @@ struct Connection {
     /// Where a TCP or UDP connection comes from. None for a WebSocket.
     remote: Option<SocketAddr>,
     topics: HashSet<String>,
-    tx: mpsc::Sender<Outgoing>,
+    /// None once the connection is cut off for falling behind. It stays
+    /// registered, and counted, until its transport lets go of the socket:
+    /// freeing its place sooner would let a peer that never reads hold
+    /// sockets past every ceiling.
+    tx: Option<mpsc::Sender<Outgoing>>,
     state: HashMap<String, String>,
 }
 
@@ -329,7 +341,7 @@ impl Hub {
                 user: user.map(str::to_string),
                 remote,
                 topics: HashSet::new(),
-                tx,
+                tx: Some(tx),
                 state: HashMap::new(),
             },
         );
@@ -361,24 +373,18 @@ impl Hub {
             return 0;
         };
         let mut reached = 0;
-        let mut cut = Vec::new();
         for id in ids {
-            if let Some(connection) = entry.connections.get(id) {
-                match connection.tx.try_send(out.clone()) {
+            if let Some(connection) = entry.connections.get_mut(id)
+                && let Some(tx) = &connection.tx
+            {
+                match tx.try_send(out.clone()) {
                     Ok(()) => reached += 1,
-                    Err(_) => cut.push(id.clone()),
+                    Err(_) => {
+                        tracing::warn!(app, "a connection fell behind and was closed");
+                        connection.tx = None;
+                    }
                 }
             }
-        }
-        let mut removed = Vec::new();
-        for id in cut {
-            if let Some(connection) = entry.connections.remove(&id) {
-                tracing::warn!(app, "a connection fell behind and was closed");
-                removed.push(connection);
-            }
-        }
-        for connection in removed {
-            inner.release(connection);
         }
         reached
     }
@@ -632,16 +638,21 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_that_falls_behind_is_cut_off_rather_than_buffered() {
-        let hub = Arc::new(Hub::new(Limits { rate_per_app: 10_000, ..Limits::default() }));
+    fn a_connection_that_falls_behind_is_cut_off_but_counted_until_its_socket_is_let_go() {
+        let hub = Arc::new(Hub::new(Limits { rate_per_app: 10_000, per_person: 1, ..Limits::default() }));
         let (slow, _rx) = hub.register("shop", Some("u1")).unwrap();
         hub.subscribe("shop", &slow.id, "a").unwrap();
         for n in 0..QUEUE {
             hub.publish("shop", "a", text(&n.to_string())).unwrap();
         }
         assert_eq!(hub.publish("shop", "a", text("one too many")).unwrap(), 0);
-        assert_eq!(hub.open("shop"), 0, "the slow connection stayed registered");
+        assert!(hub.send("shop", &slow.id, text("x")).is_err(), "a cut connection still takes messages");
+        // Still holding its socket until the transport lets go, so it still
+        // counts against the ceilings.
+        assert_eq!(hub.open("shop"), 1);
+        assert!(hub.register("shop", Some("u1")).is_err(), "the cut connection's place was given away early");
         drop(slow);
+        assert_eq!(hub.open("shop"), 0);
     }
 
     #[test]
