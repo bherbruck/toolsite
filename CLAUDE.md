@@ -61,6 +61,7 @@ content/           what gets published, and how it is served
   store.rs         page/icon/meta paths, titles, visibility, listing
   bundle.rs        tar unpacking, entry classification, traversal defence
   serve.rs         the public site: pages, assets, handler dispatch
+  favicon.rs       an app's favicon drawn from its icon, and the links added to its HTML
   browse.rs        the app browser at / and /browse/<path>: projects and apps, and running projects
 
 runtime/           executing an app's own code and data

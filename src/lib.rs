@@ -117,6 +117,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
 
     let mut public_router = Router::new()
         .route("/", get(index))
+        .route("/favicon.svg", get(crate::content::serve::site_favicon_svg))
+        .route("/favicon.ico", get(crate::content::serve::site_favicon_ico))
         .route("/browse/{*path}", get(browse))
         .route("/p/{*slug}", any(serve_page))
         .route("/icon/{*slug}", get(serve_icon))

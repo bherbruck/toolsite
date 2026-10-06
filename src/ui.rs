@@ -875,6 +875,7 @@ pub fn page(title: &str, body: Markup, script: Option<&str>) -> Markup {
         html lang="en" {
             head {
                 meta charset="utf-8";
+                link rel="icon" href="/favicon.svg" type="image/svg+xml";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -899,6 +900,7 @@ pub fn shell(title: &str, sidebar: Markup, body: Markup, script: Option<&str>) -
         html lang="en" {
             head {
                 meta charset="utf-8";
+                link rel="icon" href="/favicon.svg" type="image/svg+xml";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
@@ -937,6 +939,7 @@ pub fn form_page(title: &str, body: Markup) -> Markup {
         html lang="en" {
             head {
                 meta charset="utf-8";
+                link rel="icon" href="/favicon.svg" type="image/svg+xml";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 style { (PreEscaped(STYLE)) }

@@ -228,6 +228,14 @@ is for junk: a probe published as a page, an app nobody wants. Pass
 `page_only` to clear a single page that is shadowing an app of the same name,
 which is what an accidental upload leaves behind.
 
+Every app gets a favicon from its icon unless it ships one. Toolsite serves
+`/p/<app>/favicon.svg`, `favicon.ico` and `apple-touch-icon.png` when the
+bundle has no file of that name, and adds the three `<link>` tags to an
+app's HTML when its `<head>` names no icon of its own. A page that declares
+an icon is never changed. An uploaded image is resized, an emoji stays an
+emoji in the SVG, and an app with no icon gets the same badge of its name as
+the index shows. The favicon has the same access as the app.
+
 ### Looking at what you built
 
 `screenshot` loads a page in a real browser and returns the image, at most
@@ -1070,8 +1078,10 @@ to the browser with one line saying what happened.
 - **Title**: from the page's own `<title>` (first 8 KB scanned). Pages
   without one are listed by slug.
 - **Icon**: in priority order, an uploaded image (`?icon`), an emoji, inline
-  SVG or `data:` URI from `set_icon`, or a generated badge of the slug's
-  initials on a hash-derived colour, stable forever. Projects have a muted
+  SVG or `data:` URI from `set_icon`, or a generated badge on a
+  hash-derived colour, stable forever: the first letters of the title's
+  first two words, or of the slug when there is no title. The app's favicon
+  uses the same badge. Projects have a muted
   folder in the same place.
 
 ## Endpoints
