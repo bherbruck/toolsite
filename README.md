@@ -645,14 +645,21 @@ The rules:
   app, declared wholesale like routes and tools. `/mcp` cannot be one.
 - The upgrade passes the app's gate for that path, route rules and project
   locks included, so a route rule opens or closes a socket.
+- A browser's upgrade must come from a page on this site. An `Origin` from
+  any other site gets 403, so a page elsewhere cannot open a socket with the
+  visitor's cookies. A client that sends no `Origin` is not a browser.
 - Every 30 seconds each connection is pinged and its person's access is
-  decided again. A disabled account, a hidden or removed app, a withdrawn
-  socket or a gate that no longer admits them closes it.
+  decided again. A disabled account, a withdrawn socket or a gate that no
+  longer admits them closes it then. Hiding or removing the app closes its
+  sockets at once.
 - A topic is lower-case letters, digits, `-` and `_`, or `user:<id>`. A
   connection may join `user:<id>` only when it is that person's; the app
   may publish to any.
-- Limits: open connections per app and per person, and messages per app
-  per second (see Environment variables). A connection that falls more
+- The handler never sees toolsite's own cookies (`ts_session`, `ts_app_*`)
+  in the upgrade's headers or in a request's, and a `Set-Cookie` from a
+  handler that names one is dropped. The app sees and sets only its own.
+- Limits: open connections per app, per person and in total, and messages
+  per app per second (see Environment variables). A connection that falls more
   than 64 messages behind is closed, and so is one whose browser sends
   faster than the handler answers.
 - Nothing is stored or replayed. A page that reconnects asks the app's API
@@ -1274,6 +1281,7 @@ is required to serve HTTP.
 | `TOOLSITE_BLOB_S3_ENDPOINT` | no | With `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` and `_REGION` (default `auto`): store apps' files in this S3-compatible bucket instead of on the volume. Railway's unprefixed `ENDPOINT`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `REGION` are accepted too. `TOOLSITE_BLOB_S3_PATH_STYLE=1` for path-style buckets. |
 | `TOOLSITE_SOCKETS_PER_APP` | no (default `500`) | Open live connections one app may have at once. See Live connections. |
 | `TOOLSITE_SOCKETS_PER_PERSON` | no (default `20`) | Open live connections one account may hold at once, across apps. |
+| `TOOLSITE_SOCKETS_TOTAL` | no (default `5000`) | Open live connections across every app at once. Stops a flood of anonymous visitors spread over many public apps. |
 | `TOOLSITE_SOCKET_MESSAGES_PER_SECOND` | no (default `100`) | Messages one app may send or publish to its connections each second. The rest are refused, with one warning a second in the log. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |

@@ -217,6 +217,8 @@ pub(crate) async fn store_for_publisher(
 /// there, would otherwise open it to whoever holds them. They go to the log,
 /// not to the bin: an app that never existed has no trash entry to keep them in.
 pub(crate) async fn forget_stale_access(config: &Config, app: &str, project: Option<&str>) {
+    // Nor does it inherit a socket a former app at this name left open.
+    config.connections.close_app(app);
     let folder = project.filter(|p| !p.is_empty()).unwrap_or("");
     let path = if folder.is_empty() { app.to_string() } else { format!("{folder}/{app}") };
     let (cfg, app_owned, path_owned) = (config.clone_for_task(), app.to_string(), path.clone());

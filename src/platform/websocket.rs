@@ -57,6 +57,39 @@ pub fn is_upgrade<B>(request: &axum::http::Request<B>) -> bool {
     wants_websocket && request.uri().path().starts_with("/p/")
 }
 
+/// The `scheme://host[:port]` of a URL, lower-cased, with a default port
+/// left out, so two spellings of one origin compare equal.
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next()?.to_ascii_lowercase();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let authority = match (scheme.as_str(), authority.rsplit_once(':')) {
+        ("http", Some((host, "80"))) | ("https", Some((host, "443"))) => host.to_string(),
+        _ => authority,
+    };
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// Whether an upgrade's `Origin` is this site: the configured base URL's
+/// origin, or, with none configured, the host the request was sent to.
+fn same_origin(config: &crate::Config, origin: &str, headers: &axum::http::HeaderMap) -> bool {
+    let Some(origin) = origin_of(origin) else {
+        return false;
+    };
+    if let Some(base) = config.base_url.as_deref() {
+        return origin_of(base).is_some_and(|base| base == origin);
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    ["http", "https"]
+        .iter()
+        .any(|scheme| origin_of(&format!("{scheme}://{host}")).is_some_and(|ours| ours == origin))
+}
+
 /// Splits `/p/<app>/<rest>` into the app and the path within it.
 fn app_and_within(path: &str) -> Option<(String, String)> {
     let slug = path.strip_prefix("/p/")?.trim_end_matches('/');
@@ -78,6 +111,23 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
     if !crate::content::store::read_meta(&config, &app).await.sockets.contains(&within) {
         tracing::warn!(app = %app, path = %within, "404: websocket upgrade at a path the app does not declare as a socket");
         return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    // A browser always says which page opened the socket. A page on another
+    // site must not open one with this visitor's cookies (cross-site
+    // WebSocket hijacking), so a browser's upgrade from any other origin is
+    // refused. A client with no Origin is not a browser and carries no
+    // cookie it did not choose to send.
+    if let Some(origin) = request.headers().get(header::ORIGIN)
+        && !same_origin(&config, origin.to_str().unwrap_or(""), request.headers())
+    {
+        tracing::warn!(
+            app = %app,
+            origin = ?origin,
+            host = ?request.headers().get(header::HOST),
+            "403: websocket upgrade from a page on another origin"
+        );
+        return (StatusCode::FORBIDDEN, "a page on another site may not open this socket").into_response();
     }
 
     let visitor = users::current_app_user(&config, &app, request.headers()).await;
@@ -106,11 +156,19 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
         query: parts.uri.query().unwrap_or_default().to_string(),
         // x-toolsite-* is the host speaking; a browser's copy is dropped,
         // as it is for requests.
+        // The cookie header keeps only the app's own cookies, never the
+        // visitor's toolsite sessions.
         headers: parts
             .headers
             .iter()
             .filter(|(name, _)| !name.as_str().starts_with("x-toolsite-"))
-            .filter_map(|(name, value)| value.to_str().ok().map(|v| (name.as_str().to_string(), v.to_string())))
+            .filter_map(|(name, value)| {
+                let value = value.to_str().ok()?;
+                if name == header::COOKIE {
+                    return users::without_platform_cookies(value).map(|kept| (name.as_str().to_string(), kept));
+                }
+                Some((name.as_str().to_string(), value.to_string()))
+            })
             .collect(),
     };
 
@@ -185,6 +243,15 @@ mod tests {
         assert!(!valid_socket_path("/.hidden"));
         assert!(!valid_socket_path("/a//b"));
         assert!(!valid_socket_path("/a b"));
+    }
+
+    #[test]
+    fn an_origin_compares_by_scheme_host_and_port_only() {
+        assert_eq!(origin_of("https://Site.example/p/x").as_deref(), Some("https://site.example"));
+        assert_eq!(origin_of("https://site.example:443").as_deref(), Some("https://site.example"));
+        assert_eq!(origin_of("http://site.example:8080").as_deref(), Some("http://site.example:8080"));
+        assert_eq!(origin_of("null"), None);
+        assert_eq!(origin_of("https://user@site.example"), None);
     }
 
     #[test]

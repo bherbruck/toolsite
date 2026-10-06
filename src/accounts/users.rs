@@ -40,6 +40,35 @@ pub const SESSION_COOKIE: &str = "ts_session";
 
 /// One cookie per app. The name keeps a browser's jar readable; the `Path` is
 /// what actually does the work — see `app_cookie_path`.
+/// Whether a cookie name is one toolsite itself sets: the site session, an
+/// app session, the admin flash. Every one starts `ts_`, and an app may
+/// neither read them nor set them.
+pub fn is_platform_cookie(name: &str) -> bool {
+    name.trim().starts_with("ts_")
+}
+
+/// A `Cookie` header with toolsite's own cookies taken out, or `None` when
+/// nothing is left. A handler is the app author's code: it must never see
+/// the visitor's site session (which would let it act as them anywhere on
+/// the site) or another app's session, only cookies the app set itself.
+pub fn without_platform_cookies(header: &str) -> Option<String> {
+    let kept: Vec<&str> = header
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| !is_platform_cookie(pair.split('=').next().unwrap_or("")))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("; "))
+}
+
+/// Whether a `Set-Cookie` value from a handler names a cookie toolsite owns.
+/// Such a header is dropped: an app setting `ts_session` could sign a
+/// visitor in as someone else (session fixation) or overwrite another app's
+/// session.
+pub fn sets_platform_cookie(set_cookie: &str) -> bool {
+    is_platform_cookie(set_cookie.split(['=', ';']).next().unwrap_or(""))
+}
+
 pub fn app_cookie_name(app: &str) -> String {
     format!("ts_app_{app}")
 }

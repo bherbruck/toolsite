@@ -399,3 +399,100 @@ async fn toolsite_toml_declares_sockets_wholesale_within_limits() {
     // A refused manifest changed nothing.
     assert_eq!(store::read_meta_blocking(&site.config, "decl").sockets, vec!["/live/ws"]);
 }
+
+/// Connects with an `Origin` header, as a browser always sends one.
+async fn connect_from(site: &Site, path: &str, origin: &str, cookie: Option<&str>) -> Result<Socket, u16> {
+    let mut request = format!("ws://{}{}", site.addr, path).into_client_request().unwrap();
+    request.headers_mut().insert("origin", origin.parse().unwrap());
+    if let Some(cookie) = cookie {
+        request.headers_mut().insert("cookie", cookie.parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, _)) => Ok(socket),
+        Err(tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("connect failed: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn a_page_on_another_site_cannot_open_a_socket_with_the_visitors_cookies() {
+    let site = site(connections::Limits::default()).await;
+    app(&site.config, "team");
+    edit_meta(&site.config, "team", |meta| meta.gate = Some("authenticated".into()));
+    let (_, cookie) = app_cookie(&site.config, "me@example.com", "team");
+    for origin in ["http://evil.example", "null", "https://evil.example", &format!("http://{}.evil.example", site.addr.ip())] {
+        assert_eq!(
+            connect_from(&site, "/p/team/ws", origin, Some(&cookie)).await.err(),
+            Some(403),
+            "an upgrade from {origin} was taken"
+        );
+    }
+    // The site's own pages may, whichever spelling of the origin they send.
+    let ours = format!("http://{}", site.addr);
+    let mut socket = connect_from(&site, "/p/team/ws", &ours, Some(&cookie)).await.expect("own origin refused");
+    assert!(next_text(&mut socket).await.unwrap().starts_with("id:"));
+}
+
+#[tokio::test]
+async fn app_code_never_sees_the_visitors_toolsite_sessions_on_a_socket_or_a_request() {
+    let site = site(connections::Limits::default()).await;
+    app(&site.config, "chat");
+    let (_, app_cookie) = app_cookie(&site.config, "me@example.com", "chat");
+    let jar = format!("ts_session=site-secret; {app_cookie}; ts_app_bank=other-secret; theme=dark");
+
+    let (mut socket, _) = open(&site, "/p/chat/ws", Some(&jar)).await;
+    say(&mut socket, "log").await;
+    assert!(next_text(&mut socket).await.unwrap().contains("me@example.com"), "the person was not recognised");
+    say(&mut socket, "cookie").await;
+    assert_eq!(next_text(&mut socket).await.as_deref(), Some("theme=dark"));
+
+    let get = |cookie: String| {
+        let url = format!("http://{}/p/chat/api/cookies", site.addr);
+        async move { reqwest::Client::new().get(url).header("cookie", cookie).send().await.unwrap().text().await.unwrap() }
+    };
+    assert_eq!(get(jar.clone()).await, "theme=dark");
+    assert_eq!(get("ts_session=site-secret".into()).await, "", "a jar of only toolsite cookies reached the handler");
+}
+
+#[tokio::test]
+async fn an_app_cannot_set_one_of_toolsites_own_cookies() {
+    let site = site(connections::Limits::default()).await;
+    app(&site.config, "fixer");
+    let set_cookie = |value: &str| {
+        let url = format!("http://{}/p/fixer/api/set-cookie?{}", site.addr, value);
+        async move {
+            let response = reqwest::get(url).await.unwrap();
+            response.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect::<Vec<_>>()
+        }
+    };
+    for forged in ["ts_session%3Dforged%3B%20Path%3D%2F", "ts_app_bank%3Dforged%3B%20Path%3D%2Fp%2Fbank", "%20ts_session%3Dx"] {
+        assert!(set_cookie(forged).await.is_empty(), "{forged} reached the browser");
+    }
+    assert_eq!(set_cookie("theme%3Ddark").await, vec!["theme=dark".to_string()]);
+}
+
+#[tokio::test]
+async fn hiding_or_removing_an_app_closes_its_sockets_at_once_not_at_the_next_check() {
+    // The default check is every 30 seconds; `closes` waits 3.
+    let site = site(connections::Limits::default()).await;
+    app(&site.config, "leak");
+    let (mut socket, _) = open(&site, "/p/leak/ws", None).await;
+    edit_meta(&site.config, "leak", |meta| meta.hidden = true);
+    assert!(closes(&mut socket).await, "the hidden app's socket stayed open");
+
+    app(&site.config, "gone");
+    let (mut socket, _) = open(&site, "/p/gone/ws", None).await;
+    toolsite::platform::trash::remove(&site.config, "gone", 1).unwrap();
+    assert!(closes(&mut socket).await, "the removed app's socket stayed open");
+    assert_eq!(connect(&site, "/p/gone/ws", None).await.err(), Some(404));
+}
+
+#[tokio::test]
+async fn the_server_wide_ceiling_holds_across_apps() {
+    let site = site(connections::Limits { total: 2, ..connections::Limits::default() }).await;
+    app(&site.config, "one");
+    app(&site.config, "two");
+    let _a = open(&site, "/p/one/ws", None).await;
+    let _b = open(&site, "/p/two/ws", None).await;
+    assert_eq!(connect(&site, "/p/one/ws", None).await.err(), Some(429));
+}

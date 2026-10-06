@@ -122,6 +122,26 @@ impl Guest for Handler {
                 }
             }
 
+            // The cookie header as the handler got it, to prove toolsite's
+            // own session cookies never reach app code.
+            "/cookies" => respond(
+                200,
+                req.headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ),
+
+            // Answers with `Set-Cookie: <query>`, to prove an app cannot set
+            // one of toolsite's own cookies.
+            "/set-cookie" => Response {
+                status: 200,
+                headers: vec![("set-cookie".to_string(), decode(&req.query))],
+                body: b"set".to_vec(),
+            },
+
             "/myrole" => match identity::current_role() {
                 Some(role) => respond(200, role),
                 None => respond(200, "none".to_string()),
@@ -356,7 +376,7 @@ impl Guest for Handler {
     /// Connections, for the tests. Each event is appended to the
     /// connection's kept state under "log", so order and state can both be
     /// seen from outside. Text frames are small commands:
-    /// `echo:<x>`, `log`, `close`, `sub:<topic>`, `unsub:<topic>`,
+    /// `echo:<x>`, `log`, `cookie`, `close`, `sub:<topic>`, `unsub:<topic>`,
     /// `publish:<topic>:<data>`. A binary frame is echoed back.
     fn on_connection(conn: String, event: Event) -> Result<(), String> {
         let who = identity::current_user().map(|u| u.email).unwrap_or_else(|| "anonymous".to_string());
@@ -374,6 +394,14 @@ impl Guest for Handler {
                     return Err("this app refused the connection".to_string());
                 }
                 note(&format!("connect {who} {}", info.socket))?;
+                let cookie = info
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                connections::state_set(&conn, "cookie", Some(&cookie))?;
                 for pair in info.query.split('&') {
                     if let Some(("topic", topic)) = pair.split_once('=') {
                         connections::subscribe(&conn, &decode(topic))?;
@@ -393,6 +421,8 @@ impl Guest for Handler {
                     reply(rest.to_string())
                 } else if text == "log" {
                     reply(connections::state_get(&conn, "log").unwrap_or_default())
+                } else if text == "cookie" {
+                    reply(connections::state_get(&conn, "cookie").unwrap_or_default())
                 } else if text == "close" {
                     connections::close(&conn)
                 } else if let Some(topic) = text.strip_prefix("sub:") {

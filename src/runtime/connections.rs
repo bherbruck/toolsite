@@ -39,6 +39,10 @@ pub struct Limits {
     pub per_app: usize,
     /// Open connections one account holds at once, across apps.
     pub per_person: usize,
+    /// Open connections across every app at once. Anonymous visitors of a
+    /// public app have no account to count against, so this is what stops
+    /// a flood spread over many public apps from exhausting the server.
+    pub total: usize,
     /// Messages one app may send or publish in a second; the rest are
     /// refused.
     pub rate_per_app: u32,
@@ -52,6 +56,7 @@ impl Default for Limits {
         Self {
             per_app: 500,
             per_person: 20,
+            total: 5000,
             rate_per_app: 100,
             check_every: Duration::from_secs(30),
         }
@@ -139,9 +144,17 @@ impl AppEntry {
 struct Inner {
     apps: HashMap<String, AppEntry>,
     per_person: HashMap<String, usize>,
+    total: usize,
 }
 
 impl Inner {
+    /// Frees what one removed connection held: its place in the total and
+    /// in its person's count.
+    fn release(&mut self, user: Option<String>) {
+        self.total = self.total.saturating_sub(1);
+        self.release_person(user);
+    }
+
     fn release_person(&mut self, user: Option<String>) {
         if let Some(user) = user
             && let Some(count) = self.per_person.get_mut(&user)
@@ -233,6 +246,9 @@ impl Hub {
         user: Option<&str>,
     ) -> Result<(Registration, mpsc::Receiver<Outgoing>), String> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.total >= self.limits.total {
+            return Err(format!("the server has its maximum of {} open connections", self.limits.total));
+        }
         let open_here = inner.apps.get(app).map_or(0, |entry| entry.connections.len());
         if open_here >= self.limits.per_app {
             return Err(format!("this app has its maximum of {} open connections", self.limits.per_app));
@@ -244,6 +260,7 @@ impl Hub {
             }
             *inner.per_person.entry(user.to_string()).or_default() += 1;
         }
+        inner.total += 1;
         let id = crate::content::slug::random_token(24);
         let (tx, rx) = mpsc::channel(QUEUE);
         inner.apps.entry(app.to_string()).or_insert_with(AppEntry::new).connections.insert(
@@ -269,7 +286,7 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         let removed = inner.apps.get_mut(app).and_then(|entry| entry.connections.remove(id));
         if let Some(connection) = removed {
-            inner.release_person(connection.user);
+            inner.release(connection.user);
         }
         if inner.apps.get(app).is_some_and(|entry| entry.connections.is_empty()) {
             inner.apps.remove(app);
@@ -300,7 +317,7 @@ impl Hub {
             }
         }
         for user in users {
-            inner.release_person(user);
+            inner.release(user);
         }
         reached
     }
@@ -418,6 +435,18 @@ impl Hub {
         Ok(())
     }
 
+    /// Ends every connection `app` holds: the app was hidden, removed, or
+    /// replaced by a new app at its name. Each still gets its `close` event
+    /// from whatever handler is there; a gone app's handler is not run.
+    pub fn close_app(&self, app: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let ids: Vec<String> = inner.apps.get(app).map(|entry| entry.connections.keys().cloned().collect()).unwrap_or_default();
+        if !ids.is_empty() {
+            tracing::info!(app, open = ids.len(), "closing the app's connections");
+            Self::deliver(&mut inner, app, &ids, &Outgoing::Close);
+        }
+    }
+
     /// Open connections on one app.
     pub fn open(&self, app: &str) -> usize {
         self.inner.lock().unwrap().apps.get(app).map_or(0, |entry| entry.connections.len())
@@ -482,6 +511,28 @@ mod tests {
         assert!(hub.register("shop", Some("u3")).is_err(), "per app");
         drop(first);
         assert!(hub.register("shop", Some("u1")).is_ok());
+    }
+
+    #[test]
+    fn the_server_wide_ceiling_holds_for_anonymous_visitors_across_apps() {
+        let hub = Arc::new(Hub::new(Limits { total: 2, ..Limits::default() }));
+        let first = hub.register("one", None).unwrap();
+        let _second = hub.register("two", None).unwrap();
+        assert!(hub.register("three", None).err().unwrap().contains("server"));
+        drop(first);
+        assert!(hub.register("three", None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn closing_an_app_ends_every_connection_it_holds_and_no_other_apps() {
+        let hub = Arc::new(Hub::default());
+        let (_a, mut a_rx) = hub.register("shop", None).unwrap();
+        let (_b, mut b_rx) = hub.register("shop", None).unwrap();
+        let (_c, mut c_rx) = hub.register("ledger", None).unwrap();
+        hub.close_app("shop");
+        assert_eq!(a_rx.try_recv().unwrap(), Outgoing::Close);
+        assert_eq!(b_rx.try_recv().unwrap(), Outgoing::Close);
+        assert!(c_rx.try_recv().is_err());
     }
 
     #[test]

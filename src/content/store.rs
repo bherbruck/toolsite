@@ -255,7 +255,17 @@ pub async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io
         fs::create_dir_all(parent).await?;
     }
     let json = serde_json::to_string(meta).map_err(std::io::Error::other)?;
-    fs::write(&path, json).await
+    fs::write(&path, json).await?;
+    close_if_hidden(config, slug, meta);
+    Ok(())
+}
+
+/// A hidden app keeps no live connection open: retraction takes effect on
+/// the sockets now, not at their next check.
+fn close_if_hidden(config: &Config, slug: &str, meta: &PageMeta) {
+    if meta.hidden {
+        config.connections.close_app(slug.split('/').next().unwrap_or(slug));
+    }
 }
 
 /// `write_meta` for a blocking task, which is where migrations run. Writes
@@ -268,7 +278,9 @@ pub fn write_meta_blocking(config: &Config, slug: &str, meta: &PageMeta) -> Resu
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string(meta).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    close_if_hidden(config, slug, meta);
+    Ok(())
 }
 
 /// Coarse "when did this change" for the index; exact timestamps aren't worth

@@ -439,10 +439,14 @@ async fn run_handler(
             if name.as_str().starts_with("x-toolsite-") {
                 return None;
             }
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
+            let value = value.to_str().ok()?;
+            // The handler is the app author's code. It gets the cookies the
+            // app set, never the visitor's site session or app session.
+            if name == header::COOKIE {
+                return crate::accounts::users::without_platform_cookies(value)
+                    .map(|kept| (name.as_str().to_string(), kept));
+            }
+            Some((name.as_str().to_string(), value.to_string()))
         })
         .collect();
 
@@ -520,6 +524,9 @@ async fn run_handler(
                 if injected.is_some() && name.eq_ignore_ascii_case("content-length") {
                     continue;
                 }
+                if refused_response_header(app, name, value) {
+                    continue;
+                }
                 builder = builder.header(name, value);
             }
             builder
@@ -541,6 +548,16 @@ async fn run_handler(
 
 /// The response header a handler sets to have a stored file sent as the body.
 const BLOB_HEADER: &str = "x-toolsite-blob";
+
+/// A header a handler may not send to a visitor: a `Set-Cookie` naming one
+/// of toolsite's own cookies.
+fn refused_response_header(app: &str, name: &str, value: &str) -> bool {
+    let refused = name.eq_ignore_ascii_case("set-cookie") && crate::accounts::users::sets_platform_cookie(value);
+    if refused {
+        tracing::warn!(app, "a handler tried to set one of toolsite's own cookies; the header was dropped");
+    }
+    refused
+}
 
 async fn serve_blob(
     config: &Config,
@@ -566,6 +583,9 @@ async fn serve_blob(
         // The length is the file's, and the pointer itself is not for the
         // visitor. Everything else the handler said stands.
         if name.eq_ignore_ascii_case(BLOB_HEADER) || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if refused_response_header(app, name, value) {
             continue;
         }
         if name.eq_ignore_ascii_case("content-type") {

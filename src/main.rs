@@ -299,12 +299,14 @@ async fn main() -> anyhow::Result<()> {
     let socket_limits = toolsite::runtime::connections::Limits {
         per_app: count("TOOLSITE_SOCKETS_PER_APP", socket_defaults.per_app as u64) as usize,
         per_person: count("TOOLSITE_SOCKETS_PER_PERSON", socket_defaults.per_person as u64) as usize,
+        total: count("TOOLSITE_SOCKETS_TOTAL", socket_defaults.total as u64) as usize,
         rate_per_app: count("TOOLSITE_SOCKET_MESSAGES_PER_SECOND", socket_defaults.rate_per_app as u64) as u32,
         check_every: socket_defaults.check_every,
     };
     tracing::info!(
         per_app = socket_limits.per_app,
         per_person = socket_limits.per_person,
+        total = socket_limits.total,
         rate_per_app = socket_limits.rate_per_app,
         "live connections configuration"
     );

@@ -66,6 +66,7 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
     // path starts with nobody on it. A copy stays with the files, so putting
     // the app back can put its people back too.
     if !slug.contains('/') {
+        config.connections.close_app(slug);
         let project = std::fs::read_to_string(destination.join("slug.meta"))
             .or_else(|_| std::fs::read_to_string(destination.join("app/index.meta")))
             .ok()
