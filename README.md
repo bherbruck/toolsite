@@ -833,26 +833,31 @@ else refuses and names the folder and the scope it would take. A static
 `TOOLSITE_MCP_TOKEN` keeps every power, as the CLI relies on it. An account
 with only viewer scopes is turned away at the consent page.
 
-#### The permissions grid
+#### Permissions
 
-Access is set in one grid, the same on a project's Permissions tab in the app
-browser and on an app's Access tab. One row per person, three columns: **View**
-(viewer), **Edit** (editor), **Manage** (admin). The levels add up, so ticking
-Edit fills View too.
+Access is set in one table of rules, the same on a project's Permissions tab in
+the app browser and on an app's Access tab, the way Tableau's permissions dialog
+works. A rule is one person and a level: **View** (viewer), **Edit** (editor) or
+**Manage** (admin). The levels add up, so Edit includes View.
 
-| Cell | Means |
-|---|---|
-| Filled | held here. Click it to lower the level by one; clicking the last one removes this person's access here, after a confirm. |
-| Hatched | held from a project above. The tooltip and the From column name it; change it there. |
-| Outlined | not held. Click it to give that level here. |
+The table lists only the people who hold a rule here or above, never the whole
+directory, so a site with hundreds of accounts stays readable. Past 50 rules it
+gets a filter and pages.
 
-**Add people** opens a list of accounts with a search box. Tick several, pick a
-level, and add them in one go. Nobody types an email from memory. On an app
-whose `toolsite.toml` declares `roles`, a **Role in app** column picks the role
-the app reads; it is still only a hint.
+- **Add a person** is the first row: type a name or email, choose from at most
+  ten matches, pick a level, press Add. The row appears in place and the search
+  keeps the focus, so several people go in one after another. People who
+  already hold a rule here are not offered again.
+- **A rule row** has a level select and the View, Edit and Manage cells shaded
+  to match. Change the select, or click a cell, to set that level.
+- **Grey rows** are rules held from a project above. They name the project and
+  link to it; change them there.
+- **Click a name** to see what that person may do here and why, from the same
+  function every request is checked with.
+- **Remove** is the cross at the end of a row. It asks "Remove?" in the row.
 
-**Check a person** under the grid answers "Edit here, from ops" or "No access"
-with the reason, from the same function every request is checked with.
+On an app whose `toolsite.toml` declares `roles`, a **Role in app** column picks
+the role the app reads; it is still only a hint.
 
 Each project is **Customizable** (the default) or **Locked**. Customizable: apps
 and projects inside follow its permissions and can add their own. Locked: only

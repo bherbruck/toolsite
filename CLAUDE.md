@@ -39,7 +39,7 @@ ui.rs              the theme for pages toolsite serves itself
 
 platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
-  permissions.rs   the permissions grid: View/Edit/Manage cells, Add people, Locked/Customizable
+  permissions.rs   the permissions rules: an add row, View/Edit/Manage per person, Locked/Customizable
   mcp.rs           MCP tool definitions and the ServerHandler
   mcp_me.rs        /me/mcp: a regular account's two tools over the data apps share
   bearer.rs        bearer/x-api-key middleware for /mcp

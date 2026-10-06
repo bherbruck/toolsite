@@ -395,22 +395,39 @@ button.cell:hover { opacity: 1; }
   background: repeating-linear-gradient(45deg, var(--soft) 0 3px, var(--border) 3px 6px);
 }
 .cell:disabled { opacity: .35; cursor: not-allowed; }
-.perm-actions { margin-top: 1rem; }
-.check-answer { margin: .75rem 0 0; }
+.cell.empty { cursor: default; border-style: dashed; opacity: .5; }
+/* The rules table: an add row on top, then one row per rule. */
+.perm-rules tr.add-rule td { background: var(--soft); }
+.perm-rules tr.add-rule:hover td { background: var(--soft); }
+.add-rule-form { margin: 0; gap: .5rem; }
+.add-rule-form .combo { flex: 1 1 16rem; min-width: 12rem; }
+.add-rule-form .combo input { width: 100%; }
+.add-rule-label { font-weight: 500; font-size: .85rem; white-space: nowrap; }
+.perm-rules tr.above td { color: var(--muted); }
+.perm-rules tr.above .cell.inherited { opacity: .8; }
+.perm-rules td.level select { padding: .25rem .5rem; font-size: .85rem; }
+.perm-rules .remove-col { width: 2.5rem; text-align: right; white-space: nowrap; }
+details.rule-who > summary { cursor: pointer; list-style: none; }
+details.rule-who > summary::-webkit-details-marker { display: none; }
+details.rule-who > summary:hover { text-decoration: underline; }
+.rule-why { margin: .25rem 0 0; font-weight: 400; }
+details.remove-rule > summary {
+  list-style: none; cursor: pointer; color: var(--muted); padding: .1rem .4rem; border-radius: .3rem;
+}
+details.remove-rule > summary::-webkit-details-marker { display: none; }
+details.remove-rule > summary:hover { color: var(--danger); background: var(--danger-soft); }
+details.remove-rule[open] > summary { display: none; }
+.remove-ask { display: inline-flex; gap: .35rem; align-items: center; font-size: .85rem; }
+.rules-filter { margin: 0 0 .75rem; }
+.rules-filter input[type=search] { margin: 0; max-width: 20rem; }
+.pager { margin-top: .75rem; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 h4.group { font-size: .85rem; margin: 1rem 0 .25rem; color: var(--muted); }
 details.advanced > summary { cursor: pointer; list-style: none; }
 details.advanced > summary::-webkit-details-marker { display: none; }
 details.advanced > summary h3::before { content: "\25B8"; margin-right: .4rem; }
 details.advanced[open] > summary h3::before { content: "\25BE"; }
 dialog.wide { max-width: 34rem; width: calc(100% - 2rem); }
-.people-list {
-  list-style: none; margin: .5rem 0; padding: 0; max-height: 18rem; overflow: auto;
-  border: 1px solid var(--border); border-radius: var(--radius);
-}
-.people-list li { padding: .35rem .7rem; border-bottom: 1px solid var(--border); }
-.people-list li:last-child { border-bottom: 0; }
-.people-list label { display: flex; gap: .5rem; align-items: center; cursor: pointer; }
-.people-search input[type=search] { margin-bottom: 0; }
 .toast {
   position: fixed; right: 1rem; bottom: 1rem; z-index: 50; max-width: 24rem;
   padding: .6rem .9rem; border-radius: var(--radius); border: 1px solid var(--border);
@@ -588,8 +605,6 @@ pub const SHELL_SCRIPT: &str = r#"
         target.querySelectorAll('[data-show="' + name + '"]').forEach((e) => { e.textContent = button.dataset[k]; });
       });
       target.showModal();
-      // A list that loads on open asks for its first page now.
-      target.querySelectorAll('[data-people-search]').forEach((input) => input.dispatchEvent(new Event('input')));
     }
   });
   document.addEventListener('click', (event) => {
@@ -610,11 +625,27 @@ pub const SHELL_SCRIPT: &str = r#"
     document.body.appendChild(note);
     setTimeout(() => note.remove(), 3500);
   };
-  // A cell of the permissions grid saves in place. Removing asks first,
-  // through the same dialog every confirm uses.
+  // The permissions rules save in place: a cell, a level select, a removal
+  // and the add row all post with fetch, then the table is redrawn from the
+  // server. After an add the search is cleared and keeps the focus, so the
+  // next person can be added at once.
   const grid = document.getElementById('perm-grid');
   if (grid) {
-    const save = async (form) => {
+    const redraw = async (refocus) => {
+      const page = await fetch(location.href, { credentials: 'same-origin' });
+      const doc = new DOMParser().parseFromString(await page.text(), 'text/html');
+      const fresh = doc.getElementById('perm-people');
+      const here = document.getElementById('perm-people');
+      if (fresh && here) {
+        here.replaceWith(fresh);
+        fresh.querySelectorAll('.combo').forEach(initCombo);
+        if (refocus) {
+          const input = fresh.querySelector('form[data-perm-add] input[name="email"]');
+          if (input) input.focus();
+        }
+      }
+    };
+    const save = async (form, refocus) => {
       try {
         const res = await fetch(form.action, {
           method: 'POST', credentials: 'same-origin',
@@ -623,73 +654,27 @@ pub const SHELL_SCRIPT: &str = r#"
         });
         const reply = await res.json().catch(() => ({ ok: false, message: 'The change was not saved.' }));
         toast(reply.message, reply.ok);
-        const page = await fetch(location.href, { credentials: 'same-origin' });
-        const doc = new DOMParser().parseFromString(await page.text(), 'text/html');
-        const fresh = doc.getElementById('perm-people');
-        const here = document.getElementById('perm-people');
-        if (fresh && here) here.replaceWith(fresh);
+        await redraw(refocus);
       } catch { toast('The change was not saved.', false); }
     };
     document.addEventListener('submit', (event) => {
-      const form = event.target.closest('form[data-cell]');
+      const form = event.target.closest('form[data-cell], form[data-perm-add]');
       if (!form) return;
       event.preventDefault();
-      const ask = form.dataset.cellConfirm;
-      const box = document.getElementById('confirm');
-      if (ask && box) {
-        box.querySelector('h3').textContent = ask;
-        box.querySelector('p').textContent = 'The account keeps any access given on a project above.';
-        const go = box.querySelector('[data-go]');
-        go.textContent = 'Remove access';
-        go.className = 'danger';
-        const fresh = go.cloneNode(true);
-        go.replaceWith(fresh);
-        fresh.addEventListener('click', () => { box.close(); form.elements.confirm.value = '1'; save(form); }, { once: true });
-        box.showModal();
+      if (form.matches('[data-perm-add]')) {
+        const input = form.querySelector('input[name="email"]');
+        if (!input || !input.value.trim()) { toast('Choose an account first.', false); return; }
+        save(form, true);
       } else {
-        save(form);
+        save(form, false);
       }
     });
-  }
-  // Add people: the list narrows as the person types, and boxes already
-  // ticked stay at the top so a search never loses a choice.
-  document.querySelectorAll('[data-people-search]').forEach((input) => {
-    const dialog = input.closest('dialog, section');
-    const list = dialog && dialog.querySelector('[data-people-list]');
-    const count = dialog && dialog.querySelector('[data-people-count]');
-    if (!list) return;
-    input.closest('form').addEventListener('submit', (event) => event.preventDefault());
-    let timer = null;
-    input.addEventListener('input', () => {
-      clearTimeout(timer);
-      timer = setTimeout(async () => {
-        try {
-          const res = await fetch(input.dataset.peopleSearch + '?q=' + encodeURIComponent(input.value.trim()), { credentials: 'same-origin' });
-          if (!res.ok) return;
-          const page = await res.json();
-          const ticked = Array.from(list.querySelectorAll('input:checked')).map((box) => box.value);
-          list.replaceChildren();
-          const add = (email, checked) => {
-            const li = document.createElement('li');
-            const label = document.createElement('label');
-            const box = document.createElement('input');
-            box.type = 'checkbox'; box.name = 'email'; box.value = email; box.checked = checked;
-            label.append(box, ' ' + email);
-            li.appendChild(label);
-            list.appendChild(li);
-          };
-          ticked.forEach((email) => add(email, true));
-          page.items.filter((email) => !ticked.includes(email)).forEach((email) => add(email, false));
-          if (!list.children.length) {
-            const none = document.createElement('li');
-            none.className = 'muted'; none.textContent = 'No accounts match.';
-            list.appendChild(none);
-          }
-          if (count) count.textContent = 'Showing ' + page.items.length + ' of ' + page.total + '.';
-        } catch {}
-      }, 150);
+    // "No" in a row's removal question closes the question.
+    document.addEventListener('click', (event) => {
+      const no = event.target.closest('[data-remove-no]');
+      if (no) no.closest('details').open = false;
     });
-  });
+  }
   // Rows opened in place are kept in the address, so a shared link opens the
   // same way. The server renders them open from ?open=.
   const rows = document.querySelectorAll('details[data-rel]');
@@ -704,7 +689,7 @@ pub const SHELL_SCRIPT: &str = r#"
   }
   // A combobox: the input fetches matches as the person types and shows
   // them in a menu under itself. Without script it is a text input.
-  document.querySelectorAll('.combo').forEach((combo) => {
+  function initCombo(combo) {
     const input = combo.querySelector('input[data-search]');
     const menu = combo.querySelector('.combo-menu');
     if (!input || !menu) return;
@@ -774,13 +759,14 @@ pub const SHELL_SCRIPT: &str = r#"
         if (controller) controller.abort();
         controller = new AbortController();
         try {
-          // A search that depends on another field of the same form
-          // sends that field's value along, named by data-search-with.
+          // A search that depends on other fields of the same form sends
+          // their values along, named by data-search-with (comma separated).
           let url = input.dataset.search + '?q=' + encodeURIComponent(q);
-          const withField = input.dataset.searchWith;
-          if (withField && input.form && input.form.elements[withField]) {
-            url += '&' + encodeURIComponent(withField) + '=' + encodeURIComponent(input.form.elements[withField].value);
-          }
+          (input.dataset.searchWith || '').split(',').map((f) => f.trim()).filter(Boolean).forEach((field) => {
+            if (input.form && input.form.elements[field]) {
+              url += '&' + encodeURIComponent(field) + '=' + encodeURIComponent(input.form.elements[field].value);
+            }
+          });
           const res = await fetch(url, {
             credentials: 'same-origin', signal: controller.signal,
           });
@@ -820,7 +806,8 @@ pub const SHELL_SCRIPT: &str = r#"
     document.addEventListener('mousedown', (event) => {
       if (!combo.contains(event.target)) close();
     });
-  });
+  }
+  document.querySelectorAll('.combo').forEach(initCombo);
 })();
 </script>
 "#;

@@ -51,7 +51,7 @@ pub struct BrowseQuery {
     tab: Option<String>,
     /// Rows open in the List view, relative to this level, comma separated.
     open: Option<String>,
-    /// The permissions grid's own parts: check, add, pq, ppage.
+    /// The permissions table's own parts: the rule filter and its page.
     #[serde(flatten)]
     grid: crate::platform::permissions::GridQuery,
 }

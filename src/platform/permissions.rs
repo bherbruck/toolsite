@@ -1,13 +1,17 @@
-//! The permissions grid: who may do what at a project or an app, set by
-//! ticking shaded cells, Tableau style.
+//! The permissions rules: who may do what at a project or an app, edited in
+//! place, the way Tableau's permissions dialog works.
 //!
 //! One component serves both places a person sets access: a project's
-//! Permissions tab in the app browser and an app's Access tab. Each row is a
-//! person; the columns are View, Edit and Manage, which are cumulative, as
-//! the scopes behind them are (viewer, editor, admin). A filled cell is held
-//! here, a hatched one is held from a project above, an outlined one is not
-//! held. Every cell is a form, so the grid works without script; with
-//! script a click saves in place.
+//! Permissions tab in the app browser and an app's Access tab. A rule is one
+//! person and a level. The table lists only the people who hold a rule here
+//! or above, never the whole directory: a site can have hundreds of
+//! accounts. A person is added from the row at the top of the table, a
+//! search box that asks the server for at most ten matches. Each rule row
+//! has a level select and the View, Edit and Manage cells shaded to match;
+//! a click on a cell sets that level. Rules held from a project above are
+//! their own rows, greyed and read only. Removing a rule asks in the row.
+//! Every control is a form, so it all works without script; with script a
+//! change saves in place.
 //!
 //! A project can be locked: then only the rows set on it and above it apply
 //! to what is inside, and rows set inside are kept but ignored. The rule
@@ -30,10 +34,13 @@ use axum::{
 };
 use maud::{html, Markup};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{ops::Not, sync::Arc};
 
-/// How many accounts the Add people list shows at once.
-const PEOPLE_PAGE: usize = 50;
+/// How many rules the table shows at once.
+const RULES_PAGE: usize = 50;
+
+/// How many accounts the add row's search offers at once.
+const MAX_CANDIDATES: usize = 10;
 
 /// What a grid is for.
 #[derive(Debug, Clone)]
@@ -60,18 +67,14 @@ impl Target {
     }
 }
 
-/// The optional parts of a page that carries a grid.
+/// The optional parts of a page that carries the rules table.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GridQuery {
-    /// An account to explain: "Check a person".
-    pub check: Option<String>,
-    /// Shows the Add people list in the page, for a browser with no script.
-    pub add: Option<String>,
-    /// The search in the Add people list.
-    pub pq: Option<String>,
-    /// The page of the Add people list. Text, because this struct is also
+    /// A filter on the rules, by email.
+    pub rq: Option<String>,
+    /// The page of the rules table. Text, because this struct is also
     /// flattened into the browser's query, where numbers arrive as text.
-    pub ppage: Option<String>,
+    pub rpage: Option<String>,
 }
 
 /// The word a person reads for a scope.
@@ -90,14 +93,6 @@ fn level_help(scope: Scope) -> &'static str {
         Scope::Viewer => "View: open the apps.",
         Scope::Editor => "Edit: publish and change them, remove what they made.",
         Scope::Admin => "Manage: set access, create projects, exports, repositories.",
-    }
-}
-
-fn below(scope: Scope) -> Option<Scope> {
-    match scope {
-        Scope::Viewer => None,
-        Scope::Editor => Some(Scope::Viewer),
-        Scope::Admin => Some(Scope::Editor),
     }
 }
 
@@ -198,6 +193,22 @@ async fn facts(config: &Arc<Config>, target: &Target) -> Facts {
     .unwrap_or(Facts { people: Vec::new(), locked_by: None, locked_here: false })
 }
 
+/// One row of the rules table.
+enum Rule<'a> {
+    /// A rule set here: the person's own level at this path.
+    Own(&'a Person),
+    /// A rule held from a project above, read only.
+    Above(&'a Person),
+}
+
+impl Rule<'_> {
+    fn email(&self) -> &str {
+        match self {
+            Rule::Own(person) | Rule::Above(person) => &person.email,
+        }
+    }
+}
+
 /// The whole permissions panel for `target`, drawn for `viewer`, who holds
 /// Manage there (the page checks that before calling).
 pub(crate) async fn panel(
@@ -217,11 +228,41 @@ pub(crate) async fn panel(
         Target::Project(_) => &[],
     };
     let disabled = facts.locked_by.is_some();
-    let adding = query.add.is_some();
-    let check = match query.check.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
-        Some(email) => Some((email.to_string(), explain(config, email, &path, app.as_deref()).await)),
-        None => None,
+
+    // Own rules first, then the ones from above, each by email.
+    let mut rules: Vec<Rule> = facts.people.iter().filter(|p| p.direct.is_some()).map(Rule::Own).collect();
+    rules.extend(facts.people.iter().filter(|p| p.inherited.is_some()).map(Rule::Above));
+    let filter = query.rq.as_deref().map(str::trim).unwrap_or("").to_lowercase();
+    if !filter.is_empty() {
+        rules.retain(|rule| rule.email().contains(&filter));
+    }
+    let total = rules.len();
+    let pages = total.div_ceil(RULES_PAGE).max(1);
+    let page = query.rpage.as_deref().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).clamp(1, pages);
+    let shown: Vec<&Rule> = rules.iter().skip((page - 1) * RULES_PAGE).take(RULES_PAGE).collect();
+    let many = facts.people.iter().filter(|p| p.direct.is_some()).count()
+        + facts.people.iter().filter(|p| p.inherited.is_some()).count()
+        > RULES_PAGE;
+
+    // What each person on this page may do here, and why: the same answer
+    // the server gives, shown when the row's name is opened.
+    let mut why: Vec<(String, String)> = Vec::new();
+    for rule in &shown {
+        if !why.iter().any(|(email, _)| email == rule.email()) {
+            why.push((rule.email().to_string(), explain(config, rule.email(), &path, app.as_deref()).await));
+        }
+    }
+    let why_of = |email: &str| why.iter().find(|(e, _)| e == email).map(|(_, w)| w.clone()).unwrap_or_default();
+
+    let page_link = |n: usize| -> String {
+        let mut link = format!("{}{}rpage={n}", back, if back.contains('?') { "&" } else { "?" });
+        if !filter.is_empty() {
+            link.push_str(&format!("&rq={}", urlencoding::encode(&filter)));
+        }
+        link
     };
+    let columns = 4 + LEVELS.len() + usize::from(!roles.is_empty());
+
     html! {
         div id="perm-grid" {
             @if let Target::Project(project) = target && !project.is_empty() {
@@ -231,8 +272,8 @@ pub(crate) async fn panel(
                 div."panel-head" {
                     h3 { "People with access" }
                     p {
-                        "Tick a box to give a level. Each level includes the ones before it. "
-                        "Hatched boxes come from a project above. Site admins hold Manage everywhere."
+                        "Add a person from the first row, then set their level. Each level includes the ones before it. "
+                        "Grey rows come from a project above. Site admins hold Manage everywhere."
                     }
                     @if let Target::Project(_) = target {
                         p { "Apps here without their own setting have the site default general access: " (crate::platform::admin::gate_label(&config.default_gate)) "." }
@@ -242,57 +283,60 @@ pub(crate) async fn panel(
                     @if let Some(lock) = &facts.locked_by {
                         div."flash" role="status" {
                             span {
-                                "Locked by " a href=(grid_url(lock, None)) { (lock) } ": rows set here are ignored. "
+                                "Locked by " a href=(grid_url(lock, None)) { (lock) } ": rules set here are ignored. "
                                 "Only the permissions of " (lock) " and above apply."
                             }
                         }
                     }
-                    @if facts.people.is_empty() {
-                        p."muted" { "Nobody has access at " (place(&path)) " yet. Add people below." }
-                    } @else {
-                        div."table-scroll" {
-                            table."perm-grid" {
-                                thead {
-                                    tr {
-                                        th { "Account" }
-                                        @for level in LEVELS {
-                                            th."cell-head" title=(level_help(level)) { (level_word(level)) }
-                                        }
-                                        @if !roles.is_empty() { th { "Role in app" } }
-                                        th { "From" }
+                    @if many {
+                        form."row rules-filter" method="get" action=(base_of(&back)) {
+                            @if back.contains("?tab=permissions") { input type="hidden" name="tab" value="permissions"; }
+                            input type="search" name="rq" value=(filter) placeholder="Filter people" aria-label="Filter people";
+                            button."quiet sm" type="submit" { "Filter" }
+                        }
+                    }
+                    div."table-scroll" {
+                        table."perm-grid perm-rules" {
+                            thead {
+                                tr {
+                                    th { "Account" }
+                                    th { "Level" }
+                                    @for level in LEVELS {
+                                        th."cell-head" title=(level_help(level)) { (level_word(level)) }
                                     }
+                                    @if !roles.is_empty() { th { "Role in app" } }
+                                    th { "From" }
+                                    th."remove-col" { span."sr" { "Remove" } }
                                 }
-                                tbody {
-                                    @for person in &facts.people {
-                                        (row(person, &path, app.as_deref(), roles, mine, viewer.is_admin, disabled, token, &back))
+                            }
+                            tbody {
+                                @if !disabled {
+                                    (add_row(&path, app.as_deref(), mine, viewer.is_admin, token, &back, columns))
+                                }
+                                @if shown.is_empty() {
+                                    tr { td colspan=(columns) class="muted" {
+                                        @if filter.is_empty() { "Nobody has access at " (place(&path)) " yet. Add a person in the row above." }
+                                        @else { "Nobody here matches " (filter) "." }
+                                    } }
+                                }
+                                @for rule in &shown {
+                                    @match rule {
+                                        Rule::Own(person) => (own_row(person, &path, app.as_deref(), roles, mine, viewer.is_admin, disabled, token, &back, &why_of(&person.email))),
+                                        Rule::Above(person) => (above_row(person, roles, &why_of(&person.email))),
                                     }
                                 }
                             }
                         }
                     }
-                    div."actions perm-actions" {
-                        a."btn" href={ (back) (if back.contains('?') { "&" } else { "?" }) "add=1#add-people" }
-                          data-dialog="add-people" { "Add people" }
+                    @if pages > 1 {
+                        div."actions pager" {
+                            @if page > 1 { a."btn quiet sm" href=(page_link(page - 1)) { "Previous" } }
+                            span."muted small" { "Showing " ((page - 1) * RULES_PAGE + 1) "\u{2013}" (((page - 1) * RULES_PAGE + shown.len())) " of " (total) }
+                            @if page < pages { a."btn quiet sm" href=(page_link(page + 1)) { "Next" } }
+                        }
                     }
                     p."muted small" {
                         @for level in LEVELS { (level_help(level)) " " }
-                    }
-                }
-            }
-            (add_people(config, &path, app.as_deref(), mine, viewer.is_admin, token, &back, query, adding).await)
-            section."panel" {
-                div."panel-head" {
-                    h3 { "Check a person" }
-                    p { "What one account may do at " (place(&path)) ", and why." }
-                }
-                div."panel-body" {
-                    form."row" method="get" action=(base_of(&back)) {
-                        @if back.contains("?tab=permissions") { input type="hidden" name="tab" value="permissions"; }
-                        (ui::combobox("check", "/admin/accounts/search", "Choose an account"))
-                        button."quiet" type="submit" { "Check" }
-                    }
-                    @if let Some((email, answer)) = &check {
-                        p."check-answer" { strong { (email) } ": " (answer) }
                     }
                 }
             }
@@ -305,8 +349,56 @@ fn base_of(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
 
+/// The first row of the table: a search for one account and a level. It asks
+/// the server for at most ten matches, leaving out people who already hold a
+/// rule here. Pressing Add keeps the focus in the search, so several people
+/// can be added one after another.
 #[allow(clippy::too_many_arguments)]
-fn row(
+fn add_row(
+    path: &str,
+    app: Option<&str>,
+    mine: Option<Scope>,
+    site_admin: bool,
+    token: &str,
+    back: &str,
+    columns: usize,
+) -> Markup {
+    html! {
+        tr."add-rule" {
+            td colspan=(columns) {
+                form."row add-rule-form" method="post" action="/admin/permissions/add" data-perm-add {
+                    (admin::hidden("token", token)) (admin::hidden("path", path))
+                    @if let Some(app) = app { (admin::hidden("app", app)) } @else { (admin::hidden("app", "")) }
+                    (admin::hidden("back", back))
+                    span."add-rule-label" { "+ Add a person" }
+                    (ui::combobox_full("email", "/admin/permissions/candidates", "Type a name or email", "", Some("path,app"), "-add"))
+                    select name="scope" aria-label="Level for the new person" {
+                        @for level in LEVELS {
+                            @let allowed = site_admin || mine.is_some_and(|mine| level <= mine);
+                            option value=(level.as_str()) selected[level == Scope::Viewer] disabled[!allowed] { (level_word(level)) }
+                        }
+                    }
+                    button type="submit" { "Add" }
+                }
+            }
+        }
+    }
+}
+
+/// The person's name, which opens to say what they may do here and why.
+fn who_cell(email: &str, why: &str) -> Markup {
+    html! {
+        td."who" {
+            details."rule-who" {
+                summary { (email) }
+                p."muted small rule-why" { (why) }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn own_row(
     person: &Person,
     path: &str,
     app: Option<&str>,
@@ -316,60 +408,103 @@ fn row(
     disabled: bool,
     token: &str,
     back: &str,
+    why: &str,
 ) -> Markup {
-    let inherited = person.inherited.as_ref().map(|(scope, _)| *scope);
+    let held = person.direct.unwrap_or(Scope::Viewer);
     html! {
-        tr data-email=(person.email) {
-            td."who" { (person.email) }
-            @for level in LEVELS {
-                td."cell-col" {
-                    @if person.direct.is_some_and(|held| held >= level) {
-                        @let lower = below(level);
-                        (cell(path, app, &person.email, level, "on", lower, mine, site_admin, disabled, token, back))
-                    } @else if inherited.is_some_and(|held| held >= level) {
-                        @let from = person.inherited.as_ref().map(|(_, from)| from.as_str()).unwrap_or("");
-                        span."cell inherited" title={ (level_word(level)) " from " (place(from)) }
-                             aria-label={ (level_word(level)) " from " (place(from)) } {}
-                    } @else {
-                        (cell(path, app, &person.email, level, "off", Some(level), mine, site_admin, disabled, token, back))
-                    }
-                }
-            }
-            @if !roles.is_empty() {
-                td {
-                    @if let Some(app) = app {
-                        form."inline" method="post" action="/admin/access" {
-                            (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("email", &person.email))
-                            (admin::hidden("allow", "1")) (admin::hidden("back", back))
-                            select name="role" data-autosubmit aria-label={ "Role in app for " (person.email) } {
-                                option value="" selected[person.role.is_none()] { "None" }
-                                @for role in roles {
-                                    option value=(role) selected[person.role.as_deref() == Some(role.as_str())] { (role) }
-                                }
-                                // A role the app no longer declares still shows, as it is.
-                                @if let Some(role) = &person.role && !roles.contains(role) {
-                                    option value=(role) selected { (role) }
-                                }
-                            }
-                            noscript { button."quiet sm" type="submit" { "Save" } }
+        tr."rule own" data-email=(person.email) {
+            (who_cell(&person.email, why))
+            td."level" {
+                form."inline" method="post" action="/admin/permissions/cell" data-cell {
+                    (admin::hidden("token", token)) (admin::hidden("path", path))
+                    @if let Some(app) = app { (admin::hidden("app", app)) }
+                    (admin::hidden("email", &person.email)) (admin::hidden("back", back)) (admin::hidden("confirm", ""))
+                    select name="level" data-autosubmit disabled[disabled] aria-label={ "Level for " (person.email) } {
+                        @for level in LEVELS {
+                            @let allowed = site_admin || mine.is_some_and(|mine| level <= mine);
+                            option value=(level.as_str()) selected[level == held] disabled[!allowed] { (level_word(level)) }
                         }
                     }
+                    noscript { button."quiet sm" type="submit" disabled[disabled] { "Save" } }
                 }
             }
-            td."muted small from" {
-                @match (&person.direct, &person.inherited) {
-                    (Some(_), Some((_, from))) => { "here, and " a href=(grid_url(from, None)) { (place(from)) } }
-                    (Some(_), None) => "here",
-                    (None, Some((_, from))) => a href=(grid_url(from, None)) { (place(from)) },
-                    (None, None) => "",
+            @for level in LEVELS {
+                td."cell-col" {
+                    (cell(path, app, &person.email, level, if held >= level { "on" } else { "off" }, mine, site_admin, disabled, token, back))
+                }
+            }
+            @if !roles.is_empty() { (role_cell(person, app, roles, token, back)) }
+            td."muted small from" { "here" }
+            td."remove-col" {
+                @if !disabled {
+                    details."remove-rule" {
+                        summary aria-label={ "Remove " (person.email) } title="Remove" { "\u{2715}" }
+                        div."remove-ask" {
+                            span { "Remove?" }
+                            form."inline" method="post" action="/admin/permissions/cell" data-cell {
+                                (admin::hidden("token", token)) (admin::hidden("path", path))
+                                @if let Some(app) = app { (admin::hidden("app", app)) }
+                                (admin::hidden("email", &person.email)) (admin::hidden("level", "none"))
+                                (admin::hidden("back", back)) (admin::hidden("confirm", "1"))
+                                button."danger sm" type="submit" { "Yes" }
+                            }
+                            button."quiet sm" type="button" data-remove-no { "No" }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// One cell as a form. `to` is the level a click sets: `None` removes the
-/// person's own permission here, which asks first.
+fn above_row(person: &Person, roles: &[String], why: &str) -> Markup {
+    let (held, from) = person.inherited.clone().unwrap_or((Scope::Viewer, String::new()));
+    html! {
+        tr."rule above" data-email-above=(person.email) {
+            (who_cell(&person.email, why))
+            td."level muted" { (level_word(held)) }
+            @for level in LEVELS {
+                td."cell-col" {
+                    @if held >= level {
+                        span."cell inherited" title={ (level_word(level)) " from " (place(&from)) }
+                             aria-label={ (level_word(level)) " from " (place(&from)) } {}
+                    } @else {
+                        span."cell empty" aria-hidden="true" {}
+                    }
+                }
+            }
+            @if !roles.is_empty() { td."muted small" { (person.role.as_deref().unwrap_or("")) } }
+            td."muted small from" { a href=(grid_url(&from, None)) { (place(&from)) } }
+            td {}
+        }
+    }
+}
+
+fn role_cell(person: &Person, app: Option<&str>, roles: &[String], token: &str, back: &str) -> Markup {
+    html! {
+        td {
+            @if let Some(app) = app {
+                form."inline" method="post" action="/admin/access" {
+                    (admin::hidden("token", token)) (admin::hidden("app", app)) (admin::hidden("email", &person.email))
+                    (admin::hidden("allow", "1")) (admin::hidden("back", back))
+                    select name="role" data-autosubmit aria-label={ "Role in app for " (person.email) } {
+                        option value="" selected[person.role.is_none()] { "None" }
+                        @for role in roles {
+                            option value=(role) selected[person.role.as_deref() == Some(role.as_str())] { (role) }
+                        }
+                        // A role the app no longer declares still shows, as it is.
+                        @if let Some(role) = &person.role && !roles.contains(role) {
+                            option value=(role) selected { (role) }
+                        }
+                    }
+                    noscript { button."quiet sm" type="submit" { "Save" } }
+                }
+            }
+        }
+    }
+}
+
+/// One cell as a form: a click sets the person's level here to this cell.
 #[allow(clippy::too_many_arguments)]
 fn cell(
     path: &str,
@@ -377,7 +512,6 @@ fn cell(
     email: &str,
     level: Scope,
     state: &str,
-    to: Option<Scope>,
     mine: Option<Scope>,
     site_admin: bool,
     disabled: bool,
@@ -385,21 +519,14 @@ fn cell(
     back: &str,
 ) -> Markup {
     // A manager may not set anyone above what the manager holds here.
-    let beyond = !site_admin && to.is_some_and(|to| mine.is_none_or(|mine| to > mine));
+    let beyond = !site_admin && mine.is_none_or(|mine| level > mine);
     let off = disabled || beyond;
-    let label = match (state, to) {
-        ("on", Some(to)) => format!("{email} holds {}. Click to lower to {}.", level_word(level), level_word(to)),
-        ("on", None) => format!("{email} holds View. Click to remove access here."),
-        (_, Some(to)) => format!("Give {email} {}.", level_word(to)),
-        _ => String::new(),
-    };
-    let to_word = to.map(|to| to.as_str()).unwrap_or("none");
+    let label = format!("Set {email} to {}.", level_word(level));
     html! {
-        form."cell-form" method="post" action="/admin/permissions/cell" data-cell
-             data-cell-confirm=[to.is_none().then(|| format!("Remove access for {email} at {}?", place(path)))] {
+        form."cell-form" method="post" action="/admin/permissions/cell" data-cell {
             (admin::hidden("token", token)) (admin::hidden("path", path))
             @if let Some(app) = app { (admin::hidden("app", app)) }
-            (admin::hidden("email", email)) (admin::hidden("level", to_word))
+            (admin::hidden("email", email)) (admin::hidden("level", level.as_str()))
             (admin::hidden("back", back)) (admin::hidden("confirm", ""))
             button type="submit" class={ "cell " (state) } disabled[off] title=(label) aria-label=(label) {}
         }
@@ -414,7 +541,7 @@ fn lock_setting(project: &str, locked: bool, token: &str, back: &str) -> Markup 
                 h3 { "Apps and projects inside" }
                 p {
                     @if locked {
-                        "Locked: only the permissions set here and above apply inside " (project) ". Rows set inside are kept but ignored."
+                        "Locked: only the permissions set here and above apply inside " (project) ". Rules set inside are kept but ignored."
                     } @else {
                         "Customizable: apps and projects inside follow these permissions, and can add their own."
                     }
@@ -433,144 +560,71 @@ fn lock_setting(project: &str, locked: bool, token: &str, back: &str) -> Markup 
     }
 }
 
-/// The Add people list. Inside a dialog for a browser with script; drawn in
-/// the page when `?add=1` is in the address, for one without.
-#[allow(clippy::too_many_arguments)]
-async fn add_people(
-    config: &Arc<Config>,
-    path: &str,
-    app: Option<&str>,
-    mine: Option<Scope>,
-    site_admin: bool,
-    token: &str,
-    back: &str,
-    query: &GridQuery,
-    inline: bool,
-) -> Markup {
-    let q = query.pq.clone().unwrap_or_default();
-    let page = query.ppage.as_deref().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1).max(1);
-    let listing = if inline {
-        people_page(config, &q, page).await
-    } else {
-        PeoplePage { items: Vec::new(), total: 0, page: 1, pages: 1 }
-    };
-    let body = html! {
-        form method="get" action=(base_of(back)) class="people-search" {
-            @if back.contains("?tab=permissions") { input type="hidden" name="tab" value="permissions"; }
-            input type="hidden" name="add" value="1";
-            input type="search" name="pq" value=(q) placeholder="Search accounts" autocomplete="off"
-                  data-people-search="/admin/permissions/people" aria-label="Search accounts";
-            noscript { button."quiet sm" type="submit" { "Search" } }
-        }
-        form method="post" action="/admin/permissions/add" id="add-people-form" {
-            (admin::hidden("token", token)) (admin::hidden("path", path))
-            @if let Some(app) = app { (admin::hidden("app", app)) }
-            (admin::hidden("back", back))
-            ul."people-list" data-people-list {
-                // In the dialog the list loads when it opens, so a page never
-                // carries the accounts unless someone asks for them.
-                @if inline {
-                    @for email in &listing.items {
-                        li { label { input type="checkbox" name="email" value=(email); " " (email) } }
-                    }
-                    @if listing.items.is_empty() { li."muted" { "No accounts match." } }
-                } @else {
-                    li."muted" { "Loading accounts." }
-                }
-            }
-            p."muted small" data-people-count {
-                @if inline { "Showing " (listing.items.len()) " of " (listing.total) "." }
-                @if listing.pages > 1 {
-                    " Page " (listing.page) " of " (listing.pages) "."
-                    @if listing.page > 1 {
-                        " " a href={ (base_of(back)) "?" (if back.contains("?tab=permissions") { "tab=permissions&" } else { "" }) "add=1&pq=" (urlencoding::encode(&q)) "&ppage=" (listing.page - 1) "#add-people" } { "Previous" }
-                    }
-                    @if listing.page < listing.pages {
-                        " " a href={ (base_of(back)) "?" (if back.contains("?tab=permissions") { "tab=permissions&" } else { "" }) "add=1&pq=" (urlencoding::encode(&q)) "&ppage=" (listing.page + 1) "#add-people" } { "Next" }
-                    }
-                }
-            }
-            div."field" {
-                label { "Give them" }
-                span."seg" role="radiogroup" {
-                    @for level in LEVELS {
-                        @let allowed = site_admin || mine.is_some_and(|mine| level <= mine);
-                        label."seg-item" {
-                            input type="radio" name="scope" value=(level.as_str()) checked[level == Scope::Viewer] disabled[!allowed];
-                            " " (level_word(level))
-                        }
-                    }
-                }
-            }
-            div."actions end" {
-                @if !inline { button."quiet" type="button" data-close { "Cancel" } }
-                button type="submit" { "Add people" }
-            }
-        }
-    };
-    html! {
-        @if inline {
-            section."panel" id="add-people" {
-                div."panel-head" { h3 { "Add people" } p { "Pick one or more accounts, choose a level, and add them." } }
-                div."panel-body" { (body) }
-            }
-        } @else {
-            dialog id="add-people" class="wide" {
-                h3 { "Add people" }
-                p { "Pick one or more accounts, choose a level, and add them." }
-                (body)
-            }
-        }
-    }
-}
-
+/// One account the add row may offer.
 #[derive(serde::Serialize)]
-pub(crate) struct PeoplePage {
-    items: Vec<String>,
-    total: usize,
-    page: usize,
-    pages: usize,
-}
-
-async fn people_page(config: &Arc<Config>, q: &str, page: usize) -> PeoplePage {
-    let q = q.trim().to_lowercase();
-    let accounts = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || users::list_accounts(&config).unwrap_or_default())
-            .await
-            .unwrap_or_default()
-    };
-    let matching: Vec<String> = accounts
-        .into_iter()
-        .filter(|account| account.is_active)
-        .map(|account| account.email)
-        .filter(|email| q.is_empty() || email.contains(&q))
-        .collect();
-    let total = matching.len();
-    let pages = total.div_ceil(PEOPLE_PAGE).max(1);
-    let page = page.clamp(1, pages);
-    let items = matching.into_iter().skip((page - 1) * PEOPLE_PAGE).take(PEOPLE_PAGE).collect();
-    PeoplePage { items, total, page, pages }
-}
-
-/// `GET /admin/permissions/people?q=&page=`: one page of accounts for the
-/// Add people list. For anyone who manages something.
-pub async fn people(
-    State(config): State<Arc<Config>>,
-    headers: HeaderMap,
-    Query(query): Query<PeopleQuery>,
-) -> Response {
-    if let Err(response) = admin::require_manager(&config, &headers).await {
-        return response;
-    }
-    let listing = people_page(&config, query.q.as_deref().unwrap_or(""), query.page.unwrap_or(1)).await;
-    ([admin::no_store()], Json(listing)).into_response()
+pub(crate) struct Candidate {
+    value: String,
+    label: String,
 }
 
 #[derive(Deserialize)]
-pub struct PeopleQuery {
+pub struct CandidateQuery {
     q: Option<String>,
-    page: Option<usize>,
+    path: Option<String>,
+    app: Option<String>,
+}
+
+/// `GET /admin/permissions/candidates?q=&path=&app=`: at most ten active
+/// accounts for the add row, leaving out anyone who already holds a rule at
+/// that path (or access given on that app). For a manager of the path.
+pub async fn candidates(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Query(query): Query<CandidateQuery>,
+) -> Response {
+    let path = query.path.as_deref().unwrap_or("").trim_matches('/').to_string();
+    if !users::valid_prefix(&path) {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+    let viewer = match admin::require_manager(&config, &headers).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let manages = viewer.is_admin || admin::held(&config, &viewer, &path).await.is_some_and(|held| held >= Scope::Admin);
+    if !manages {
+        return (StatusCode::FORBIDDEN, "you do not manage access here").into_response();
+    }
+    let q = query.q.as_deref().unwrap_or("").trim().to_lowercase();
+    let app = query.app.filter(|a| !a.is_empty());
+    let config2 = config.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let mut taken: Vec<String> = users::list_scopes(&config2)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.prefix == path)
+            .map(|row| row.email)
+            .collect();
+        if let Some(app) = &app {
+            taken.extend(
+                users::list_grants(&config2)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(granted, _, _)| granted == app)
+                    .map(|(_, email, _)| email),
+            );
+        }
+        users::list_accounts(&config2)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|account| account.is_active && !taken.contains(&account.email))
+            .filter(|account| q.is_empty() || account.email.contains(&q))
+            .take(MAX_CANDIDATES)
+            .map(|account| Candidate { value: account.email.clone(), label: account.email })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    ([admin::no_store()], Json(found)).into_response()
 }
 
 /// The answer to "Check a person", from the same rule the server uses.
@@ -762,25 +816,37 @@ pub async fn add(State(config): State<Arc<Config>>, headers: HeaderMap, body: St
         Ok(user) => user,
         Err(response) => return response,
     };
+    let app = app.filter(|a| !a.is_empty());
     let back = admin::back_or(back.as_deref(), &grid_url(&path, app.as_deref()));
     if let Some(message) = locked_out(&config, &path) {
-        return admin::redirect_flash(&back, false, message);
+        return answer(&headers, &back, false, message);
     }
     if emails.is_empty() {
-        return admin::redirect_flash(&back, false, "Pick at least one account.");
+        return answer(&headers, &back, false, "Choose an account first.".to_string());
     }
     let Some(scope) = Scope::parse(&level) else {
-        return admin::redirect_flash(&back, false, "Choose View, Edit or Manage.");
+        return answer(&headers, &back, false, "Choose View, Edit or Manage.".to_string());
     };
     let mut added = 0;
     for email in &emails {
+        if users_exists(&config, email).await.not() {
+            return answer(&headers, &back, false, format!("There is no active account {email}."));
+        }
         match projects::grant(&config, Some(&actor), &path, email, scope).await {
             Ok(()) => added += 1,
-            Err(problem) => return admin::redirect_flash(&back, false, format!("{email}: {}", problem.message())),
+            Err(problem) => return answer(&headers, &back, false, format!("{email}: {}", problem.message())),
         }
     }
     let who = if added == 1 { emails[0].clone() } else { format!("{added} accounts") };
-    admin::redirect_flash(&back, true, format!("{who} now have {} at {}.", level_word(scope), place(&path)))
+    answer(&headers, &back, true, format!("{who} now has {} at {}.", level_word(scope), place(&path)))
+}
+
+/// Whether an active account has this email.
+async fn users_exists(config: &Arc<Config>, email: &str) -> bool {
+    let (config, email) = (config.clone(), email.to_string());
+    tokio::task::spawn_blocking(move || users::user_by_email(&config, &email).is_some())
+        .await
+        .unwrap_or(false)
 }
 
 #[derive(Deserialize)]

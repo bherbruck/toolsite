@@ -256,7 +256,7 @@ may hold `editor` on one folder only. A refused tool names the folder and the
 scope it needs ("holds editor at ops/yard; this needs admin"). Publish under a
 folder you hold, or ask for the scope; `list_pages` shows what you may open.
 
-**Permissions.** People set access in a grid of View, Edit and Manage (viewer,
+**Permissions.** People set access as rules of View, Edit or Manage (viewer,
 editor, admin) on a project's Permissions tab or an app's Access tab. A
 project can be Locked, and then rows set inside it are ignored: before you
 grant on an app or a subproject, check the project with
