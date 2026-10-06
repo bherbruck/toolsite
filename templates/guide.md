@@ -58,6 +58,15 @@ Any other flag is refused rather than guessed at. Order matters: migrations
 and the manifest first, so an app is never briefly live without its tables or
 its gate.
 
+If curl cannot reach this host from your sandbox, send the file through the
+tools instead: `upload_begin(slug, kind)` opens an upload for the same kinds
+(`page`, `bundle`, `handler`, `migrations`, `manifest`, `source`, `icon`,
+`blob`), `upload_chunk(id, index, data)` carries it in standard base64 chunks
+of at most 768 KB decoded, in any order, and `upload_finish(id, chunks)`
+stores it with the same rules and the same reply as the upload URL. Bytes
+through a tool call cost tokens, so this is the fallback, not the default.
+`push_page` and `push_app` remain for plain HTML.
+
 ## What a visitor can reach
 
 Only what the bundle contained. The project, the notes, the settings, the

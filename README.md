@@ -216,6 +216,7 @@ which is the mistake that ships a blank page while looking like a success.
 | `create_user`, `set_user_active`, `set_access` | Accounts and grants, as on the admin page. |
 | `push_page(html, slug?)` | Fallback for clients with no shell; HTML inline. |
 | `push_app(app, pages)` | Fallback, multi-page. A page named `index` also serves at the app root. |
+| `upload_begin` / `upload_chunk` / `upload_finish` | Fallback for a sandbox that cannot reach the upload URL: any kind the URL takes, sent inline as base64 chunks of at most 768 KB decoded. Same rules, same reply. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
 | `remove_page(slug, confirm)` | Takes a slug down for good. Files move to `.trash/` on the server rather than being deleted. |
 

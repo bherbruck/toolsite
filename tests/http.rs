@@ -4819,3 +4819,199 @@ async fn every_mcp_request_leaves_one_line_naming_its_method_and_tool_but_not_it
     assert!(mine.iter().any(|l| l.contains("method=tools/call") && l.contains("tool=run_sql") && l.contains("status=200")), "{mine:?}");
     assert!(!logged.contains("needle-in-sql"), "a statement's text was logged");
 }
+
+// --- an upload that arrives in chunks over MCP ----------------------------------
+//
+// For a sandbox that cannot reach the upload URL. Same kinds, same rules,
+// same reply as the PUT, proved by comparing the two.
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A gzipped tar of `files`, the shape a bundle or a source archive takes.
+fn tgz_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, body) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, &body[..]).unwrap();
+    }
+    let tar = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut encoder, &tar).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Sends `bytes` through upload_begin / upload_chunk / upload_finish in the
+/// given chunk order and returns the finish reply.
+async fn inline_upload(mcp: &mut Mcp, args: serde_json::Value, bytes: &[u8], chunk: usize, reversed: bool) -> (bool, String) {
+    let (is_error, text) = mcp.call("upload_begin", args).await;
+    assert!(!is_error, "{text}");
+    let id = text.split_whitespace().nth(1).expect("no upload id in the reply").to_string();
+    let parts: Vec<&[u8]> = bytes.chunks(chunk).collect();
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    if reversed {
+        order.reverse();
+    }
+    for index in order {
+        let (is_error, text) = mcp
+            .call("upload_chunk", serde_json::json!({ "id": id, "index": index, "data": b64(parts[index]) }))
+            .await;
+        assert!(!is_error, "chunk {index}: {text}");
+    }
+    mcp.call("upload_finish", serde_json::json!({ "id": id, "chunks": parts.len() })).await
+}
+
+#[tokio::test]
+async fn a_bundle_in_chunks_out_of_order_serves_exactly_as_the_put_does() {
+    let (_dir, config) = server();
+    // Big enough for three chunks at a small chunk size; the ceiling per
+    // chunk is tested in the unit tests, so a small chunk keeps this fast.
+    // Pseudo-random, so gzip cannot shrink it below three chunks.
+    let mut state: u32 = 0x9e37_79b9;
+    let asset: Vec<u8> = (0..200_000u32)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        })
+        .collect();
+    let archive = tgz_of(&[("index.html", b"<title>Chunked</title>"), ("assets/app.js", &asset)]);
+    assert!(archive.len() > 2 * 70_000, "the archive is too small to need three chunks");
+
+    // The PUT path.
+    let ticket = ticket(&config, "via-put", Duration::from_secs(60));
+    let (status, put_reply, _) = send(
+        &config,
+        Request::builder().method("PUT").uri(format!("/upload/{ticket}?bundle&spa")).body(Body::from(archive.clone())).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{put_reply}");
+
+    // The same bytes in three chunks, last chunk first.
+    let mut mcp = Mcp::open(&config, TOKEN).await;
+    let (is_error, reply) = inline_upload(
+        &mut mcp,
+        serde_json::json!({ "slug": "via-inline", "kind": "bundle", "spa": true }),
+        &archive,
+        70_000,
+        true,
+    )
+    .await;
+    assert!(!is_error, "{reply}");
+    assert_eq!(
+        reply.replace("via-inline", "via-put"),
+        put_reply.trim_end(),
+        "the inline reply is not the PUT's reply"
+    );
+
+    let (_, from_put) = send_bytes(&config, get("/p/via-put/assets/app.js")).await;
+    let (status, from_inline) = send_bytes(&config, get("/p/via-inline/assets/app.js")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(from_inline, from_put, "the asset differs between the two paths");
+    assert_eq!(from_inline, asset);
+    assert!(toolsite::content::store::read_meta(&config, "via-inline").await.spa, "spa was lost on the way");
+}
+
+#[tokio::test]
+async fn a_missing_chunk_is_refused_by_number_and_the_id_is_spent() {
+    let (dir, config) = server();
+    let mut mcp = Mcp::open(&config, TOKEN).await;
+    let (_, text) = mcp.call("upload_begin", serde_json::json!({ "slug": "holey", "kind": "page" })).await;
+    let id = text.split_whitespace().nth(1).unwrap().to_string();
+    mcp.call("upload_chunk", serde_json::json!({ "id": id, "index": 0, "data": b64(b"<h1>") })).await;
+    mcp.call("upload_chunk", serde_json::json!({ "id": id, "index": 2, "data": b64(b"</h1>") })).await;
+    let (is_error, text) = mcp.call("upload_finish", serde_json::json!({ "id": id, "chunks": 3 })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("chunks 1 never arrived"), "{text}");
+    assert!(!dir.path().join("holey.html").exists(), "a partial page was published");
+    assert!(!dir.path().join(".tmp/inline").join(&id).exists(), "the spool stayed");
+    let (is_error, text) = mcp.call("upload_chunk", serde_json::json!({ "id": id, "index": 1, "data": b64(b"x") })).await;
+    assert!(is_error && text.contains("unknown or expired"), "{text}");
+}
+
+#[tokio::test]
+async fn a_handler_sent_in_chunks_is_validated_like_the_put() {
+    let (_dir, config) = server();
+    let mut mcp = Mcp::open(&config, TOKEN).await;
+
+    let (is_error, text) = inline_upload(
+        &mut mcp,
+        serde_json::json!({ "slug": "broken", "kind": "handler" }),
+        b"this is not a wasm component at all",
+        16,
+        false,
+    )
+    .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("not a valid handler"), "{text}");
+    assert!(!config.data_dir.join("broken/handler.wasm").exists());
+
+    let (is_error, text) = inline_upload(
+        &mut mcp,
+        serde_json::json!({ "slug": "echoer", "kind": "handler" }),
+        HANDLER,
+        100_000,
+        true,
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert!(text.contains("handler live at"), "{text}");
+    let (status, body, _) = send(&config, get("/p/echoer/api/echo")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "GET /api/echo?");
+}
+
+#[tokio::test]
+async fn an_inline_page_lands_under_the_app_like_the_put_sub_path() {
+    let (_dir, config) = server();
+    let mut mcp = Mcp::open(&config, TOKEN).await;
+    let (is_error, text) = inline_upload(
+        &mut mcp,
+        serde_json::json!({ "slug": "manual", "kind": "page", "page": "about" }),
+        b"<title>About</title>",
+        8,
+        false,
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    let (status, body, _) = send(&config, get("/p/manual/about")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("About"));
+    // A kind that is not a file of the app refuses the wrong options.
+    let (is_error, text) = mcp.call("upload_begin", serde_json::json!({ "slug": "manual", "kind": "blob" })).await;
+    assert!(is_error && text.contains("needs key"), "{text}");
+    let (is_error, text) = mcp.call("upload_begin", serde_json::json!({ "slug": "manual", "kind": "zip" })).await;
+    assert!(is_error && text.contains("kind must be"), "{text}");
+}
+
+#[tokio::test]
+async fn an_editor_whose_scope_went_away_is_refused_at_the_finish() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "", "labs").await;
+    account(&config, "ed@example.com", "correct horse");
+    scope(&config, "ed@example.com", "ops", "editor");
+    // A second folder keeps ed a publisher, so the connection itself stays
+    // open and the refusal is the scope at the target, not the door.
+    scope(&config, "ed@example.com", "labs", "editor");
+    let token = mcp_token_for(&config, "ed@example.com", "correct horse").await;
+    let mut mcp = Mcp::open(&config, &token).await;
+
+    let (is_error, text) = mcp.call("upload_begin", serde_json::json!({ "slug": "late", "kind": "page", "project": "ops" })).await;
+    assert!(!is_error, "{text}");
+    let id = text.split_whitespace().nth(1).unwrap().to_string();
+    mcp.call("upload_chunk", serde_json::json!({ "id": id, "index": 0, "data": b64(b"<title>late</title>") })).await;
+
+    // Between begin and finish, the scope is taken away.
+    toolsite::accounts::users::revoke_scope(&config, "ed@example.com", "ops").unwrap();
+    let (is_error, text) = mcp.call("upload_finish", serde_json::json!({ "id": id, "chunks": 1 })).await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("editor access"), "{text}");
+    assert!(!config.data_dir.join("late").exists() && !config.data_dir.join("late.html").exists(), "the page landed anyway");
+}

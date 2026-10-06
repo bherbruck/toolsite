@@ -8,7 +8,8 @@ use crate::{
     platform::{
         bearer::Caller,
         knowledge::{self, FetchOutput, SearchOutput},
-        upload::{upload_url, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
+        inline_upload,
+        upload::{self, upload_url, SourceMeta, UploadKind, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
     },
     runtime::db,
 };
@@ -92,6 +93,46 @@ pub(crate) struct CreateUploadRequest {
         description = "Slug the upload writes to. Random one is generated if omitted. For a multi-page app pass the app name, then upload one file per page."
     )]
     pub(crate) slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct UploadBeginRequest {
+    #[schemars(description = "Slug the upload writes to: the app, or 'myapp/about' for one page of it.")]
+    pub(crate) slug: String,
+    #[schemars(
+        description = "What is coming: 'page' (one HTML page), 'bundle' (gzipped tar of a built site), 'handler' (a wasm32-wasip2 component), 'migrations' (gzipped tar of numbered .sql files), 'manifest' (toolsite.toml), 'source' (gzipped tar of the project), 'icon', or 'blob' (one file for the app, needs key). The same kinds the upload URL takes, with the same rules."
+    )]
+    pub(crate) kind: String,
+    #[schemars(description = "For a new app: the project folder it goes in, as for create_upload.")]
+    pub(crate) project: Option<String>,
+    #[schemars(description = "bundle only: true when the app has a client-side router, so unknown paths serve its index.html.")]
+    pub(crate) spa: Option<bool>,
+    #[schemars(description = "blob only: the key to store the file under, like 'photos/cover.jpg'.")]
+    pub(crate) key: Option<String>,
+    #[schemars(description = "page or icon only: the page's name under the app, like 'about'. Left out, the slug itself is the page.")]
+    pub(crate) page: Option<String>,
+    #[schemars(description = "source only: the commit message when the app is linked to a repository.")]
+    pub(crate) message: Option<String>,
+    #[schemars(description = "source only: the commit the project was built from, 7 to 40 hex characters.")]
+    pub(crate) commit: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct UploadChunkRequest {
+    #[schemars(description = "The id upload_begin returned.")]
+    pub(crate) id: String,
+    #[schemars(description = "Position of this chunk, from 0. Chunks may arrive in any order; a repeat of an index replaces it.")]
+    pub(crate) index: u32,
+    #[schemars(description = "The chunk, standard base64, at most 786432 bytes decoded.")]
+    pub(crate) data: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct UploadFinishRequest {
+    #[schemars(description = "The id upload_begin returned.")]
+    pub(crate) id: String,
+    #[schemars(description = "How many chunks there are in total. Every index from 0 to chunks-1 must have arrived.")]
+    pub(crate) chunks: u32,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -751,7 +792,134 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Fallback publisher for when you cannot reach this host from a shell: pastes the page's HTML through this call. If you can run shell commands with network access, use create_upload instead. Call again with the same slug to update in place. Use a slug like 'myapp/about' to group pages under one app.",
+        description = "Fallback for a sandbox that cannot reach this host: opens an upload that arrives in base64 chunks through upload_chunk and lands with upload_finish. Same kinds as the upload URL (page, bundle, handler, migrations, manifest, source, icon, blob) and the same rules; the result is identical. Use create_upload and curl whenever the host is reachable, since bytes through a tool call cost tokens. Returns the upload id and the chunk size. Expires in 15 minutes.",
+        annotations(title = "Begin an inline upload", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn upload_begin(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(UploadBeginRequest { slug, kind, project, spa, key, page, message, commit }): Parameters<UploadBeginRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let refuse = |text: String| Ok(CallToolResult::error(vec![ContentBlock::text(text)]));
+        if !valid_slug(&slug) {
+            return refuse("slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'".into());
+        }
+        let kind = match kind.as_str() {
+            "page" => UploadKind::Page,
+            "icon" => UploadKind::Icon,
+            "bundle" => UploadKind::Bundle { spa: spa.unwrap_or(false) },
+            "handler" => UploadKind::Handler,
+            "migrations" => UploadKind::Migrations,
+            "manifest" => UploadKind::Manifest,
+            "source" => UploadKind::Source,
+            "blob" => match key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                Some(key) => UploadKind::Blob(key.to_string()),
+                None => return refuse("kind 'blob' needs key: where the file is stored, like 'photos/cover.jpg'".into()),
+            },
+            other => {
+                return refuse(format!(
+                    "kind must be page, bundle, handler, migrations, manifest, source, icon or blob, not '{other}'"
+                ))
+            }
+        };
+        // A page name under the app, exactly as /upload/<ticket>/<page>.
+        let target = match page.as_deref().map(|p| p.trim_matches('/').trim_end_matches(".html")).filter(|p| !p.is_empty()) {
+            Some(page) if matches!(kind, UploadKind::Page | UploadKind::Icon) => format!("{slug}/{page}"),
+            Some(_) => return refuse("page is only for kind 'page' or 'icon'".into()),
+            None => slug.clone(),
+        };
+        if !valid_slug(&target) {
+            return refuse("page name must be path segments of letters, numbers, '-' or '_'".into());
+        }
+        let (caller, folder) = match self.allowed_to_publish(&ctx, &slug, project.as_deref()).await {
+            Ok(allowed) => allowed,
+            Err(refused) => return Ok(refused),
+        };
+        let meta = SourceMeta {
+            push: true,
+            message: message.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
+            commit: commit.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+        };
+        let user = caller.user.as_ref().map(|user| user.id.clone());
+        let config = self.config.clone();
+        let outcome = tokio::task::spawn_blocking(move || inline_upload::begin(&config, target, kind, meta, user, folder))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(match outcome {
+            Ok(id) => CallToolResult::success(vec![ContentBlock::text(format!(
+                "Upload {id} is open for 15 minutes. Send the file in order with upload_chunk(id, index, data): \
+                 index from 0, data standard base64 of at most {} bytes decoded per chunk. Then \
+                 upload_finish(id, chunks) with the total count. The reply is what the upload URL would have said.",
+                inline_upload::CHUNK_BYTES
+            ))]),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
+    }
+
+    #[tool(
+        description = "One chunk of an inline upload: standard base64, at most 786432 bytes decoded, with its index from 0. Any order; a repeat of an index replaces it. Returns the bytes received so far and the indexes present.",
+        annotations(title = "Send an upload chunk", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn upload_chunk(
+        &self,
+        Parameters(UploadChunkRequest { id, index, data }): Parameters<UploadChunkRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = self.config.clone();
+        let outcome = tokio::task::spawn_blocking(move || inline_upload::chunk(&config, &id, index, &data))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(match outcome {
+            Ok(progress) => CallToolResult::success(vec![ContentBlock::text(format!(
+                "{} bytes received; chunks present: {}",
+                progress.received,
+                progress.present.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+            ))]),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        })
+    }
+
+    #[tool(
+        description = "Closes an inline upload: joins the chunks in order and stores the result exactly as the upload URL would, with the same validation and the same reply. Refuses when a chunk is missing, naming it. The id is spent either way.",
+        annotations(title = "Finish an inline upload", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn upload_finish(
+        &self,
+        Parameters(UploadFinishRequest { id, chunks }): Parameters<UploadFinishRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = self.config.clone();
+        let joined = tokio::task::spawn_blocking(move || inline_upload::finish(&config, &id, chunks))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let (upload, bytes) = match joined {
+            Ok(joined) => joined,
+            Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+        };
+        let response = upload::store_for_publisher(
+            &self.config,
+            &self.runtime,
+            upload.slug,
+            upload.kind,
+            bytes::Bytes::from(bytes),
+            upload.meta,
+            upload.user,
+            upload.project,
+        )
+        .await;
+        let ok = response.status().is_success();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).trim_end().to_string())
+            .unwrap_or_default();
+        Ok(if ok {
+            CallToolResult::success(vec![ContentBlock::text(body)])
+        } else {
+            CallToolResult::error(vec![ContentBlock::text(format!("{status}: {body}"))])
+        })
+    }
+
+    #[tool(
+        description = "Fallback publisher for when you cannot reach this host from a shell: pastes one page's HTML through this call. If you can run shell commands with network access, use create_upload instead. For anything that is not plain HTML (a built bundle, a handler, migrations, a manifest, the source, a blob) use upload_begin / upload_chunk / upload_finish. Call again with the same slug to update in place. Use a slug like 'myapp/about' to group pages under one app.",
         annotations(title = "Publish a page", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn push_page(
@@ -812,7 +980,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Fallback publisher for a whole multi-page app when you cannot reach this host from a shell: pastes every page's HTML through this call. If you can run shell commands with network access, use create_upload instead. A page named 'index' is also served at the app's own root URL. Returns each page's URL.",
+        description = "Fallback publisher for a whole multi-page app when you cannot reach this host from a shell: pastes every page's HTML through this call. If you can run shell commands with network access, use create_upload instead; for a built bundle, a handler or anything that is not plain HTML, use upload_begin / upload_chunk / upload_finish. A page named 'index' is also served at the app's own root URL. Returns each page's URL.",
         annotations(title = "Publish an app", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn push_app(
@@ -950,6 +1118,9 @@ impl PageHost {
              \nEvery flag this URL takes: ?bundle, ?spa, ?handler, ?migrations, ?manifest, \
              ?icon, ?source, ?blob=<key>. No flag at all publishes the body as a page. \
              Anything else is refused rather than guessed at.\n\
+             \nIf curl cannot reach this host from your sandbox, use upload_begin / \
+             upload_chunk / upload_finish with base64 chunks: same kinds, same rules, \
+             same reply.\n\
              \nKeep the project with the app, since a bundle cannot be turned back into the \
              sources that built it. Visitors only ever see what the bundle contained:\n\
              \n  tar -czf - --exclude node_modules --exclude target . | curl -f -T - '{upload}?source'\n\
@@ -1725,9 +1896,12 @@ impl ServerHandler for PageHost {
                  into the conversation — that is the whole point. Emitting a page's HTML as \
                  tool-call arguments when you could have written a file is wasteful, so treat \
                  this as the default path.\n\
-                 2. If curl fails because the sandbox has no network access to this host, fall \
-                 back to push_page / push_app, which take the HTML inline.\n\
-                 3. If there is no shell at all, use push_page / push_app directly.\n\
+                 2. If curl fails because the sandbox has no network access to this host, send \
+                 the file in base64 chunks with upload_begin / upload_chunk / upload_finish: \
+                 same kinds (bundle, handler, migrations, manifest, source, blob, page), same \
+                 rules. push_page / push_app take plain HTML inline.\n\
+                 3. If there is no shell at all, build nothing: push_page / push_app for HTML, \
+                 or the chunked upload for a file you already have.\n\
                  \n\
                  Build anything interactive as a real front-end project, not as one \
                  hand-written HTML file. If it has state, forms, or more than one screen, \

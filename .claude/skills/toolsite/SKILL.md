@@ -22,6 +22,7 @@ Decide by what the thing does, not by what is quickest to start:
 | Needs server-side data or logic | Add `--handler`, see [Server-side handlers](#server-side-handlers) |
 | Something that should keep deploying from a repository | Publish once, then `app_repo(app, "create")`, see [A repository](#a-repository) |
 | No shell available (claude.ai web) | Fall back to the `push_page` / `push_app` MCP tools |
+| A shell that cannot reach the host (ChatGPT's sandbox) | Build there, then send the file with `upload_begin` / `upload_chunk` / `upload_finish` in base64 chunks |
 
 **Reach for `--react` by default for an app.** Hand-writing one big
 `index.html` looks cheaper because it starts with no setup, and that is the
@@ -203,6 +204,7 @@ For when the CLI isn't installed, or there is no shell at all.
 | `create_user(email, password?, admin?)` | An account. Leave the password out and the reply carries a one-time setup link for them. |
 | `set_access(app, email, allow?, role?)` / `set_user_active(email, active)` | Grants on a `granted` app, and disabling an account. |
 | `push_page(html, slug?)` / `push_app(app, pages)` | No-shell fallbacks, HTML inline. A page named `index` also serves at the app root. |
+| `upload_begin(slug, kind, …)` / `upload_chunk(id, index, data)` / `upload_finish(id, chunks)` | The upload URL's kinds (`bundle`, `handler`, `migrations`, `manifest`, `source`, `icon`, `blob`, `page`) sent inline as base64 chunks of at most 768 KB decoded, for a sandbox that cannot reach the host. Same rules, same reply. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
 | `remove_page(slug, confirm, page_only?)` | Takes a slug down for good. Files move to `.trash/` on the server, never deleted. Prefer `set_visibility`. |
 

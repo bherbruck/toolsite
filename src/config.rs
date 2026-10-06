@@ -1,6 +1,6 @@
 use crate::{
     accounts::providers::{PendingLogin, Provider},
-    platform::{github, upload::UploadTicket},
+    platform::{github, inline_upload::InlineUpload, upload::UploadTicket},
     runtime::blobs::{self, Blobs},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
@@ -20,6 +20,9 @@ pub struct Config {
     /// OAuth server needs none of these; it is on whenever `base_url` is.
     pub valid_tokens: Vec<String>,
     pub uploads: Mutex<HashMap<String, UploadTicket>>,
+    /// Uploads arriving in base64 chunks over MCP, for a sandbox that cannot
+    /// reach the upload URL. Spooled under `.tmp/inline/` until finished.
+    pub inline_uploads: Mutex<HashMap<String, InlineUpload>>,
     /// Ceiling on any one SQLite file. Zero means none.
     pub max_db_bytes: u64,
     /// Where apps' files go, and how big one may be.
@@ -54,6 +57,7 @@ impl Config {
             local_base: self.local_base.clone(),
             valid_tokens: Vec::new(),
             uploads: Mutex::new(HashMap::new()),
+            inline_uploads: Mutex::new(HashMap::new()),
             max_db_bytes: self.max_db_bytes,
             // A task that needs the bucket gets a config that knows it; the
             // scheduler runs handlers, which may well store files.
@@ -76,6 +80,7 @@ impl Config {
             local_base: "http://localhost:8080".to_string(),
             valid_tokens: vec![token.into()],
             uploads: Mutex::new(HashMap::new()),
+            inline_uploads: Mutex::new(HashMap::new()),
             max_db_bytes: DEFAULT_MAX_DB_BYTES,
             blobs: Blobs::local(DEFAULT_MAX_BLOB_BYTES),
             blob_uploads: Mutex::new(HashMap::new()),

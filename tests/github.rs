@@ -1255,3 +1255,68 @@ async fn tagged_repositories_are_proposed_for_import_and_linked_or_untagged_ones
     let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
     assert!(page.contains("No tagged repository is waiting"));
 }
+
+/// One JSON-RPC call to `/mcp` with the static token, answered as the SSE
+/// data line or plain JSON. Enough to drive the inline upload tools.
+async fn mcp_call(config: &Arc<Config>, name: &str, arguments: serde_json::Value) -> (bool, String) {
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": arguments } });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, text, _) = send(config, request).await;
+    assert_eq!(status, StatusCode::OK, "{name}: {text}");
+    let raw = text.lines().filter_map(|l| l.strip_prefix("data:")).map(str::trim).last().unwrap_or(text.trim()).to_string();
+    let reply: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| panic!("not JSON-RPC: {text}"));
+    let result = &reply["result"];
+    (
+        result["isError"].as_bool().unwrap_or(false),
+        result["content"][0]["text"].as_str().unwrap_or("").to_string(),
+    )
+}
+
+#[tokio::test]
+async fn a_source_archive_sent_in_chunks_pushes_with_its_message_like_the_put() {
+    use base64::Engine as _;
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = github_server(&api);
+    publish_app(&config, "shop");
+    store_source(&config, "shop");
+    let session = admin(&config);
+    install(&config, &session).await;
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    let token = form_token_from(&page);
+    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1);
+
+    let next = tgz(&[("./package.json", b"{}"), ("./src/Phone.tsx", b"export default () => <p>phone</p>")]);
+    let (is_error, text) = mcp_call(
+        &config,
+        "upload_begin",
+        serde_json::json!({ "slug": "shop", "kind": "source", "message": "Fix the phone field" }),
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    let id = text.split_whitespace().nth(1).unwrap().to_string();
+    for (index, part) in next.chunks(500).enumerate() {
+        let data = base64::engine::general_purpose::STANDARD.encode(part);
+        let (is_error, text) = mcp_call(&config, "upload_chunk", serde_json::json!({ "id": id, "index": index, "data": data })).await;
+        assert!(!is_error, "{text}");
+    }
+    let count = next.chunks(500).count();
+    let (is_error, reply) = mcp_call(&config, "upload_finish", serde_json::json!({ "id": id, "chunks": count })).await;
+    assert!(!is_error, "{reply}");
+    assert!(reply.contains("pushed to acme/shop@main as "), "{reply}");
+
+    let fake = fake.lock().unwrap();
+    let repo = fake.repo("acme/shop");
+    assert_eq!(repo.commits_made, 2, "one commit per publish");
+    assert!(repo.files.contains_key("src/Phone.tsx"));
+    let (_, message) = &repo.history[0];
+    assert_eq!(message, "Fix the phone field\n\nPublished from toolsite");
+}

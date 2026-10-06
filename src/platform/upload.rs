@@ -74,7 +74,7 @@ pub(crate) struct UploadQuery {
 /// upload is the publisher's act and pushes to a linked repository; a
 /// deploy-token upload comes from a pipeline and never pushes back.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SourceMeta {
+pub struct SourceMeta {
     pub(crate) push: bool,
     pub(crate) message: Option<String>,
     pub(crate) commit: Option<String>,
@@ -99,7 +99,8 @@ impl SourceMeta {
     }
 }
 
-pub(crate) enum UploadKind {
+#[derive(Clone, Debug)]
+pub enum UploadKind {
     Page,
     Icon,
     Bundle { spa: bool },
@@ -142,6 +143,24 @@ pub(crate) async fn store_upload(
         Some(sub) => format!("{slug}/{}", sub.trim_end_matches(".html")),
         None => slug,
     };
+    store_for_publisher(config, runtime, slug, kind, body, meta, user, project).await
+}
+
+/// Writes `body` as `kind` at `slug` for a publisher the platform already
+/// identified: the account behind an upload ticket, or an inline upload over
+/// MCP. Both paths end here, so the slug rules, the editor check at arrival,
+/// the store itself and the first-publish stamp are one rule.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_for_publisher(
+    config: &Config,
+    runtime: &Runtime,
+    slug: String,
+    kind: UploadKind,
+    body: Bytes,
+    meta: SourceMeta,
+    user: Option<String>,
+    project: Option<String>,
+) -> Response {
     if !valid_slug(&slug) {
         return (
             StatusCode::BAD_REQUEST,
@@ -173,7 +192,7 @@ pub(crate) async fn store_upload(
             tracing::warn!(app = %app, path = %path, "upload refused: the account no longer has editor access");
             return (
                 StatusCode::FORBIDDEN,
-                format!("the account behind this upload URL needs editor access at {path}\n"),
+                format!("the account behind this upload needs editor access at {path}\n"),
             )
                 .into_response();
         }
