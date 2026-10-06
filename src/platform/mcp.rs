@@ -484,6 +484,27 @@ impl PageHost {
         if crate::content::store::app_exists(&self.config, &app).await {
             return self.allowed(ctx, slug, Scope::Editor).await.map(|caller| (caller, None));
         }
+        // A new app may not land at a project's path: the two would share
+        // every permission row. Checked for every caller, the static token
+        // included, before anything else is decided.
+        let landing = match project.as_deref() {
+            Some(folder) => format!("{folder}/{app}"),
+            None => match &caller.user {
+                Some(user) => {
+                    let (config, who) = (self.config.clone(), user.clone());
+                    match tokio::task::spawn_blocking(move || users::default_folder_for(&config, &who)).await.ok().flatten() {
+                        Some(folder) if !folder.is_empty() => format!("{folder}/{app}"),
+                        _ => app.clone(),
+                    }
+                }
+                None => app.clone(),
+            },
+        };
+        if crate::content::store::project_at_path(&self.config, &landing).await {
+            return Err(CallToolResult::error(vec![ContentBlock::text(format!(
+                "{landing} is a project; a new app cannot take a project's path. Choose another name for the app."
+            ))]));
+        }
         let Some(user) = caller.user.clone() else {
             if let Some(folder) = &project
                 && !crate::content::store::folder_exists(&self.config, folder).await
@@ -555,16 +576,28 @@ impl PageHost {
     /// static token sees the rest; an account sees public and signed-in
     /// apps and the ones it holds a scope on. The same rule as list_pages.
     async fn may_see(&self, caller: &Caller, slug: &str) -> bool {
+        // A page inside an app is judged by the app, as serving judges it:
+        // the app's own meta decides hidden and access, and its rule for
+        // the page's path inside it applies. A page's missing meta must
+        // never read as "open".
         let meta = read_meta(&self.config, slug).await;
-        if meta.hidden {
+        let app = slug.split('/').next().unwrap_or(slug).to_string();
+        let app_meta = read_meta(&self.config, &app).await;
+        if meta.hidden || app_meta.hidden {
             return false;
         }
         let Some(user) = &caller.user else {
             return true;
         };
-        let app = slug.split('/').next().unwrap_or(slug).to_string();
-        let gate = crate::content::store::effective_gate(&self.config, &app, "/").await.gate;
-        matches!(gate.as_str(), "public" | "authenticated") || self.held_on(user, &app).await.is_some()
+        let within = match slug.split_once('/') {
+            Some((_, rest)) => format!("/{rest}"),
+            None => "/".to_string(),
+        };
+        let gate = crate::content::store::effective_gate(&self.config, &app, &within).await.gate;
+        match gate.as_str() {
+            "public" | "authenticated" => true,
+            _ => self.held_on(user, &app).await.is_some(),
+        }
     }
 
     /// Every slug the caller may open, for search.
@@ -1373,12 +1406,15 @@ impl PageHost {
         ctx: RequestContext<RoleServer>,
         Parameters(RunSqlRequest { app, sql, params, as_user }): Parameters<RunSqlRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
+        let as_user = as_user.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        // Running as someone else is impersonation: it needs Manage on the
+        // app, not the Edit that plain SQL needs.
+        let needed = if as_user.is_some() { Scope::Admin } else { Scope::Editor };
+        if let Err(refused) = self.allowed(&ctx, &app, needed).await {
             return Ok(refused);
         }
         let config = self.config.clone();
         let params = params.unwrap_or_default();
-        let as_user = as_user.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
         let outcome = tokio::task::spawn_blocking(move || match as_user {
             None => db::run(&config, &app, &sql, &params),
             Some(email) => {

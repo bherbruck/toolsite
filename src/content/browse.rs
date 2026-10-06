@@ -154,14 +154,24 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
     let mut entries = Vec::with_capacity(slugs.len());
     for slug in &slugs {
         let meta = read_meta(config, slug).await;
-        if meta.hidden || !meta.listed {
-            continue;
-        }
-        let gate = crate::content::store::effective_gate(config, slug, "/").await.gate;
-        if !admits(config, &gate, slug, viewer).await {
-            continue;
-        }
         let app = slug.split('/').next().unwrap_or(slug).to_string();
+        // Judged by the app, as serving judges it: the app's meta decides
+        // hidden and access, with its rule for this page's path. A loose
+        // page with no meta of its own must not read as open.
+        let app_meta = read_meta(config, &app).await;
+        if meta.hidden || app_meta.hidden || !meta.listed {
+            continue;
+        }
+        let within = match slug.split_once('/') {
+            Some((_, rest)) => format!("/{rest}"),
+            None => "/".to_string(),
+        };
+        // The app's own rules, its projects', the site's: one resolution,
+        // with this page's path inside the app.
+        let gate = crate::content::store::effective_gate(config, &app, &within).await.gate;
+        if !admits(config, &gate, &app, viewer).await {
+            continue;
+        }
         let project = store::app_folder(config, &app).await;
         let path = page_path(config, slug).await;
         let title = match &path {

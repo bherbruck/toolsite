@@ -672,6 +672,27 @@ pub async fn folder_exists(config: &Config, path: &str) -> bool {
     path.is_empty() || list_folders(config).await.iter().any(|folder| folder.path == path)
 }
 
+/// Whether some app already sits at `path` in the tree (its project plus its
+/// slug). Project paths and app paths share one namespace, because a
+/// permission row is keyed by path alone: a project and an app at the same
+/// path would share every row, so access given on one would open the other.
+pub async fn app_at_path(config: &Config, path: &str) -> Option<String> {
+    apps_with_folders(config)
+        .await
+        .into_iter()
+        .find(|(app, folder)| {
+            let at = if folder.is_empty() { app.clone() } else { format!("{folder}/{app}") };
+            at == path
+        })
+        .map(|(app, _)| app)
+}
+
+/// Whether a project has this path. See [`app_at_path`] for why the two
+/// must never meet.
+pub async fn project_at_path(config: &Config, path: &str) -> bool {
+    !path.is_empty() && list_folders(config).await.iter().any(|folder| folder.path == path)
+}
+
 /// Creates `parent/name`. The parent must exist, or be the root.
 pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<Folder, String> {
     if !crate::content::slug::valid_segment(name) {
@@ -687,6 +708,11 @@ pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<
     let path = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
     if folders.iter().any(|folder| folder.path == path) {
         return Err(format!("there is already a folder '{path}'"));
+    }
+    if let Some(app) = app_at_path(config, &path).await {
+        return Err(format!(
+            "the app {app} is at {path}; a project cannot share an app's path, because access on one would open the other"
+        ));
     }
     let folder = Folder {
         path,
