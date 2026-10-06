@@ -43,6 +43,10 @@ enum Command {
         /// hand-written index.html costs more by the second edit.
         #[arg(long)]
         react: bool,
+        /// Start from one of the server's example apps instead, named and
+        /// with its base path set for NAME. `curl <site>/examples` lists them.
+        #[arg(long, conflicts_with_all = ["spa", "handler", "react"])]
+        example: Option<String>,
     },
     /// Fetch back the project a previous deploy stored.
     Fetch {
@@ -234,8 +238,18 @@ fn run() -> Result<()> {
         spa,
         handler,
         react,
+        example,
     } = &cli.command
     {
+        if let Some(example) = example {
+            // Reads from the server, but needs no token: examples are public.
+            let url = cli
+                .url
+                .clone()
+                .or_else(|| std::env::var("TOOLSITE_URL").ok())
+                .ok_or_else(|| anyhow!("--example reads from the server: set --url or TOOLSITE_URL"))?;
+            return scaffold::init_example(&url, name, example);
+        }
         return scaffold::init(name, *spa, *handler, *react);
     }
 

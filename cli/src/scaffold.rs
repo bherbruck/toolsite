@@ -146,3 +146,51 @@ fn write_handler(root: &Path, name: &str) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// An example app from the server, unpacked under the last segment of
+/// `name`. The server renames it, so the slug and the base path already
+/// agree with `name` and it deploys as it is.
+pub fn init_example(base_url: &str, name: &str, example: &str) -> Result<()> {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    let root = Path::new(leaf);
+    if root.exists() {
+        bail!("{leaf} already exists");
+    }
+    let url = format!(
+        "{}/examples/{}.tar.gz?slug={}",
+        base_url.trim_end_matches('/'),
+        urlencoding_component(example),
+        urlencoding_component(name)
+    );
+    let response = reqwest::blocking::get(&url)?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        bail!("the server did not hand over '{example}' ({status}): {}", body.trim());
+    }
+    let gz = response.bytes()?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(gz.as_ref()));
+    // unpack refuses absolute paths and '..', so an archive cannot write
+    // outside the current directory.
+    archive.unpack(".")?;
+    if !root.join("toolsite.toml").is_file() {
+        bail!("the archive for '{example}' did not unpack into {leaf}/");
+    }
+
+    println!("created {leaf}/ from the {example} example");
+    println!("  README.md            what it shows and where to look");
+    println!("  toolsite.toml        slug {name}, base path /p/{name}/");
+    println!();
+    println!("Next: cd {leaf} && toolsite deploy");
+    Ok(())
+}
+
+/// Enough percent-encoding for a slug or an example name in a query.
+fn urlencoding_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}

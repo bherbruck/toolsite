@@ -266,6 +266,7 @@ can do here, and some things only happen here.
 | `GET /admin/...`, `GET /account` | admin, signed in | The admin pages and one's own account. |
 | `GET /guide` | public | How the platform works, for an agent about to build on it. |
 | `GET /wit/toolsite.wit`, `GET /scaffold/<app>` | public | The contract, and a handler crate ready to build. |
+| `GET /examples`, `GET /examples/<name>.tar.gz?slug=<app>` | public | Working example apps, and one renamed for `<app>`. |
 | `GET /` | public | The index. |
 
 The transport holds no session. A client on MCP 2026-07-28 asks

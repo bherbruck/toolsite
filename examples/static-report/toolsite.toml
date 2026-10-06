@@ -1,0 +1,7 @@
+slug = "static-report"
+spa = false
+icon = "📊"
+
+# A report anyone with the link may read. No handler, no database: the
+# page in public/ is the whole app.
+gate = "public"

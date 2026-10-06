@@ -1379,6 +1379,9 @@ impl PageHost {
              \nWith a router, set its basename to '{trimmed}' too (e.g. \
              createBrowserRouter(routes, {{ basename: '{trimmed}' }})).\n\
              \nAfter uploading, verify with: curl -I {page}/assets/<one-built-file>\n\
+             \nWorking example apps to start from or copy a part of (handler, policies, files, \
+             jobs, tools): curl {site}/examples. One renamed for this slug, base path set:\n\
+             \n  curl -fsS '{site}/examples/kitchen-sink.tar.gz?slug={slug}' | tar -xz\n\
              \nServer-side code — a wasm component that gets this app's own SQLite database \
              and nothing else. Start from the scaffold; it vendors the contract and builds \
              as-is:\n\
@@ -2396,7 +2399,8 @@ impl ServerHandler for PageHost {
                  [--handler]`.\n\
                  \n\
                  GET /guide is how this platform works, kept current. Read it before \
-                 building anything with a handler, a schema or a gate.\n\
+                 building anything with a handler, a schema or a gate. GET /examples lists \
+                 working example apps to start from or copy a part of.\n\
                  \n\
                  Call list_pages to see what already exists before picking a slug or editing \
                  something, and app_notes to read what a previous session left about an app \

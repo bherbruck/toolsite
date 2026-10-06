@@ -1,0 +1,30 @@
+slug = "inventory-policies"
+spa = false
+icon = "🏷️"
+
+# Only people with a grant open the app. The policies below then decide
+# which rows each of them sees.
+gate = "restricted"
+
+[access]
+# Totals across every location, with no location column. Readable by all.
+views = ["stock_totals"]
+
+# A person sees and changes the stock of their own location only. A write
+# that would move a row to another location is refused.
+[[access.table]]
+table = "stock"
+where = "location = (select location from members where email = current_email())"
+write = true
+
+# Movements at the person's location. by_user is filled with current_user().
+[[access.table]]
+table = "movements"
+where = "location = (select location from members where email = current_email())"
+owner = "by_user"
+write = true
+
+# A person sees their own membership row, and cannot change it.
+[[access.table]]
+table = "members"
+where = "email = current_email()"
