@@ -97,11 +97,31 @@ pub(crate) fn sniff_image_type(bytes: &[u8]) -> &'static str {
     }
 }
 
-pub(crate) async fn serve_icon(State(config): State<Arc<Config>>, Path(slug): Path<String>) -> Response {
+pub(crate) async fn serve_icon(
+    State(config): State<Arc<Config>>,
+    Path(slug): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let slug = slug.trim_end_matches('/');
     if !valid_slug(slug) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
+    // The icon follows the app: a hidden app, or one the visitor may not
+    // open, has no icon as far as they can tell. The index asks for icons
+    // with the site cookie, so that is who is asking here too.
+    let app = slug.split('/').next().unwrap_or(slug);
+    let meta = read_meta(&config, app).await;
+    let gate = meta.gate_for("/", &config.default_gate).to_string();
+    if meta.hidden {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    if gate != "public" {
+        let viewer = crate::accounts::users::current_site_user(&config, &headers).await;
+        if !admits(&config, &gate, app, viewer.as_ref()).await {
+            return (StatusCode::NOT_FOUND, "not found").into_response();
+        }
+    }
+    let cache = if gate == "public" { "public, max-age=300" } else { "private, max-age=300" };
     let Some(path) = icon_path(&config, slug).await else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -112,7 +132,7 @@ pub(crate) async fn serve_icon(State(config): State<Arc<Config>>, Path(slug): Pa
     (
         [
             (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "public, max-age=300"),
+            (header::CACHE_CONTROL, cache),
         ],
         bytes,
     )

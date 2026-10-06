@@ -6092,3 +6092,33 @@ async fn toolsites_own_pages_have_a_favicon() {
     let (_, index, _) = send(&config, get("/")).await;
     assert!(index.contains(r#"<link rel="icon" href="/favicon.svg""#));
 }
+
+#[tokio::test]
+async fn a_restricted_apps_icon_is_hidden_from_someone_who_may_not_open_it() {
+    let (dir, config) = server();
+    write_page(&config, "secret/index", "<title>Secret</title>");
+    std::fs::write(
+        dir.path().join("secret.meta"),
+        r#"{"listed":true,"hidden":false,"spa":false,"gate":"restricted","allow_http":[],"rules":[]}"#,
+    )
+    .unwrap();
+    // A one-pixel PNG as the uploaded icon.
+    let png: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1,
+        8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0, 1, 0, 0,
+        5, 0, 1, 0x0D, 0x0A, 0x2D, 0xB4, 0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    std::fs::write(dir.path().join("secret.icon"), png).unwrap();
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    account(&config, "reader@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let reader = sign_in(&config, "reader@example.com", "correct horse battery");
+
+    let (status, ..) = send(&config, get("/icon/secret")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a stranger fetched a restricted app's icon");
+    let (status, ..) = send(&config, get_as("/icon/secret", &reader)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "an account without access fetched the icon");
+    let (status, _, headers) = send(&config, get_as("/icon/secret", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.iter().any(|(k, v)| k == "cache-control" && v.starts_with("private")), "{headers:?}");
+}
