@@ -210,7 +210,9 @@ hold; `list_pages` shows what you may open.
 level. With admin there you can `create` a project, `move` an app into one
 (admin where it is and where it goes; the project must exist), and read or
 change its `permissions` with `grant` and `revoke`. You cannot give more than
-you hold.
+you hold. `rename` and `move_project` carry the apps, the access and the lock
+along and keep the old path working as a link; `remove` takes away only an
+empty project.
 
 A gate decides whether a request arrives:
 

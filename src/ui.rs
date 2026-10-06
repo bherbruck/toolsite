@@ -714,14 +714,39 @@ pub const SHELL_SCRIPT: &str = r#"
     });
   }
   // Rows opened in place are kept in the address, so a shared link opens the
-  // same way. The server renders them open from ?open=.
+  // same way, and in this browser per level, so coming back opens them
+  // again. The server renders them open from ?open=. A remembered row that
+  // is no longer there (renamed, moved, removed) is simply not found.
   const rows = document.querySelectorAll('details[data-rel]');
   if (rows.length) {
-    const keep = () => {
-      const open = Array.from(document.querySelectorAll('details[data-rel][open]')).map((d) => d.dataset.rel);
+    const openKey = 'toolsite.open:' + location.pathname;
+    const remember = (list) => {
+      try {
+        if (list) localStorage.setItem(openKey, list); else localStorage.removeItem(openKey);
+      } catch (e) {}
+    };
+    const setUrl = (list) => {
       const url = new URL(location.href);
-      if (open.length) url.searchParams.set('open', open.join(',')); else url.searchParams.delete('open');
+      if (list) url.searchParams.set('open', list); else url.searchParams.delete('open');
       history.replaceState(null, '', url.pathname + url.search + url.hash);
+    };
+    const current = new URL(location.href).searchParams.get('open');
+    if (current !== null) {
+      remember(current);
+    } else {
+      let stored = null;
+      try { stored = localStorage.getItem(openKey); } catch (e) {}
+      if (stored) {
+        const wanted = new Set(stored.split(',').filter(Boolean));
+        rows.forEach((d) => { if (wanted.has(d.dataset.rel)) d.open = true; });
+        const found = Array.from(document.querySelectorAll('details[data-rel][open]')).map((d) => d.dataset.rel).join(',');
+        setUrl(found);
+      }
+    }
+    const keep = () => {
+      const list = Array.from(document.querySelectorAll('details[data-rel][open]')).map((d) => d.dataset.rel).join(',');
+      setUrl(list);
+      remember(list);
     };
     rows.forEach((d) => d.addEventListener('toggle', keep));
   }

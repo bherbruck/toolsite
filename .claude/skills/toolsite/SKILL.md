@@ -206,7 +206,7 @@ For when the CLI isn't installed, or there is no shell at all.
 | `app_repo(app, action, repo?, branch?, directory?, installation?, public?)` | `status`, `installations`, `discover`, `create`, `import`, `sync`, `disconnect`. See [A repository](#a-repository). |
 | `app_deploy_tokens(app, action, label?, id?)` | A token that publishes one app only, for a pipeline that is not GitHub: `create`, `list`, `revoke`. |
 | `app_exports(app, action, label?, id?)` | A read-only token for `GET <site>/export/<app>.sqlite`, a snapshot of the whole database for a reporting tool. |
-| `projects(action, path?, name?, app?, email?, scope?)` | Projects and who may act in them: `list`, `create` (admin at the parent), `move` an app (admin at both ends, the target must exist), `permissions`, `grant`, `revoke` (admin there, never more than you hold). The same rules as the app browser. |
+| `projects(action, path?, name?, parent?, app?, email?, scope?)` | Projects and who may act in them: `list`, `create` (admin at the parent), `move` an app (admin at both ends, the target must exist), `rename` a project (admin at its parent), `move_project` (admin at the project, where it is and where it goes), `remove` an empty project (admin at its parent), `permissions`, `grant`, `revoke` (admin there, never more than you hold). The same rules as the app browser. |
 | `create_user(email, password?, admin?)` | An account. Leave the password out and the reply carries a one-time setup link for them. |
 | `set_access(app, email, allow?, role?)` / `set_user_active(email, active)` | Access on a `restricted` app, and disabling an account. |
 | `push_page(html, slug?)` / `push_app(app, pages)` | No-shell fallbacks, HTML inline. A page named `index` also serves at the app root. |

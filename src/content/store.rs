@@ -491,7 +491,15 @@ pub struct Folder {
     /// locked. Customizable (false) is the default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// Paths this project had before a rename or a move, newest last, so a
+    /// link to the old place still arrives. An alias goes when another
+    /// project takes that path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed_from: Vec<String>,
 }
+
+/// Aliases kept per project. Enough for a few renames in a row.
+const MAX_ALIASES: usize = 5;
 
 fn projects_path(config: &Config) -> PathBuf {
     config.data_dir.join(".site").join("projects.json")
@@ -570,11 +578,89 @@ pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<
             .unwrap_or_default()
             .as_secs(),
         locked: false,
+        renamed_from: Vec::new(),
     };
+    drop_alias(&mut folders, &folder.path);
     folders.push(folder.clone());
     folders.sort_by(|a, b| a.path.cmp(&b.path));
     write_folders(config, &folders).await.map_err(|e| e.to_string())?;
     Ok(folder)
+}
+
+/// A path is now a real project, so no other project may still answer to it
+/// as an old name.
+fn drop_alias(folders: &mut [Folder], path: &str) {
+    for folder in folders.iter_mut() {
+        folder.renamed_from.retain(|old| old != path && !old.starts_with(&format!("{path}/")));
+    }
+}
+
+/// Moves the project at `from`, and every project below it, to `to`. Only
+/// the tree changes here; the caller moves what points into it first.
+pub async fn relocate_folder(config: &Config, from: &str, to: &str) -> Result<(), String> {
+    let mut folders = list_folders(config).await;
+    if !folders.iter().any(|folder| folder.path == from) {
+        return Err(format!("there is no project '{from}'"));
+    }
+    let under = format!("{from}/");
+    for folder in folders.iter_mut() {
+        if folder.path == from {
+            folder.path = to.to_string();
+            folder.name = to.rsplit('/').next().unwrap_or(to).to_string();
+            folder.renamed_from.retain(|old| old != to);
+            folder.renamed_from.push(from.to_string());
+            if folder.renamed_from.len() > MAX_ALIASES {
+                let excess = folder.renamed_from.len() - MAX_ALIASES;
+                folder.renamed_from.drain(..excess);
+            }
+        } else if let Some(rest) = folder.path.strip_prefix(&under) {
+            folder.path = format!("{to}/{rest}");
+        }
+    }
+    // Every new path is real now; no alias elsewhere may claim it.
+    let new_paths: Vec<String> = folders
+        .iter()
+        .filter(|folder| folder.path == to || folder.path.starts_with(&format!("{to}/")))
+        .map(|folder| folder.path.clone())
+        .collect();
+    for path in new_paths {
+        for folder in folders.iter_mut() {
+            if folder.path != to {
+                folder.renamed_from.retain(|old| *old != path);
+            }
+        }
+    }
+    folders.sort_by(|a, b| a.path.cmp(&b.path));
+    write_folders(config, &folders).await.map_err(|e| e.to_string())
+}
+
+/// Removes the project row at `path`. The caller has checked it is empty.
+pub async fn remove_folder(config: &Config, path: &str) -> Result<(), String> {
+    let mut folders = list_folders(config).await;
+    let before = folders.len();
+    folders.retain(|folder| folder.path != path);
+    if folders.len() == before {
+        return Err(format!("there is no project '{path}'"));
+    }
+    write_folders(config, &folders).await.map_err(|e| e.to_string())
+}
+
+/// Where an old project path now lives, if a project was renamed or moved
+/// away from it: `ops/yard` after `ops` became `site` gives `site/yard`.
+pub async fn renamed_path(config: &Config, path: &str) -> Option<String> {
+    let folders = list_folders(config).await;
+    if folders.iter().any(|folder| folder.path == path) {
+        return None;
+    }
+    folders.iter().find_map(|folder| {
+        folder.renamed_from.iter().rev().find_map(|old| {
+            if path == old {
+                Some(folder.path.clone())
+            } else {
+                path.strip_prefix(&format!("{old}/")).map(|rest| format!("{}/{rest}", folder.path))
+            }
+        })
+    })
 }
 
 /// The folders directly inside `parent`.

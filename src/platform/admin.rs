@@ -2321,6 +2321,56 @@ pub async fn new_folder(
 }
 
 #[derive(Deserialize)]
+pub struct ProjectChange {
+    token: String,
+    /// rename, move or remove.
+    action: String,
+    path: String,
+    name: Option<String>,
+    parent: Option<String>,
+    back: Option<String>,
+}
+
+/// Renames, moves or removes a project. The door is admin at the project;
+/// the projects module then asks for what each change needs (the parent for
+/// a rename or removal, all three places for a move).
+pub async fn change_project(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<ProjectChange>,
+) -> Response {
+    let path = form.path.trim_matches('/').to_string();
+    if path.is_empty() || !users::valid_prefix(&path) {
+        return (StatusCode::BAD_REQUEST, "invalid project").into_response();
+    }
+    let admin = match checked_at(&config, &headers, &form.token, &path, Scope::Admin).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), &crate::content::browse::browser_url(&path));
+    let outcome = match form.action.as_str() {
+        "rename" => projects::rename(&config, Some(&admin), &path, form.name.as_deref().unwrap_or(""))
+            .await
+            .map(|to| (crate::content::browse::browser_url(&to), format!("The project is now {to}."))),
+        "move" => projects::move_project(&config, Some(&admin), &path, form.parent.as_deref().unwrap_or("").trim_matches('/'))
+            .await
+            .map(|to| (crate::content::browse::browser_url(&to), format!("The project is now at {to}."))),
+        "remove" => {
+            let parent = path.rsplit_once('/').map(|(above, _)| above.to_string()).unwrap_or_default();
+            projects::remove(&config, Some(&admin), &path)
+                .await
+                .map(|()| (crate::content::browse::browser_url(&parent), format!("Project {path} is removed.")))
+        }
+        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    };
+    match outcome {
+        Ok((to, message)) => redirect_flash(&to, true, message),
+        Err(projects::Problem::Refused(message)) => (StatusCode::FORBIDDEN, message).into_response(),
+        Err(problem) => redirect_flash(&back, false, problem.message()),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct MoveApp {
     token: String,
     app: String,

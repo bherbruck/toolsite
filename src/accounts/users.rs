@@ -895,6 +895,39 @@ pub fn holds_below(config: &Config, user: &User, prefix: &str) -> bool {
 
 /// Moves an app's own scope rows when the app moves in the tree, so a scope
 /// given on the app follows it.
+/// Moves every scope row at `from` or below it to the same place under
+/// `to`, in one transaction. Running it again finds nothing to move, so a
+/// rename that stopped halfway can simply be run again.
+pub fn move_scope_tree(config: &Config, from: &str, to: &str) -> Result<usize, String> {
+    let mut conn = open(config)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let changed = tx
+        .execute(
+            "update or replace scopes set prefix = ?1 || substr(prefix, ?2)
+              where prefix = ?3 or substr(prefix, 1, ?4) = ?5",
+            rusqlite::params![
+                to,
+                (from.len() + 1) as i64,
+                from,
+                (from.len() + 1) as i64,
+                format!("{from}/"),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+/// Removes every scope row at `path` or below it.
+pub fn remove_scope_tree(config: &Config, path: &str) -> Result<usize, String> {
+    let conn = open(config)?;
+    conn.execute(
+        "delete from scopes where prefix = ?1 or substr(prefix, 1, ?2) = ?3",
+        rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")],
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn move_scopes(config: &Config, from: &str, to: &str) -> Result<(), String> {
     let conn = open(config)?;
     conn.execute(

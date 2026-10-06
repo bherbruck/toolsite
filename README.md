@@ -213,7 +213,7 @@ which is the mistake that ships a blank page while looking like a success.
 | `list_pages(include_all?)` | What already exists: slug, title, URL, last modified, visibility. Newest first. |
 | `set_visibility(slug, hidden?, listed?, gate?, path?)` | Take a page down, hide it from the index, or set its gate. Reversible; nothing is deleted. |
 | `set_icon(slug, icon)` | An emoji, inline `<svg>`, or `data:` URI. Optional. |
-| `projects(action, path?, name?, app?, email?, scope?)` | Projects and who may act in them: `list`, `create` (admin at the parent), `move` an app (admin at both ends, the target must exist), `permissions`, `grant`, `revoke` (admin there, never more than you hold). The same rules as the app browser. |
+| `projects(action, path?, name?, parent?, app?, email?, scope?)` | Projects and who may act in them: `list`, `create` (admin at the parent), `move` an app (admin at both ends, the target must exist), `rename` a project (admin at its parent), `move_project` (admin at the project, where it is and where it goes), `remove` an empty project (admin at its parent), `permissions`, `grant`, `revoke` (admin there, never more than you hold). The same rules as the app browser. |
 | `app_migrations`, `app_jobs`, `app_settings`, `app_notes`, `app_exports` | An app's schema, schedule, settings, notes and export tokens, each described below. |
 | `create_user`, `set_user_active`, `set_access` | Accounts and grants, as on the admin page. |
 | `push_page(html, slug?)` | Fallback for clients with no shell; HTML inline. |
@@ -1057,7 +1057,8 @@ the icon buttons by the title and kept in the browser for every level:
   it in place, so its subprojects and apps show indented beneath it; the
   name goes into the project. Open rows are kept in the address as
   `?open=yard,yard/north`, relative to the level, so a shared link opens the
-  same way.
+  same way. The browser also keeps them per level, so a level opens the way
+  you left it.
 - **Cards**: the current level as tiles, project tiles first.
 
 A search covers everything below the current level and shows each result
@@ -1077,6 +1078,13 @@ What a person may do depends on the access they hold:
 | `editor` on an app | an actions menu on the app: **Open** and **Settings** |
 | `admin` on an app | also **Permissions** (the Access tab in Settings) and **Move to project**, to a project where they hold admin |
 | `admin` at a project | an actions menu on the project (**Open**, **Permissions**, **New project inside**), **New project** by the title, and the **Permissions** tab |
+| `admin` where a project sits | also **Rename**, **Move to project** and, for an empty project, **Remove** in the project's menu |
+
+Renaming or moving a project carries everything with it: the apps inside
+and below, the access set there and below, and the lock. The old path keeps
+working: `/browse/<old path>` is redirected to the new one, until another
+project takes that path. Only an empty project can be removed; one with
+anything inside is refused with what is inside.
 
 The actions menu opens from the **⋯** button at the end of a row or tile, or
 with a right-click (or Shift+F10) on the row. It is a small panel next to

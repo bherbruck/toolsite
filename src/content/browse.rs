@@ -82,6 +82,11 @@ struct Tree {
     projects: BTreeSet<String>,
     /// What the viewer holds on each project it holds something on.
     held: std::collections::BTreeMap<String, Scope>,
+    /// Whether the viewer is a site admin, who holds admin at the top level.
+    site_admin: bool,
+    /// Every project path and every app's project, for "is it empty".
+    all_projects: Vec<String>,
+    all_app_projects: Vec<String>,
 }
 
 impl Tree {
@@ -98,6 +103,13 @@ impl Tree {
 
     fn apps_in(&self, project: &str) -> Vec<&Entry> {
         self.entries.iter().filter(|entry| entry.project == project).collect()
+    }
+
+    /// No projects below it and no apps in it or below, counting every app,
+    /// not only the ones the viewer may see.
+    fn is_empty_project(&self, project: &str) -> bool {
+        !self.all_projects.iter().any(|p| p.starts_with(&format!("{project}/")))
+            && !self.all_app_projects.iter().any(|at| !at.is_empty() && users::prefix_covers(project, at))
     }
 
     fn apps_below(&self, project: &str) -> usize {
@@ -210,7 +222,16 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
             with_parents.insert(above);
         }
     }
-    Tree { entries, projects: with_parents, held }
+    let all_projects: Vec<String> = store::list_folders(config).await.into_iter().map(|f| f.path).collect();
+    let all_app_projects: Vec<String> = store::apps_with_folders(config).await.into_iter().map(|(_, at)| at).collect();
+    Tree {
+        entries,
+        projects: with_parents,
+        held,
+        site_admin: viewer.is_some_and(|user| user.is_admin),
+        all_projects,
+        all_app_projects,
+    }
 }
 
 /// The projects `viewer` may see, each with the apps in it or below that it
@@ -257,6 +278,19 @@ pub(crate) async fn browse(
     }
     if !users::valid_prefix(&project) {
         return (StatusCode::NOT_FOUND, "There is no such project.").into_response();
+    }
+    // A project that was renamed or moved still answers at its old path. The
+    // query goes along so a shared link opens the same view.
+    if let Some(to) = store::renamed_path(&config, &project).await {
+        let rest: Vec<String> = [("q", &query.q), ("tab", &query.tab), ("open", &query.open)]
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| format!("{k}={}", urlencoding::encode(v))))
+            .collect();
+        let mut url = browser_url(&to);
+        if !rest.is_empty() {
+            url = format!("{url}?{}", rest.join("&"));
+        }
+        return Redirect::permanent(&url).into_response();
     }
     render(config, headers, project, query).await
 }
@@ -467,8 +501,47 @@ fn project_menu(tree: &Tree, path: &str, place: &str, ctx: &Ctx) -> Markup {
                         button."sm" type="submit" { "Create" }
                     }
                 }
+                // Rename and remove change the parent's contents, so they
+                // are offered to an admin there; the server checks again.
+                @if admin_at_parent(tree, path) {
+                    details."menu-sub" {
+                        summary role="menuitem" { "Rename\u{2026}" }
+                        form."menu-form" method="post" action="/admin/project" {
+                            (admin::hidden("token", ctx.token)) (admin::hidden("action", "rename")) (admin::hidden("path", path)) (admin::hidden("back", ctx.back))
+                            input name="name" value=(name_of(path)) aria-label="New name" required pattern="[A-Za-z0-9_-]+" autocomplete="off";
+                            button."sm" type="submit" { "Rename" }
+                        }
+                    }
+                    details."menu-sub" {
+                        summary role="menuitem" { "Move to project\u{2026}" }
+                        form."menu-form" method="post" action="/admin/project" {
+                            (admin::hidden("token", ctx.token)) (admin::hidden("action", "move")) (admin::hidden("path", path)) (admin::hidden("back", ctx.back))
+                            (ui::combobox_full("parent", "/admin/projects/search", "Type a project, or / for the top level", "", None, &format!("-{id}-move")))
+                            button."sm" type="submit" { "Move" }
+                        }
+                    }
+                    @if tree.is_empty_project(path) {
+                        details."menu-sub" {
+                            summary role="menuitem" { "Remove" }
+                            form."menu-form" method="post" action="/admin/project" {
+                                (admin::hidden("token", ctx.token)) (admin::hidden("action", "remove")) (admin::hidden("path", path)) (admin::hidden("back", ctx.back))
+                                span."small" { "Remove? " }
+                                button."sm danger" type="submit" { "Yes" }
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+/// Whether the viewer is admin where `path` sits: its parent project, or
+/// the top level, which only a site admin holds as admin.
+fn admin_at_parent(tree: &Tree, path: &str) -> bool {
+    match path.rsplit_once('/') {
+        Some((parent, _)) => tree.held.get(parent) == Some(&Scope::Admin),
+        None => tree.site_admin,
     }
 }
 

@@ -171,6 +171,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/permissions/lock", post(crate::platform::permissions::change_lock))
         .route("/admin/permissions/candidates", get(crate::platform::permissions::candidates))
         .route("/admin/folder", post(admin::new_folder))
+        .route("/admin/project", post(admin::change_project))
         .route("/admin/projects/search", get(admin::search_projects))
         .route("/admin/move", post(admin::move_app))
         .route("/admin/exports", get(admin::exports_page).post(admin::change_export))

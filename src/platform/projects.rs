@@ -233,3 +233,140 @@ pub(crate) async fn revoke(config: &Arc<Config>, actor: Option<&User>, path: &st
     tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), account = %email, prefix = %path, "scope revoked");
     Ok(())
 }
+
+fn parent_of(path: &str) -> String {
+    path.rsplit_once('/').map(|(above, _)| above.to_string()).unwrap_or_default()
+}
+
+/// Moves a project and everything keyed by its path to `to`: the tree, the
+/// apps inside it and below, the access rows set there and below, and the
+/// lock (it lives on the project). Access rows move first in one
+/// transaction, the apps next, the tree last, and each step finds nothing
+/// left to do when run again, so a move that stopped halfway can be run
+/// again to finish.
+async fn relocate(config: &Arc<Config>, actor: Option<&User>, from: &str, to: &str) -> Result<(), Problem> {
+    if store::folder_exists(config, to).await {
+        return Err(Problem::Invalid(format!("There is already a project '{to}'.")));
+    }
+    // An app at the top level answers to its own slug as a path, so a
+    // project there may not take an app's name.
+    if !to.contains('/') && store::app_exists(config, to).await {
+        return Err(Problem::Invalid(format!("There is an app called '{to}' at the top level. Choose another name.")));
+    }
+    let (config2, old, new) = (config.clone(), from.to_string(), to.to_string());
+    tokio::task::spawn_blocking(move || users::move_scope_tree(&config2, &old, &new))
+        .await
+        .map_err(|_| Problem::Invalid("The project was not moved.".into()))?
+        .map_err(Problem::Invalid)?;
+    for (app, at) in store::apps_with_folders(config).await {
+        if users::prefix_covers(from, &at) && !at.is_empty() {
+            let rest = &at[from.len()..];
+            let mut meta = read_meta(config, &app).await;
+            meta.project = Some(format!("{to}{rest}"));
+            write_meta(config, &app, &meta)
+                .await
+                .map_err(|_| Problem::Invalid(format!("{app} was not moved. Run the same change again to finish it.")))?;
+        }
+    }
+    store::relocate_folder(config, from, to).await.map_err(Problem::Invalid)?;
+    tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), from, to, "project moved");
+    Ok(())
+}
+
+/// Renames a project in place. Admin at its parent, since the parent's
+/// contents change. Returns the new path.
+pub(crate) async fn rename(config: &Arc<Config>, actor: Option<&User>, path: &str, name: &str) -> Result<String, Problem> {
+    let path = clean(path)?;
+    if path.is_empty() {
+        return Err(Problem::Invalid("The top level has no name to change.".into()));
+    }
+    if !store::folder_exists(config, &path).await {
+        return Err(Problem::Invalid(format!("There is no project '{path}'.")));
+    }
+    let name = name.trim();
+    if !crate::content::slug::valid_segment(name) {
+        return Err(Problem::Invalid("A project name is letters, numbers, '-' or '_'.".into()));
+    }
+    let parent = parent_of(&path);
+    need(config, actor, &parent, Scope::Admin).await?;
+    let to = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
+    if to == path {
+        return Ok(to);
+    }
+    relocate(config, actor, &path, &to).await?;
+    Ok(to)
+}
+
+/// Moves a project under `parent` (empty for the top level). Admin at the
+/// project, where it is now, and where it goes. Returns the new path.
+pub(crate) async fn move_project(config: &Arc<Config>, actor: Option<&User>, path: &str, parent: &str) -> Result<String, Problem> {
+    let path = clean(path)?;
+    let parent = clean(parent)?;
+    if path.is_empty() {
+        return Err(Problem::Invalid("The top level cannot be moved.".into()));
+    }
+    if !store::folder_exists(config, &path).await {
+        return Err(Problem::Invalid(format!("There is no project '{path}'.")));
+    }
+    if users::prefix_covers(&path, &parent) {
+        return Err(Problem::Invalid(format!("{path} cannot go inside itself.")));
+    }
+    if !store::folder_exists(config, &parent).await {
+        return Err(Problem::Invalid(format!("There is no project '{parent}'.")));
+    }
+    let old_parent = parent_of(&path);
+    need(config, actor, &path, Scope::Admin).await?;
+    need(config, actor, &old_parent, Scope::Admin).await?;
+    need(config, actor, &parent, Scope::Admin).await?;
+    let name = path.rsplit('/').next().unwrap_or(&path);
+    let to = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
+    if to == path {
+        return Ok(to);
+    }
+    relocate(config, actor, &path, &to).await?;
+    Ok(to)
+}
+
+/// Removes an empty project. Admin at its parent. A project with anything
+/// inside is refused with what is inside: nothing is destroyed here.
+pub(crate) async fn remove(config: &Arc<Config>, actor: Option<&User>, path: &str) -> Result<(), Problem> {
+    let path = clean(path)?;
+    if path.is_empty() {
+        return Err(Problem::Invalid("The top level cannot be removed.".into()));
+    }
+    if !store::folder_exists(config, &path).await {
+        return Err(Problem::Invalid(format!("There is no project '{path}'.")));
+    }
+    need(config, actor, &parent_of(&path), Scope::Admin).await?;
+    let projects = store::list_folders(config)
+        .await
+        .iter()
+        .filter(|folder| folder.path.starts_with(&format!("{path}/")))
+        .count();
+    let apps = store::apps_with_folders(config)
+        .await
+        .iter()
+        .filter(|(_, at)| !at.is_empty() && users::prefix_covers(&path, at))
+        .count();
+    if projects > 0 || apps > 0 {
+        let mut parts = Vec::new();
+        if apps > 0 {
+            parts.push(if apps == 1 { "1 app".to_string() } else { format!("{apps} apps") });
+        }
+        if projects > 0 {
+            parts.push(if projects == 1 { "1 project".to_string() } else { format!("{projects} projects") });
+        }
+        return Err(Problem::Invalid(format!(
+            "{path} is not empty: it holds {}. Move them out first.",
+            parts.join(" and ")
+        )));
+    }
+    let (config2, at) = (config.clone(), path.clone());
+    tokio::task::spawn_blocking(move || users::remove_scope_tree(&config2, &at))
+        .await
+        .map_err(|_| Problem::Invalid("The project was not removed.".into()))?
+        .map_err(Problem::Invalid)?;
+    store::remove_folder(config, &path).await.map_err(Problem::Invalid)?;
+    tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), path = %path, "project removed");
+    Ok(())
+}

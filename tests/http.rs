@@ -6280,3 +6280,150 @@ async fn the_add_control_sits_above_the_table_so_the_headers_label_rules() {
     let tbody = &page[table..page[table..].find("</table>").map(|i| table + i).unwrap()];
     assert!(!tbody.contains("data-perm-add"), "the add control is still inside the table");
 }
+
+// --- renaming, moving and removing projects -------------------------------------------
+
+#[tokio::test]
+async fn renaming_a_project_carries_its_apps_access_and_lock_and_keeps_the_old_link() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    app_in(&config, "forklifts", "ops/yard").await;
+    toolsite::content::store::set_locked(&config, "ops/yard", true).await.unwrap();
+    for email in ["fa@example.com", "ed@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops", "admin");
+    scope(&config, "ed@example.com", "ops/yard", "editor");
+
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &fa)).await;
+    assert!(page.contains("Rename\u{2026}"), "an admin at the parent was not offered Rename");
+    let token = form_token_from(&page);
+    let (status, _, headers) = send(
+        &config,
+        post_form("/admin/project", &fa, format!("token={token}&action=rename&path=ops/yard&name=dock&back=/browse/ops")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = headers.iter().find(|(k, _)| k == "location").unwrap().1.clone();
+    assert_eq!(location, "/browse/ops/dock");
+
+    assert!(toolsite::content::store::folder_exists(&config, "ops/dock").await);
+    assert!(!toolsite::content::store::folder_exists(&config, "ops/yard").await);
+    assert_eq!(toolsite::content::store::app_folder(&config, "forklifts").await, "ops/dock");
+    assert!(toolsite::content::store::folder_locked(&config, "ops/dock").await, "the lock did not move");
+    // The editor holds Edit on the new path, and nothing is left on the old one.
+    let rows = toolsite::accounts::users::list_scopes(&config).unwrap();
+    assert!(rows.iter().any(|r| r.email == "ed@example.com" && r.prefix == "ops/dock"), "{rows:?}");
+    assert!(!rows.iter().any(|r| r.prefix.starts_with("ops/yard")), "{rows:?}");
+    let ed = sign_in(&config, "ed@example.com", "correct horse");
+    let (status, page, _) = send(&config, get_as("/browse/ops/dock", &ed)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("forklifts"));
+
+    // The old path still arrives, with its query.
+    let (status, _, headers) = send(&config, get_as("/browse/ops/yard?tab=apps", &fa)).await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(headers.iter().find(|(k, _)| k == "location").unwrap().1, "/browse/ops/dock?tab=apps");
+    // Until another project takes the name.
+    folder(&config, "ops", "yard").await;
+    let (status, ..) = send(&config, get_as("/browse/ops/yard", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_project_cannot_be_renamed_onto_another_or_by_someone_without_admin_at_its_parent() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    folder(&config, "ops", "dock").await;
+    account(&config, "ya@example.com", "correct horse");
+    account(&config, "fa@example.com", "correct horse");
+    scope(&config, "ya@example.com", "ops/yard", "admin");
+    scope(&config, "fa@example.com", "ops", "admin");
+    let token = mcp_token_for(&config, "fa@example.com", "correct horse").await;
+    let mut fa = Mcp::open(&config, &token).await;
+    let (is_error, text) = fa.call("projects", serde_json::json!({ "action": "rename", "path": "ops/yard", "name": "dock" })).await;
+    assert!(is_error && text.contains("already"), "{text}");
+
+    let token = mcp_token_for(&config, "ya@example.com", "correct horse").await;
+    let mut ya = Mcp::open(&config, &token).await;
+    let (is_error, text) = ya.call("projects", serde_json::json!({ "action": "rename", "path": "ops/yard", "name": "north" })).await;
+    assert!(is_error, "an admin of the project alone renamed it: {text}");
+    assert!(text.contains("admin") && text.contains("ops"), "{text}");
+    assert!(toolsite::content::store::folder_exists(&config, "ops/yard").await);
+}
+
+#[tokio::test]
+async fn moving_a_project_refuses_its_own_inside_and_needs_admin_at_three_places() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    folder(&config, "ops/yard", "north").await;
+    folder(&config, "", "finance").await;
+    app_in(&config, "forklifts", "ops/yard/north").await;
+    account(&config, "fa@example.com", "correct horse");
+    scope(&config, "fa@example.com", "ops", "admin");
+    let token = mcp_token_for(&config, "fa@example.com", "correct horse").await;
+    let mut fa = Mcp::open(&config, &token).await;
+
+    let (is_error, text) = fa.call("projects", serde_json::json!({ "action": "move_project", "path": "ops/yard", "parent": "ops/yard/north" })).await;
+    assert!(is_error && text.contains("inside itself"), "{text}");
+    let (is_error, text) = fa.call("projects", serde_json::json!({ "action": "move_project", "path": "ops/yard", "parent": "finance" })).await;
+    assert!(is_error, "moved into a project without admin there: {text}");
+    assert!(text.contains("finance"), "{text}");
+
+    scope(&config, "fa@example.com", "finance", "admin");
+    let (is_error, text) = fa.call("projects", serde_json::json!({ "action": "move_project", "path": "ops/yard", "parent": "finance" })).await;
+    assert!(!is_error, "{text}");
+    assert!(toolsite::content::store::folder_exists(&config, "finance/yard/north").await);
+    assert_eq!(toolsite::content::store::app_folder(&config, "forklifts").await, "finance/yard/north");
+
+    // A static token may do it all.
+    let mut full = Mcp::open(&config, TOKEN).await;
+    let (is_error, text) = full.call("projects", serde_json::json!({ "action": "move_project", "path": "finance/yard", "parent": "" })).await;
+    assert!(!is_error, "{text}");
+    assert!(toolsite::content::store::folder_exists(&config, "yard/north").await);
+}
+
+#[tokio::test]
+async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    folder(&config, "ops", "empty").await;
+    app_in(&config, "forklifts", "ops/yard").await;
+    account(&config, "fa@example.com", "correct horse");
+    account(&config, "ed@example.com", "correct horse");
+    scope(&config, "fa@example.com", "ops", "admin");
+    scope(&config, "ed@example.com", "ops/empty", "editor");
+
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops", &fa)).await;
+    let token = form_token_from(&page);
+    let (_, _, headers) = send(
+        &config,
+        post_form("/admin/project", &fa, format!("token={token}&action=remove&path=ops/yard&back=/browse/ops")),
+    )
+    .await;
+    let (_, page) = follow(&config, &fa, &headers).await;
+    assert!(page.contains("not empty") && page.contains("1 app"), "the refusal does not say what is inside");
+    assert!(toolsite::content::store::folder_exists(&config, "ops/yard").await);
+
+    let (_, _, headers) = send(
+        &config,
+        post_form("/admin/project", &fa, format!("token={token}&action=remove&path=ops/empty&back=/browse/ops")),
+    )
+    .await;
+    assert_eq!(headers.iter().find(|(k, _)| k == "location").unwrap().1, "/browse/ops");
+    assert!(!toolsite::content::store::folder_exists(&config, "ops/empty").await);
+    let rows = toolsite::accounts::users::list_scopes(&config).unwrap();
+    assert!(!rows.iter().any(|r| r.prefix == "ops/empty"), "{rows:?}");
+
+    // The tool refuses the same way.
+    let token = mcp_token_for(&config, "fa@example.com", "correct horse").await;
+    let mut mcp = Mcp::open(&config, &token).await;
+    let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "remove", "path": "ops/yard" })).await;
+    assert!(is_error && text.contains("not empty"), "{text}");
+}
