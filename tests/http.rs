@@ -4596,3 +4596,226 @@ async fn a_client_discovers_the_server_and_lists_tools_with_no_initialize_and_no
     assert_eq!(status, StatusCode::OK, "{json}");
     assert!(json["result"]["content"][0]["text"].as_str().unwrap_or("").contains("\"one\""), "{json}");
 }
+
+// --- what a connector needs: annotations, search and fetch, a method log -------
+
+/// A tool call's whole result object, for the structured half.
+async fn mcp_tool_raw(config: &Arc<Config>, path: &str, token: &str, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    let router = mcp_router(config);
+    let (status, _, json) = mcp_post(
+        &router,
+        path,
+        token,
+        None,
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    json["result"].clone()
+}
+
+async fn tool_listing(config: &Arc<Config>, path: &str, token: &str) -> Vec<serde_json::Value> {
+    let router = mcp_router(config);
+    let (status, _, json) = mcp_post(&router, path, token, None, serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list"})).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    json["result"]["tools"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn every_tool_on_both_hosts_carries_a_title_and_says_whether_it_reads_or_writes() {
+    let (_dir, config) = scoped_site();
+    let reader = toolsite::accounts::users::sign_up(&config, "reader@example.com", "correct horse battery").unwrap();
+    let reader_token = bearer_for(&config, &reader);
+
+    for (path, token) in [("/mcp", TOKEN.to_string()), ("/me/mcp", reader_token)] {
+        let tools = tool_listing(&config, path, &token).await;
+        assert!(!tools.is_empty(), "{path} lists no tools");
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap_or("?");
+            let annotations = &tool["annotations"];
+            assert!(annotations["title"].is_string(), "{path} {name} has no title");
+            assert!(annotations["readOnlyHint"].is_boolean(), "{path} {name} does not say whether it reads or writes");
+        }
+        for name in ["search", "fetch"] {
+            let tool = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{path} has no {name}"));
+            assert!(tool["outputSchema"].is_object(), "{path} {name} declares no output schema");
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        }
+        let read_only = |name: &str| tools.iter().find(|t| t["name"] == name).map(|t| t["annotations"]["readOnlyHint"] == true);
+        if path == "/mcp" {
+            assert_eq!(read_only("list_pages"), Some(true));
+            assert_eq!(read_only("remove_page"), Some(false));
+            assert_eq!(tools.iter().find(|t| t["name"] == "remove_page").unwrap()["annotations"]["destructiveHint"], true);
+            assert_eq!(tools.iter().find(|t| t["name"] == "app_repo").unwrap()["annotations"]["openWorldHint"], true);
+        } else {
+            assert_eq!(read_only("my_apps"), Some(true));
+            assert_eq!(read_only("query"), Some(false));
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_finds_by_title_and_slug_and_fetch_returns_words_notes_and_the_same_json_twice() {
+    let (_dir, config) = server();
+    write_page(
+        &config,
+        "reports/index",
+        "<!doctype html><html><head><title>Quarterly Reports</title><script>var x = 1;</script></head>\
+         <body><h1>Quarterly &amp; annual</h1><p>Totals by region.</p></body></html>",
+    );
+    write_page(&config, "intranet-links", "<title>Links</title><ul><li>HR</li></ul>");
+    toolsite::content::store::write_notes(&config, "reports", "Built from the ledger export. Owner: finance.").await.unwrap();
+
+    let by_title = mcp_tool_raw(&config, "/mcp", TOKEN, "search", serde_json::json!({ "query": "quarterly" })).await;
+    let ids: Vec<&str> = by_title["structuredContent"]["results"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+    assert_eq!(ids, ["reports"], "{by_title}");
+    assert_eq!(by_title["structuredContent"]["results"][0]["title"], "Quarterly Reports");
+    assert!(by_title["structuredContent"]["results"][0]["url"].as_str().unwrap().ends_with("/p/reports"));
+
+    let by_slug = mcp_tool_raw(&config, "/mcp", TOKEN, "search", serde_json::json!({ "query": "intra" })).await;
+    let ids: Vec<&str> = by_slug["structuredContent"]["results"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+    assert_eq!(ids, ["intranet-links"]);
+
+    let by_notes = mcp_tool_raw(&config, "/mcp", TOKEN, "search", serde_json::json!({ "query": "finance" })).await;
+    let ids: Vec<&str> = by_notes["structuredContent"]["results"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+    assert_eq!(ids, ["reports"], "notes are searched");
+
+    let fetched = mcp_tool_raw(&config, "/mcp", TOKEN, "fetch", serde_json::json!({ "id": "reports" })).await;
+    assert_ne!(fetched["isError"], true, "{fetched}");
+    let doc = &fetched["structuredContent"];
+    let text = doc["text"].as_str().unwrap();
+    assert!(text.contains("Quarterly & annual"), "{text}");
+    assert!(text.contains("Totals by region."), "{text}");
+    assert!(!text.contains("<h1>") && !text.contains("var x"), "markup or script leaked: {text}");
+    assert!(text.contains("Built from the ledger export"), "notes not appended: {text}");
+    assert_eq!(doc["id"], "reports");
+    assert_eq!(doc["title"], "Quarterly Reports");
+    assert_eq!(doc["metadata"]["access"], "public");
+    // The text block is the same JSON, as the connector shape asks.
+    let as_text: serde_json::Value = serde_json::from_str(fetched["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(&as_text, doc);
+    let as_text: serde_json::Value = serde_json::from_str(by_title["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(as_text, by_title["structuredContent"]);
+
+    // The guide is a document too.
+    let about = mcp_tool_raw(&config, "/mcp", TOKEN, "search", serde_json::json!({ "query": "how do I publish a handler" })).await;
+    assert!(about["structuredContent"]["results"].as_array().unwrap().iter().any(|r| r["id"] == "guide"), "{about}");
+    let guide = mcp_tool_raw(&config, "/mcp", TOKEN, "fetch", serde_json::json!({ "id": "guide" })).await;
+    assert!(guide["structuredContent"]["text"].as_str().unwrap().contains("Building on toolsite"));
+
+    let missing = mcp_tool_raw(&config, "/mcp", TOKEN, "fetch", serde_json::json!({ "id": "nothing-here" })).await;
+    assert_eq!(missing["isError"], true);
+}
+
+#[tokio::test]
+async fn search_and_fetch_show_each_account_only_what_it_may_open() {
+    let (_dir, config) = scoped_site();
+    write_page(&config, "brochure/index", "<title>Brochure</title><p>Public.</p>");
+    write_page(&config, "internal/index", "<title>Internal Plan</title><p>Secret numbers.</p>");
+    toolsite::content::store::write_meta(
+        &config,
+        "internal",
+        &toolsite::content::store::PageMeta { gate: Some("granted".to_string()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let alice = toolsite::accounts::users::sign_up(&config, "alice@example.com", "correct horse battery").unwrap();
+    let bob = toolsite::accounts::users::sign_up(&config, "bob@example.com", "correct horse battery").unwrap();
+    toolsite::accounts::users::grant(&config, "alice@example.com", "internal", "viewer").unwrap();
+    let (alice_token, bob_token) = (bearer_for(&config, &alice), bearer_for(&config, &bob));
+
+    let ids = |result: &serde_json::Value| -> Vec<String> {
+        result["structuredContent"]["results"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str().map(str::to_string)).collect()
+    };
+    let alice_sees = mcp_tool_raw(&config, "/me/mcp", &alice_token, "search", serde_json::json!({ "query": "" })).await;
+    assert_eq!(ids(&alice_sees), ["brochure", "internal"]);
+    let bob_sees = mcp_tool_raw(&config, "/me/mcp", &bob_token, "search", serde_json::json!({ "query": "" })).await;
+    assert_eq!(ids(&bob_sees), ["brochure"], "bob saw an app he may not open");
+
+    let bob_fetch = mcp_tool_raw(&config, "/me/mcp", &bob_token, "fetch", serde_json::json!({ "id": "internal" })).await;
+    assert_eq!(bob_fetch["isError"], true);
+    assert!(!bob_fetch.to_string().contains("Secret numbers"), "fetch leaked a closed page");
+    let missing = mcp_tool_raw(&config, "/me/mcp", &bob_token, "fetch", serde_json::json!({ "id": "no-such-app" })).await;
+    // The same sentence either way, with only the asked-for id in it.
+    let shape = |r: &serde_json::Value| r["content"][0]["text"].as_str().unwrap().replace("internal", "X").replace("no-such-app", "X");
+    assert_eq!(shape(&bob_fetch), shape(&missing), "a closed app reads differently from a missing one");
+
+    let alice_fetch = mcp_tool_raw(&config, "/me/mcp", &alice_token, "fetch", serde_json::json!({ "id": "internal" })).await;
+    assert!(alice_fetch["structuredContent"]["text"].as_str().unwrap().contains("Secret numbers"));
+}
+
+/// Collects what the server logs. Installed once for the whole test binary,
+/// since a tracing subscriber is global; each test picks its own lines out
+/// by a user agent nothing else sends.
+#[derive(Clone, Default)]
+struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogSink;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn captured_logs() -> LogSink {
+    static SINK: std::sync::OnceLock<LogSink> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+        sink
+    })
+    .clone()
+}
+
+#[tokio::test]
+async fn every_mcp_request_leaves_one_line_naming_its_method_and_tool_but_not_its_arguments() {
+    let (_dir, config) = server();
+    write_page(&config, "one", "<title>One</title>");
+    let sink = captured_logs();
+    let agent = format!("logtest-{}", toolsite::content::slug::random_token(8));
+    let router = mcp_router(&config);
+
+    let post = |body: serde_json::Value| {
+        let router = router.clone();
+        let agent = agent.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "localhost")
+                .header("user-agent", agent)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            // Drain the body so the exchange completes before we read the log.
+            let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
+        }
+    };
+    post(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})).await;
+    post(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_sql","arguments":{"app":"one","sql":"select 'needle-in-sql'"}}})).await;
+
+    let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let mine: Vec<&str> = logged.lines().filter(|l| l.contains(&agent)).collect();
+    assert!(mine.iter().any(|l| l.contains("method=initialize") && l.contains("client=t") && l.contains("protocol=2025-03-26")), "{mine:?}");
+    assert!(mine.iter().any(|l| l.contains("method=tools/call") && l.contains("tool=run_sql") && l.contains("status=200")), "{mine:?}");
+    assert!(!logged.contains("needle-in-sql"), "a statement's text was logged");
+}

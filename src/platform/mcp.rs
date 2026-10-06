@@ -7,6 +7,7 @@ use crate::{
     },
     platform::{
         bearer::Caller,
+        knowledge::{self, FetchOutput, SearchOutput},
         upload::{upload_url, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
     },
     runtime::db,
@@ -29,6 +30,18 @@ use std::{
     time::{Instant, SystemTime},
 };
 use tokio::fs;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SearchRequest {
+    #[schemars(description = "Words to look for in app titles, slugs and notes. Empty lists everything the caller may open.")]
+    pub(crate) query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct FetchRequest {
+    #[schemars(description = "The id a search result carried: a page's slug, or 'guide'.")]
+    pub(crate) id: String,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PushPageRequest {
@@ -453,8 +466,84 @@ impl PageHost {
         crate::platform::upload::stamp_new_app(&self.config, app, user_id, project).await;
     }
 
+    /// Whether the caller may open `slug`: a hidden page is nobody's; a
+    /// static token sees the rest; an account sees public and signed-in
+    /// apps and the ones it holds a scope on. The same rule as list_pages.
+    async fn may_see(&self, caller: &Caller, slug: &str) -> bool {
+        let meta = read_meta(&self.config, slug).await;
+        if meta.hidden {
+            return false;
+        }
+        let Some(user) = &caller.user else {
+            return true;
+        };
+        let app = slug.split('/').next().unwrap_or(slug).to_string();
+        let gate = meta.gate_for("/", &self.config.default_gate).to_string();
+        matches!(gate.as_str(), "public" | "authenticated") || self.held_on(user, &app).await.is_some()
+    }
+
+    /// Every slug the caller may open, for search.
+    async fn visible_slugs(&self, caller: &Caller) -> Vec<String> {
+        let mut slugs = Vec::new();
+        collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
+        let mut out = Vec::new();
+        for slug in slugs {
+            if self.may_see(caller, &slug).await {
+                out.push(slug);
+            }
+        }
+        out
+    }
+
     #[tool(
-        description = "Keep an app's source in a GitHub repository, with history. The repository is a mirror: publishing the source of a linked app pushes a commit (say why with ?source&message=...), and a push to the repository is pulled into the app's source archive. Nothing is built or run in GitHub; you build and publish from wherever you run, as always. 'create' needs the app's source to have been published with ?source, names the repository toolsite-<app> unless repo says otherwise, and tags it with the toolsite topic. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts."
+        description = "Find apps and pages on this site by words in their title, slug or notes, plus the platform guide when the question is about toolsite itself. Returns ids for fetch. Only what the caller may open is listed.",
+        annotations(title = "Search", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SearchOutput>()
+    )]
+    async fn search(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(SearchRequest { query }): Parameters<SearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = Self::caller(&ctx);
+        let visible = self.visible_slugs(&caller).await;
+        let output = knowledge::search(&self.config, &query, &visible).await;
+        let value = serde_json::to_value(output).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::structured(value))
+    }
+
+    #[tool(
+        description = "Read one app or page as text, by the id search returned: the page's visible words, then the notes kept with the app, with metadata about access and what it declares. 'guide' returns the platform guide.",
+        annotations(title = "Fetch", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<FetchOutput>()
+    )]
+    async fn fetch(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(FetchRequest { id }): Parameters<FetchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = Self::caller(&ctx);
+        let refused = || CallToolResult::error(vec![ContentBlock::text(format!("nothing to fetch at {id}"))]);
+        if id == knowledge::GUIDE_ID {
+            let value = serde_json::to_value(knowledge::fetch_guide(&self.config))
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResult::structured(value));
+        }
+        if !valid_slug(&id) || !self.may_see(&caller, &id).await {
+            return Ok(refused());
+        }
+        match knowledge::fetch_page(&self.config, &id).await {
+            Some(output) => {
+                let value = serde_json::to_value(output).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::structured(value))
+            }
+            None => Ok(refused()),
+        }
+    }
+
+    #[tool(
+        description = "Keep an app's source in a GitHub repository, with history. The repository is a mirror: publishing the source of a linked app pushes a commit (say why with ?source&message=...), and a push to the repository is pulled into the app's source archive. Nothing is built or run in GitHub; you build and publish from wherever you run, as always. 'create' needs the app's source to have been published with ?source, names the repository toolsite-<app> unless repo says otherwise, and tags it with the toolsite topic. Needs the site to be configured with a GitHub App (TOOLSITE_GITHUB_*); 'installations' tells you whether it is and on which accounts.",
+        annotations(title = "Repository", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
     pub(crate) async fn app_repo(
         &self,
@@ -546,7 +635,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "A token that may publish one app and nothing else, for a CI system of your own: PUT <site>/deploy/<app> takes the same flags as an upload ticket (?bundle&spa, ?handler, ?migrations, ?manifest, ?source, ?blob=<key>, or a page) with Authorization: Bearer <token>; add &commit=<sha> to say which commit was published. Returned once, stored only as a hash."
+        description = "A token that may publish one app and nothing else, for a CI system of your own: PUT <site>/deploy/<app> takes the same flags as an upload ticket (?bundle&spa, ?handler, ?migrations, ?manifest, ?source, ?blob=<key>, or a page) with Authorization: Bearer <token>; add &commit=<sha> to say which commit was published. Returned once, stored only as a hash.",
+        annotations(title = "Deploy tokens", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     pub(crate) async fn app_deploy_tokens(
         &self,
@@ -598,7 +688,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Read-only access to one app's database from outside: a token for GET <site>/export/<app>.sqlite, which answers with a consistent snapshot of the whole SQLite file. For reporting tools that pull SQLite over HTTP (a BI or sync tool). Each token opens one app only and is revocable on its own; the publish token is never accepted there. The token is returned once, by this call, and stored only as a hash."
+        description = "Read-only access to one app's database from outside: a token for GET <site>/export/<app>.sqlite, which answers with a consistent snapshot of the whole SQLite file. For reporting tools that pull SQLite over HTTP (a BI or sync tool). Each token opens one app only and is revocable on its own; the publish token is never accepted there. The token is returned once, by this call, and stored only as a hash.",
+        annotations(title = "Export tokens", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     pub(crate) async fn app_exports(
         &self,
@@ -660,7 +751,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Fallback publisher for when you cannot reach this host from a shell: pastes the page's HTML through this call. If you can run shell commands with network access, use create_upload instead. Call again with the same slug to update in place. Use a slug like 'myapp/about' to group pages under one app."
+        description = "Fallback publisher for when you cannot reach this host from a shell: pastes the page's HTML through this call. If you can run shell commands with network access, use create_upload instead. Call again with the same slug to update in place. Use a slug like 'myapp/about' to group pages under one app.",
+        annotations(title = "Publish a page", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn push_page(
         &self,
@@ -694,7 +786,9 @@ impl PageHost {
         Ok(CallToolResult::success(vec![ContentBlock::text(url)]))
     }
 
-    #[tool(description = "Fetch the current HTML source of a previously pushed page by its slug, so it can be edited and pushed back.")]
+    #[tool(description = "Fetch the current HTML source of a previously pushed page by its slug, so it can be edited and pushed back.",
+        annotations(title = "Read a page", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn pull_page(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -718,7 +812,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Fallback publisher for a whole multi-page app when you cannot reach this host from a shell: pastes every page's HTML through this call. If you can run shell commands with network access, use create_upload instead. A page named 'index' is also served at the app's own root URL. Returns each page's URL."
+        description = "Fallback publisher for a whole multi-page app when you cannot reach this host from a shell: pastes every page's HTML through this call. If you can run shell commands with network access, use create_upload instead. A page named 'index' is also served at the app's own root URL. Returns each page's URL.",
+        annotations(title = "Publish an app", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn push_app(
         &self,
@@ -774,7 +869,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "The default way to publish. Returns a short-lived upload URL; write the HTML to a local file, then PUT the file to that URL with curl. Do not paste HTML into this call — the point is that the page never passes through the conversation. Works for a single page, a multi-page app, or a whole built front-end (TypeScript/React/Vite — tar the dist folder to ?bundle). The response includes the base path the build must be configured with. If the upload URL turns out to be unreachable from your sandbox, fall back to push_page/push_app."
+        description = "The default way to publish. Returns a short-lived upload URL; write the HTML to a local file, then PUT the file to that URL with curl. Do not paste HTML into this call — the point is that the page never passes through the conversation. Works for a single page, a multi-page app, or a whole built front-end (TypeScript/React/Vite — tar the dist folder to ?bundle). The response includes the base path the build must be configured with. If the upload URL turns out to be unreachable from your sandbox, fall back to push_page/push_app.",
+        annotations(title = "Create an upload URL", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn create_upload(
         &self,
@@ -877,7 +973,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Run SQL against one app's own SQLite database — create tables, seed or inspect data. Only reachable over MCP, never from a published page, so it is safe for schema work but is not how an app reads its own data at runtime."
+        description = "Run SQL against one app's own SQLite database — create tables, seed or inspect data. Only reachable over MCP, never from a published page, so it is safe for schema work but is not how an app reads its own data at runtime.",
+        annotations(title = "Run SQL", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     pub(crate) async fn run_sql(
         &self,
@@ -934,7 +1031,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Create an account someone can sign in with. Accounts are global to the site; use set_access to say which apps they may reach. There is no public signup, so this is the only way an account comes into being."
+        description = "Create an account someone can sign in with. Accounts are global to the site; use set_access to say which apps they may reach. There is no public signup, so this is the only way an account comes into being.",
+        annotations(title = "Create an account", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     pub(crate) async fn create_user(
         &self,
@@ -985,7 +1083,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "An app's own database schema, as numbered migrations. Each runs once, in order, in a transaction, so adding a column later reaches databases that already exist — which 'create table if not exists' in a handler cannot do. The platform never reads what they create; tables and their meaning are the app's business."
+        description = "An app's own database schema, as numbered migrations. Each runs once, in order, in a transaction, so adding a column later reaches databases that already exist — which 'create table if not exists' in a handler cannot do. The platform never reads what they create; tables and their meaning are the app's business.",
+        annotations(title = "Schema migrations", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn app_migrations(
         &self,
@@ -1046,7 +1145,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Schedule an app's handler to run on its own — refreshing a cache, pulling from an API, tidying a table. A job is a cron expression and a path, and firing it calls the same handler a request would, with the same sandbox and limits. Give run_now to trigger one immediately, or no name to list them with when each last ran."
+        description = "Schedule an app's handler to run on its own — refreshing a cache, pulling from an API, tidying a table. A job is a cron expression and a path, and firing it calls the same handler a request would, with the same sandbox and limits. Give run_now to trigger one immediately, or no name to list them with when each last ran.",
+        annotations(title = "Scheduled jobs", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn app_jobs(
         &self,
@@ -1114,7 +1214,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "An app's settings — API keys and the like, which its handler reads through the secrets import. Pass link: true to get a URL the owner opens to paste values in, which is the right way: a secret you never see cannot leak through you. Values never come back out: this lists names only, they are absent from the source archive, and no URL serves them. Give a name and value to set, a name alone to remove, neither to list."
+        description = "An app's settings — API keys and the like, which its handler reads through the secrets import. Pass link: true to get a URL the owner opens to paste values in, which is the right way: a secret you never see cannot leak through you. Values never come back out: this lists names only, they are absent from the source archive, and no URL serves them. Give a name and value to set, a name alone to remove, neither to list.",
+        annotations(title = "App settings", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn app_settings(
         &self,
@@ -1170,7 +1271,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Read or write notes kept with one app for the next session to find. Call it with no notes to read. They are about THIS app: what it is, where things are, its schema, why it was built that way, what is half-finished. Not how the platform behaves — that is at GET /guide, which stays current, while a platform note here is wrong the moment it changes. Read the notes for the app you are changing, not a neighbour's."
+        description = "Read or write notes kept with one app for the next session to find. Call it with no notes to read. They are about THIS app: what it is, where things are, its schema, why it was built that way, what is half-finished. Not how the platform behaves — that is at GET /guide, which stays current, while a platform note here is wrong the moment it changes. Read the notes for the app you are changing, not a neighbour's.",
+        annotations(title = "App notes", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn app_notes(
         &self,
@@ -1206,7 +1308,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Turn an account off or back on. A disabled account cannot sign in and its live sessions stop working at once, but it is not deleted."
+        description = "Turn an account off or back on. A disabled account cannot sign in and its live sessions stop working at once, but it is not deleted.",
+        annotations(title = "Enable or disable an account", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn set_user_active(
         &self,
@@ -1234,7 +1337,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Give or take away one account's access to one app. Only matters for apps whose gate is 'granted'."
+        description = "Give or take away one account's access to one app. Only matters for apps whose gate is 'granted'.",
+        annotations(title = "Grant or revoke access", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn set_access(
         &self,
@@ -1284,7 +1388,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "List published pages: slug, title, URL, when each was last changed, and its visibility. Call this to find out what already exists before editing or reusing a slug."
+        description = "List published pages: slug, title, URL, when each was last changed, and its visibility. Call this to find out what already exists before editing or reusing a slug.",
+        annotations(title = "List apps and pages", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn list_pages(
         &self,
@@ -1348,7 +1453,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Take a slug down for good, moving everything belonging to it out of the site. Prefer set_visibility, which hides without removing; this is for junk — a probe published as a page, an app nobody wants. Files are moved aside rather than deleted, so a mistake is recoverable from the server, but nothing on the site refers to them again."
+        description = "Take a slug down for good, moving everything belonging to it out of the site. Prefer set_visibility, which hides without removing; this is for junk — a probe published as a page, an app nobody wants. Files are moved aside rather than deleted, so a mistake is recoverable from the server, but nothing on the site refers to them again.",
+        annotations(title = "Remove an app or page", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     pub(crate) async fn remove_page(
         &self,
@@ -1412,7 +1518,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Take a page down or restore it, and control whether it appears on the site index. Nothing is ever deleted, so this is the safe way to retract a page published by mistake."
+        description = "Take a page down or restore it, and control whether it appears on the site index. Nothing is ever deleted, so this is the safe way to retract a page published by mistake.",
+        annotations(title = "Set visibility and access", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn set_visibility(
         &self,
@@ -1512,7 +1619,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Set the icon shown next to a page on the site index: an emoji, inline SVG, or data: URI. Pages without one get a generated icon, so this is optional."
+        description = "Set the icon shown next to a page on the site index: an emoji, inline SVG, or data: URI. Pages without one get a generated icon, so this is optional.",
+        annotations(title = "Set an icon", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn set_icon(
         &self,
@@ -1561,7 +1669,8 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Fetch the current HTML for every page in an app namespace, keyed by page name, so the app can be edited and pushed back with push_app."
+        description = "Fetch the current HTML for every page in an app namespace, keyed by page name, so the app can be edited and pushed back with push_app.",
+        annotations(title = "Read an app", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn pull_app(
         &self,

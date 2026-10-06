@@ -135,6 +135,13 @@ INFO toolsite: auth configuration bearer_auth=true oauth_auth=true base_url="htt
 INFO toolsite: storage configuration blobs="local" max_db_mb=4096 max_blob_mb=4096
 ```
 
+Every MCP request also leaves one line: the method, the tool, the client,
+the protocol version, who, and the status. Never the arguments.
+
+```
+INFO toolsite::platform::mcp_log: mcp path=/mcp method=tools/call tool=list_pages client=- protocol=- user_agent="openai-mcp/1.0.0 (ChatGPT)" email=you@example.com status=200
+```
+
 ---
 
 # Reference
@@ -152,8 +159,10 @@ suffix.** Responses are SSE-framed, but the path is still `/mcp`.
 - **Claude Code**: `claude mcp add --transport http toolsite
   https://yourdomain.com/mcp`, then `/mcp` to sign in; the browser opens the
   same consent screen. Or add it with a bearer token header.
-- **ChatGPT**: enable Developer Mode and add a connector with the same URL;
-  sign in the same way, or use token auth.
+- **ChatGPT**: add a connector with the same URL and sign in the same way.
+  Outside Developer Mode, ChatGPT uses two tools, `search` and `fetch`, to
+  read the apps and pages the account may open; with Developer Mode on it
+  gets every tool.
 
 Signing in needs `TOOLSITE_BASE_URL` set, and an admin account to sign in
 with (see Accounts). A visitor account is told no: a connected client

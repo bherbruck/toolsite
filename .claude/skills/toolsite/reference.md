@@ -281,6 +281,9 @@ given a session id. ChatGPT speaks the newer lifecycle.
 - **Claude Code**: `claude mcp add --transport http toolsite https://<host>/mcp`,
   then `/mcp` to sign in. Or add it with an `Authorization: Bearer` header
   carrying `TOOLSITE_MCP_TOKEN`.
+- **ChatGPT**: the same URL and sign-in. Outside Developer Mode it has two
+  tools, `search` and `fetch`, which read what the account may open; in
+  Developer Mode it has every tool.
 - **The CLI**: a static token only, `TOOLSITE_TOKEN=<TOOLSITE_MCP_TOKEN>`.
 
 Only an admin account may connect a publishing client; a visitor account is

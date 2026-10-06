@@ -23,6 +23,7 @@ use crate::{
         mcp_me::MeHost,
         scaffold, secrets,
         upload::{self, upload_root, upload_sub, MAX_UPLOAD_BYTES},
+        mcp_log,
     },
 };
 use crate::runtime::wasm::Runtime;
@@ -93,8 +94,12 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         host_config,
     );
 
+    // The method log sits inside the auth layer, so it sees who the caller
+    // is and runs only for accepted requests; a refusal is already logged
+    // by the auth layer itself.
     let mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
+        .layer(middleware::from_fn(mcp_log::log_mcp))
         .layer(middleware::from_fn_with_state(config.clone(), require_bearer));
 
     // The same transport for a regular account, with two tools and the
@@ -107,6 +112,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     );
     let me_router = Router::new()
         .nest_service("/me/mcp", me_service)
+        .layer(middleware::from_fn(mcp_log::log_mcp))
         .layer(middleware::from_fn_with_state(config.clone(), require_person));
 
     let mut public_router = Router::new()

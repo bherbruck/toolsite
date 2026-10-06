@@ -17,7 +17,7 @@ use std::{io::Write, sync::Arc};
 use crate::{config::Config, content::slug::valid_slug};
 
 const WIT: &str = include_str!("../../wit/toolsite.wit");
-const GUIDE: &str = include_str!("../../templates/guide.md");
+pub(crate) const GUIDE: &str = include_str!("../../templates/guide.md");
 const HANDLER_CARGO: &str = include_str!("../../templates/handler/Cargo.toml");
 const HANDLER_LIB: &str = include_str!("../../templates/handler/src/lib.rs");
 const HANDLER_MIGRATION: &str =

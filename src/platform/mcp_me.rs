@@ -11,7 +11,8 @@
 use crate::{
     accounts::users::{self, User},
     config::Config,
-    content::store::{collect_slugs, read_meta_blocking},
+    content::store::{collect_slugs, read_meta, read_meta_blocking},
+    platform::knowledge::{self, FetchOutput, SearchOutput},
     runtime::db,
 };
 use rmcp::{
@@ -24,6 +25,18 @@ use rmcp::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SearchRequest {
+    #[schemars(description = "Words to look for in app titles, slugs and notes. Empty lists everything this account may open.")]
+    pub(crate) query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct FetchRequest {
+    #[schemars(description = "The id a search result carried: a page's slug, or 'guide'.")]
+    pub(crate) id: String,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct QueryRequest {
@@ -118,8 +131,77 @@ impl MeHost {
         out
     }
 
+    /// Whether this account may open the page at `slug`: the app's gate and
+    /// hidden flag, decided as serving decides them.
+    async fn may_see(&self, user: &User, slug: &str) -> bool {
+        if read_meta(&self.config, slug).await.hidden {
+            return false;
+        }
+        let app = slug.split('/').next().unwrap_or(slug).to_string();
+        crate::content::serve::may_open(&self.config, &app, user).await
+    }
+
+    async fn visible_slugs(&self, user: &User) -> Vec<String> {
+        let mut slugs = Vec::new();
+        collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
+        let mut out = Vec::new();
+        for slug in slugs {
+            if self.may_see(user, &slug).await {
+                out.push(slug);
+            }
+        }
+        out
+    }
+
     #[tool(
-        description = "The apps this account may open that share data, and for each the views you may query with their columns. A view marked writable takes INSERT, UPDATE and DELETE as well; the app's policy decides which rows are yours. Call this first; query takes the app and view names exactly as listed."
+        description = "Find apps and pages this account may open, by words in their title, slug or notes, plus the platform guide when the question is about toolsite itself. Returns ids for fetch.",
+        annotations(title = "Search", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SearchOutput>()
+    )]
+    pub(crate) async fn search(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(SearchRequest { query }): Parameters<SearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let user = caller(&ctx)?;
+        let visible = self.visible_slugs(&user).await;
+        let output = knowledge::search(&self.config, &query, &visible).await;
+        let value = serde_json::to_value(output).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::structured(value))
+    }
+
+    #[tool(
+        description = "Read one app or page this account may open as text, by the id search returned: the page's visible words, then the notes kept with the app, with metadata. 'guide' returns the platform guide.",
+        annotations(title = "Fetch", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<FetchOutput>()
+    )]
+    pub(crate) async fn fetch(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(FetchRequest { id }): Parameters<FetchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let user = caller(&ctx)?;
+        let refused = || CallToolResult::error(vec![ContentBlock::text(format!("nothing to fetch at {id}"))]);
+        if id == knowledge::GUIDE_ID {
+            let value = serde_json::to_value(knowledge::fetch_guide(&self.config))
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResult::structured(value));
+        }
+        if !crate::content::slug::valid_slug(&id) || !self.may_see(&user, &id).await {
+            return Ok(refused());
+        }
+        match knowledge::fetch_page(&self.config, &id).await {
+            Some(output) => {
+                let value = serde_json::to_value(output).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::structured(value))
+            }
+            None => Ok(refused()),
+        }
+    }
+
+    #[tool(
+        description = "The apps this account may open that share data, and for each the views you may query with their columns. A view marked writable takes INSERT, UPDATE and DELETE as well; the app's policy decides which rows are yours. Call this first; query takes the app and view names exactly as listed.",
+        annotations(title = "My apps", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn my_apps(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
         let user = caller(&ctx)?;
@@ -142,7 +224,8 @@ impl MeHost {
     }
 
     #[tool(
-        description = "Run one SQL statement as this account against an app's shared views. Reads any view my_apps lists; writes only a view it marks writable, and only the rows the app's policy says are yours: an insert for someone else is aborted, an update or delete of someone else's row changes nothing. Returns columns, rows and rows_affected. Bind values with '?'."
+        description = "Run one SQL statement as this account against an app's shared views. Reads any view my_apps lists; writes only a view it marks writable, and only the rows the app's policy says are yours: an insert for someone else is aborted, an update or delete of someone else's row changes nothing. Returns columns, rows and rows_affected. Bind values with '?'.",
+        annotations(title = "Query shared data", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     pub(crate) async fn query(
         &self,
