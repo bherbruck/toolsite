@@ -455,7 +455,10 @@ impl PageHost {
     async fn held_on(&self, user: &users::User, app: &str) -> Option<Scope> {
         let folder = crate::content::store::app_folder(&self.config, app).await;
         let (config, user, app) = (self.config.clone(), user.clone(), app.to_string());
-        tokio::task::spawn_blocking(move || users::app_scope(&config, &user, &folder, &app))
+        tokio::task::spawn_blocking(move || {
+            let locks = crate::content::store::locked_prefixes_blocking(&config);
+            users::app_scope(&config, &user, &folder, &app, &locks)
+        })
             .await
             .ok()
             .flatten()
@@ -508,7 +511,10 @@ impl PageHost {
             ))]));
         }
         let (config, who, at) = (self.config.clone(), user.clone(), folder.clone());
-        let held = tokio::task::spawn_blocking(move || users::effective_scope(&config, &who, &at))
+        let held = tokio::task::spawn_blocking(move || {
+            let locks = crate::content::store::locked_prefixes_blocking(&config);
+            users::effective_scope(&config, &who, &at, &locks)
+        })
             .await
             .ok()
             .flatten();
@@ -1744,6 +1750,16 @@ impl PageHost {
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // The same as the Access tab: access on the app is a View row on it.
+        if outcome.is_ok() {
+            let path = crate::content::store::logical_path(&self.config, &app).await;
+            if allow {
+                crate::platform::permissions::give_view_if_absent(&self.config, &email, &path).await;
+            } else {
+                let (config, who) = (self.config.clone(), email.clone());
+                let _ = tokio::task::spawn_blocking(move || crate::accounts::users::revoke_scope(&config, &who, &path)).await;
+            }
+        }
 
         match outcome {
             Ok(()) if allow => Ok(CallToolResult::success(vec![ContentBlock::text(format!(

@@ -59,7 +59,10 @@ pub(crate) async fn require_admin(config: &Arc<Config>, headers: &HeaderMap) -> 
 /// admin page and action asks.
 pub(crate) async fn held(config: &Arc<Config>, user: &User, path: &str) -> Option<Scope> {
     let (config, user, path) = (config.clone(), user.clone(), path.to_string());
-    tokio::task::spawn_blocking(move || users::effective_scope(&config, &user, &path))
+    tokio::task::spawn_blocking(move || {
+        let locks = store::locked_prefixes_blocking(&config);
+        users::effective_scope(&config, &user, &path, &locks)
+    })
         .await
         .ok()
         .flatten()
@@ -72,6 +75,24 @@ pub(crate) async fn manages_something(config: &Arc<Config>, user: &User) -> bool
     tokio::task::spawn_blocking(move || users::holds_anywhere(&config, &user, Scope::Editor))
         .await
         .unwrap_or(false)
+}
+
+/// Anyone who holds Manage somewhere: who may list accounts to give them
+/// access. A site admin, or an admin of any project or app.
+pub(crate) async fn require_manager(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
+    let user = match users::current_site_user(config, headers).await {
+        Some(user) => user,
+        None => return Err(Redirect::to("/auth/login?next=/admin").into_response()),
+    };
+    let (config2, who) = (config.clone(), user.clone());
+    let manages = tokio::task::spawn_blocking(move || users::holds_anywhere(&config2, &who, Scope::Admin))
+        .await
+        .unwrap_or(false);
+    if manages {
+        Ok(user)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not an admin").into_response())
+    }
 }
 
 /// Anyone who may enter the admin pages. What they then see is decided
@@ -129,7 +150,10 @@ pub(crate) async fn app_path(config: &Config, app: &str) -> String {
 pub(crate) async fn held_on(config: &Arc<Config>, user: &User, app: &str) -> Option<Scope> {
     let folder = store::app_folder(config, app).await;
     let (config, user, app) = (config.clone(), user.clone(), app.to_string());
-    tokio::task::spawn_blocking(move || users::app_scope(&config, &user, &folder, &app))
+    tokio::task::spawn_blocking(move || {
+        let locks = store::locked_prefixes_blocking(&config);
+        users::app_scope(&config, &user, &folder, &app, &locks)
+    })
         .await
         .ok()
         .flatten()
@@ -309,20 +333,6 @@ pub(crate) fn admin_page(headers: &HeaderMap, admin: &User, page: Page<'_>) -> R
     response
 }
 
-/// The three platform scopes as radios: a fixed, short choice.
-fn scope_choice(default: &str) -> Markup {
-    html! {
-        span."seg" role="radiogroup" {
-            @for scope in ["viewer", "editor", "admin"] {
-                label."seg-item" {
-                    input type="radio" name="scope" value=(scope) checked[scope == default];
-                    " " (scope)
-                }
-            }
-        }
-    }
-}
-
 pub(crate) fn hidden(name: &str, value: &str) -> Markup {
     html! { input type="hidden" name=(name) value=(value); }
 }
@@ -412,11 +422,11 @@ pub struct Match {
 
 const MAX_MATCHES: usize = 10;
 
+/// At most ten matches. An empty query gives the first ten, so a picker
+/// shows something to choose from as soon as it opens, and never the whole
+/// list.
 fn matches<T>(all: Vec<T>, q: &str, to_match: impl Fn(&T) -> Match) -> Vec<Match> {
     let q = q.trim().to_lowercase();
-    if q.is_empty() {
-        return Vec::new();
-    }
     all.into_iter()
         .map(|row| to_match(&row))
         .filter(|m| m.value.to_lowercase().contains(&q) || m.label.to_lowercase().contains(&q))
@@ -424,14 +434,14 @@ fn matches<T>(all: Vec<T>, q: &str, to_match: impl Fn(&T) -> Match) -> Vec<Match
         .collect()
 }
 
-/// `GET /admin/accounts/search?q=`: at most ten emails, for a picker. An
-/// empty query finds nothing, so the page never carries every account.
+/// `GET /admin/accounts/search?q=`: at most ten emails, for a picker. The
+/// page never carries every account; the picker asks as it opens.
 pub async fn search_accounts(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    if let Err(response) = require_admin(&config, &headers).await {
+    if let Err(response) = require_manager(&config, &headers).await {
         return response;
     }
     let accounts = {
@@ -762,8 +772,9 @@ pub async fn app_tab_page(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
     Path((app, tab)): Path<(String, String)>,
+    Query(grid): Query<crate::platform::permissions::GridQuery>,
 ) -> Response {
-    app_tab(config, headers, app, tab, None).await
+    app_tab_with(config, headers, app, tab, None, grid).await
 }
 
 /// Something minted by the request that rendered this page, shown this once.
@@ -779,6 +790,17 @@ pub(crate) async fn app_tab(
     app: String,
     tab: String,
     fresh: Option<Fresh>,
+) -> Response {
+    app_tab_with(config, headers, app, tab, fresh, Default::default()).await
+}
+
+async fn app_tab_with(
+    config: Arc<Config>,
+    headers: HeaderMap,
+    app: String,
+    tab: String,
+    fresh: Option<Fresh>,
+    grid: crate::platform::permissions::GridQuery,
 ) -> Response {
     if !export::valid_app(&app) || !TABS.iter().any(|(key, _)| *key == tab) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -810,7 +832,7 @@ pub(crate) async fn app_tab(
 
     let body = match tab.as_str() {
         "overview" => render_overview(&config, &app, &meta, &token, &back, is_admin_here).await,
-        "access" => render_access_tab(&config, &app, &meta, &token, &back).await,
+        "access" => render_access_tab(&config, &admin, &app, &meta, &token, &back, &grid).await,
         "repo" => {
             let fresh_token = match &fresh {
                 Some(Fresh::DeployToken(value)) => Some(value.as_str()),
@@ -1011,36 +1033,6 @@ pub async fn download_source(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// The role field on a grant form. Declared roles are offered, any word is
-/// accepted: the platform never interprets a role, so it never refuses one.
-fn role_input(declared: &[String]) -> Markup {
-    let first = declared.first().map(String::as_str).unwrap_or("viewer");
-    html! {
-        input name="role" value=(first) placeholder="role" size="8"
-              list=[(!declared.is_empty()).then_some("role-hints")]
-              title="The app reads this word with identity::current-role.";
-        @if !declared.is_empty() {
-            datalist id="role-hints" {
-                @for role in declared { option value=(role) {} }
-            }
-        }
-    }
-}
-
-/// Every role any app declares, for a form that is not about one app. A
-/// hint, so a bounded read is plenty.
-async fn all_declared_roles(config: &Config) -> Vec<String> {
-    let mut roles = Vec::new();
-    for app in app_names(config).await.into_iter().take(200) {
-        for role in read_meta(config, &app).await.roles {
-            if !roles.contains(&role) {
-                roles.push(role);
-            }
-        }
-    }
-    roles
-}
-
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
@@ -1057,77 +1049,37 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 async fn render_access_tab(
-    config: &Config,
+    config: &Arc<Config>,
+    viewer: &User,
     app: &str,
     meta: &crate::content::store::PageMeta,
     token: &str,
     back: &str,
+    grid: &crate::platform::permissions::GridQuery,
 ) -> Markup {
-    let grants: Vec<(String, String)> = {
-        let config = config.clone_for_task();
-        let app = app.to_string();
-        tokio::task::spawn_blocking(move || users::list_grants(&config))
-            .await
-            .unwrap_or_else(|_| Ok(Vec::new()))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(granted_app, _, _)| granted_app == &app)
-            .map(|(_, email, role)| (email, role))
-            .collect()
-    };
+    let path = app_path(config, app).await;
+    let target = crate::platform::permissions::Target::App { app: app.to_string(), path, roles: meta.roles.clone() };
+    let current = meta.gate.as_deref();
     html! {
-        (ui::panel("Access", Some("This setting applies to the whole app. Route rules below set exceptions for a path."), html! {
+        (ui::panel("General access", Some("Who may open the app at all. People with access below always may, unless it is Public, when anyone may."), html! {
             form method="post" action="/admin/gate" {
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
-                div."choices" {
-                    label."choice" {
-                        input type="radio" name="gate" value="default" checked[meta.gate.is_none()];
-                        strong { "Site default" }
-                        span {
-                            "The site default is " (gate_label(&config.default_gate)) ". Set it for the whole site with "
-                            code { "TOOLSITE_DEFAULT_ACCESS" } ". An app without its own setting uses it."
-                        }
+                span."seg" role="radiogroup" aria-label="General access" {
+                    @for (value, label, _) in GATES {
+                        button type="submit" name="gate" value=(value) aria-pressed=(if current == Some(value) { "true" } else { "false" }) { (label) }
                     }
-                    @for (value, label, help) in GATES {
-                        label."choice" {
-                            input type="radio" name="gate" value=(value) checked[meta.gate.as_deref() == Some(value)];
-                            strong { (label) }
-                            span { (help) }
-                        }
-                    }
+                    button type="submit" name="gate" value="default" aria-pressed=(if current.is_none() { "true" } else { "false" }) { "Site default" }
                 }
-                div."actions end" { button type="submit" { "Save access" } }
+            }
+            p."muted small" {
+                @match current {
+                    Some(level) => { (gate_label(level)) ": " (GATES.iter().find(|(v, ..)| *v == level).map(|(_, _, help)| *help).unwrap_or("")) }
+                    None => { "Follows the site default (" (gate_label(&config.default_gate)) "). Set it for the whole site with " code { "TOOLSITE_DEFAULT_ACCESS" } "." }
+                }
             }
         }))
 
-        (ui::panel("Route rules", Some("A rule sets access for one path prefix. The longest matching prefix applies."), html! {
-            @if !meta.rules.is_empty() {
-                table {
-                    thead { tr { th { "Prefix" } th { "Access" } th {} } }
-                    tbody {
-                        @for rule in &meta.rules {
-                            tr {
-                                td { code { (rule.prefix) } }
-                                td { (gate_badge(&rule.gate)) }
-                                td."actions-cell" {
-                                    form method="post" action="/admin/rule" {
-                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
-                                        (hidden("prefix", &rule.prefix)) (hidden("action", "remove"))
-                                        button."danger quiet sm" type="submit" { "Remove rule" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            form."row" method="post" action="/admin/rule" {
-                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("action", "add"))
-                input name="prefix" placeholder="/admin" required pattern="/.*";
-                select name="gate" { @for (value, label, _) in GATES { option value=(value) { (label) } } }
-                button."quiet" type="submit" { "Add rule" }
-            }
-        }))
+        (crate::platform::permissions::panel(config, viewer, &target, token, grid).await)
 
         (ui::panel("Shared data", Some("What a person may query from outside the app, as this account, through /me/mcp. Declared in toolsite.toml under [access]."), html! {
             @if meta.queryable.is_empty() && meta.policies.is_empty() {
@@ -1156,40 +1108,38 @@ async fn render_access_tab(
             }
         }))
 
-        (ui::panel("People with access", Some("This list applies while access is Restricted. The app reads each person's role."), html! {
-            form."row" method="post" action="/admin/access" {
-                (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("allow", "1"))
-                label."small" for="email" { "Add an account" }
-                (ui::combobox("email", "/admin/accounts/search", "Type an email"))
-                (role_input(&meta.roles))
-                button type="submit" { "Add" }
-            }
-            @if grants.is_empty() {
-                p."muted" { "Nobody has access yet. Add a person above." }
-            } @else {
-                table {
-                    thead { tr { th { "Account" } th { "Role" } th {} } }
-                    tbody {
-                        @for (email, role) in &grants {
-                            tr {
-                                td { a."row-link" href={ "/admin/accounts/" (urlencoding::encode(email)) } { (email) } }
-                                td { span."badge" { (role) } }
-                                td."actions-cell" {
-                                    form method="post" action="/admin/access"
-                                         data-confirm={ "Revoke " (email) "?" }
-                                         data-confirm-detail="The account stays. The account cannot open this app."
-                                         data-confirm-label="Revoke grant" data-confirm-danger="1" {
-                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
-                                        (hidden("email", email)) (hidden("allow", "0"))
-                                        button."danger quiet sm" type="submit" { "Revoke grant" }
+        details."panel advanced" open[!meta.rules.is_empty()] {
+            summary."panel-head" { h3 { "Advanced: route rules" } }
+            div."panel-body" {
+                p."muted small" { "A rule sets general access for one path prefix of the app. The longest matching prefix applies." }
+                @if !meta.rules.is_empty() {
+                    table {
+                        thead { tr { th { "Prefix" } th { "Access" } th {} } }
+                        tbody {
+                            @for rule in &meta.rules {
+                                tr {
+                                    td { code { (rule.prefix) } }
+                                    td { (gate_badge(&rule.gate)) }
+                                    td."actions-cell" {
+                                        form method="post" action="/admin/rule" {
+                                            (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
+                                            (hidden("prefix", &rule.prefix)) (hidden("action", "remove"))
+                                            button."danger quiet sm" type="submit" { "Remove rule" }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                form."row" method="post" action="/admin/rule" {
+                    (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("action", "add"))
+                    input name="prefix" placeholder="/admin" required pattern="/.*";
+                    select name="gate" { @for (value, label, _) in GATES { option value=(value) { (label) } } }
+                    button."quiet" type="submit" { "Add rule" }
+                }
             }
-        }))
+        }
     }
 }
 
@@ -1416,6 +1366,67 @@ pub async fn accounts_page(
 
 /// One account: who they are, what they may open, and the two things an
 /// admin does for them — a fresh setup link, and switching them off.
+/// One place an account holds a level, for its read-only summary.
+struct AccessLine {
+    label: String,
+    level: &'static str,
+    source: &'static str,
+    link: String,
+}
+
+/// An account's rows and app access, grouped by the project they sit in.
+async fn access_summary(
+    config: &Arc<Config>,
+    scopes: &[users::ScopeGrant],
+    grants: &[(String, String)],
+) -> Vec<(String, Vec<AccessLine>)> {
+    use crate::platform::permissions::{grid_url, level_word};
+    let folders: Vec<String> = store::list_folders(config).await.into_iter().map(|f| f.path).collect();
+    let mut lines: Vec<(String, AccessLine)> = Vec::new();
+    for row in scopes {
+        if row.prefix.is_empty() || folders.contains(&row.prefix) {
+            let group = row.prefix.split('/').next().unwrap_or("").to_string();
+            lines.push((group, AccessLine {
+                label: if row.prefix.is_empty() { "The whole site".to_string() } else { row.prefix.clone() },
+                level: level_word(row.scope),
+                source: "project",
+                link: grid_url(&row.prefix, None),
+            }));
+        } else {
+            let app = row.prefix.rsplit('/').next().unwrap_or(&row.prefix).to_string();
+            let group = row.prefix.split('/').next().filter(|first| *first != app).unwrap_or("").to_string();
+            lines.push((group, AccessLine {
+                label: row.prefix.clone(),
+                level: level_word(row.scope),
+                source: "app",
+                link: grid_url(&row.prefix, Some(&app)),
+            }));
+        }
+    }
+    for (app, _) in grants {
+        let path = app_path(config, app).await;
+        if scopes.iter().any(|row| row.prefix == path) {
+            continue;
+        }
+        let group = path.split('/').next().filter(|first| first != app).unwrap_or("").to_string();
+        lines.push((group, AccessLine {
+            label: path.clone(),
+            level: level_word(Scope::Viewer),
+            source: "access on the app",
+            link: grid_url(&path, Some(app)),
+        }));
+    }
+    lines.sort_by(|a, b| (&a.0, &a.1.label).cmp(&(&b.0, &b.1.label)));
+    let mut groups: Vec<(String, Vec<AccessLine>)> = Vec::new();
+    for (group, line) in lines {
+        match groups.last_mut() {
+            Some((last, rows)) if *last == group => rows.push(line),
+            _ => groups.push((group, vec![line])),
+        }
+    }
+    groups
+}
+
 pub async fn account_page(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
@@ -1464,7 +1475,7 @@ async fn render_account_page(
     let token = form_token(&config, &admin);
     let back = format!("/admin/accounts/{}", urlencoding::encode(&account.email));
     let is_self = account.email == admin.email;
-    let declared_roles = all_declared_roles(&config).await;
+    let access = access_summary(&config, &scopes, &grants).await;
     let title = account.email.clone();
     admin_page(
         &headers,
@@ -1485,70 +1496,23 @@ async fn render_account_page(
                         (ui::secret("setup-link", link))
                     }))
                 }
-                (ui::panel("Projects", Some("What this account may do to the platform, from a folder down. Viewer opens apps. Editor also publishes and changes apps. Admin also sets access. An empty folder is the whole site."), html! {
-                    form."row" method="post" action="/admin/scope" {
-                        (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("action", "grant"))
-                        input name="prefix" placeholder="Folder path, or empty for the site" pattern="[A-Za-z0-9_/-]*";
-                        (scope_choice("editor"))
-                        button type="submit" { "Give access" }
+                (ui::panel("Has access to", Some("Every place this account holds a level of its own. Change it on that project or app's permissions."), html! {
+                    @if account.is_admin {
+                        p { "This account is a site admin and holds Manage everywhere." }
                     }
-                    @if scopes.is_empty() {
-                        p."muted" { "No access of its own. Give access above, or on a folder's page." }
+                    @if access.is_empty() {
+                        @if !account.is_admin { p."muted" { "No access of its own. Add it from a project's Permissions tab or an app's Access tab." } }
                     } @else {
-                        table {
-                            thead { tr { th { "Folder" } th { "Scope" } th {} } }
-                            tbody {
-                                @for row in &scopes {
-                                    tr {
-                                        td {
-                                            @if row.prefix.is_empty() { "the site" } @else {
-                                                a."row-link" href={ "/admin/apps?folder=" (urlencoding::encode(&row.prefix)) } { (row.prefix) }
-                                            }
-                                        }
-                                        td { span."badge solid" { (row.scope) } }
-                                        td."actions-cell" {
-                                            form method="post" action="/admin/scope"
-                                                 data-confirm={ "Revoke " (row.scope) " at " (if row.prefix.is_empty() { "the site" } else { row.prefix.as_str() }) "?" }
-                                                 data-confirm-detail="The account keeps every other scope it holds."
-                                                 data-confirm-label="Revoke access" data-confirm-danger="1" {
-                                                (hidden("token", &token)) (hidden("prefix", &row.prefix)) (hidden("email", &account.email))
-                                                (hidden("back", &back)) (hidden("action", "revoke"))
-                                                button."danger quiet sm" type="submit" { "Revoke access" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }))
-                (ui::panel("Apps with access", Some("This applies to apps whose access is Restricted. The app reads the role. The usual role is viewer."), html! {
-                    form."row" method="post" action="/admin/access" {
-                        (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back)) (hidden("allow", "1"))
-                        label."small" for="app" { "Add to an app" }
-                        (ui::combobox("app", "/admin/apps/search", "Type an app name"))
-                        (role_input(&declared_roles))
-                        button type="submit" { "Add" }
-                    }
-                    @if grants.is_empty() {
-                        p."muted" { "No app access yet. Add an app above." }
-                    } @else {
-                        table {
-                            thead { tr { th { "App" } th { "Role" } th {} } }
-                            tbody {
-                                @for (app, role) in &grants {
-                                    tr {
-                                        td { a."row-link" href={ "/admin/apps/" (app) "/access" } { (app) } }
-                                        td { span."badge" { (role) } }
-                                        td."actions-cell" {
-                                            form method="post" action="/admin/access"
-                                                 data-confirm={ "Revoke " (app) "?" }
-                                                 data-confirm-detail="The account stays. The account cannot open this app."
-                                                 data-confirm-label="Revoke grant" data-confirm-danger="1" {
-                                                (hidden("token", &token)) (hidden("app", app)) (hidden("email", &account.email))
-                                                (hidden("allow", "0")) (hidden("back", &back))
-                                                button."danger quiet sm" type="submit" { "Revoke grant" }
-                                            }
+                        @for (group, rows) in &access {
+                            h4."group" { @if group.is_empty() { "Top level" } @else { (group) } }
+                            table {
+                                thead { tr { th { "Where" } th { "Level" } th { "Given as" } } }
+                                tbody {
+                                    @for row in rows {
+                                        tr {
+                                            td { a."row-link" href=(row.link) { (row.label) } }
+                                            td { span."badge solid" { (row.level) } }
+                                            td."muted small" { (row.source) }
                                         }
                                     }
                                 }
@@ -1975,6 +1939,7 @@ pub async fn change_access(
     }
     let config2 = config.clone();
     let (email, app) = (form.email.clone(), form.app.clone());
+    let path = app_path(&config, &app).await;
     let outcome = tokio::task::spawn_blocking(move || {
         if allow {
             users::grant(&config2, &form.email, &form.app, &role)
@@ -1983,6 +1948,16 @@ pub async fn change_access(
         }
     })
     .await;
+    // Access given on the app is a View row on it too, so the grid shows
+    // it; taking access away takes that row with it.
+    if matches!(outcome, Ok(Ok(()))) {
+        if allow {
+            crate::platform::permissions::give_view_if_absent(&config, &email, &path).await;
+        } else {
+            let (config3, who, at) = (config.clone(), email.clone(), path.clone());
+            let _ = tokio::task::spawn_blocking(move || users::revoke_scope(&config3, &who, &at)).await;
+        }
+    }
     match outcome {
         Ok(Ok(())) => redirect_flash(
             &back,

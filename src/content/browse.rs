@@ -51,6 +51,9 @@ pub struct BrowseQuery {
     tab: Option<String>,
     /// Rows open in the List view, relative to this level, comma separated.
     open: Option<String>,
+    /// The permissions grid's own parts: check, add, pq, ppage.
+    #[serde(flatten)]
+    grid: crate::platform::permissions::GridQuery,
 }
 
 /// One app the viewer may open.
@@ -321,7 +324,15 @@ async fn render(config: Arc<Config>, headers: HeaderMap, project: String, query:
             ))
         }
         @if tab == "permissions" {
-            (permissions(&config, &project, &token).await)
+            @if let Some(user) = &viewer {
+                (crate::platform::permissions::panel(
+                    &config,
+                    user,
+                    &crate::platform::permissions::Target::Project(project.clone()),
+                    &token,
+                    &query.grid,
+                ).await)
+            }
         } @else {
             form."search" method="get" action=(browser_url(&project)) {
                 input type="search" id="q" name="q" value=(q) autocomplete="off"
@@ -411,6 +422,7 @@ fn row_tools(entry: &Entry) -> Markup {
             span."row-tools" {
                 a."btn ghost sm" href={ "/admin/apps/" (entry.app) } { "Manage" }
                 @if entry.scope == Some(Scope::Admin) {
+                    a."btn ghost sm" href={ "/admin/apps/" (entry.app) "/access" } { "Access" }
                     button."ghost sm" type="button" data-dialog="move-app" data-fill-app=(entry.app) { "Move" }
                 }
             }
@@ -569,80 +581,3 @@ fn results(tree: &Tree, project: &str, q: &str) -> Markup {
     }
 }
 
-/// The Permissions tab: who holds what at this project, set here or above.
-async fn permissions(config: &Arc<Config>, project: &str, token: &str) -> Markup {
-    let crate::platform::projects::Holders { direct, inherited } =
-        crate::platform::projects::holders_unchecked(config, project).await;
-    let back = permissions_url(project);
-    let here = if project.is_empty() { "the site".to_string() } else { project.to_string() };
-    html! {
-        p."muted" {
-            "Viewer opens the apps here. Editor also publishes and changes apps here. Admin also sets access here. "
-            "Access on a project applies to everything inside it. Site admins hold admin everywhere."
-        }
-        section."panel" {
-            table."permissions" {
-                thead { tr { th { "Account" } th { "Access" } th { "Set at" } th {} } }
-                tbody {
-                    @for row in &direct {
-                        tr {
-                            td { a href={ "/admin/accounts/" (row.email) } { (row.email) } }
-                            td {
-                                form."inline" method="post" action="/admin/scope" {
-                                    (admin::hidden("token", token)) (admin::hidden("action", "grant"))
-                                    (admin::hidden("prefix", project)) (admin::hidden("email", &row.email)) (admin::hidden("back", &back))
-                                    select name="scope" data-autosubmit aria-label={ "Access for " (row.email) } {
-                                        @for scope in ["viewer", "editor", "admin"] {
-                                            option value=(scope) selected[row.scope.as_str() == scope] { (scope) }
-                                        }
-                                    }
-                                    noscript { button."quiet sm" type="submit" { "Save" } }
-                                }
-                            }
-                            td."muted small" { "this project" }
-                            td."actions-cell" {
-                                form method="post" action="/admin/scope"
-                                     data-confirm={ "Remove access for " (row.email) "?" }
-                                     data-confirm-detail={ "The account keeps any access given above " (here) "." }
-                                     data-confirm-label="Remove" data-confirm-danger="1" {
-                                    (admin::hidden("token", token)) (admin::hidden("action", "revoke"))
-                                    (admin::hidden("prefix", project)) (admin::hidden("email", &row.email)) (admin::hidden("back", &back))
-                                    button."danger quiet sm" type="submit" { "Remove" }
-                                }
-                            }
-                        }
-                    }
-                    @for row in &inherited {
-                        tr."inherited" {
-                            td { (row.email) }
-                            td { span."badge" { (row.scope) } }
-                            td."muted small" {
-                                "inherited from "
-                                a href=(permissions_url(&row.prefix)) { @if row.prefix.is_empty() { "the site" } @else { (row.prefix) } }
-                            }
-                            td {}
-                        }
-                    }
-                    @if direct.is_empty() && inherited.is_empty() {
-                        tr { td colspan="4" { span."muted" { "Nobody holds access at " (here) " yet." } } }
-                    }
-                    tr."add-row" {
-                        td colspan="4" {
-                            form."row" method="post" action="/admin/scope" {
-                                (admin::hidden("token", token)) (admin::hidden("action", "grant"))
-                                (admin::hidden("prefix", project)) (admin::hidden("back", &back))
-                                (ui::combobox("email", "/admin/accounts/search", "Add permission: type an email"))
-                                select name="scope" aria-label="Access" {
-                                    option value="viewer" { "viewer" }
-                                    option value="editor" selected { "editor" }
-                                    option value="admin" { "admin" }
-                                }
-                                button type="submit" { "Save" }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}

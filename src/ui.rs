@@ -376,6 +376,49 @@ form.search input[type=search] { margin: 0; }
 .flash.error { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: var(--danger-soft); }
 .flash button { padding: .1rem .4rem; }
 
+/* The permissions grid: one row per person, a shaded cell per level. */
+.table-scroll { overflow-x: auto; }
+table.perm-grid td.who { font-weight: 500; overflow-wrap: anywhere; }
+.perm-grid th.cell-head, .perm-grid td.cell-col { text-align: center; width: 4.75rem; }
+.perm-grid th.cell-head { cursor: help; }
+form.cell-form { display: inline-flex; margin: 0; }
+.cell {
+  display: inline-block; width: 1.5rem; height: 1.5rem; padding: 0; vertical-align: middle;
+  border: 1.5px solid var(--border); border-radius: .35rem; background: transparent; cursor: pointer;
+}
+button.cell:hover { opacity: 1; }
+.cell.on { background: var(--primary); border-color: var(--primary); }
+.cell.on:hover { opacity: .8; }
+.cell.off:hover { border-color: var(--primary); background: var(--soft); }
+.cell.inherited {
+  cursor: default; border-color: var(--border);
+  background: repeating-linear-gradient(45deg, var(--soft) 0 3px, var(--border) 3px 6px);
+}
+.cell:disabled { opacity: .35; cursor: not-allowed; }
+.perm-actions { margin-top: 1rem; }
+.check-answer { margin: .75rem 0 0; }
+h4.group { font-size: .85rem; margin: 1rem 0 .25rem; color: var(--muted); }
+details.advanced > summary { cursor: pointer; list-style: none; }
+details.advanced > summary::-webkit-details-marker { display: none; }
+details.advanced > summary h3::before { content: "\25B8"; margin-right: .4rem; }
+details.advanced[open] > summary h3::before { content: "\25BE"; }
+dialog.wide { max-width: 34rem; width: calc(100% - 2rem); }
+.people-list {
+  list-style: none; margin: .5rem 0; padding: 0; max-height: 18rem; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.people-list li { padding: .35rem .7rem; border-bottom: 1px solid var(--border); }
+.people-list li:last-child { border-bottom: 0; }
+.people-list label { display: flex; gap: .5rem; align-items: center; cursor: pointer; }
+.people-search input[type=search] { margin-bottom: 0; }
+.toast {
+  position: fixed; right: 1rem; bottom: 1rem; z-index: 50; max-width: 24rem;
+  padding: .6rem .9rem; border-radius: var(--radius); border: 1px solid var(--border);
+  background: var(--card); box-shadow: 0 6px 24px #0002; font-size: .9rem;
+}
+.toast.ok { border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); background: var(--ok-soft); }
+.toast.error { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: var(--danger-soft); }
+
 /* The browser's own dialog, dressed. */
 dialog {
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -529,25 +572,123 @@ pub const SHELL_SCRIPT: &str = r#"
   document.querySelectorAll('.flash [data-dismiss]').forEach((button) => {
     button.addEventListener('click', () => button.closest('.flash').remove());
   });
-  // A button that opens a dialog, filling named fields from its data-fill-*.
-  document.querySelectorAll('[data-dialog]').forEach((button) => {
-    button.addEventListener('click', () => {
+  // A button or link that opens a dialog, filling named fields from its
+  // data-fill-*. Delegated, so parts of a page swapped in later work too;
+  // a link keeps its address for a browser with no script.
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-dialog]');
+    if (!button) return;
+    {
       const target = document.getElementById(button.dataset.dialog);
-      if (!target) return;
+      if (!target || typeof target.showModal !== 'function') return;
+      event.preventDefault();
       Object.keys(button.dataset).filter((k) => k.startsWith('fill') && k.length > 4).forEach((k) => {
         const name = k.charAt(4).toLowerCase() + k.slice(5);
         target.querySelectorAll('[name="' + name + '"]').forEach((f) => { f.value = button.dataset[k]; });
         target.querySelectorAll('[data-show="' + name + '"]').forEach((e) => { e.textContent = button.dataset[k]; });
       });
       target.showModal();
-    });
+      // A list that loads on open asks for its first page now.
+      target.querySelectorAll('[data-people-search]').forEach((input) => input.dispatchEvent(new Event('input')));
+    }
   });
-  document.querySelectorAll('dialog [data-close]').forEach((button) => {
-    button.addEventListener('click', () => button.closest('dialog').close());
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('dialog [data-close]');
+    if (button) button.closest('dialog').close();
   });
   // A select that saves as soon as it changes.
-  document.querySelectorAll('select[data-autosubmit]').forEach((select) => {
-    select.addEventListener('change', () => select.form.requestSubmit());
+  document.addEventListener('change', (event) => {
+    const select = event.target.closest('select[data-autosubmit]');
+    if (select) select.form.requestSubmit();
+  });
+  // A short message in the corner, for an action saved in place.
+  const toast = (text, ok) => {
+    const note = document.createElement('div');
+    note.className = 'toast ' + (ok ? 'ok' : 'error');
+    note.setAttribute('role', 'status');
+    note.textContent = text;
+    document.body.appendChild(note);
+    setTimeout(() => note.remove(), 3500);
+  };
+  // A cell of the permissions grid saves in place. Removing asks first,
+  // through the same dialog every confirm uses.
+  const grid = document.getElementById('perm-grid');
+  if (grid) {
+    const save = async (form) => {
+      try {
+        const res = await fetch(form.action, {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'x-toolsite-fetch': '1' },
+          body: new URLSearchParams(new FormData(form)),
+        });
+        const reply = await res.json().catch(() => ({ ok: false, message: 'The change was not saved.' }));
+        toast(reply.message, reply.ok);
+        const page = await fetch(location.href, { credentials: 'same-origin' });
+        const doc = new DOMParser().parseFromString(await page.text(), 'text/html');
+        const fresh = doc.getElementById('perm-people');
+        const here = document.getElementById('perm-people');
+        if (fresh && here) here.replaceWith(fresh);
+      } catch { toast('The change was not saved.', false); }
+    };
+    document.addEventListener('submit', (event) => {
+      const form = event.target.closest('form[data-cell]');
+      if (!form) return;
+      event.preventDefault();
+      const ask = form.dataset.cellConfirm;
+      const box = document.getElementById('confirm');
+      if (ask && box) {
+        box.querySelector('h3').textContent = ask;
+        box.querySelector('p').textContent = 'The account keeps any access given on a project above.';
+        const go = box.querySelector('[data-go]');
+        go.textContent = 'Remove access';
+        go.className = 'danger';
+        const fresh = go.cloneNode(true);
+        go.replaceWith(fresh);
+        fresh.addEventListener('click', () => { box.close(); form.elements.confirm.value = '1'; save(form); }, { once: true });
+        box.showModal();
+      } else {
+        save(form);
+      }
+    });
+  }
+  // Add people: the list narrows as the person types, and boxes already
+  // ticked stay at the top so a search never loses a choice.
+  document.querySelectorAll('[data-people-search]').forEach((input) => {
+    const dialog = input.closest('dialog, section');
+    const list = dialog && dialog.querySelector('[data-people-list]');
+    const count = dialog && dialog.querySelector('[data-people-count]');
+    if (!list) return;
+    input.closest('form').addEventListener('submit', (event) => event.preventDefault());
+    let timer = null;
+    input.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        try {
+          const res = await fetch(input.dataset.peopleSearch + '?q=' + encodeURIComponent(input.value.trim()), { credentials: 'same-origin' });
+          if (!res.ok) return;
+          const page = await res.json();
+          const ticked = Array.from(list.querySelectorAll('input:checked')).map((box) => box.value);
+          list.replaceChildren();
+          const add = (email, checked) => {
+            const li = document.createElement('li');
+            const label = document.createElement('label');
+            const box = document.createElement('input');
+            box.type = 'checkbox'; box.name = 'email'; box.value = email; box.checked = checked;
+            label.append(box, ' ' + email);
+            li.appendChild(label);
+            list.appendChild(li);
+          };
+          ticked.forEach((email) => add(email, true));
+          page.items.filter((email) => !ticked.includes(email)).forEach((email) => add(email, false));
+          if (!list.children.length) {
+            const none = document.createElement('li');
+            none.className = 'muted'; none.textContent = 'No accounts match.';
+            list.appendChild(none);
+          }
+          if (count) count.textContent = 'Showing ' + page.items.length + ' of ' + page.total + '.';
+        } catch {}
+      }, 150);
+    });
   });
   // Rows opened in place are kept in the address, so a shared link opens the
   // same way. The server renders them open from ?open=.
@@ -625,10 +766,10 @@ pub const SHELL_SCRIPT: &str = r#"
       menu.hidden = false;
       input.setAttribute('aria-expanded', 'true');
     };
-    input.addEventListener('input', () => {
+    // Asks the server as the person types, and as soon as the field is
+    // focused, so there is something to choose from before typing.
+    const search = (q) => {
       clearTimeout(timer);
-      const q = input.value.trim();
-      if (!q) { close(); return; }
       timer = setTimeout(async () => {
         if (controller) controller.abort();
         controller = new AbortController();
@@ -644,10 +785,17 @@ pub const SHELL_SCRIPT: &str = r#"
             credentials: 'same-origin', signal: controller.signal,
           });
           if (!res.ok) return;
-          show(await res.json(), q);
+          const found = await res.json();
+          if (!found.length && !q) { close(); return; }
+          show(found, q);
         } catch {}
       }, 150);
-    });
+    };
+    input.addEventListener('input', () => search(input.value.trim()));
+    input.addEventListener('focus', () => { if (menu.hidden) search(input.value.trim()); });
+    // Leaving the field closes the menu. A pick happens on mousedown, before
+    // the field blurs, so this never eats a choice.
+    input.addEventListener('blur', () => setTimeout(close, 120));
     input.addEventListener('keydown', (event) => {
       if (menu.hidden) return;
       if (event.key === 'ArrowDown') {

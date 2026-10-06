@@ -163,6 +163,11 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/settings-link", post(admin::settings_link))
         .route("/admin/job-run", post(admin::run_job))
         .route("/admin/scope", post(admin::change_scope))
+        // The permissions grid: one cell, several people, the lock.
+        .route("/admin/permissions/cell", post(crate::platform::permissions::change_cell))
+        .route("/admin/permissions/add", post(crate::platform::permissions::add))
+        .route("/admin/permissions/lock", post(crate::platform::permissions::change_lock))
+        .route("/admin/permissions/people", get(crate::platform::permissions::people))
         .route("/admin/folder", post(admin::new_folder))
         .route("/admin/projects/search", get(admin::search_projects))
         .route("/admin/move", post(admin::move_app))

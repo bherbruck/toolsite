@@ -303,6 +303,9 @@ async fn main() -> anyhow::Result<()> {
         preview_base,
     });
 
+    // Per-app grants became View rows on their apps; done once.
+    toolsite::platform::permissions::adopt_grants(&config).await;
+
     let runtime = Runtime::new()?;
     let app = build_router(config.clone(), runtime.clone());
 

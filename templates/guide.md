@@ -190,6 +190,12 @@ Anything the file does not mention is left alone.
 
 ## Access
 
+People are given access in a grid of View, Edit and Manage on a project or an
+app, and a project can be Locked so only its own permissions apply inside. As
+an agent, use `projects(action: "grant")` or `set_access`; to see why someone
+can or cannot open something, `projects(action: "permissions")` lists direct
+and inherited rows.
+
 Publishing may be limited to a folder. Apps sit in a project tree, and the
 account behind your connection may hold editor on `ops/yard` and nothing
 elsewhere. A tool that is asked to touch an app outside that refuses with the

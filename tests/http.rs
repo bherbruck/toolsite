@@ -3158,7 +3158,7 @@ async fn saving_a_gate_returns_to_the_tab_with_the_outcome_shown_once() {
     assert_eq!(status, StatusCode::OK);
     // The old word still works on the way in, and the page answers in the new one.
     assert!(page.contains("Access for reports is Restricted"), "no flash: {page}");
-    assert!(page.contains(r#"value="restricted" checked"#), "the radio does not reflect the save");
+    assert!(page.contains(r#"value="restricted" aria-pressed="true""#), "the control does not reflect the save");
     // Shown once: the next visit is quiet.
     let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
     assert!(!page.contains("Access for reports is Restricted"));
@@ -3261,7 +3261,7 @@ async fn an_admin_can_put_an_app_back_on_the_site_default() {
     let boss = sign_in(&config, "boss@example.com", "correct horse battery");
     let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
     let token = form_token_from(&page);
-    assert!(page.contains(r#"value="default" checked"#), "a fresh app is not shown on the default");
+    assert!(page.contains(r#"value="default" aria-pressed="true""#), "a fresh app is not shown on the default");
 
     send(&config, post_form("/admin/gate", &boss, format!("token={token}&app=reports&gate=public"))).await;
     let (status, ..) = send(&config, get("/p/reports/")).await;
@@ -3340,9 +3340,8 @@ async fn an_account_page_shows_grants_and_lets_an_admin_change_them() {
 
     let (status, page, _) = send(&config, get_as("/admin/accounts/reader%40example.com", &boss)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("No app access yet"));
-    assert!(page.contains(r#"data-search="/admin/apps/search""#), "the app picker is not a combobox");
-    assert!(page.contains(r#"role="combobox""#), "the picker is not a real combobox");
+    // Read-only now: what the account holds, each linking to where it is set.
+    assert!(page.contains("No access of its own"));
     assert!(!page.contains("<datalist"), "a native datalist is still in use");
     assert!(!page.contains("<select"), "a select lists every app");
     let token = form_token_from(&page);
@@ -3357,7 +3356,8 @@ async fn an_account_page_shows_grants_and_lets_an_admin_change_them() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (status, page) = follow(&config, &boss, &headers).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("reports") && page.contains("editor"), "the grant is not listed with its role: {page}");
+    assert!(page.contains("Has access to"), "{page}");
+    assert!(page.contains(r#"href="/admin/apps/reports/access""#), "the app access does not link to its grid: {page}");
     let who = toolsite::accounts::users::log_in(&config, "reader@example.com", "correct horse battery").unwrap().0;
     assert_eq!(toolsite::accounts::users::role_for(&config, &who.id, "reports").as_deref(), Some("editor"));
 
@@ -3414,13 +3414,14 @@ async fn the_pickers_search_the_server_and_never_list_everyone() {
     let (status, ..) = send(&config, get_as("/admin/apps/search?q=rep", &reader)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Capped at ten, nothing for nothing.
+    // Capped at ten; an empty query gives the first ten, never everyone.
     let (status, body, _) = send(&config, get_as("/admin/accounts/search?q=person", &boss)).await;
     assert_eq!(status, StatusCode::OK);
     let found: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(found.len(), 10, "{body}");
     let (_, body, _) = send(&config, get_as("/admin/accounts/search?q=", &boss)).await;
-    assert_eq!(body, "[]");
+    let found: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(found.len(), 10, "{body}");
     let (_, body, _) = send(&config, get_as("/admin/accounts/search?q=person1", &boss)).await;
     let found: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(found.len(), 5);
@@ -3433,7 +3434,7 @@ async fn the_pickers_search_the_server_and_never_list_everyone() {
 
     // The Access tab carries the picker, not the directory.
     let (_, page, _) = send(&config, get_as("/admin/apps/reports/access", &boss)).await;
-    assert!(page.contains("Add an account"));
+    assert!(page.contains("Add people"));
     assert!(page.contains(r#"data-search="/admin/accounts/search""#));
     for n in 0..15 {
         assert!(!page.contains(&format!("person{n:02}@example.com")), "the page lists every account");
@@ -3648,10 +3649,13 @@ async fn roles_an_app_declares_are_offered_when_granting_but_never_required() {
     account(&config, "reader@example.com", "correct horse battery");
     let boss = sign_in(&config, "boss@example.com", "correct horse battery");
 
-    // Before the manifest says anything: a plain field, viewer by default.
+    // Before the manifest says anything: no role column at all.
     let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
-    assert!(!page.contains("role-hints"));
-    assert!(page.contains(r#"name="role" value="viewer""#));
+    assert!(!page.contains("Role in app"));
+    let token = form_token_from(&page);
+    send(&config, post_form("/admin/access", &boss, format!("token={token}&app=board&email=reader@example.com&allow=1"))).await;
+    let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
+    assert!(!page.contains("Role in app"), "a role column without declared roles");
 
     let changed = toolsite::platform::manifest::apply(&config, "board", "roles = [\"editor\", \"approver\"]\n")
         .await
@@ -3660,12 +3664,10 @@ async fn roles_an_app_declares_are_offered_when_granting_but_never_required() {
     let meta = toolsite::content::store::read_meta(&config, "board").await;
     assert_eq!(meta.roles, ["editor", "approver"]);
 
-    // Offered on the app's Access tab and on the account page.
+    // Offered on the app's Access tab, as the Role in app column.
     let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
+    assert!(page.contains("Role in app"), "declared roles bring no column");
     assert!(page.contains(r#"<option value="approver">"#), "declared roles are not offered");
-    assert!(page.contains(r#"name="role" value="editor""#), "the first declared role is not the default");
-    let (_, page, _) = send(&config, get_as("/admin/accounts/reader@example.com", &boss)).await;
-    assert!(page.contains(r#"<option value="editor">"#));
 
     // Still only a hint: an undeclared role is granted without complaint.
     let (_, page, _) = send(&config, get_as("/admin/apps/board/access", &boss)).await;
@@ -5493,13 +5495,13 @@ async fn the_permissions_tab_changes_a_scope_in_place_and_leaves_inherited_rows_
 
     let (status, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &fa)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("Add permission"));
+    assert!(page.contains("Add people"));
     assert!(page.contains("worker@example.com"));
     // The inherited row says where it comes from and offers no change.
     let chief = page.find("chief@example.com").expect("the inherited holder is not listed");
     let row_end = chief + page[chief..].find("</tr>").unwrap();
     let row = &page[chief..row_end];
-    assert!(row.contains("inherited from"), "{row}");
+    assert!(row.contains("cell inherited"), "{row}");
     assert!(row.contains("href=\"/browse/ops?tab=permissions\""), "{row}");
     assert!(!row.contains("<select"), "an inherited row can be changed here");
     assert!(!row.contains("Remove"), "an inherited row can be removed here");
@@ -5735,4 +5737,238 @@ async fn the_old_word_granted_still_closes_an_app_and_is_stored_as_restricted() 
     assert!(raw.contains("\"restricted\"") && !raw.contains("\"granted\""), "{raw}");
     let (_, index, _) = send(&config, get_as("/", &outside)).await;
     assert!(!index.contains("Man"), "the manifest's old word left the app open");
+}
+
+// --- the permissions grid ----------------------------------------------------------
+
+/// A person's grid row on a page: from their email to the end of the row.
+fn grid_row<'a>(page: &'a str, email: &str) -> &'a str {
+    let start = page.find(&format!("data-email=\"{email}\"")).unwrap_or_else(|| panic!("no grid row for {email}"));
+    let end = start + page[start..].find("</tr>").unwrap();
+    &page[start..end]
+}
+
+fn cell_post(token: &str, path: &str, email: &str, level: &str, confirm: &str) -> String {
+    format!(
+        "token={token}&path={}&email={}&level={level}&confirm={confirm}&back=/browse/{path}?tab%3Dpermissions",
+        urlencoding::encode(path),
+        urlencoding::encode(email)
+    )
+}
+
+fn level_at(config: &Config, email: &str, prefix: &str) -> Option<String> {
+    toolsite::accounts::users::list_scopes(config)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.email == email && r.prefix == prefix)
+        .map(|r| r.scope.as_str().to_string())
+}
+
+#[tokio::test]
+async fn the_grid_shades_what_a_person_holds_from_a_project_above() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    for email in ["fa@example.com", "chief@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops/yard", "admin");
+    scope(&config, "chief@example.com", "ops", "editor");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+
+    let (status, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+    let row = grid_row(&page, "chief@example.com");
+    assert_eq!(row.matches("cell inherited").count(), 2, "View and Edit come from ops: {row}");
+    assert!(row.contains("Edit from ops"), "the shading does not say where it comes from: {row}");
+    assert!(row.contains(r#"class="cell off""#), "Manage can still be given here: {row}");
+    let mine = grid_row(&page, "fa@example.com");
+    assert_eq!(mine.matches(r#"class="cell on""#).count(), 3, "{mine}");
+}
+
+#[tokio::test]
+async fn a_cell_raises_and_lowers_a_level_and_removing_asks_first() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    for email in ["fa@example.com", "worker@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops/yard", "admin");
+    scope(&config, "worker@example.com", "ops/yard", "viewer");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &fa)).await;
+    let token = form_token_from(&page);
+
+    let (status, _, headers) = send(&config, post_form("/admin/permissions/cell", &fa, cell_post(&token, "ops/yard", "worker@example.com", "editor", ""))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers.iter().find(|(k, _)| k == "location").unwrap().1, "/browse/ops/yard?tab=permissions");
+    assert_eq!(level_at(&config, "worker@example.com", "ops/yard").as_deref(), Some("editor"));
+
+    send(&config, post_form("/admin/permissions/cell", &fa, cell_post(&token, "ops/yard", "worker@example.com", "viewer", ""))).await;
+    assert_eq!(level_at(&config, "worker@example.com", "ops/yard").as_deref(), Some("viewer"));
+
+    // Removing without confirming asks, and changes nothing yet.
+    let (status, page, _) = send(&config, post_form("/admin/permissions/cell", &fa, cell_post(&token, "ops/yard", "worker@example.com", "none", ""))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Remove access") && page.contains(r#"name="confirm" value="1""#), "{page}");
+    assert_eq!(level_at(&config, "worker@example.com", "ops/yard").as_deref(), Some("viewer"));
+
+    let (status, ..) = send(&config, post_form("/admin/permissions/cell", &fa, cell_post(&token, "ops/yard", "worker@example.com", "none", "1"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(level_at(&config, "worker@example.com", "ops/yard"), None);
+
+    // The grid's script gets an answer it can show, not a redirect.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/admin/permissions/cell")
+        .header("cookie", format!("ts_session={fa}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("x-toolsite-fetch", "1")
+        .body(Body::from(cell_post(&token, "ops/yard", "worker@example.com", "editor", "")))
+        .unwrap();
+    let (status, body, _) = send(&config, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#""ok":true"#), "{body}");
+}
+
+#[tokio::test]
+async fn a_manager_changes_only_its_own_project_and_below() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    for email in ["fa@example.com", "worker@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops/yard", "admin");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions", &fa)).await;
+    let token = form_token_from(&page);
+    assert!(!page.contains(r#"name="path" value="ops""#), "a form edits the project above");
+
+    let (status, ..) = send(&config, post_form("/admin/permissions/cell", &fa, cell_post(&token, "ops", "worker@example.com", "viewer", ""))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a manager of ops/yard changed ops");
+    assert_eq!(level_at(&config, "worker@example.com", "ops"), None);
+    let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions", &fa)).await;
+    assert!(!page.contains(r#"id="perm-grid""#), "the grid of ops is open to a manager of ops/yard");
+}
+
+#[tokio::test]
+async fn add_people_gives_several_accounts_a_level_at_once() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    for email in ["fa@example.com", "one@example.com", "two@example.com", "three@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "fa@example.com", "ops", "admin");
+    let fa = sign_in(&config, "fa@example.com", "correct horse");
+    let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions", &fa)).await;
+    let token = form_token_from(&page);
+    // The page does not carry the accounts until the list is asked for.
+    assert!(!page.contains("three@example.com"));
+    let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions&add=1", &fa)).await;
+    assert!(page.contains(r#"value="three@example.com""#), "the Add people list is empty without script");
+
+    let body = format!("token={token}&path=ops&scope=editor&email=one%40example.com&email=two%40example.com&back=/browse/ops?tab%3Dpermissions");
+    let (status, _, headers) = send(&config, post_form("/admin/permissions/add", &fa, body)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=ok")));
+    assert_eq!(level_at(&config, "one@example.com", "ops").as_deref(), Some("editor"));
+    assert_eq!(level_at(&config, "two@example.com", "ops").as_deref(), Some("editor"));
+    assert_eq!(level_at(&config, "three@example.com", "ops"), None);
+
+    // The list endpoint pages and searches, for managers only.
+    let (status, body, _) = send(&config, get_as("/admin/permissions/people?q=t", &fa)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("two@example.com") && body.contains("three@example.com") && !body.contains("one@example.com"), "{body}");
+    let one = sign_in(&config, "one@example.com", "correct horse");
+    let (status, ..) = send(&config, get_as("/admin/permissions/people", &one)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "an editor listed every account");
+}
+
+#[tokio::test]
+async fn a_locked_project_ignores_rows_set_inside_it_and_unlocking_brings_them_back() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    app_in(&config, "tool", "ops/yard").await;
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    for email in ["reader@example.com", "granted@example.com", "lead@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "reader@example.com", "ops/yard/tool", "viewer");
+    scope(&config, "lead@example.com", "ops", "viewer");
+    toolsite::accounts::users::grant(&config, "granted@example.com", "tool", "viewer").unwrap();
+    let held = |email: &str| {
+        let user = toolsite::accounts::users::user_by_email(&config, email).unwrap();
+        let locks = toolsite::content::store::locked_prefixes_blocking(&config);
+        toolsite::accounts::users::app_scope(&config, &user, "ops/yard", "tool", &locks)
+    };
+    assert!(held("reader@example.com").is_some());
+    assert!(held("granted@example.com").is_some());
+
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (_, page, _) = send(&config, get_as("/browse/ops?tab=permissions", &boss)).await;
+    let token = form_token_from(&page);
+    assert!(page.contains("Customizable"));
+    let (status, ..) = send(&config, post_form("/admin/permissions/lock", &boss, format!("token={token}&path=ops&locked=1&back=/browse/ops?tab%3Dpermissions"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    assert_eq!(held("reader@example.com"), None, "a row set inside a locked project still counted");
+    assert_eq!(held("granted@example.com"), None, "access given on the app still counted under a lock");
+    assert!(held("lead@example.com").is_some(), "the locked project's own row stopped counting");
+    let (_, page, _) = send(&config, get_as("/admin/apps/tool/access", &boss)).await;
+    assert!(page.contains("Locked by"), "the app's grid does not say it is locked");
+    let row = grid_row(&page, "reader@example.com");
+    assert!(row.contains("disabled"), "cells under a lock can still be changed: {row}");
+    let (status, _, headers) = send(&config, post_form("/admin/permissions/cell", &boss, format!("token={token}&path=ops/yard/tool&app=tool&email=reader%40example.com&level=editor&back=/admin/apps/tool/access"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_flash=error")), "a change under a lock was accepted");
+
+    send(&config, post_form("/admin/permissions/lock", &boss, format!("token={token}&path=ops&locked=0"))).await;
+    assert!(held("reader@example.com").is_some(), "unlocking lost the row set inside");
+    assert!(held("granted@example.com").is_some());
+}
+
+#[tokio::test]
+async fn old_per_app_grants_become_view_rows_once_and_keep_their_role() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    app_in(&config, "board", "ops").await;
+    account(&config, "reader@example.com", "correct horse");
+    toolsite::accounts::users::grant(&config, "reader@example.com", "board", "approver").unwrap();
+
+    toolsite::platform::permissions::adopt_grants(&config).await;
+    assert_eq!(level_at(&config, "reader@example.com", "ops/board").as_deref(), Some("viewer"));
+    // Once: a row removed afterwards is not brought back by a restart.
+    toolsite::accounts::users::revoke_scope(&config, "reader@example.com", "ops/board").unwrap();
+    toolsite::platform::permissions::adopt_grants(&config).await;
+    assert_eq!(level_at(&config, "reader@example.com", "ops/board"), None);
+    let who = toolsite::accounts::users::user_by_email(&config, "reader@example.com").unwrap();
+    assert_eq!(toolsite::accounts::users::role_for(&config, &who.id, "board").as_deref(), Some("approver"));
+}
+
+#[tokio::test]
+async fn check_a_person_answers_with_the_rule_the_server_uses() {
+    let (_dir, config) = scoped_site();
+    folder(&config, "", "ops").await;
+    folder(&config, "ops", "yard").await;
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    for email in ["chief@example.com", "nobody@example.com"] {
+        account(&config, email, "correct horse");
+    }
+    scope(&config, "chief@example.com", "ops", "editor");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions&check=chief%40example.com", &boss)).await;
+    assert!(page.contains("Edit here, from ops."), "{page}");
+    let chief = toolsite::accounts::users::user_by_email(&config, "chief@example.com").unwrap();
+    assert_eq!(
+        toolsite::accounts::users::effective_scope(&config, &chief, "ops/yard", &[]).map(|s| s.as_str()),
+        Some("editor")
+    );
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions&check=nobody%40example.com", &boss)).await;
+    assert!(page.contains("No access."), "{page}");
+    let (_, page, _) = send(&config, get_as("/browse/ops/yard?tab=permissions&check=boss%40example.com", &boss)).await;
+    assert!(page.contains("Manage everywhere, as a site admin."), "{page}");
 }

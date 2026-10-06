@@ -183,7 +183,10 @@ pub(crate) async fn store_for_publisher(
         let (check, who, in_folder, which) = (config.clone_for_task(), user_id.clone(), folder, app.clone());
         let held = tokio::task::spawn_blocking(move || {
             crate::accounts::users::user_by_id(&check, &who)
-                .and_then(|user| crate::accounts::users::app_scope(&check, &user, &in_folder, &which))
+                .and_then(|user| {
+                    let locks = crate::content::store::locked_prefixes_blocking(&check);
+                    crate::accounts::users::app_scope(&check, &user, &in_folder, &which, &locks)
+                })
         })
         .await
         .ok()

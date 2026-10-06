@@ -367,7 +367,7 @@ pub(crate) async fn admits(
                 let folder = crate::content::store::app_folder(config, app).await;
                 let (config, user, app) = (config.clone(), user.clone(), app.to_string());
                 tokio::task::spawn_blocking(move || {
-                    crate::accounts::users::app_scope(&config, &user, &folder, &app).is_some()
+                    crate::accounts::users::app_scope(&config, &user, &folder, &app, &crate::content::store::locked_prefixes_blocking(&config)).is_some()
                 })
                 .await
                 .unwrap_or(false)

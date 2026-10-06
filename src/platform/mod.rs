@@ -14,6 +14,7 @@ pub mod export;
 pub mod inline_upload;
 pub mod github;
 pub mod oauth_store;
+pub mod permissions;
 pub mod preview;
 pub mod projects;
 pub mod screenshot;

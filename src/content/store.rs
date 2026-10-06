@@ -461,6 +461,11 @@ pub struct Folder {
     pub path: String,
     pub name: String,
     pub created_at: u64,
+    /// Locked: only the permissions set on this project and above it apply
+    /// to what is inside. Rows set inside are kept, but ignored while it is
+    /// locked. Customizable (false) is the default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
 }
 
 fn projects_path(config: &Config) -> PathBuf {
@@ -481,6 +486,34 @@ async fn write_folders(config: &Config, folders: &[Folder]) -> std::io::Result<(
     }
     let json = serde_json::to_string_pretty(folders).map_err(std::io::Error::other)?;
     fs::write(path, json).await
+}
+
+/// The projects that are locked, for the permission rule. Read in a blocking
+/// context because every scope check runs in one.
+pub fn locked_prefixes_blocking(config: &Config) -> Vec<String> {
+    std::fs::read_to_string(projects_path(config))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<Folder>>(&text).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|folder| folder.locked)
+        .map(|folder| folder.path)
+        .collect()
+}
+
+/// Whether one project is locked.
+pub async fn folder_locked(config: &Config, path: &str) -> bool {
+    list_folders(config).await.iter().any(|folder| folder.path == path && folder.locked)
+}
+
+/// Locks or unlocks a project. The top level has no row and cannot be locked.
+pub async fn set_locked(config: &Config, path: &str, locked: bool) -> Result<(), String> {
+    let mut folders = list_folders(config).await;
+    let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
+        return Err(format!("there is no project '{path}'"));
+    };
+    folder.locked = locked;
+    write_folders(config, &folders).await.map_err(|e| e.to_string())
 }
 
 /// Whether `path` is a folder. The root always is and has no row.
@@ -511,6 +544,7 @@ pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        locked: false,
     };
     folders.push(folder.clone());
     folders.sort_by(|a, b| a.path.cmp(&b.path));

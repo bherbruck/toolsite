@@ -256,6 +256,12 @@ may hold `editor` on one folder only. A refused tool names the folder and the
 scope it needs ("holds editor at ops/yard; this needs admin"). Publish under a
 folder you hold, or ask for the scope; `list_pages` shows what you may open.
 
+**Permissions.** People set access in a grid of View, Edit and Manage (viewer,
+editor, admin) on a project's Permissions tab or an app's Access tab. A
+project can be Locked, and then rows set inside it are ignored: before you
+grant on an app or a subproject, check the project with
+`projects(action: "permissions")`, or the grant will not take effect.
+
 **Access.** A gate decides whether a request arrives; what it may then do is
 yours to decide. An app that names no gate follows the site's default
 (`TOOLSITE_DEFAULT_ACCESS`), which on an internal site is usually `restricted`,

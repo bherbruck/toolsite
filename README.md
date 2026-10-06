@@ -825,11 +825,41 @@ else refuses and names the folder and the scope it would take. A static
 `TOOLSITE_MCP_TOKEN` keeps every power, as the CLI relies on it. An account
 with only viewer scopes is turned away at the consent page.
 
-A project's Permissions tab in the app browser lists who holds what there,
-with inherited rows marked by the project they come from, and an admin of
-the project adds or changes access there. A folder admin never grants above its folder, and never a
-scope stronger than its own. An admin who is not a site admin opens the
-admin pages and sees only the folders and apps it holds scope on.
+#### The permissions grid
+
+Access is set in one grid, the same on a project's Permissions tab in the app
+browser and on an app's Access tab. One row per person, three columns: **View**
+(viewer), **Edit** (editor), **Manage** (admin). The levels add up, so ticking
+Edit fills View too.
+
+| Cell | Means |
+|---|---|
+| Filled | held here. Click it to lower the level by one; clicking the last one removes this person's access here, after a confirm. |
+| Hatched | held from a project above. The tooltip and the From column name it; change it there. |
+| Outlined | not held. Click it to give that level here. |
+
+**Add people** opens a list of accounts with a search box. Tick several, pick a
+level, and add them in one go. Nobody types an email from memory. On an app
+whose `toolsite.toml` declares `roles`, a **Role in app** column picks the role
+the app reads; it is still only a hint.
+
+**Check a person** under the grid answers "Edit here, from ops" or "No access"
+with the reason, from the same function every request is checked with.
+
+Each project is **Customizable** (the default) or **Locked**. Customizable: apps
+and projects inside follow its permissions and can add their own. Locked: only
+the permissions set on it and above it apply inside. Rows set inside are kept,
+but ignored while it is locked, and their grids say "Locked by ops". Access given
+on an app is ignored under a lock too. Unlocking brings everything back.
+
+Access given on one app with `set_access`, `toolsite grant` or the grid is a
+View row on that app; grants from before the grid became such rows on the
+first start. A manager changes access only at its own project and below, and
+never gives more than it holds. An account's page lists what it holds,
+grouped by project, each linking to the grid where it is set.
+
+An admin who is not a site admin opens the admin pages and sees only the
+folders and apps it holds scope on.
 
 ### Gates
 

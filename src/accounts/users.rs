@@ -335,6 +335,23 @@ pub fn user_by_id(config: &Config, id: &str) -> Option<User> {
 
 /// The account a provider identity was linked to before, if any. Nothing for
 /// a disabled account: a provider login is still a login.
+/// The active account with this email, if there is one.
+pub fn user_by_email(config: &Config, email: &str) -> Option<User> {
+    let conn = open(config).ok()?;
+    conn.query_row(
+        "select id, email, is_admin from users where email = ? and disabled_at is null",
+        [normalise(email)],
+        |row| {
+            Ok(User {
+                id: row.get(0)?,
+                email: row.get(1)?,
+                is_admin: row.get::<_, i64>(2)? != 0,
+            })
+        },
+    )
+    .ok()
+}
+
 pub fn user_by_identity(config: &Config, provider: &str, provider_id: &str) -> Option<User> {
     let conn = open(config).ok()?;
     conn.query_row(
@@ -757,35 +774,79 @@ pub fn scopes_for(config: &Config, user_id: &str) -> Vec<(String, Scope)> {
         .unwrap_or_default()
 }
 
+/// The outermost locked project over `path`, if any. A locked project
+/// discards every row set inside it, so the outermost lock decides.
+fn lock_over<'a>(path: &str, locks: &'a [String]) -> Option<&'a str> {
+    locks
+        .iter()
+        .filter(|lock| !lock.is_empty() && prefix_covers(lock, path))
+        .min_by_key(|lock| lock.len())
+        .map(String::as_str)
+}
+
+/// Whether a row at `prefix` counts for `path`: it covers the path, and no
+/// locked project sits above the row while covering the path.
+fn row_counts(prefix: &str, path: &str, lock: Option<&str>) -> bool {
+    prefix_covers(prefix, path) && lock.is_none_or(|lock| prefix_covers(prefix, lock))
+}
+
+/// Where an account's access at a path comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccessSource {
+    /// A site admin holds admin everywhere.
+    SiteAdmin,
+    /// A permission row at this prefix (empty for the whole site).
+    Row(String),
+    /// Access to one app given on that app, which reads as viewer.
+    AppAccess,
+}
+
 /// The one question every check asks: what may this account do at `path`?
 /// The strongest scope held on the path or any prefix above it; a site admin
 /// is admin everywhere. Scopes only add, so nothing below can narrow what a
-/// row above grants.
-pub fn effective_scope(config: &Config, user: &User, path: &str) -> Option<Scope> {
-    if user.is_admin {
-        return Some(Scope::Admin);
-    }
-    scopes_for(config, &user.id)
-        .into_iter()
-        .filter(|(prefix, _)| prefix_covers(prefix, path))
-        .map(|(_, scope)| scope)
-        .max()
+/// row above grants. `locks` are the locked projects
+/// (`store::locked_prefixes_blocking`): under one, rows set inside it are
+/// ignored.
+pub fn effective_scope(config: &Config, user: &User, path: &str, locks: &[String]) -> Option<Scope> {
+    explain_scope(config, user, path, None, locks).map(|(scope, _)| scope)
 }
 
 /// What the account may do to one app, which sits in `folder` (empty for
 /// the root): the strongest scope over the app's path, or viewer if the
-/// account holds a plain grant on the app. The grant is the old way in and
-/// still works everywhere it did.
-pub fn app_scope(config: &Config, user: &User, folder: &str, app: &str) -> Option<Scope> {
-    if user.is_admin {
-        return Some(Scope::Admin);
-    }
+/// account holds access given on the app itself. Under a locked project
+/// that app access is ignored, like any row set inside the lock.
+pub fn app_scope(config: &Config, user: &User, folder: &str, app: &str, locks: &[String]) -> Option<Scope> {
     let path = if folder.is_empty() { app.to_string() } else { format!("{folder}/{app}") };
-    let held = effective_scope(config, user, &path);
-    if has_grant(config, user, app) {
-        held.max(Some(Scope::Viewer))
-    } else {
-        held
+    explain_scope(config, user, &path, Some(app), locks).map(|(scope, _)| scope)
+}
+
+/// The scope and the place it comes from: the same rule as
+/// [`effective_scope`] and [`app_scope`], with the reason kept, for the
+/// "check a person" box. Pass `app` when `path` is an app's path.
+pub fn explain_scope(
+    config: &Config,
+    user: &User,
+    path: &str,
+    app: Option<&str>,
+    locks: &[String],
+) -> Option<(Scope, AccessSource)> {
+    if user.is_admin {
+        return Some((Scope::Admin, AccessSource::SiteAdmin));
+    }
+    let lock = lock_over(path, locks);
+    let best = scopes_for(config, &user.id)
+        .into_iter()
+        .filter(|(prefix, _)| row_counts(prefix, path, lock))
+        // The strongest wins; between equals, the nearest row names it.
+        .max_by(|(pa, a), (pb, b)| a.cmp(b).then(pa.len().cmp(&pb.len())))
+        .map(|(prefix, scope)| (scope, AccessSource::Row(prefix)));
+    let app_access = match app {
+        Some(app) if lock.is_none() && has_grant(config, user, app) => Some((Scope::Viewer, AccessSource::AppAccess)),
+        _ => None,
+    };
+    match (best, app_access) {
+        (Some(row), _) => Some(row),
+        (None, other) => other,
     }
 }
 
@@ -927,10 +988,10 @@ mod tests {
         let ann = person(&config, "ann@example.com");
         grant_scope(&config, "ann@example.com", "ops", Scope::Admin, None).unwrap();
         grant_scope(&config, "ann@example.com", "ops/yard", Scope::Viewer, None).unwrap();
-        assert_eq!(effective_scope(&config, &ann, "ops/yard/checklist"), Some(Scope::Admin), "a weaker row below narrowed an admin above");
-        assert_eq!(effective_scope(&config, &ann, "ops"), Some(Scope::Admin));
-        assert_eq!(effective_scope(&config, &ann, "finance"), None);
-        assert_eq!(effective_scope(&config, &ann, "opsx"), None, "a prefix matched by text, not by segment");
+        assert_eq!(effective_scope(&config, &ann, "ops/yard/checklist", &[]), Some(Scope::Admin), "a weaker row below narrowed an admin above");
+        assert_eq!(effective_scope(&config, &ann, "ops", &[]), Some(Scope::Admin));
+        assert_eq!(effective_scope(&config, &ann, "finance", &[]), None);
+        assert_eq!(effective_scope(&config, &ann, "opsx", &[]), None, "a prefix matched by text, not by segment");
     }
 
     #[test]
@@ -940,10 +1001,10 @@ mod tests {
         grant_scope(&config, "bo@example.com", "ops/warehouse", Scope::Editor, None).unwrap();
         grant_scope(&config, "bo@example.com", "finance/reports", Scope::Viewer, None).unwrap();
         grant_scope(&config, "bo@example.com", "labs", Scope::Admin, None).unwrap();
-        assert_eq!(effective_scope(&config, &bo, "ops/warehouse/tool"), Some(Scope::Editor));
-        assert_eq!(effective_scope(&config, &bo, "finance/reports/q3"), Some(Scope::Viewer));
-        assert_eq!(effective_scope(&config, &bo, "labs/x/y"), Some(Scope::Admin));
-        assert_eq!(effective_scope(&config, &bo, "finance/ledger"), None);
+        assert_eq!(effective_scope(&config, &bo, "ops/warehouse/tool", &[]), Some(Scope::Editor));
+        assert_eq!(effective_scope(&config, &bo, "finance/reports/q3", &[]), Some(Scope::Viewer));
+        assert_eq!(effective_scope(&config, &bo, "labs/x/y", &[]), Some(Scope::Admin));
+        assert_eq!(effective_scope(&config, &bo, "finance/ledger", &[]), None);
         assert!(holds_anywhere(&config, &bo, Scope::Editor));
         assert!(holds_below(&config, &bo, "finance"));
         assert!(!holds_below(&config, &bo, "ops/warehouse"), "a row at the folder itself is not below it");
@@ -956,21 +1017,21 @@ mod tests {
         let (_t, config) = config();
         let cy = person(&config, "cy@example.com");
         grant(&config, "cy@example.com", "ledger", "editor").unwrap();
-        assert_eq!(app_scope(&config, &cy, "finance", "ledger"), Some(Scope::Viewer));
-        assert_eq!(app_scope(&config, &cy, "", "ledger"), Some(Scope::Viewer));
-        assert_eq!(app_scope(&config, &cy, "finance", "other"), None);
+        assert_eq!(app_scope(&config, &cy, "finance", "ledger", &[]), Some(Scope::Viewer));
+        assert_eq!(app_scope(&config, &cy, "", "ledger", &[]), Some(Scope::Viewer));
+        assert_eq!(app_scope(&config, &cy, "finance", "other", &[]), None);
         revoke(&config, "cy@example.com", "ledger").unwrap();
-        assert_eq!(app_scope(&config, &cy, "finance", "ledger"), None, "a revoked grant still opened the app");
+        assert_eq!(app_scope(&config, &cy, "finance", "ledger", &[]), None, "a revoked grant still opened the app");
         // A real scope on the folder is what it is, grant or not.
         grant_scope(&config, "cy@example.com", "finance", Scope::Editor, None).unwrap();
-        assert_eq!(app_scope(&config, &cy, "finance", "ledger"), Some(Scope::Editor));
+        assert_eq!(app_scope(&config, &cy, "finance", "ledger", &[]), Some(Scope::Editor));
     }
 
     #[test]
     fn a_site_admin_is_admin_everywhere_and_a_scope_needs_a_valid_prefix() {
         let (_t, config) = config();
         let root = sign_up_as(&config, "root@example.com", "correct horse battery", true).unwrap();
-        assert_eq!(effective_scope(&config, &root, "anything/at/all"), Some(Scope::Admin));
+        assert_eq!(effective_scope(&config, &root, "anything/at/all", &[]), Some(Scope::Admin));
         assert_eq!(default_folder_for(&config, &root), Some(String::new()));
         assert!(grant_scope(&config, "root@example.com", "../x", Scope::Viewer, None).is_err());
         assert!(grant_scope(&config, "root@example.com", ".site", Scope::Viewer, None).is_err());
@@ -983,10 +1044,10 @@ mod tests {
         let (_t, config) = config();
         let di = person(&config, "di@example.com");
         grant_scope(&config, "di@example.com", "tool", Scope::Editor, None).unwrap();
-        assert_eq!(effective_scope(&config, &di, "tool"), Some(Scope::Editor));
+        assert_eq!(effective_scope(&config, &di, "tool", &[]), Some(Scope::Editor));
         move_scopes(&config, "tool", "ops/tool").unwrap();
-        assert_eq!(effective_scope(&config, &di, "tool"), None);
-        assert_eq!(effective_scope(&config, &di, "ops/tool"), Some(Scope::Editor));
+        assert_eq!(effective_scope(&config, &di, "tool", &[]), None);
+        assert_eq!(effective_scope(&config, &di, "ops/tool", &[]), Some(Scope::Editor));
     }
 
     #[test]
