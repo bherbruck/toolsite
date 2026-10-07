@@ -639,9 +639,7 @@ events, in the same component that answers requests:
 - **`message`**: a text or binary frame, at most 64 KB.
 - **`close`**: the connection ended, from either side.
 
-Events for one connection run one at a time, in order. What a connection's
-`connect` sends or publishes reaches it before anything other events send
-it, so a snapshot sent after `subscribe` is never overtaken. Each runs in a fresh
+Events for one connection run one at a time, in order. Each runs in a fresh
 instance like a request, with the database, files, settings and identity
 as usual. The `connections` import acts on connections by id: `send`,
 `close`, `subscribe`, `unsubscribe`, `publish` to a topic, and
