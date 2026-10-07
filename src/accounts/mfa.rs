@@ -13,7 +13,8 @@
 //! What this module holds to:
 //!
 //! - The shared secret is sealed with the site key (`seal`), never logged,
-//!   and shown only while setup waits for its first code.
+//!   and shown only while setup waits for its first code, and then only to
+//!   the session or pending sign-in that began that setup.
 //! - A code is accepted for the current step and one either side, and each
 //!   step once per account (`last_step`), so a code seen over a shoulder or
 //!   in a log is already spent.
@@ -265,26 +266,41 @@ enum Used {
     Recovery,
 }
 
-/// Checks a code for an account and spends it if it is good. `confirmed`
-/// picks the enabled secret, or the one that setup is waiting on.
+/// Which secret a code is checked against.
+#[derive(Clone, Copy)]
+enum Secret<'a> {
+    /// The one that is on.
+    Enabled,
+    /// The one setup waits on, if the sign-in whose raw token this is began
+    /// it. Anyone else's setup is not there to confirm.
+    Setup(&'a str),
+}
+
+/// Checks a code for an account and spends it if it is good.
 fn accept(
     config: &Config,
     conn: &Connection,
     user_id: &str,
     code: &str,
-    confirmed: bool,
+    secret: Secret<'_>,
     allow_recovery: bool,
 ) -> Result<Option<Used>, String> {
     let code = normalise_code(code);
     if code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()) {
-        let row: Option<(String, i64)> = conn
-            .query_row(
-                "select secret, last_step from mfa where user_id = ? and (enabled_at is not null) = ?",
-                rusqlite::params![user_id, confirmed],
+        let row: Option<(String, i64)> = match secret {
+            Secret::Enabled => conn.query_row(
+                "select secret, last_step from mfa where user_id = ? and enabled_at is not null",
+                [user_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
+            ),
+            Secret::Setup(by) => conn.query_row(
+                "select secret, last_step from mfa where user_id = ? and enabled_at is null and begun_by = ?",
+                rusqlite::params![user_id, users::hash_token(by)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ),
+        }
+        .optional()
+        .map_err(|e| e.to_string())?;
         let Some((sealed, last_step)) = row else {
             return Ok(None);
         };
@@ -353,7 +369,7 @@ fn accept_from_account(config: &Config, conn: &Connection, user: &User, code: &s
         tracing::warn!(email = %user.email, "two-step code refused: too many wrong codes for this account");
         return Err("Too many wrong codes. Wait 15 minutes, then try again.".into());
     }
-    match accept(config, conn, &user.id, code, true, allow_recovery)? {
+    match accept(config, conn, &user.id, code, Secret::Enabled, allow_recovery)? {
         Some(used) => Ok(used),
         None => {
             record_failure(config, conn, &user.id);
@@ -401,34 +417,52 @@ pub fn is_enabled(config: &Config, user_id: &str) -> bool {
     status(config, user_id).enabled
 }
 
-/// The secret setup is waiting on, if setup has begun. Nothing once it is
-/// confirmed: after that the secret is never shown again.
-pub fn setup_secret(config: &Config, user_id: &str) -> Option<String> {
+/// The secret setup is waiting on, if setup has begun and `by` (the raw
+/// token of a site session or a pending sign-in) began it. Nothing once it
+/// is confirmed: after that the secret is never shown again.
+pub fn setup_secret(config: &Config, user_id: &str, by: &str) -> Option<String> {
     let conn = users::open(config).ok()?;
     let sealed: String = conn
-        .query_row("select secret from mfa where user_id = ? and enabled_at is null", [user_id], |row| row.get(0))
+        .query_row(
+            "select secret from mfa where user_id = ? and enabled_at is null and begun_by = ?",
+            rusqlite::params![user_id, users::hash_token(by)],
+            |row| row.get(0),
+        )
         .ok()?;
     seal::open(config, &sealed)
 }
 
-/// Starts setup, or returns the secret of a setup already begun, so a
-/// reload shows the same QR code the phone may already have scanned.
-pub fn begin_setup(config: &Config, user_id: &str) -> Result<String, String> {
+/// Starts setup for `by`, or returns the secret of the setup `by` already
+/// began, so a reload shows the same QR code the phone may already have
+/// scanned. A setup another sign-in began is replaced with a new secret:
+/// whoever saw that one must not be holding the secret this person scans.
+pub fn begin_setup(config: &Config, user_id: &str, by: &str) -> Result<String, String> {
     if is_enabled(config, user_id) {
         return Err("Two-step sign-in is already on.".into());
     }
-    if let Some(secret) = setup_secret(config, user_id) {
+    if let Some(secret) = setup_secret(config, user_id, by) {
         return Ok(secret);
     }
     let secret = new_secret();
     let conn = users::open(config)?;
     conn.execute(
-        "insert into mfa (user_id, secret, enabled_at, last_step) values (?, ?, null, 0)
-         on conflict(user_id) do update set secret = excluded.secret, last_step = 0 where enabled_at is null",
-        rusqlite::params![user_id, seal::seal(config, &secret)?],
+        "insert into mfa (user_id, secret, enabled_at, last_step, begun_by) values (?1, ?2, null, 0, ?3)
+         on conflict(user_id) do update set secret = excluded.secret, last_step = 0, begun_by = excluded.begun_by
+         where enabled_at is null",
+        rusqlite::params![user_id, seal::seal(config, &secret)?, users::hash_token(by)],
     )
     .map_err(|e| e.to_string())?;
     Ok(secret)
+}
+
+/// Whether the site's policy requires two-step sign-in of this account and
+/// it is not on: a session from before the policy, or one that came through
+/// a door the policy does not cover. Such a session may set it up, and may
+/// not use an admin's powers until it has.
+pub fn owes_setup(config: &Config, user: &User) -> bool {
+    config.mfa.policy.requires(user)
+        && (config.mfa.for_providers || users::has_password(config, &user.id))
+        && !is_enabled(config, &user.id)
 }
 
 pub fn cancel_setup(config: &Config, user_id: &str) -> Result<(), String> {
@@ -445,7 +479,7 @@ pub fn cancel_setup(config: &Config, user_id: &str) -> Result<(), String> {
 fn enable(config: &Config, conn: &Connection, user_id: &str, keep: Option<&str>) -> Result<Vec<String>, String> {
     let changed = conn
         .execute(
-            "update mfa set enabled_at = ? where user_id = ? and enabled_at is null",
+            "update mfa set enabled_at = ?, begun_by = null where user_id = ? and enabled_at is null",
             rusqlite::params![users_now() as i64, user_id],
         )
         .map_err(|e| e.to_string())?;
@@ -464,10 +498,11 @@ fn enable(config: &Config, conn: &Connection, user_id: &str, keep: Option<&str>)
 }
 
 /// Confirms setup from the account page with the first code. `keep` is the
-/// site session that sent it, which stays signed in.
+/// site session that sent it, which stays signed in, and which must be the
+/// one that began the setup.
 pub fn confirm_setup(config: &Config, user: &User, code: &str, keep: &str) -> Result<Vec<String>, String> {
     let conn = users::open(config)?;
-    if accept(config, &conn, &user.id, code, false, false)?.is_none() {
+    if accept(config, &conn, &user.id, code, Secret::Setup(keep), false)?.is_none() {
         tracing::warn!(email = %user.email, "two-step setup refused: the code is not correct");
         return Err("The code is not correct. Check the time on your phone, then enter the code the app shows now.".into());
     }
@@ -522,9 +557,10 @@ fn remove(conn: &Connection, user_id: &str) -> Result<(), String> {
 
 /// An admin's reset, for someone who lost their phone and their recovery
 /// codes: removes the secret and the codes and ends every session of the
-/// account, so whoever might hold the phone is signed out too. Says whether
-/// two-step sign-in was on.
-pub fn reset(config: &Config, email: &str) -> Result<bool, String> {
+/// account, so whoever might hold the phone is signed out too. Returns the
+/// account's id, for the caller to revoke its OAuth tokens as well (they are
+/// the platform's), and whether two-step sign-in was on.
+pub fn reset(config: &Config, email: &str) -> Result<(String, bool), String> {
     let conn = users::open(config)?;
     let user_id: String = conn
         .query_row("select id from users where email = ?", [email.trim().to_lowercase()], |row| row.get(0))
@@ -532,7 +568,7 @@ pub fn reset(config: &Config, email: &str) -> Result<bool, String> {
     let was_on = is_enabled(config, &user_id);
     remove(&conn, &user_id)?;
     conn.execute("delete from sessions where user_id = ?", [&user_id]).map_err(|e| e.to_string())?;
-    Ok(was_on)
+    Ok((user_id, was_on))
 }
 
 // --- signing in -----------------------------------------------------------
@@ -687,7 +723,7 @@ pub fn finish_with_code(config: &Config, token: &str, code: &str) -> Result<Fini
         tracing::warn!(email = %pending.user.email, "two-step sign-in refused: too many wrong codes for this account");
         return Err(Refusal::Locked);
     }
-    match accept(config, &conn, &pending.user.id, code, true, true).map_err(Refusal::Failed)? {
+    match accept(config, &conn, &pending.user.id, code, Secret::Enabled, true).map_err(Refusal::Failed)? {
         Some(used) => {
             tracing::info!(
                 email = %pending.user.email,
@@ -706,7 +742,7 @@ pub fn finish_with_code(config: &Config, token: &str, code: &str) -> Result<Fini
 /// The secret for the setup a pending sign-in owes, begun on first view.
 pub fn pending_setup(config: &Config, token: &str) -> Option<(Pending, String)> {
     let pending = pending(config, token).filter(|p| p.stage == "setup")?;
-    let secret = begin_setup(config, &pending.user.id).ok()?;
+    let secret = begin_setup(config, &pending.user.id, token).ok()?;
     Some((pending, secret))
 }
 
@@ -715,7 +751,22 @@ pub fn pending_setup(config: &Config, token: &str) -> Option<(Pending, String)> 
 pub fn finish_setup(config: &Config, token: &str, code: &str) -> Result<Finished, Refusal> {
     let conn = users::open(config).map_err(Refusal::Failed)?;
     let pending = load_pending(config, &conn, token).filter(|p| p.stage == "setup").ok_or(Refusal::Expired)?;
-    match accept(config, &conn, &pending.user.id, code, false, false).map_err(Refusal::Failed)? {
+    // Another sign-in began a setup of its own since this one was shown its
+    // secret: this one is over, rather than taking the setup back.
+    let still_ours: bool = conn
+        .query_row(
+            "select count(*) from mfa where user_id = ? and enabled_at is null and begun_by = ?",
+            rusqlite::params![pending.user.id, users::hash_token(token)],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(|e| Refusal::Failed(e.to_string()))?;
+    if !still_ours {
+        tracing::warn!(email = %pending.user.email, "two-step setup refused: another sign-in began setup since");
+        let _ = conn.execute("delete from mfa_pending where token_hash = ?", [users::hash_token(token)]);
+        return Err(Refusal::Expired);
+    }
+    match accept(config, &conn, &pending.user.id, code, Secret::Setup(token), false).map_err(Refusal::Failed)? {
         Some(_) => {
             let codes = enable(config, &conn, &pending.user.id, None).map_err(Refusal::Failed)?;
             tracing::info!(email = %pending.user.email, "two-step sign-in turned on at sign-in, as the site requires");

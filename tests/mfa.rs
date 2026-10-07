@@ -196,7 +196,7 @@ async fn enable(config: &Arc<Config>, user: &users::User, site_session: &str) ->
     assert!(page.body.contains("<svg"), "no QR code on the account page");
     let secret = secret_on(&page.body);
     let code = next_code(config, &secret);
-    let done = post(config, "/account/mfa/confirm", &format!("token={token}&code={code}"), Some(&cookie)).await;
+    let done = post(config, "/account/mfa/confirm", &format!("token={token}&code={code}&password={}", urlencoding::encode(PASSWORD)), Some(&cookie)).await;
     assert_eq!(done.status, StatusCode::OK, "{}", done.body);
     let codes = recovery_codes_on(&done.body);
     assert_eq!(codes.len(), 10);
@@ -243,7 +243,7 @@ async fn setup_needs_a_correct_code() {
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
     assert!(!mfa::is_enabled(&config, &ann.id));
 
-    let done = post(&config, "/account/mfa/confirm", &format!("token={token}&code={code}"), Some(&cookie)).await;
+    let done = post(&config, "/account/mfa/confirm", &format!("token={token}&code={code}&password={}", urlencoding::encode(PASSWORD)), Some(&cookie)).await;
     assert_eq!(done.status, StatusCode::OK, "{}", done.body);
     assert!(mfa::is_enabled(&config, &ann.id));
     assert_eq!(recovery_codes_on(&done.body).len(), 10);
@@ -476,7 +476,7 @@ async fn the_subdomain_handoff_refuses_to_mint_for_a_pending_sign_in() {
     let page = send(&config, Request::builder().uri("/account").header("host", "site.test").header("cookie", cookie.clone()).body(Body::empty()).unwrap()).await;
     let secret = secret_on(&page.body);
     let code = next_code(&config, &secret);
-    let done = send(&config, host_post("/account/mfa/confirm", format!("token={token}&code={code}"))).await;
+    let done = send(&config, host_post("/account/mfa/confirm", format!("token={token}&code={code}&password={}", urlencoding::encode(PASSWORD)))).await;
     assert_eq!(done.status, StatusCode::OK, "{}", done.body);
 
     let login = send(
@@ -839,4 +839,451 @@ async fn nothing_logs_a_code_or_a_secret() {
         assert!(!text.contains(code.as_str()) && !text.contains(&code.replace('-', "")), "a recovery code was logged");
     }
     assert!(!text.contains(&pending), "a pending token was logged");
+}
+
+// --- the adversarial pass -----------------------------------------------------
+
+impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+}
+
+async fn post_as(config: &Arc<Config>, uri: &str, body: &str, cookie: &str, extra: &[(&str, &str)]) -> Reply {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("cookie", cookie);
+    for (name, value) in extra {
+        request = request.header(*name, *value);
+    }
+    send(config, request.body(Body::from(body.to_string())).unwrap()).await
+}
+
+/// The pending setup page's secret, for a pending sign-in.
+async fn forced_secret(config: &Arc<Config>, pending: &str) -> String {
+    secret_on(&get(config, "/auth/mfa/setup", Some(&format!("ts_mfa={pending}"))).await.body)
+}
+
+/// Someone who learned the password opens the forced setup page and stops
+/// there. When the owner then signs in and sets it up, the secret they scan
+/// must be a new one: a shared one would leave the code in the attacker's
+/// phone for good, and the owner believing their account was safe.
+#[tokio::test]
+async fn a_setup_secret_seen_by_another_sign_in_is_never_the_one_the_owner_confirms() {
+    let (_dir, config) = site(Policy::Admins);
+    person(&config, "root@example.com", true);
+
+    let (_, theirs) = password(&config, "root@example.com", "/").await;
+    let theirs = theirs.unwrap();
+    let seen = forced_secret(&config, &theirs).await;
+
+    let (_, mine) = password(&config, "root@example.com", "/").await;
+    let mine = mine.unwrap();
+    let scanned = forced_secret(&config, &mine).await;
+    assert_ne!(seen, scanned, "the owner was shown the secret another sign-in had seen");
+    // A reload still shows the owner the same one.
+    assert_eq!(forced_secret(&config, &mine).await, scanned);
+
+    // The other sign-in can no longer finish with what it saw.
+    let code = next_code(&config, &seen);
+    let reply = post(&config, "/auth/mfa/setup", &format!("code={code}"), Some(&format!("ts_mfa={theirs}"))).await;
+    assert_ne!(reply.status, StatusCode::OK, "a replaced setup was confirmed");
+    assert!(reply.cookie("ts_session").is_none());
+
+    let code = next_code(&config, &scanned);
+    let done = post(&config, "/auth/mfa/setup", &format!("code={code}"), Some(&format!("ts_mfa={mine}"))).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+
+    // The secret seen first gives no codes that work.
+    let (_, pending) = password(&config, "root@example.com", "/").await;
+    let reply = submit_code(&config, &pending.unwrap(), &next_code(&config, &seen)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "the first secret signs in");
+}
+
+/// The same on the account page: setup begun in one session is not shown to,
+/// nor confirmed by, another.
+#[tokio::test]
+async fn a_setup_begun_in_one_session_is_not_shown_to_or_confirmed_by_another() {
+    let (_dir, config) = site(Policy::Off);
+    let wu = person(&config, "wu@example.com", false);
+    let token = form_token(&config, &wu);
+    let (first, second) = (session(&config, "wu@example.com"), session(&config, "wu@example.com"));
+    let (first, second) = (format!("ts_session={first}"), format!("ts_session={second}"));
+    post(&config, "/account/mfa/start", &format!("token={token}"), Some(&first)).await;
+    let seen = secret_on(&get(&config, "/account", Some(&first)).await.body);
+
+    let page = get(&config, "/account", Some(&second)).await;
+    assert!(!page.body.contains(&seen) && !page.body.contains("mfa-key"), "another session was shown the secret");
+    let code = next_code(&config, &seen);
+    let pass = urlencoding::encode(PASSWORD);
+    post(&config, "/account/mfa/confirm", &format!("token={token}&code={code}&password={pass}"), Some(&second)).await;
+    assert!(!mfa::is_enabled(&config, &wu.id), "another session confirmed a setup it never saw");
+
+    // Starting again there replaces the secret, and the first session's is dead.
+    post(&config, "/account/mfa/start", &format!("token={token}"), Some(&second)).await;
+    let scanned = secret_on(&get(&config, "/account", Some(&second)).await.body);
+    assert_ne!(seen, scanned);
+    let code = next_code(&config, &seen);
+    post(&config, "/account/mfa/confirm", &format!("token={token}&code={code}&password={pass}"), Some(&first)).await;
+    assert!(!mfa::is_enabled(&config, &wu.id), "a replaced setup was confirmed");
+}
+
+/// A stolen session cookie alone must not put the thief's phone on the
+/// account: that would sign the owner out and keep them out, since their
+/// password would no longer be enough.
+#[tokio::test]
+async fn turning_it_on_needs_the_password_as_well_as_the_session() {
+    let (_dir, config) = site(Policy::Off);
+    let xi = person(&config, "xi@example.com", false);
+    let owners = session(&config, "xi@example.com");
+    let stolen = format!("ts_session={}", session(&config, "xi@example.com"));
+    let token = form_token(&config, &xi);
+    post(&config, "/account/mfa/start", &format!("token={token}"), Some(&stolen)).await;
+    let secret = secret_on(&get(&config, "/account", Some(&stolen)).await.body);
+    for password in ["", "&password=", "&password=guess%20one%20two"] {
+        let code = next_code(&config, &secret);
+        let reply = post(&config, "/account/mfa/confirm", &format!("token={token}&code={code}{password}"), Some(&stolen)).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        assert!(!mfa::is_enabled(&config, &xi.id), "turned on without the password ({password:?})");
+    }
+    assert!(users::site_session_user(&config, &owners).is_some(), "the owner was signed out");
+}
+
+#[tokio::test]
+async fn one_code_sent_on_two_requests_at_once_signs_in_once() {
+    let (_dir, config) = site(Policy::Off);
+    let ya = person(&config, "ya@example.com", false);
+    let (secret, codes) = enable(&config, &ya, &session(&config, "ya@example.com")).await;
+    for round in 0..3 {
+        let (_, a) = password(&config, "ya@example.com", "/").await;
+        let (_, b) = password(&config, "ya@example.com", "/").await;
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let code = if round == 2 { codes[round].clone() } else { next_code(&config, &secret) };
+        let (one, two) = tokio::join!(submit_code(&config, &a, &code), submit_code(&config, &b, &code));
+        let signed_in = [&one, &two].iter().filter(|r| r.cookie("ts_session").is_some()).count();
+        assert_eq!(signed_in, 1, "round {round}: {} and {}", one.status, two.status);
+    }
+}
+
+#[tokio::test]
+async fn a_pending_sign_in_finishes_once() {
+    let (_dir, config) = site(Policy::Off);
+    let za = person(&config, "za@example.com", false);
+    let (secret, _) = enable(&config, &za, &session(&config, "za@example.com")).await;
+    let (_, pending) = password(&config, "za@example.com", "/").await;
+    let pending = pending.unwrap();
+    assert_eq!(submit_code(&config, &pending, &next_code(&config, &secret)).await.status, StatusCode::SEE_OTHER);
+    let again = submit_code(&config, &pending, &next_code(&config, &secret)).await;
+    assert_eq!(again.status, StatusCode::UNAUTHORIZED, "a finished sign-in finished again");
+    assert!(again.cookie("ts_session").is_none());
+}
+
+/// What the old password started ends with it: a new password, a setup link
+/// spent, the account disabled.
+#[tokio::test]
+async fn a_pending_sign_in_ends_with_the_password_or_the_account() {
+    let (_dir, config) = site(Policy::Off);
+    let ab = person(&config, "ab@example.com", false);
+    let mine = session(&config, "ab@example.com");
+    let (secret, _) = enable(&config, &ab, &mine).await;
+
+    // A new password from the account page.
+    let (_, pending) = password(&config, "ab@example.com", "/").await;
+    let pending = pending.unwrap();
+    users::change_password(&config, &ab.id, PASSWORD, "a brand new password", &mine).unwrap();
+    let reply = submit_code(&config, &pending, &next_code(&config, &secret)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "a sign-in begun with the old password finished");
+    users::change_password(&config, &ab.id, "a brand new password", PASSWORD, &mine).unwrap();
+
+    // A setup link spent: also the end of every session.
+    let (_, pending) = password(&config, "ab@example.com", "/").await;
+    let pending = pending.unwrap();
+    let link = users::reinvite(&config, "ab@example.com").unwrap();
+    users::accept_invite(&config, &link, PASSWORD).unwrap();
+    let reply = submit_code(&config, &pending, &next_code(&config, &secret)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "a sign-in begun before the reset finished");
+    assert!(users::site_session_user(&config, &mine).is_none(), "a session outlived a password reset by link");
+
+    // The account disabled.
+    let (_, pending) = password(&config, "ab@example.com", "/").await;
+    let pending = pending.unwrap();
+    users::set_active(&config, "ab@example.com", false).unwrap();
+    let reply = submit_code(&config, &pending, &next_code(&config, &secret)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "a disabled account finished signing in");
+    assert!(reply.cookie("ts_session").is_none());
+}
+
+/// Someone who knows only the email cannot start a pending sign-in, so
+/// cannot spend the account's wrong-code allowance and lock its owner out.
+#[tokio::test]
+async fn a_wrong_password_starts_nothing_and_cannot_lock_the_account() {
+    let (_dir, config) = site(Policy::Off);
+    let bc = person(&config, "bc@example.com", false);
+    let (secret, _) = enable(&config, &bc, &session(&config, "bc@example.com")).await;
+    for _ in 0..12 {
+        let reply = post(&config, "/auth/login", "email=bc%40example.com&password=not-it&next=%2F", None).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert!(reply.cookie("ts_mfa").is_none() && reply.cookie("ts_session").is_none());
+        // No pending cookie to send, so the code page has nothing to count against.
+        let code = post(&config, "/auth/mfa", "code=000000", None).await;
+        assert_eq!(code.status, StatusCode::UNAUTHORIZED);
+    }
+    let (_, pending) = password(&config, "bc@example.com", "/").await;
+    let reply = submit_code(&config, &pending.unwrap(), &next_code(&config, &secret)).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "the owner was locked out: {}", reply.body);
+}
+
+#[tokio::test]
+async fn the_forced_setup_page_opens_only_for_a_pending_setup() {
+    let (_dir, config) = site(Policy::Admins);
+    person(&config, "root@example.com", true);
+    let cd = person(&config, "cd@example.com", false);
+    let (secret, _) = enable(&config, &cd, &session(&config, "cd@example.com")).await;
+
+    let none = get(&config, "/auth/mfa/setup", None).await;
+    assert!(none.location().starts_with("/auth/login"));
+    let as_session = get(&config, "/auth/mfa/setup", Some(&format!("ts_session={}", session(&config, "cd@example.com")))).await;
+    assert!(as_session.location().starts_with("/auth/login"), "a session opened the forced setup page");
+    // A sign-in that owes a code, not setup, is sent to the code page and
+    // cannot replace the secret it owes a code for.
+    let (_, pending) = password(&config, "cd@example.com", "/").await;
+    let pending = pending.unwrap();
+    let held = get(&config, "/auth/mfa/setup", Some(&format!("ts_mfa={pending}"))).await;
+    assert_eq!(held.location(), "/auth/mfa");
+    let posted = post(&config, "/auth/mfa/setup", "code=123456", Some(&format!("ts_mfa={pending}"))).await;
+    assert!(posted.cookie("ts_session").is_none());
+    assert_eq!(submit_code(&config, &pending, &next_code(&config, &secret)).await.status, StatusCode::SEE_OTHER);
+
+    // Walking away from forced setup leaves nothing signed in.
+    let (_, pending) = password(&config, "root@example.com", "/admin").await;
+    let pending = pending.unwrap();
+    forced_secret(&config, &pending).await;
+    for path in ["/admin", "/account", "/auth/me", "/"] {
+        let reply = get(&config, path, Some(&format!("ts_mfa={pending}"))).await;
+        assert!(!reply.body.contains("root@example.com"), "{path} knew who was there during forced setup");
+    }
+}
+
+#[tokio::test]
+async fn pages_with_a_secret_or_codes_are_never_cached() {
+    let (_dir, config) = site(Policy::Admins);
+    let root = person(&config, "root@example.com", true);
+    let (_, pending) = password(&config, "root@example.com", "/").await;
+    let pending = pending.unwrap();
+    let setup = get(&config, "/auth/mfa/setup", Some(&format!("ts_mfa={pending}"))).await;
+    assert_eq!(setup.header("cache-control"), Some("no-store"));
+    let secret = secret_on(&setup.body);
+    let done = post(&config, "/auth/mfa/setup", &format!("code={}", next_code(&config, &secret)), Some(&format!("ts_mfa={pending}"))).await;
+    assert_eq!(done.header("cache-control"), Some("no-store"), "the recovery codes page may be cached");
+
+    let (_, pending) = password(&config, "root@example.com", "/").await;
+    let pending = pending.unwrap();
+    assert_eq!(get(&config, "/auth/mfa", Some(&format!("ts_mfa={pending}"))).await.header("cache-control"), Some("no-store"));
+    let signed_in = submit_code(&config, &pending, &next_code(&config, &secret)).await.cookie("ts_session").unwrap();
+    let cookie = format!("ts_session={signed_in}");
+    assert_eq!(get(&config, "/account", Some(&cookie)).await.header("cache-control"), Some("no-store"));
+    let fresh = post(&config, "/account/mfa/recovery", &format!("token={}&code={}", form_token(&config, &root), next_code(&config, &secret)), Some(&cookie)).await;
+    assert_eq!(fresh.status, StatusCode::OK);
+    assert_eq!(fresh.header("cache-control"), Some("no-store"));
+}
+
+/// Turning it off takes the page's form token and a code, and the page that
+/// holds the token cannot be read by a script.
+#[tokio::test]
+async fn turning_it_off_needs_the_form_token_and_a_code() {
+    let (_dir, config) = site(Policy::Off);
+    let de = person(&config, "de@example.com", false);
+    let s = session(&config, "de@example.com");
+    let (secret, _) = enable(&config, &de, &s).await;
+    let cookie = format!("ts_session={s}");
+    let token = form_token(&config, &de);
+
+    let code = next_code(&config, &secret);
+    let forged = post(&config, "/account/mfa/off", &format!("code={code}"), Some(&cookie)).await;
+    assert_ne!(forged.status, StatusCode::SEE_OTHER);
+    let forged = post(&config, "/account/mfa/off", &format!("token=nope&code={code}"), Some(&cookie)).await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    let no_code = post(&config, "/account/mfa/off", &format!("token={token}&code="), Some(&cookie)).await;
+    assert_eq!(no_code.status, StatusCode::SEE_OTHER);
+    assert!(mfa::is_enabled(&config, &de.id), "turned off without a code");
+
+    let read = send(
+        &config,
+        Request::builder()
+            .uri("/account")
+            .header("cookie", &cookie)
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::FORBIDDEN, "a script read the account page and its form token");
+    assert!(!read.body.contains(&token));
+}
+
+/// Only a site admin resets someone's two-step sign-in. Manage on an app or
+/// a project is not enough, and one admin resetting another is allowed and
+/// logged.
+#[tokio::test]
+async fn only_a_site_admin_may_reset_it_and_a_reset_is_logged_and_revokes_clients() {
+    let (_dir, config) = site(Policy::Off);
+    let target = person(&config, "ef@example.com", true);
+    enable(&config, &target, &session(&config, "ef@example.com")).await;
+    let client = toolsite::platform::oauth_store::register_client(&config, Some("Test"), &["https://client.test/cb".to_string()]).unwrap();
+    let issued = toolsite::platform::oauth_store::issue_tokens(&config, &client.id, &target.id, None).unwrap();
+
+    // Manage over the whole tree is the most a non-admin can hold.
+    let manager = person(&config, "gh@example.com", false);
+    users::grant_scope(&config, "gh@example.com", "", users::Scope::Admin, None).unwrap();
+    let cookie = format!("ts_session={}", session(&config, "gh@example.com"));
+    let reply = post(
+        &config,
+        "/admin/mfa-reset",
+        &format!("token={}&email=ef%40example.com", form_token(&config, &manager)),
+        Some(&cookie),
+    )
+    .await;
+    assert_ne!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(mfa::is_enabled(&config, &target.id), "a non-admin reset an admin's two-step sign-in");
+
+    let root = person(&config, "root@example.com", true);
+    let cookie = format!("ts_session={}", session(&config, "root@example.com"));
+    let reply = post(
+        &config,
+        "/admin/mfa-reset",
+        &format!("token={}&email=ef%40example.com", form_token(&config, &root)),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(!mfa::is_enabled(&config, &target.id));
+    assert!(toolsite::platform::oauth_store::access_token_holder(&config, &issued.access_token).is_none(), "a client outlived the reset");
+    assert!(toolsite::platform::oauth_store::rotate_refresh(&config, &client.id, &issued.refresh_token).is_none());
+    let text = String::from_utf8_lossy(&log().0.lock().unwrap()).to_string();
+    assert!(
+        text.lines().any(|l| l.contains("WARN") && l.contains("reset by an admin") && l.contains("root@example.com") && l.contains("ef@example.com")),
+        "the reset was not logged with both accounts"
+    );
+}
+
+#[tokio::test]
+async fn a_new_password_revokes_connected_clients() {
+    let (_dir, config) = site(Policy::Off);
+    let ij = person(&config, "ij@example.com", false);
+    let s = session(&config, "ij@example.com");
+    let client = toolsite::platform::oauth_store::register_client(&config, Some("Test"), &["https://client.test/cb".to_string()]).unwrap();
+    let issued = toolsite::platform::oauth_store::issue_tokens(&config, &client.id, &ij.id, None).unwrap();
+    let new = urlencoding::encode("a brand new password");
+    let reply = post(
+        &config,
+        "/account/password",
+        &format!("token={}&current={}&new={new}&confirm={new}", form_token(&config, &ij), urlencoding::encode(PASSWORD)),
+        Some(&format!("ts_session={s}")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(toolsite::platform::oauth_store::access_token_holder(&config, &issued.access_token).is_none(), "a client outlived the new password");
+}
+
+/// An admin's session from before the policy (or before the deployment set
+/// it) keeps its own account page, where it can set two-step sign-in up,
+/// and nothing an admin page or a new MCP client could do with it.
+#[tokio::test]
+async fn an_admin_session_that_owes_setup_reaches_only_its_account_page() {
+    let (_dir, config) = site_with(Policy::Admins, false, Some("https://site.test"));
+    let root = person(&config, "root@example.com", true);
+    let s = session(&config, "root@example.com");
+    let cookie = format!("ts_session={s}");
+    for path in ["/admin", "/admin/accounts", "/admin/accounts/root%40example.com"] {
+        let reply = get(&config, path, Some(&cookie)).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{path} opened");
+        assert_eq!(reply.location(), "/account#two-step", "{path}");
+    }
+    let made = post(&config, "/admin/mfa-reset", &format!("token={}&email=root%40example.com", form_token(&config, &root)), Some(&cookie)).await;
+    assert_eq!(made.location(), "/account#two-step");
+    assert_eq!(get(&config, "/account", Some(&cookie)).await.status, StatusCode::OK);
+
+    let client = toolsite::platform::oauth_store::register_client(&config, Some("Test"), &["https://client.test/cb".to_string()]).unwrap();
+    let authorize = format!(
+        "/authorize?response_type=code&client_id={}&redirect_uri={}&state=xyz&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256",
+        client.id,
+        urlencoding::encode("https://client.test/cb")
+    );
+    let consent = get(&config, &authorize, Some(&cookie)).await;
+    assert_eq!(consent.status, StatusCode::FORBIDDEN, "a new client was offered to a session that owes setup");
+
+    enable(&config, &root, &s).await;
+    assert_eq!(get(&config, "/admin", Some(&cookie)).await.status, StatusCode::OK);
+    assert_eq!(get(&config, &authorize, Some(&cookie)).await.status, StatusCode::OK);
+
+    // A regular account under `admins` owes nothing.
+    person(&config, "kl@example.com", false);
+    let page = get(&config, "/account", Some(&format!("ts_session={}", session(&config, "kl@example.com")))).await;
+    assert_eq!(page.status, StatusCode::OK);
+}
+
+/// By design a provider's own second step stands in for toolsite's unless
+/// `TOOLSITE_MFA_FOR_PROVIDERS` is set, so under `admins` a provider-only
+/// admin is let in without one, and with the setting is held for setup.
+#[tokio::test]
+async fn a_provider_admin_is_held_for_setup_only_with_mfa_for_providers() {
+    for for_providers in [false, true] {
+        let (_dir, config) = site_with(Policy::Admins, for_providers, None);
+        // No route promotes an account, so the admin flag is set on the
+        // value the sign-in would carry.
+        let op = users::User { is_admin: true, ..users::create_provider_account(&config, "op@example.com").unwrap() };
+        let step = mfa::after_primary(&config, &op, Primary::Provider, "/").unwrap();
+        assert_eq!(matches!(step, Step::Setup(_)), for_providers, "for_providers={for_providers}: {step:?}");
+        assert_eq!(mfa::owes_setup(&config, &op), for_providers);
+    }
+}
+
+#[tokio::test]
+async fn nothing_another_admin_sees_carries_the_secret() {
+    let (_dir, config) = site(Policy::Off);
+    person(&config, "root@example.com", true);
+    let mn = person(&config, "mn@example.com", false);
+    let theirs = format!("ts_session={}", session(&config, "mn@example.com"));
+    post(&config, "/account/mfa/start", &format!("token={}", form_token(&config, &mn)), Some(&theirs)).await;
+    let secret = secret_on(&get(&config, "/account", Some(&theirs)).await.body);
+    let admin = format!("ts_session={}", session(&config, "root@example.com"));
+    for path in ["/admin/accounts", "/admin/accounts/mn%40example.com", "/account", "/admin"] {
+        let page = get(&config, path, Some(&admin)).await;
+        assert!(!page.body.contains(&secret) && !page.body.contains(&mfa::grouped(&secret)), "{path} shows the secret");
+    }
+}
+
+/// The account database lives under `.site/`, which no app name, export or
+/// served path can name.
+#[tokio::test]
+async fn no_serving_route_reaches_the_account_database() {
+    let (_dir, config) = site(Policy::Off);
+    let op = person(&config, "op@example.com", false);
+    enable(&config, &op, &session(&config, "op@example.com")).await;
+    for path in [
+        "/export/.site.sqlite",
+        "/export/..%2F.site%2Fauth.sqlite",
+        "/p/.site/auth.db",
+        "/.site/auth.db",
+        "/p/%2E%2E/.site/auth.db",
+        "/p/x/..%2F..%2F.site%2Fauth.db",
+    ] {
+        let reply = get(&config, path, None).await;
+        assert!(!reply.status.is_success(), "{path} answered {}", reply.status);
+        assert!(!reply.body.contains("SQLite format"), "{path} served a database");
+    }
+}
+
+#[test]
+fn a_deployment_checks_codes_against_the_system_clock() {
+    let settings = Settings::from_env(Some("admins"), None).unwrap();
+    let system = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert!(settings.clock.now().abs_diff(system) < 5);
+    // And a fixed clock's setter does nothing to it.
+    settings.clock.set(1);
+    assert!(settings.clock.now().abs_diff(system) < 5);
 }

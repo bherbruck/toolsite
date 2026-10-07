@@ -48,13 +48,34 @@ const GATES: [(&str, &str, &str); 3] = [
 
 /// Resolves an admin from the request, or the response to send instead.
 pub(crate) async fn require_admin(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
-    match users::current_site_user(config, headers).await {
-        Some(user) if user.is_admin => Ok(user),
+    match signed_in(config, headers).await? {
+        user if user.is_admin => Ok(user),
         // Someone signed in but not an admin is told no, not sent to sign in
         // again — that would loop.
-        Some(_) => Err((StatusCode::FORBIDDEN, "not an admin").into_response()),
-        None => Err(Redirect::to("/auth/login?next=/admin").into_response()),
+        _ => Err((StatusCode::FORBIDDEN, "not an admin").into_response()),
     }
+}
+
+/// Who is signed in, for an admin page, or where to send them instead: to
+/// sign in, or to their account page when the site's policy requires
+/// two-step sign-in of them and it is not on. A session from before the
+/// policy (or from a provider, which the policy does not cover unless
+/// `TOOLSITE_MFA_FOR_PROVIDERS` is set) keeps its own account page and
+/// nothing an admin page could do with it, until it sets one up.
+async fn signed_in(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
+    let Some(user) = users::current_site_user(config, headers).await else {
+        return Err(Redirect::to("/auth/login?next=/admin").into_response());
+    };
+    let (worker, who) = (config.clone(), user.clone());
+    if tokio::task::spawn_blocking(move || crate::accounts::mfa::owes_setup(&worker, &who)).await.unwrap_or(true) {
+        tracing::warn!(email = %user.email, "admin refused: the site requires two-step sign-in of this account and it is off");
+        return Err(redirect_flash(
+            "/account#two-step",
+            false,
+            "This site requires two-step sign-in for your account. Set it up to continue.",
+        ));
+    }
+    Ok(user)
 }
 
 /// What the signed-in account holds at `path`, the one question every
@@ -82,10 +103,7 @@ pub(crate) async fn manages_something(config: &Arc<Config>, user: &User) -> bool
 /// Anyone who holds Manage somewhere: who may list accounts to give them
 /// access. A site admin, or an admin of any project or app.
 pub(crate) async fn require_manager(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
-    let user = match users::current_site_user(config, headers).await {
-        Some(user) => user,
-        None => return Err(Redirect::to("/auth/login?next=/admin").into_response()),
-    };
+    let user = signed_in(config, headers).await?;
     let (config2, who) = (config.clone(), user.clone());
     let manages = tokio::task::spawn_blocking(move || users::holds_anywhere(&config2, &who, Scope::Admin))
         .await
@@ -100,10 +118,9 @@ pub(crate) async fn require_manager(config: &Arc<Config>, headers: &HeaderMap) -
 /// Anyone who may enter the admin pages. What they then see is decided
 /// page by page from what they hold.
 pub(crate) async fn require_entry(config: &Arc<Config>, headers: &HeaderMap) -> Result<User, Response> {
-    match users::current_site_user(config, headers).await {
-        Some(user) if manages_something(config, &user).await => Ok(user),
-        Some(_) => Err((StatusCode::FORBIDDEN, "not an admin").into_response()),
-        None => Err(Redirect::to("/auth/login?next=/admin").into_response()),
+    match signed_in(config, headers).await? {
+        user if manages_something(config, &user).await => Ok(user),
+        _ => Err((StatusCode::FORBIDDEN, "not an admin").into_response()),
     }
 }
 
@@ -114,10 +131,7 @@ pub(crate) async fn require_scope(
     path: &str,
     needed: Scope,
 ) -> Result<User, Response> {
-    let user = match users::current_site_user(config, headers).await {
-        Some(user) => user,
-        None => return Err(Redirect::to("/auth/login?next=/admin").into_response()),
-    };
+    let user = signed_in(config, headers).await?;
     match held(config, &user, path).await {
         Some(have) if have >= needed => Ok(user),
         _ => {
@@ -168,10 +182,7 @@ pub(crate) async fn require_app(
     app: &str,
     needed: Scope,
 ) -> Result<User, Response> {
-    let user = match users::current_site_user(config, headers).await {
-        Some(user) => user,
-        None => return Err(Redirect::to("/auth/login?next=/admin").into_response()),
-    };
+    let user = signed_in(config, headers).await?;
     match held_on(config, &user, app).await {
         Some(have) if have >= needed => Ok(user),
         _ => {
@@ -1809,12 +1820,13 @@ pub async fn reset_mfa(
     let (worker, email) = (config.clone(), form.email.clone());
     let outcome = tokio::task::spawn_blocking(move || crate::accounts::mfa::reset(&worker, &email)).await;
     match outcome {
-        Ok(Ok(was_on)) => {
+        Ok(Ok((user_id, was_on))) => {
             tracing::warn!(admin = %admin.email, email = %form.email, was_on, "two-step sign-in reset by an admin; all sessions of the account ended");
+            crate::platform::account::revoke_clients(&config, &user_id, &form.email, "two-step sign-in reset").await;
             redirect_flash(
                 &back,
                 true,
-                format!("Two-step sign-in for {} is reset. All of their sessions are signed out.", form.email),
+                format!("Two-step sign-in for {} is reset. All of their sessions and connected MCP clients are signed out.", form.email),
             )
         }
         Ok(Err(message)) => redirect_flash(&back, false, message),

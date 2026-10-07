@@ -171,6 +171,23 @@ fn verify_password(stored: &str, password: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `password` is the active account's current one: what an action
+/// that a stolen session alone must not take asks for.
+pub fn password_matches(config: &Config, user_id: &str, password: &str) -> bool {
+    let Ok(conn) = open(config) else {
+        return false;
+    };
+    let stored: Option<String> = conn
+        .query_row(
+            "select password_hash from users where id = ? and disabled_at is null",
+            [user_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    stored.is_some_and(|stored| verify_password(&stored, password))
+}
+
 pub fn sign_up(config: &Config, email: &str, password: &str) -> Result<User, String> {
     sign_up_as(config, email, password, false)
 }
@@ -554,6 +571,10 @@ pub fn change_password(
         rusqlite::params![user_id, hash_token(current_session)],
     )
     .map_err(|e| e.to_string())?;
+    // A sign-in that got past the old password and waits for its code is
+    // something the leak opened too.
+    conn.execute("delete from mfa_pending where user_id = ?", [user_id])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1483,6 +1504,11 @@ mod tests {
             assert!(!is_platform_cookie(name), "{name}");
         }
         assert_eq!(without_platform_cookies("__Host-ts_app=s; theme=dark; __Host-ts_handoff=n").as_deref(), Some("theme=dark"));
+        // The pending two-step sign-in is the platform's in every spelling.
+        for name in ["ts_mfa", "__Host-ts_mfa", "__HOST-TS_MFA", "__Secure-ts_mfa", " Ts_Mfa"] {
+            assert!(is_platform_cookie(name), "{name}");
+        }
+        assert_eq!(without_platform_cookies("ts_mfa=p; theme=dark; __Host-ts_mfa=q").as_deref(), Some("theme=dark"));
         assert!(sets_platform_cookie("__Host-ts_app=forged; Path=/; Secure"));
     }
 
@@ -2302,6 +2328,10 @@ pub fn invited_account(config: &Config, token: &str) -> Option<User> {
 /// whether or not anything else follows, so a link works exactly once. The
 /// session that follows is `mfa::after_primary`'s to give, since a setup
 /// link is also how someone with two-step sign-in gets back in.
+///
+/// A setup link is also the reset for a forgotten or leaked password, so
+/// every session and pending sign-in of the account ends: whatever the old
+/// password opened closes with it.
 pub fn accept_invite(config: &Config, token: &str, password: &str) -> Result<User, String> {
     let user = invited_account(config, token).ok_or("This link is not valid.")?;
     if password.chars().count() < 8 {
@@ -2318,6 +2348,9 @@ pub fn accept_invite(config: &Config, token: &str, password: &str) -> Result<Use
     .map_err(|e| e.to_string())?;
     conn.execute("delete from invites where token_hash = ?", [hash_token(token)])
         .map_err(|e| e.to_string())?;
+    for sql in ["delete from sessions where user_id = ?", "delete from mfa_pending where user_id = ?"] {
+        conn.execute(sql, [&user.id]).map_err(|e| e.to_string())?;
+    }
     Ok(user)
 }
 

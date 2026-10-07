@@ -396,6 +396,31 @@ async fn a_disabled_accounts_connection_closes_on_the_next_check() {
     assert!(closes(&mut socket).await, "the disabled account's socket stayed open");
 }
 
+/// A socket is the visitor's only while the session it came in with lasts,
+/// even on a public app that would let anyone connect: what the handler is
+/// told about who is there must stop being true when the session ends.
+/// Turning on two-step sign-in, an admin's reset and a new password all end
+/// sessions this way.
+#[tokio::test]
+async fn a_connection_closes_when_the_session_it_came_in_with_ends() {
+    let site = site(quick()).await;
+    app(&site.config, "lobby");
+    let (_, cookie) = app_cookie(&site.config, "ender@example.com", "lobby");
+    let (mut socket, _) = open(&site, "/p/lobby/ws", Some(&cookie)).await;
+    toolsite::accounts::mfa::reset(&site.config, "ender@example.com").unwrap();
+    assert!(closes(&mut socket).await, "the socket outlived its session");
+
+    // Signing out ends it too, and an anonymous socket beside it stays.
+    let (_, site_token) = users::log_in(&site.config, "ender@example.com", "correct horse battery").unwrap();
+    let (_, token, _) = users::create_app_session(&site.config, &site_token, "lobby").unwrap();
+    let (mut signed_in, _) = open(&site, "/p/lobby/ws", Some(&format!("ts_app_lobby={token}"))).await;
+    let (mut anonymous, _) = open(&site, "/p/lobby/ws", None).await;
+    users::log_out(&site.config, &site_token).unwrap();
+    assert!(closes(&mut signed_in).await, "the socket outlived sign-out");
+    say(&mut anonymous, "echo:still here").await;
+    assert_eq!(next_text(&mut anonymous).await.as_deref(), Some("still here"), "an anonymous socket closed with someone else's session");
+}
+
 #[tokio::test]
 async fn losing_access_closes_the_connection_on_the_next_check() {
     let site = site(quick()).await;

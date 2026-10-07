@@ -361,7 +361,24 @@ async fn consenting_user(
     query: Option<&str>,
 ) -> Result<User, Response> {
     match users::current_site_user(config, headers).await {
-        Some(user) => Ok(user),
+        Some(user) => {
+            // A client connected now would outlive the session, so one the
+            // site's policy holds for two-step setup does not get to
+            // connect one until it has.
+            let (worker, who) = (config.clone(), user.clone());
+            if tokio::task::spawn_blocking(move || crate::accounts::mfa::owes_setup(&worker, &who)).await.unwrap_or(true) {
+                tracing::warn!(email = %user.email, "consent refused: the site requires two-step sign-in of this account and it is off");
+                return Err(plain_page(
+                    StatusCode::FORBIDDEN,
+                    "Set up two-step sign-in",
+                    maud::html! {
+                        p { "This site requires two-step sign-in for your account. Set it up, then connect the client again." }
+                        a."btn" href="/account#two-step" { "Set up two-step sign-in" }
+                    },
+                ));
+            }
+            Ok(user)
+        }
         None => {
             let here = match query {
                 Some(query) => format!("/authorize?{query}"),

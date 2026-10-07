@@ -701,6 +701,15 @@ mod tests {
             ("Set-Cookie", "=ts_app=forged; Domain=apps.test; Path=/"),
             ("set-cookie", "=__Host-ts_app=forged; Path=/; Secure"),
             ("set-cookie", "TS_APP=forged"),
+            // The pending two-step sign-in: planted, it would hand the
+            // visitor someone else's sign-in to finish.
+            ("set-cookie", "ts_mfa=attackers; Path=/"),
+            ("set-cookie", "__Host-ts_mfa=attackers; Path=/; Secure"),
+            ("set-cookie", "__host-TS_MFA=attackers; Path=/; Secure"),
+            ("set-cookie", "__Secure-ts_mfa=attackers; Path=/; Secure"),
+            ("set-cookie", "=ts_mfa=attackers; Path=/"),
+            ("set-cookie", "= __Host-ts_mfa=attackers; Path=/"),
+            ("set-cookie", " ts_mfa =attackers"),
         ] {
             assert!(refused_response_header("a", name, value), "{name}: {value}");
         }

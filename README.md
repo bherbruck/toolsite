@@ -1151,10 +1151,12 @@ and destroys nothing; enabling restores the same password.
 Everyone signed in has `/account`, reached from their email in the sidebar:
 how they sign in (a password, a provider, or both) and, for an account with
 a password, a form to change it. Changing it signs out every other session
-of that account. There is no mailer, so there is no reset email: someone who
+of that account, ends any sign-in still waiting for its two-step code, and
+revokes the account's OAuth tokens. There is no mailer, so there is no reset email: someone who
 has forgotten their password asks an admin, who issues a new setup link from
-the account's page in the admin. The same page turns two-step sign-in on and
-off.
+the account's page in the admin. Using a setup link also signs out every
+session of the account, since it is how a leaked password is replaced. The
+same page turns two-step sign-in on and off.
 
 ### Two-step sign-in
 
@@ -1163,7 +1165,11 @@ Microsoft Authenticator, 1Password and the like) to its password. It is TOTP
 (RFC 6238): six digits, a new code every 30 seconds.
 
 - **Turn it on** from `/account`: scan the QR code, or type the key into the
-  app, and enter the first code. Ten recovery codes are shown one time, with
+  app, and enter the first code and your password (a stolen session cookie
+  alone cannot put someone else's phone on the account). The QR code is
+  shown only to the session that began setup; a setup begun anywhere else
+  starts over with a new secret, so a secret someone else saw is never the
+  one you scan. Ten recovery codes are shown one time, with
   copy and download. Each recovery code works one time. Turning it on keeps
   the session you are using, signs out every other session of the account
   (app sessions too), and revokes the account's OAuth tokens, so a connected
@@ -1183,8 +1189,14 @@ Microsoft Authenticator, 1Password and the like) to its password. It is TOTP
   from the app), or turn it off (needs a code from the app or a recovery
   code). Someone who lost the phone and the recovery codes asks an admin,
   whose "Reset two-step sign-in" on the account's page removes it and signs
-  out every session of that person. On the server, `toolsite user reset-mfa
-  <email>` does the same, which is the way back in for the only admin.
+  out every session of that person and revokes their OAuth tokens. Only a
+  site admin may reset it (Manage over the whole tree is not enough); one
+  admin may reset another, and every reset is logged at `warn` with both
+  accounts. On the server, `toolsite user reset-mfa <email>` does the same,
+  which is the way back in for the only admin.
+- **Live connections**: a WebSocket belongs to the app session it was opened
+  with, and closes at the next check once that session ends, whatever ended
+  it: sign-out, a new password, turning two-step sign-in on, or a reset.
 - **At rest**: the shared secret is sealed with the same key as app settings
   (`TOOLSITE_SECRET_KEY`), and recovery codes are stored as digests keyed
   with it. Neither is logged, and the secret is not shown again after setup.
@@ -1193,19 +1205,35 @@ Microsoft Authenticator, 1Password and the like) to its password. It is TOTP
 default: site admins), `everyone`, or `off`. Someone the policy covers who
 has not set it up is sent to a setup page after the password and gets no
 session until the first code confirms it, so an existing admin is not locked
-out and sets it up at the next sign-in. Under the policy, turning it off on
-`/account` is refused.
+out and sets it up at the next sign-in. A session from before the policy keeps
+working on `/account` and nowhere an admin's powers are used: the admin pages send it to `/account` to set two-step
+sign-in up, and the consent screen will not connect a new MCP client for it.
+Under the policy, turning it off on `/account` is refused.
+
+Whoever has the password of an account the policy holds for setup can set it
+up first, with their own phone; that is the nature of a first sign-in, so
+issue admin accounts by setup link and have the person sign in promptly. They
+can also restart a setup the owner has begun, which makes the owner sign in
+again, but never see the owner's secret.
 
 **Providers.** A sign-in through Google, Entra, GitHub or an OIDC issuer
 skips toolsite's code, since the provider asks for its own. Set
 `TOOLSITE_MFA_FOR_PROVIDERS=1` to ask for the code (and for setup, under the
-policy) after the provider too.
+policy) after the provider too. With it off, an admin who signs in through a
+provider and has no password owes nothing under `admins`; one who also has a
+password is sent to set it up before using the admin pages.
 
 **What it does not cover.** Two-step sign-in protects interactive sign-ins
 and new OAuth consents. Credentials that skip sign-in stay as they are: the
 MCP bearer token, per-app export, deploy and device tokens, and OAuth tokens
-issued before. Existing OAuth tokens keep working until they are revoked,
-and turning two-step sign-in on revokes those of that account.
+issued before. Existing OAuth tokens keep working until they are revoked
+(an access token lasts a day); turning two-step sign-in on, a new
+password and a reset all revoke those of that account, refresh tokens
+included. In path mode an app's script shares the site's origin and can
+plant a cookie of its own named like the pending sign-in's; the code page
+names the account it is for, and such a sign-in cannot be finished without
+that account's code. Subdomain mode over HTTPS names the cookie
+`__Host-ts_mfa`, which a sibling host cannot set.
 
 ### Projects and scopes
 

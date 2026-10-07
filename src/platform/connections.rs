@@ -93,6 +93,8 @@ pub struct Session {
     app: String,
     door: Door,
     visitor: Option<User>,
+    /// The raw app session token the visitor came in with.
+    session: Option<String>,
     registration: Registration,
     outgoing: mpsc::Receiver<Outgoing>,
 }
@@ -142,15 +144,29 @@ async fn deliver(
     .map_err(|e| format!("{e:#}"))
 }
 
+/// A signed-in visitor, and the app session they proved it with. The
+/// connection is theirs only while that session lasts: signing out, a new
+/// password, turning on two-step sign-in or an admin's reset ends it, and
+/// the connection closes at the next check, as a request with the cookie
+/// would be refused.
+pub struct Visitor {
+    pub user: User,
+    pub session: String,
+}
+
 /// Registers a connection and asks the handler whether to accept it.
 pub async fn open(
     state: AppState,
     app: String,
     door: Door,
-    visitor: Option<User>,
+    visitor: Option<Visitor>,
     remote: Option<SocketAddr>,
     info: ConnectInfo,
 ) -> Result<Session, Refusal> {
+    let (visitor, session) = match visitor {
+        Some(Visitor { user, session }) => (Some(user), Some(session)),
+        None => (None, None),
+    };
     let Some(wasm) = crate::content::serve::handler_wasm(&state.config, &app).await else {
         return Err(Refusal::NotOffered);
     };
@@ -180,6 +196,7 @@ pub async fn open(
             app,
             door,
             visitor,
+            session,
             registration,
             outgoing,
         })
@@ -217,6 +234,7 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
         app,
         door,
         visitor,
+        session,
         registration,
         mut outgoing,
     } = session;
@@ -326,19 +344,23 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
                 {
                     break;
                 }
-                let current = match &user_id {
-                    Some(id) => {
-                        let (config, id) = (state.config.clone(), id.clone());
-                        match tokio::task::spawn_blocking(move || users::user_by_id(&config, &id)).await.ok().flatten() {
+                let current = match (&user_id, &session) {
+                    (Some(id), session) => {
+                        let (config, id, session, scope) = (state.config.clone(), id.clone(), session.clone(), app.clone());
+                        let found = tokio::task::spawn_blocking(move || match session {
+                            Some(token) => users::app_session_user(&config, &token, &scope).filter(|user| user.id == id),
+                            None => users::user_by_id(&config, &id),
+                        });
+                        match found.await.ok().flatten() {
                             Some(user) => Some(user),
                             None => {
-                                tracing::info!(app = %app, "connection closed: the account is disabled or gone");
+                                tracing::info!(app = %app, "connection closed: the account is disabled or gone, or its session ended");
                                 transport.close().await;
                                 break;
                             }
                         }
                     }
-                    None => None,
+                    (None, _) => None,
                 };
                 if !may_stay(&state, &app, &door, current.as_ref()).await {
                     tracing::info!(app = %app, door = ?door, "connection closed: it may no longer come in this way");

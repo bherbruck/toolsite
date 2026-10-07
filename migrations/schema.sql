@@ -33,7 +33,7 @@ CREATE TABLE mfa (
     secret     text not null,
     enabled_at integer,
     last_step  integer not null default 0
-)
+, begun_by text)
 CREATE TABLE mfa_failures (
     user_id text not null references users(id),
     at      integer not null

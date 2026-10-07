@@ -181,6 +181,7 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
         return (StatusCode::FORBIDDEN, "a page on another site may not open this socket").into_response();
     }
 
+    let session = users::app_token_from_cookies(&config, request.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()), &app);
     let visitor = users::current_app_user(&config, &app, request.headers()).await;
     let path = request.uri().path().trim_end_matches('/').to_string();
     // The refusal any API request gets: no redirect, since a socket cannot
@@ -225,6 +226,7 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
             .collect(),
     };
 
+    let visitor = visitor.zip(session).map(|(user, session)| connections::Visitor { user, session });
     match connections::open(state, app.clone(), Door::Path(within.clone()), visitor, None, info).await {
         Ok(session) => upgrade
             .max_message_size(MAX_MESSAGE_BYTES)

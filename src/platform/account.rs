@@ -33,6 +33,11 @@ async fn require_user(config: &Arc<Config>, headers: &HeaderMap) -> Result<User,
     }
 }
 
+/// The raw site session token the request carries.
+fn site_token(config: &Config, headers: &HeaderMap) -> Option<String> {
+    users::token_from_cookies(config, headers.get(header::COOKIE).and_then(|v| v.to_str().ok()))
+}
+
 fn form_token(config: &Config, user: &User) -> String {
     users::derive_form_token(config, &user.id)
 }
@@ -43,13 +48,13 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
         Err(response) => return response,
     };
     let (has_password, providers, two_step, setup_secret) = {
-        let (config, id) = (config.clone(), user.id.clone());
+        let (config, id, session) = (config.clone(), user.id.clone(), site_token(&config, &headers).unwrap_or_default());
         tokio::task::spawn_blocking(move || {
             (
                 users::has_password(&config, &id),
                 users::identities_for(&config, &id),
                 mfa::status(&config, &id),
-                mfa::setup_secret(&config, &id),
+                mfa::setup_secret(&config, &id, &session),
             )
         })
         .await
@@ -190,7 +195,8 @@ pub async fn change_password(
     match outcome {
         Ok(Ok(())) => {
             tracing::info!(%email, "password changed");
-            redirect_flash("/account", true, "The password is changed. Your other sessions are signed out.")
+            revoke_clients(&config, &user.id, &email, "password changed").await;
+            redirect_flash("/account", true, "The password is changed. Your other sessions and connected MCP clients are signed out.")
         }
         Ok(Err(message)) => {
             tracing::warn!(%email, %message, "password change refused");
@@ -296,6 +302,14 @@ fn two_step_panel(
                     form method="post" action="/account/mfa/confirm" {
                         (hidden_token)
                         (code_field("confirm-code", "Code from your authenticator app"))
+                        @if has_password {
+                            div."field" {
+                                label for="confirm-password" { "Your password" }
+                                input id="confirm-password" name="password" type="password"
+                                      autocomplete="current-password" required;
+                                p."help" { "Your other sessions end when two-step sign-in turns on." }
+                            }
+                        }
                         div."actions end" { button type="submit" { "Turn on" } }
                     }
                     form method="post" action="/account/mfa/cancel" {
@@ -343,14 +357,17 @@ async fn account_shell(config: &Arc<Config>, user: &User, title: &str, body: Mar
     ([(header::CACHE_CONTROL, "no-store")], Html(markup.into_string())).into_response()
 }
 
-/// Turning it on ends every connection a client holds for this account, so
-/// a client connected with a password alone must sign in again with a code.
-async fn revoke_clients(config: &Arc<Config>, user: &User) {
-    let (worker, id) = (config.clone(), user.id.clone());
+/// Ends every connection a client holds for this account. Turning two-step
+/// sign-in on does it, so a client connected with a password alone must
+/// sign in again with a code; so do a new password and an admin's reset,
+/// which close whatever the old password or the lost phone opened. `why`
+/// says which, for the log.
+pub(crate) async fn revoke_clients(config: &Arc<Config>, user_id: &str, email: &str, why: &str) {
+    let (worker, id) = (config.clone(), user_id.to_string());
     match tokio::task::spawn_blocking(move || crate::platform::oauth_store::revoke_for_user(&worker, &id)).await {
-        Ok(Ok(count)) => tracing::info!(email = %user.email, revoked = count, "two-step sign-in on: OAuth tokens of this account revoked"),
-        Ok(Err(why)) => tracing::warn!(email = %user.email, %why, "two-step sign-in on: OAuth tokens were not revoked"),
-        Err(_) => tracing::warn!(email = %user.email, "two-step sign-in on: OAuth tokens were not revoked"),
+        Ok(Ok(count)) => tracing::info!(%email, revoked = count, "{why}: OAuth tokens of this account revoked"),
+        Ok(Err(error)) => tracing::warn!(%email, %error, "{why}: OAuth tokens were not revoked"),
+        Err(_) => tracing::warn!(%email, "{why}: OAuth tokens were not revoked"),
     }
 }
 
@@ -365,13 +382,26 @@ pub struct WithCode {
     code: String,
 }
 
+#[derive(Deserialize)]
+pub struct Confirm {
+    token: String,
+    code: String,
+    /// Required of an account with a password: turning it on ends every
+    /// other session, so a stolen cookie alone must not be able to put the
+    /// thief's phone on the account and sign the owner out.
+    password: Option<String>,
+}
+
 pub async fn mfa_start(State(config): State<Arc<Config>>, headers: HeaderMap, Form(form): Form<TokenOnly>) -> Response {
     let user = match checked_user(&config, &headers, &form.token).await {
         Ok(user) => user,
         Err(response) => return response,
     };
+    let Some(session) = site_token(&config, &headers) else {
+        return Redirect::to("/auth/login?next=/account").into_response();
+    };
     let (worker, id) = (config.clone(), user.id.clone());
-    match tokio::task::spawn_blocking(move || mfa::begin_setup(&worker, &id)).await {
+    match tokio::task::spawn_blocking(move || mfa::begin_setup(&worker, &id, &session)).await {
         Ok(Ok(_)) => Redirect::to("/account#two-step").into_response(),
         Ok(Err(message)) => redirect_flash("/account", false, message),
         Err(_) => redirect_flash("/account", false, "Setup did not start."),
@@ -388,20 +418,29 @@ pub async fn mfa_cancel(State(config): State<Arc<Config>>, headers: HeaderMap, F
     redirect_flash("/account", true, "Setup is cancelled. Two-step sign-in is off.")
 }
 
-pub async fn mfa_confirm(State(config): State<Arc<Config>>, headers: HeaderMap, Form(form): Form<WithCode>) -> Response {
+pub async fn mfa_confirm(State(config): State<Arc<Config>>, headers: HeaderMap, Form(form): Form<Confirm>) -> Response {
     let user = match checked_user(&config, &headers, &form.token).await {
         Ok(user) => user,
         Err(response) => return response,
     };
     // The session to keep is the one that sent this form.
-    let Some(session) = users::token_from_cookies(&config, headers.get(header::COOKIE).and_then(|v| v.to_str().ok())) else {
+    let Some(session) = site_token(&config, &headers) else {
         return Redirect::to("/auth/login?next=/account").into_response();
     };
     let (worker, who) = (config.clone(), user.clone());
-    let outcome = tokio::task::spawn_blocking(move || mfa::confirm_setup(&worker, &who, &form.code, &session)).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        if users::has_password(&worker, &who.id)
+            && !users::password_matches(&worker, &who.id, form.password.as_deref().unwrap_or_default())
+        {
+            tracing::warn!(email = %who.email, "two-step setup refused: the password is not correct");
+            return Err("The password is not correct.".to_string());
+        }
+        mfa::confirm_setup(&worker, &who, &form.code, &session)
+    })
+    .await;
     match outcome {
         Ok(Ok(codes)) => {
-            revoke_clients(&config, &user).await;
+            revoke_clients(&config, &user.id, &user.email, "two-step sign-in on").await;
             account_shell(&config, &user, "Two-step sign-in is on", html! {
                 div."title-row" { div { h1 { "Two-step sign-in is on" } p."muted" { (user.email) } } }
                 div."flash ok" role="status" {
@@ -530,7 +569,7 @@ pub async fn forced_setup_submit(
     .await;
     match outcome {
         Ok((Ok(done), _)) => {
-            revoke_clients(&config, &done.user).await;
+            revoke_clients(&config, &done.user.id, &done.user.email, "two-step sign-in on").await;
             let markup = ui::form_page_with_script(
                 "Two-step sign-in is on",
                 html! {

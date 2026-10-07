@@ -582,9 +582,10 @@ fn run_user_command(
             report(users::set_active(&config, &email, true), "active again")
         }
         UserCommand::ResetMfa { email } => {
-            let was_on = toolsite::accounts::mfa::reset(&config, &email).map_err(anyhow::Error::msg)?;
+            let (user_id, was_on) = toolsite::accounts::mfa::reset(&config, &email).map_err(anyhow::Error::msg)?;
+            toolsite::platform::oauth_store::revoke_for_user(&config, &user_id).map_err(anyhow::Error::msg)?;
             println!(
-                "{}; all sessions of {email} ended",
+                "{}; all sessions and MCP client tokens of {email} ended",
                 if was_on { "two-step sign-in removed" } else { "two-step sign-in was off" }
             );
             Ok(())
