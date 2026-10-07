@@ -47,6 +47,36 @@ pub fn valid_socket_path(path: &str) -> bool {
         })
 }
 
+/// Subprotocols one socket may agree to.
+pub const MAX_SUBPROTOCOLS: usize = 8;
+
+/// A socket's declared subprotocols, trimmed, or why they are refused.
+/// Each is a token as RFC 6455 allows one, kept to letters, digits and
+/// `.`, `_`, `-`, `+`, at most 64 characters, so it is a header value as
+/// it stands.
+pub fn check_subprotocols(declared: &[String]) -> Result<Vec<String>, String> {
+    if declared.len() > MAX_SUBPROTOCOLS {
+        return Err(format!("at most {MAX_SUBPROTOCOLS} subprotocols, got {}", declared.len()));
+    }
+    let mut checked: Vec<String> = Vec::new();
+    for name in declared {
+        let name = name.trim();
+        let valid = !name.is_empty()
+            && name.len() <= 64
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'));
+        if !valid {
+            return Err(format!(
+                "a subprotocol is 1 to 64 letters, digits, '.', '_', '-' and '+', got {name:?}"
+            ));
+        }
+        if checked.iter().any(|seen| seen == name) {
+            return Err(format!("subprotocol {name:?} declared twice"));
+        }
+        checked.push(name.to_string());
+    }
+    Ok(checked)
+}
+
 /// Whether a request asks to become a WebSocket under an app's path.
 pub fn is_upgrade<B>(request: &axum::http::Request<B>) -> bool {
     let wants_websocket = request
@@ -108,10 +138,12 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
     if crate::content::store::is_hidden(&config, &app).await || !crate::content::store::app_exists(&config, &app).await {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    if !crate::content::store::read_meta(&config, &app).await.sockets.contains(&within) {
+    let meta = crate::content::store::read_meta(&config, &app).await;
+    if !meta.sockets.contains(&within) {
         tracing::warn!(app = %app, path = %within, "404: websocket upgrade at a path the app does not declare as a socket");
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
+    let subprotocols = meta.socket_protocols.get(&within).cloned().unwrap_or_default();
 
     // A browser always says which page opened the socket. A page on another
     // site must not open one with this visitor's cookies (cross-site
@@ -144,7 +176,10 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
 
     let (mut parts, _body) = request.into_parts();
     let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-        Ok(upgrade) => upgrade,
+        // The first declared subprotocol the client offers is echoed back.
+        // None offered, or none in common, upgrades with none, and a browser
+        // that asked for one then gives up on the socket itself.
+        Ok(upgrade) => upgrade.protocols(subprotocols),
         Err(rejection) => {
             tracing::warn!(app = %app, headers = ?parts.headers.keys().collect::<Vec<_>>(), "websocket refused: not a valid upgrade");
             return rejection.into_response();

@@ -1,0 +1,25 @@
+slug = "mqtt-broker"
+spa = false
+icon = "📡"
+# Only the people an admin grants may open the page or its socket. Devices
+# on the TCP port pass no gate; they present a device token instead.
+gate = "restricted"
+
+# MQTT over WebSocket, for browsers and MQTT.js. Clients ask for the
+# subprotocol "mqtt", and a browser refuses a socket that does not agree.
+[[socket]]
+path = "/mqtt"
+subprotocols = ["mqtt"]
+
+# Plain MQTT for devices. Live only once the site's owner maps the port to
+# this app: TOOLSITE_PORTS=1883=mqtt-broker.
+[[socket]]
+protocol = "tcp"
+port = 1883
+
+# One long-lived instance holds the broker: sessions, subscriptions,
+# retained messages and queued QoS 1 and 2 messages live in its memory.
+[resident]
+enabled = true
+memory_mb = 128
+tick_ms = 1000

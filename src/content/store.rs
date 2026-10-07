@@ -102,6 +102,11 @@ pub struct PageMeta {
     /// toolsite.toml. An upgrade anywhere else is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sockets: Vec<String>,
+    /// The WebSocket subprotocols a socket path agrees to, in the app's
+    /// order of preference, from `subprotocols` on its `[[socket]]`. A path
+    /// absent here agrees to none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub socket_protocols: std::collections::BTreeMap<String, Vec<String>>,
     /// TCP and UDP ports the app takes, from `[[socket]] protocol = "tcp"`.
     /// A declaration alone opens nothing: the site's owner maps the port to
     /// the app with `TOOLSITE_PORTS`.
@@ -250,6 +255,7 @@ impl Default for PageMeta {
             generated: Vec::new(),
             access_salt: None,
             sockets: Vec::new(),
+            socket_protocols: Default::default(),
             ports: Vec::new(),
             resident: None,
         }

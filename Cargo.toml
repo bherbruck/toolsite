@@ -56,4 +56,7 @@ tar = "0.4.46"
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
+# A real MQTT client for the mqtt-broker example; its codec frames MQTT over
+# the WebSocket tests open themselves. No TLS: the tests stay on 127.0.0.1.
+rumqttc = { version = "0.25.1", default-features = false }
 wat = "1.255.0"

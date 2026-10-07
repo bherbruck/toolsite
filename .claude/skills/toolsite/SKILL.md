@@ -73,7 +73,8 @@ back into the conversation either; `curl` it to a file and edit that.
   conventions from a neighbouring app.
 - `GET <server>/examples` lists working apps to start from or copy a part
   of: `kitchen-sink` (every capability), `orders`, `static-report`,
-  `blob-gallery`, `inventory-policies`, `live-board` (live connections).
+  `blob-gallery`, `inventory-policies`, `live-board` (live connections),
+  `mqtt-broker` (resident mode, a TCP port, device tokens).
   `toolsite init <name> --example
   <example>` unpacks one with its slug and base path set.
 
@@ -504,6 +505,8 @@ from ordinary API routes and jobs, so a write broadcasts a change.
 - Nothing is replayed. The page reconnects with backoff and refetches on
   every open. The guide has a React hook.
 - The gate for the socket's path applies, and is checked again every 30 s.
+- A client that asks for a subprotocol (MQTT.js: `mqtt`) needs it declared:
+  `subprotocols = ["mqtt"]` under the `[[socket]]`.
 - `user:<id>` topics: a connection joins only its own; publish to anyone's.
 - Prove it: open two browsers, change data in one, see the other update.
 
@@ -535,7 +538,8 @@ Memory is lost on a crash, redeploy or server restart: save what matters to
 the database. A crash closes all the app's connections; clients reconnect.
 Requests and jobs still run fresh and share only the database and files.
 `fetch` on the app reports the instance under `metadata.resident` to whoever
-manages the app. A site runs a limited number of resident instances.
+manages the app. A site runs a limited number of resident instances. The
+`mqtt-broker` example is a whole broker run this way.
 
 ## Keep the project, and start from it
 

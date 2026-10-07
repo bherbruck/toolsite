@@ -1,0 +1,26 @@
+rumqttd
+Copyright the rumqtt authors (https://github.com/bytebeamio/rumqtt)
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+This directory is a modified copy of the rumqttd crate from the rumqtt
+repository at the tag rumqttd-0.20.0 (commit
+c03ba8bbb785dc6cd7809ce14fc2845d14b6bb74).
+
+Changed by the toolsite project:
+
+- Removed the network layer and everything that needs threads, sockets or
+  a tokio runtime: src/server/, src/main.rs, src/link/remote.rs,
+  src/link/network.rs, src/link/bridge.rs, src/link/console.rs,
+  src/link/timer.rs, and src/replicator/ (which upstream does not build).
+  The crate's examples/, rumqttd.toml and architecture.md are not copied.
+- Removed the dependencies only those parts used, and the features that
+  selected them (use-rustls, use-native-tls, websocket,
+  verify-client-cert).
+- Replaced the router's thread and blocking loop with Router::step, and
+  added non-blocking ways to open a link and to collect its notifications.
+- Allowed two lints crate-wide in src/lib.rs, for upstream items the
+  removed parts used.
+- Added src/step.rs: the network side of the broker as a step function,
+  driven by whoever owns the sockets.
+
+Each change and its reason is listed in ../FORK.md.

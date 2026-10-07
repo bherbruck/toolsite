@@ -25,7 +25,8 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
 const BASE: &str = "https://site.test";
-const EXAMPLES: [&str; 6] = ["kitchen-sink", "orders", "static-report", "blob-gallery", "inventory-policies", "live-board"];
+const EXAMPLES: [&str; 7] =
+    ["kitchen-sink", "orders", "static-report", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker"];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -155,13 +156,20 @@ fn migrations_archive(dir: &Path) -> Vec<u8> {
 /// Schema, then manifest, then handler, then the page: the order `toolsite
 /// deploy` uses, so nothing is live before what it needs.
 async fn publish(config: &Arc<Config>, name: &str) {
+    let manifest = std::fs::read_to_string(root().join("examples").join(name).join("toolsite.toml")).unwrap();
+    publish_with(config, name, &manifest).await;
+}
+
+/// `publish` with the manifest given, for a test that must change one
+/// value in it, such as a port.
+async fn publish_with(config: &Arc<Config>, name: &str, manifest: &str) {
     let source = root().join("examples").join(name);
     let fixtures = root().join("tests/fixtures/examples");
     let ticket = ticket(config, name);
     if source.join("migrations").is_dir() {
         upload(config, &ticket, "migrations", migrations_archive(&source.join("migrations"))).await;
     }
-    upload(config, &ticket, "manifest", std::fs::read(source.join("toolsite.toml")).unwrap()).await;
+    upload(config, &ticket, "manifest", manifest.as_bytes().to_vec()).await;
     if let Ok(wasm) = std::fs::read(fixtures.join(format!("{name}.wasm"))) {
         upload(config, &ticket, "handler", wasm).await;
     }
@@ -295,7 +303,7 @@ async fn every_example_publishes_as_it_ships() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Q3 shipping report"));
     // The rest are not.
-    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies", "live-board"] {
+    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker"] {
         let (status, _) = send_text(&config, get(&format!("/p/{name}/"))).await;
         assert_ne!(status, StatusCode::OK, "{name} opened with no account");
     }
@@ -917,4 +925,479 @@ async fn live_board_refuses_the_socket_to_a_stranger_and_to_no_account() {
     // A path the manifest does not declare takes no socket at all.
     let status = board_socket(board.addr, Some(alice_app), "/api/board").await.expect_err("an undeclared path upgraded");
     assert_eq!(status, 404);
+}
+
+// --- mqtt-broker ---------------------------------------------------------------------
+
+use bytes::BytesMut;
+use rumqttc::{AsyncClient, ConnectReturnCode, ConnectionError, Event as MqttEvent, Incoming, LastWill, MqttOptions, Packet, QoS};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+struct Mqtt {
+    config: Arc<Config>,
+    addr: std::net::SocketAddr,
+    /// The TCP port the site's owner mapped to the broker.
+    port: u16,
+    /// A device token of the broker, labelled "sensor-1".
+    token: String,
+    _dir: TempDir,
+}
+
+/// The broker published on a site whose owner gave it a free TCP port, as
+/// `TOOLSITE_PORTS=<port>=mqtt-broker` would, with the HTTP side on a real
+/// port for the WebSocket. The manifest declares 1883; the test declares
+/// the port it was given instead, since 1883 may be taken on this machine.
+async fn mqtt_broker() -> Mqtt {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        data_dir: dir.path().to_path_buf(),
+        base_url: Some(BASE.to_string()),
+        valid_tokens: vec![TOKEN.to_string()],
+        ports: toolsite::platform::ports::PortMap {
+            bind: "127.0.0.1".parse().unwrap(),
+            mappings: toolsite::platform::ports::parse(&format!("{port}=mqtt-broker")).unwrap(),
+        },
+        ..Config::local(dir.path().to_path_buf(), "unused")
+    });
+    let manifest = std::fs::read_to_string(root().join("examples/mqtt-broker/toolsite.toml")).unwrap();
+    assert!(manifest.contains("port = 1883"), "the example no longer declares 1883");
+    publish_with(&config, "mqtt-broker", &manifest.replace("port = 1883", &format!("port = {port}"))).await;
+    let addr = listen(&config).await;
+    toolsite::platform::ports::listen(config.clone(), Runtime::new().unwrap()).await.unwrap();
+    let (_, token) = toolsite::platform::devices::create(&config, "mqtt-broker", "sensor-1").unwrap();
+    // The first connection starts the resident instance, which compiles
+    // the handler. Done here, unhurried, so the tests' own timings measure
+    // the broker and not a busy machine compiling seven handlers at once.
+    let warm = device_within(port, "warm-up", Some(&token), true, Duration::from_secs(120)).await;
+    drop(warm.expect("the broker did not start"));
+    Mqtt { config, addr, port, token, _dir: dir }
+}
+
+/// A real MQTT client on the TCP port, past its CONNACK.
+struct Client {
+    client: AsyncClient,
+    events: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Client {
+    /// Drops the network connection without DISCONNECT, as a device that
+    /// loses power does.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn device(port: u16, id: &str, password: Option<&str>, clean: bool) -> Result<Client, Box<ConnectionError>> {
+    device_within(port, id, password, clean, Duration::from_secs(10)).await
+}
+
+async fn device_within(
+    port: u16,
+    id: &str,
+    password: Option<&str>,
+    clean: bool,
+    within: Duration,
+) -> Result<Client, Box<ConnectionError>> {
+    let mut options = MqttOptions::new(id, "127.0.0.1", port);
+    options.set_keep_alive(Duration::from_secs(30)).set_clean_session(clean);
+    if let Some(password) = password {
+        options.set_credentials("device", password);
+    }
+    let (client, mut eventloop) = AsyncClient::new(options, 64);
+    let mut network = rumqttc::NetworkOptions::new();
+    network.set_connection_timeout(within.as_secs());
+    eventloop.set_network_options(network);
+    loop {
+        match tokio::time::timeout(within, eventloop.poll()).await.expect("no CONNACK in time") {
+            Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => break,
+            Ok(_) => continue,
+            Err(e) => return Err(Box::new(e)),
+        }
+    }
+    let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Ok(event) = eventloop.poll().await {
+            if let MqttEvent::Incoming(incoming) = event
+                && tx.send(incoming).is_err()
+            {
+                break;
+            }
+        }
+    });
+    Ok(Client { client, events, task })
+}
+
+impl Client {
+    /// The next packet the broker sent that `pick` takes, within 5 seconds.
+    async fn next<T>(&mut self, mut pick: impl FnMut(Incoming) -> Option<T>) -> Option<T> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let incoming = tokio::time::timeout_at(deadline, self.events.recv()).await.ok()??;
+            if let Some(found) = pick(incoming) {
+                return Some(found);
+            }
+        }
+    }
+
+    async fn subscribe(&mut self, filter: &str, qos: QoS) {
+        self.client.subscribe(filter, qos).await.unwrap();
+        self.next(|i| matches!(i, Incoming::SubAck(_)).then_some(())).await.expect("no SUBACK");
+    }
+
+    /// Publishes and waits for the broker's acknowledgement, if the QoS has one.
+    async fn publish(&mut self, topic: &str, qos: QoS, retain: bool, payload: &str) {
+        self.client.publish(topic, qos, retain, payload.as_bytes().to_vec()).await.unwrap();
+        match qos {
+            QoS::AtMostOnce => {}
+            QoS::AtLeastOnce => self.next(|i| matches!(i, Incoming::PubAck(_)).then_some(())).await.expect("no PUBACK"),
+            QoS::ExactlyOnce => self.next(|i| matches!(i, Incoming::PubComp(_)).then_some(())).await.expect("no PUBCOMP"),
+        }
+    }
+
+    async fn message(&mut self) -> Option<rumqttc::Publish> {
+        self.next(|i| match i {
+            Incoming::Publish(p) => Some(p),
+            _ => None,
+        })
+        .await
+    }
+
+    /// No message arrives for a short while.
+    async fn quiet(&mut self) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+        loop {
+            match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                Err(_) | Ok(None) => return true,
+                Ok(Some(Incoming::Publish(_))) => return false,
+                Ok(Some(_)) => continue,
+            }
+        }
+    }
+}
+
+fn refusal(result: Result<Client, Box<ConnectionError>>) -> ConnectReturnCode {
+    match result.err().map(|e| *e) {
+        Some(ConnectionError::ConnectionRefused(code)) => code,
+        Some(other) => panic!("refused without a CONNACK code: {other}"),
+        None => panic!("connected"),
+    }
+}
+
+/// Reads one MQTT packet from a byte stream.
+async fn read_packet(stream: &mut tokio::net::TcpStream, buffer: &mut BytesMut) -> Option<Packet> {
+    loop {
+        if let Ok(packet) = Packet::read(buffer, 1 << 20) {
+            return Some(packet);
+        }
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await.ok()?.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// A device driven byte by byte, for what a client library will not do:
+/// a short keep alive it then ignores, or a will it leaves behind.
+async fn raw_device(port: u16, id: &str, token: &str, keep_alive: u16, will: Option<LastWill>) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut connect = rumqttc::Connect::new(id);
+    connect.keep_alive = keep_alive;
+    connect.last_will = will;
+    connect.set_login("device", token);
+    let mut out = BytesMut::new();
+    connect.write(&mut out).unwrap();
+    stream.write_all(&out).await.unwrap();
+    let mut buffer = BytesMut::new();
+    match read_packet(&mut stream, &mut buffer).await {
+        Some(Packet::ConnAck(ack)) => assert_eq!(ack.code, ConnectReturnCode::Success),
+        other => panic!("no CONNACK: {other:?}"),
+    }
+    stream
+}
+
+/// Whether the broker ends the connection within `within`.
+async fn closed_within(stream: &mut tokio::net::TcpStream, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut chunk = [0u8; 1024];
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Err(_) => return false,
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn mqtt_broker_lets_a_device_in_by_its_token_and_refuses_any_other_with_the_right_code() {
+    let broker = mqtt_broker().await;
+    assert!(device(broker.port, "good", Some(&broker.token), true).await.is_ok());
+
+    // A token that is not one, none at all, and a live token of another
+    // app: each is turned away with a CONNACK saying why.
+    assert_eq!(refusal(device(broker.port, "bad", Some("tsv_not-a-token"), true).await), ConnectReturnCode::BadUserNamePassword);
+    assert_eq!(refusal(device(broker.port, "none", None, true).await), ConnectReturnCode::NotAuthorized);
+    let (_, theirs) = toolsite::platform::devices::create(&broker.config, "live-board", "theirs").unwrap();
+    assert_eq!(refusal(device(broker.port, "theirs", Some(&theirs), true).await), ConnectReturnCode::BadUserNamePassword);
+
+    // A revoked token stops working at once.
+    let (minted, revoked) = toolsite::platform::devices::create(&broker.config, "mqtt-broker", "old").unwrap();
+    toolsite::platform::devices::revoke(&broker.config, "mqtt-broker", &minted.id).unwrap();
+    assert_eq!(refusal(device(broker.port, "old", Some(&revoked), true).await), ConnectReturnCode::BadUserNamePassword);
+}
+
+#[tokio::test]
+async fn mqtt_broker_delivers_between_two_devices_at_qos_0_1_and_2() {
+    let broker = mqtt_broker().await;
+    let mut sub = device(broker.port, "sub", Some(&broker.token), true).await.unwrap();
+    let mut publisher = device(broker.port, "pub", Some(&broker.token), true).await.unwrap();
+    sub.subscribe("plant/+/temp", QoS::ExactlyOnce).await;
+
+    for (n, qos) in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce].into_iter().enumerate() {
+        publisher.publish(&format!("plant/line{n}/temp"), qos, false, &format!("{n}1.5")).await;
+        let got = sub.message().await.unwrap_or_else(|| panic!("nothing arrived at {qos:?}"));
+        assert_eq!(got.topic, format!("plant/line{n}/temp"));
+        assert_eq!(got.payload.as_ref(), format!("{n}1.5").as_bytes());
+        // rumqttd forwards at the subscription's QoS, not the lower of the
+        // two as MQTT says. Upstream's behavior, kept: see FORK.md.
+        assert_eq!(got.qos, QoS::ExactlyOnce, "{qos:?}");
+    }
+
+    // A topic outside the filter does not arrive.
+    publisher.publish("plant/line0/humidity", QoS::AtLeastOnce, false, "40").await;
+    assert!(sub.quiet().await, "a topic outside the filter arrived");
+}
+
+#[tokio::test]
+async fn mqtt_broker_hands_a_retained_message_to_a_later_subscriber() {
+    let broker = mqtt_broker().await;
+    let mut publisher = device(broker.port, "pub", Some(&broker.token), true).await.unwrap();
+    publisher.publish("config/rate", QoS::AtLeastOnce, true, "5s").await;
+
+    let mut later = device(broker.port, "later", Some(&broker.token), true).await.unwrap();
+    later.subscribe("config/#", QoS::AtLeastOnce).await;
+    let got = later.message().await.expect("the retained message did not arrive");
+    assert_eq!((got.topic.as_str(), got.payload.as_ref(), got.retain), ("config/rate", b"5s".as_slice(), true));
+}
+
+#[tokio::test]
+async fn mqtt_broker_fires_a_will_when_a_device_drops_and_not_when_it_says_goodbye() {
+    let broker = mqtt_broker().await;
+    let mut watcher = device(broker.port, "watcher", Some(&broker.token), true).await.unwrap();
+    watcher.subscribe("status/#", QoS::AtLeastOnce).await;
+
+    let will = LastWill::new("status/pump", "offline", QoS::AtLeastOnce, false);
+    let stream = raw_device(broker.port, "pump", &broker.token, 30, Some(will)).await;
+    drop(stream);
+    let got = watcher.message().await.expect("the will did not fire");
+    assert_eq!((got.topic.as_str(), got.payload.as_ref()), ("status/pump", b"offline".as_slice()));
+
+    // A device that sends DISCONNECT first leaves no will behind.
+    let will = LastWill::new("status/fan", "offline", QoS::AtLeastOnce, false);
+    let mut stream = raw_device(broker.port, "fan", &broker.token, 30, Some(will)).await;
+    let mut out = BytesMut::new();
+    rumqttc::Disconnect.write(&mut out).unwrap();
+    stream.write_all(&out).await.unwrap();
+    assert!(closed_within(&mut stream, Duration::from_secs(3)).await, "DISCONNECT did not end the connection");
+    assert!(watcher.quiet().await, "a will fired after a clean DISCONNECT");
+}
+
+#[tokio::test]
+async fn mqtt_broker_closes_a_silent_device_after_its_keep_alive() {
+    let broker = mqtt_broker().await;
+    let mut watcher = device(broker.port, "watcher", Some(&broker.token), true).await.unwrap();
+    watcher.subscribe("status/#", QoS::AtMostOnce).await;
+
+    // Keep alive 1 second: silent for 1.5 seconds is gone, checked each tick.
+    let will = LastWill::new("status/meter", "lost", QoS::AtMostOnce, false);
+    let mut stream = raw_device(broker.port, "meter", &broker.token, 1, Some(will)).await;
+    let started = Instant::now();
+    assert!(closed_within(&mut stream, Duration::from_secs(5)).await, "a silent device stayed connected");
+    assert!(started.elapsed() >= Duration::from_millis(1400), "closed before its keep alive ran out: {:?}", started.elapsed());
+    let got = watcher.message().await.expect("the will of a timed-out device did not fire");
+    assert_eq!(got.payload.as_ref(), b"lost");
+}
+
+#[tokio::test]
+async fn mqtt_broker_keeps_a_persistent_session_and_its_qos_1_messages_while_the_device_is_away() {
+    let broker = mqtt_broker().await;
+    let mut keeper = device(broker.port, "keeper", Some(&broker.token), false).await.unwrap();
+    keeper.subscribe("orders/#", QoS::AtLeastOnce).await;
+    drop(keeper);
+    // The broker has seen the connection end once a new one with the same
+    // client id would not take it over: give the close event a moment.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut publisher = device(broker.port, "pub", Some(&broker.token), true).await.unwrap();
+    publisher.publish("orders/42", QoS::AtLeastOnce, false, "picked").await;
+    publisher.publish("orders/43", QoS::AtMostOnce, false, "not kept").await;
+
+    let mut back = device(broker.port, "keeper", Some(&broker.token), false).await.unwrap();
+    let got = back.message().await.expect("the queued QoS 1 message did not arrive after reconnecting");
+    assert_eq!((got.topic.as_str(), got.payload.as_ref()), ("orders/42", b"picked".as_slice()));
+    // Still subscribed: the session kept its subscription, not only its queue.
+    publisher.publish("orders/44", QoS::AtLeastOnce, false, "packed").await;
+    let next = back.next(|i| match i {
+        Incoming::Publish(p) if p.topic == "orders/44" => Some(p),
+        _ => None,
+    });
+    assert!(next.await.is_some(), "the session lost its subscription");
+}
+
+/// MQTT over the broker's WebSocket, as MQTT.js in a browser speaks it:
+/// subprotocol "mqtt", binary frames, and the app cookie the hand-off set.
+async fn mqtt_socket(addr: std::net::SocketAddr, cookie: Option<&str>) -> Result<Socket, u16> {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
+    let mut request = format!("ws://{addr}/p/mqtt-broker/mqtt").into_client_request().unwrap();
+    request.headers_mut().insert("sec-websocket-protocol", "mqtt".parse().unwrap());
+    if let Some(cookie) = cookie {
+        request.headers_mut().insert("cookie", cookie.parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((socket, response)) => {
+            assert_eq!(response.headers().get("sec-websocket-protocol").map(|v| v.to_str().unwrap()), Some("mqtt"));
+            Ok(socket)
+        }
+        Err(Error::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("connect failed: {other}"),
+    }
+}
+
+async fn socket_send(socket: &mut Socket, packet: Packet) {
+    use futures_util::SinkExt;
+    let mut out = BytesMut::new();
+    packet.write(&mut out, 1 << 20).unwrap();
+    socket.send(tokio_tungstenite::tungstenite::Message::Binary(out.freeze())).await.unwrap();
+}
+
+async fn socket_packet(socket: &mut Socket, buffer: &mut BytesMut) -> Option<Packet> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        if let Ok(packet) = Packet::read(buffer, 1 << 20) {
+            return Some(packet);
+        }
+        match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.ok()??.ok()? {
+            Message::Binary(bytes) => buffer.extend_from_slice(&bytes),
+            Message::Close(_) => return None,
+            _ => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn mqtt_broker_takes_a_signed_in_browser_on_its_socket_without_a_token_and_bridges_it_to_devices() {
+    let broker = mqtt_broker().await;
+    let alice = person(&broker.config, "alice@example.com");
+    toolsite::accounts::users::grant(&broker.config, "alice@example.com", "mqtt-broker", "viewer").unwrap();
+    let cookie = app_cookie(&broker.config, &alice, "mqtt-broker").await;
+
+    let mut sensor = device(broker.port, "sensor", Some(&broker.token), true).await.unwrap();
+    sensor.subscribe("cmd/#", QoS::AtLeastOnce).await;
+
+    let mut socket = mqtt_socket(broker.addr, Some(&cookie)).await.expect("a signed-in person was refused the socket");
+    let mut buffer = BytesMut::new();
+    // No username and no password: the person is who toolsite says.
+    socket_send(&mut socket, Packet::Connect(rumqttc::Connect::new("web-alice"))).await;
+    match socket_packet(&mut socket, &mut buffer).await {
+        Some(Packet::ConnAck(ack)) => assert_eq!(ack.code, ConnectReturnCode::Success),
+        other => panic!("no CONNACK on the socket: {other:?}"),
+    }
+
+    // Browser to device.
+    socket_send(&mut socket, Packet::Publish(rumqttc::Publish::new("cmd/valve", QoS::AtMostOnce, "open"))).await;
+    let got = sensor.message().await.expect("the browser's publish did not reach the device");
+    assert_eq!((got.topic.as_str(), got.payload.as_ref()), ("cmd/valve", b"open".as_slice()));
+
+    // Device to browser.
+    let mut subscribe = rumqttc::Subscribe::new("readings/#", QoS::AtMostOnce);
+    subscribe.pkid = 1;
+    socket_send(&mut socket, Packet::Subscribe(subscribe)).await;
+    assert!(matches!(socket_packet(&mut socket, &mut buffer).await, Some(Packet::SubAck(_))));
+    sensor.publish("readings/flow", QoS::AtMostOnce, false, "12").await;
+    match socket_packet(&mut socket, &mut buffer).await {
+        Some(Packet::Publish(p)) => assert_eq!((p.topic.as_str(), p.payload.as_ref()), ("readings/flow", b"12".as_slice())),
+        other => panic!("the device's publish did not reach the browser: {other:?}"),
+    }
+
+    // The status page shows both, as the broker saved them on a tick.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let (status, body) = call(&broker.config, &cookie, "GET", "/p/mqtt-broker/api/status", serde_json::Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let clients = body["clients"].as_array().cloned().unwrap_or_default();
+        let labels: Vec<&str> = clients.iter().filter_map(|c| c["label"].as_str()).collect();
+        if body["running"] == true && labels.contains(&"sensor-1") && labels.contains(&"alice@example.com") {
+            let recent = body["recent"].as_array().unwrap();
+            assert!(recent.iter().any(|m| m["topic"] == "cmd/valve" && m["client_id"] == "web-alice"), "{body}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the status never showed both clients: {body}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[tokio::test]
+async fn mqtt_broker_refuses_its_socket_to_a_stranger_and_to_no_account() {
+    let broker = mqtt_broker().await;
+    // Dave has an account and no grant: the gate in front of the socket is
+    // the app's, so he never reaches the broker.
+    let dave = person(&broker.config, "dave@example.com");
+    let site_session = format!("ts_session={}", dave.site);
+    let status = mqtt_socket(broker.addr, Some(&site_session)).await.expect_err("a stranger got the socket");
+    assert!(status == 401 || status == 403, "stranger: {status}");
+    let status = mqtt_socket(broker.addr, None).await.expect_err("no account got the socket");
+    assert!([401, 403, 303].contains(&status), "no account: {status}");
+}
+
+#[tokio::test]
+async fn mqtt_broker_speaks_mqtt_5_to_a_v5_client_on_the_same_port() {
+    use rumqttc::v5::{mqttbytes::v5::Packet as V5Packet, mqttbytes::QoS as V5QoS, AsyncClient as V5Client, Event, MqttOptions as V5Options};
+    let broker = mqtt_broker().await;
+    let mut v4 = device(broker.port, "v4", Some(&broker.token), true).await.unwrap();
+    v4.subscribe("mixed/#", QoS::AtMostOnce).await;
+
+    let mut options = V5Options::new("v5", "127.0.0.1", broker.port);
+    options.set_keep_alive(Duration::from_secs(30)).set_credentials("device", broker.token.clone());
+    let (client, mut eventloop) = V5Client::new(options, 16);
+    let connack = tokio::time::timeout(Duration::from_secs(10), eventloop.poll()).await.unwrap().unwrap();
+    assert!(matches!(connack, Event::Incoming(V5Packet::ConnAck(_))), "{connack:?}");
+    client.publish("mixed/from-v5", V5QoS::AtLeastOnce, false, "hello").await.unwrap();
+    let acked = async {
+        loop {
+            if let Event::Incoming(V5Packet::PubAck(_)) = eventloop.poll().await.unwrap() {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), acked).await.expect("no PUBACK for the v5 publish");
+
+    let got = v4.message().await.expect("the v5 publish did not reach the v4 subscriber");
+    assert_eq!((got.topic.as_str(), got.payload.as_ref()), ("mixed/from-v5", b"hello".as_slice()));
+
+    // A refused v5 CONNECT gets the v5 reason code for the same refusal.
+    let mut options = V5Options::new("v5-bad", "127.0.0.1", broker.port);
+    options.set_credentials("device", "tsv_wrong");
+    let (_client, mut eventloop) = V5Client::new(options, 16);
+    let refused = tokio::time::timeout(Duration::from_secs(10), eventloop.poll()).await.unwrap();
+    assert!(
+        matches!(refused, Err(rumqttc::v5::ConnectionError::ConnectionRefused(rumqttc::v5::mqttbytes::v5::ConnectReturnCode::BadUserNamePassword))),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn mqtt_broker_takes_a_device_off_once_its_token_is_revoked() {
+    let broker = mqtt_broker().await;
+    let (minted, token) = toolsite::platform::devices::create(&broker.config, "mqtt-broker", "pump-7").unwrap();
+    let mut stream = raw_device(broker.port, "pump-7", &token, 60, None).await;
+    let mut kept = raw_device(broker.port, "sensor-1", &broker.token, 60, None).await;
+    toolsite::platform::devices::revoke(&broker.config, "mqtt-broker", &minted.id).unwrap();
+    // Tokens are checked again every 10 seconds.
+    assert!(closed_within(&mut stream, Duration::from_secs(13)).await, "a revoked device stayed connected");
+    assert!(!closed_within(&mut kept, Duration::from_millis(200)).await, "a device with a live token was closed too");
 }

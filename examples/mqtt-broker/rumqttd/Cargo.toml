@@ -1,0 +1,39 @@
+[package]
+name = "rumqttd"
+version = "0.20.0"
+publish = false
+description = "rumqttd is a high performance MQTT broker written in Rust which is light weight and embeddable"
+keywords = ["mqtt", "broker", "iot", "kafka", "nats"]
+categories = ["network-programming"]
+rust-version = "1.70.0"
+edition = "2021"
+repository = "https://github.com/bytebeamio/rumqtt"
+license = "Apache-2.0"
+authors = ["tekjar <raviteja@bytebeam.io>"]
+
+# Fork of rumqttd 0.20.0 (tag rumqttd-0.20.0). See NOTICE and
+# ../FORK.md: the network layer and everything that needs threads, sockets
+# or a tokio runtime are gone, so the crate builds for wasm32-wasip2.
+[dependencies]
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.113"
+bytes = { version = "1", features = ["serde"] }
+flume = { version = "0.11.0", default-features = false, features = ["async"]}
+slab = "0.4.9"
+thiserror = "1.0.57"
+parking_lot = "0.12.1"
+tracing = { version="0.1", features=["log"] }
+rand = "0.8.5"
+uuid = { version = "1.7.0", features = ["v4", "fast-rng"] }
+
+[features]
+default = []
+validate-tenant-prefix = []
+allow-duplicate-clientid = []
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+
+# Built on its own for its tests, and for wasm32-wasip2 by the handler, so it
+# stays out of any host workspace.
+[workspace]

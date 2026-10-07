@@ -180,8 +180,8 @@ agent about to build a handler, a schema or a gate.
 `GET /examples` lists working example apps, and `GET /examples/<name>.tar.gz`
 hands one over (`?slug=` renames it and sets its base path). They live in
 [`examples/`](examples/): `kitchen-sink` uses every capability, one screen
-each; `orders`, `static-report`, `blob-gallery`, `inventory-policies` and
-`live-board` are smaller and focused. The same apps are test fixtures: `tests/examples.rs`
+each; `orders`, `static-report`, `blob-gallery`, `inventory-policies`,
+`live-board` and `mqtt-broker` are smaller and focused. The same apps are test fixtures: `tests/examples.rs`
 publishes each one through the router and checks what its README claims.
 
 ## The CLI
@@ -658,6 +658,12 @@ The rules:
 - Only a declared path takes an upgrade; anywhere else is 404. A plain
   request to the same path is served as always. At most 16 sockets per
   app, declared wholesale like routes and tools. `/mcp` cannot be one.
+- A socket agrees to a WebSocket subprotocol only when it declares it:
+  `subprotocols = ["mqtt"]` on its `[[socket]]`, at most 8, in order of
+  preference. The upgrade answers with the first one declared that the
+  client offers, and with none when nothing matches. A browser that asked
+  for one then gives up on the socket, so a client library that insists on
+  a subprotocol (MQTT.js asks for `mqtt`) needs it declared.
 - The upgrade passes the app's gate for that path, route rules and project
   locks included, so a route rule opens or closes a socket.
 - A browser's upgrade must come from a page on this site. An `Origin` from
@@ -830,6 +836,12 @@ refused if the handler on the server does not, and a handler without it is
 refused for an app that runs resident. The app's Connections tab on
 `/admin` shows the instance: running since, memory used, restarts and the
 last failure. The MCP `fetch` tool reports the same in its metadata.
+
+[`examples/mqtt-broker`](examples/mqtt-broker/) runs resident: a fork of
+the rumqttd MQTT broker whose router and session state live in the
+instance, with devices on a TCP port presenting device tokens as their
+MQTT password and signed-in browsers on a WebSocket with the subprotocol
+`mqtt`. Its FORK.md lists what changed from upstream to run on events.
 
 ## Notes for the next session
 

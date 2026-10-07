@@ -75,6 +75,9 @@ Either way the slug, the base path and the package names are set for
 - `live-board`: a shared board over a declared socket. Changes by request,
   then `publish`; the board as the first message; presence; a nudge to one
   person through `user:<id>`; a front end that reconnects.
+- `mqtt-broker`: an MQTT broker (a fork of rumqttd) running resident. A TCP
+  port and a WebSocket with the subprotocol `mqtt`, device tokens as MQTT
+  passwords, `on_tick` for keep alive, status saved for requests to read.
 
 ## Publishing
 
@@ -399,7 +402,9 @@ as usual.
 The socket passes the app's gate for its path, so a `[[route]]` rule can
 open or close it. A signed-in person's connection closes within 30 seconds
 of losing access. Only declared paths take an upgrade; plain requests to
-the same path are served as usual.
+the same path are served as usual. A client that asks for a WebSocket
+subprotocol (MQTT.js asks for `mqtt`) gets it only when the socket declares
+it: `subprotocols = ["mqtt"]` under its `[[socket]]`.
 
 TCP and UDP work the same way for devices that do not speak HTTP. Declare
 `[[socket]] protocol = "tcp"` (or `"udp"`) with `port = 1883`; the site's

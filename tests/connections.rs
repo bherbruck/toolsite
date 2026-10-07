@@ -543,6 +543,61 @@ async fn the_server_wide_ceiling_holds_across_apps() {
     assert_eq!(connect(&site, "/p/one/ws", None).await.err(), Some(429));
 }
 
+/// Upgrades `path` offering `offered` as Sec-WebSocket-Protocol, and
+/// answers the subprotocol the server chose, if any.
+async fn chosen_subprotocol(site: &Site, path: &str, offered: &str) -> Option<String> {
+    let mut request = format!("ws://{}{}", site.addr, path).into_client_request().unwrap();
+    request.headers_mut().insert("sec-websocket-protocol", offered.parse().unwrap());
+    // tungstenite refuses an answer naming no subprotocol it offered, so it
+    // is driven by hand: the 101 is all this needs.
+    let stream = tokio::net::TcpStream::connect(site.addr).await.unwrap();
+    let (mut stream, response) = match tokio_tungstenite::client_async(request, stream).await {
+        Ok(done) => done,
+        Err(tungstenite::Error::Protocol(tungstenite::error::ProtocolError::SecWebSocketSubProtocolError(_))) => return None,
+        Err(other) => panic!("upgrade failed: {other}"),
+    };
+    let chosen = response.headers().get("sec-websocket-protocol").map(|v| v.to_str().unwrap().to_string());
+    let _ = stream.close(None).await;
+    chosen
+}
+
+#[tokio::test]
+async fn a_socket_agrees_to_the_first_declared_subprotocol_the_client_offers_and_no_other() {
+    let site = site(connections::Limits::default()).await;
+    app_with(&site.config, "subs", HANDLER, &[]);
+    let apply = |text: &str| {
+        let (config, text) = (site.config.clone(), text.to_string());
+        async move { toolsite::platform::manifest::apply(&config, "subs", &text).await }
+    };
+    apply("[[socket]]\npath = \"/ws\"\nsubprotocols = [\"mqtt\", \"mqttv3.1\"]\n\n[[socket]]\npath = \"/plain\"\n")
+        .await
+        .unwrap();
+    let meta = store::read_meta_blocking(&site.config, "subs");
+    assert_eq!(meta.socket_protocols.get("/ws"), Some(&vec!["mqtt".to_string(), "mqttv3.1".to_string()]));
+
+    // The app's order wins over the client's.
+    assert_eq!(chosen_subprotocol(&site, "/p/subs/ws", "mqttv3.1, mqtt").await.as_deref(), Some("mqtt"));
+    assert_eq!(chosen_subprotocol(&site, "/p/subs/ws", "soap, mqttv3.1").await.as_deref(), Some("mqttv3.1"));
+    // Nothing in common, or a socket that declares none: no subprotocol is
+    // claimed, so a client never believes the app speaks one it does not.
+    assert_eq!(chosen_subprotocol(&site, "/p/subs/ws", "soap").await, None);
+    assert_eq!(chosen_subprotocol(&site, "/p/subs/plain", "mqtt").await, None);
+
+    for bad in [
+        "[[socket]]\npath = \"/ws\"\nsubprotocols = [\"\"]\n",
+        "[[socket]]\npath = \"/ws\"\nsubprotocols = [\"mq tt\"]\n",
+        "[[socket]]\npath = \"/ws\"\nsubprotocols = [\"a,b\"]\n",
+        "[[socket]]\npath = \"/ws\"\nsubprotocols = [\"mqtt\", \"mqtt\"]\n",
+        "[[socket]]\nprotocol = \"tcp\"\nport = 1883\nsubprotocols = [\"mqtt\"]\n",
+    ] {
+        assert!(apply(bad).await.is_err(), "{bad} was taken");
+    }
+    // Withdrawn with the socket.
+    apply("[[socket]]\npath = \"/ws\"\n").await.unwrap();
+    assert!(store::read_meta_blocking(&site.config, "subs").socket_protocols.is_empty());
+    assert_eq!(chosen_subprotocol(&site, "/p/subs/ws", "mqtt").await, None);
+}
+
 // --- TCP and UDP ------------------------------------------------------------
 
 use tokio::{

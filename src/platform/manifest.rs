@@ -160,6 +160,10 @@ pub struct SocketDecl {
     /// For tcp and udp: the port, which the site's owner maps to this app.
     #[serde(default)]
     pub port: Option<u16>,
+    /// For a WebSocket: the subprotocols it agrees to, in order of
+    /// preference. The first one the client offers is chosen.
+    #[serde(default)]
+    pub subprotocols: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,8 +242,19 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
         ));
     }
     let mut sockets: Vec<String> = Vec::new();
+    let mut socket_protocols: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut ports: Vec<PortSocket> = Vec::new();
     for socket in &manifest.sockets {
+        if let Some(offered) = &socket.subprotocols {
+            let Some(path) = socket.path.as_deref().filter(|_| socket.port.is_none()) else {
+                return Err("subprotocols are for a websocket [[socket]] with a path".to_string());
+            };
+            let checked = crate::platform::websocket::check_subprotocols(offered)
+                .map_err(|why| format!("socket {}: {why}", path.trim()))?;
+            if !checked.is_empty() {
+                socket_protocols.insert(path.trim().to_string(), checked);
+            }
+        }
         let protocol = match socket.protocol.as_deref().map(str::trim) {
             None | Some("websocket") => None,
             Some("tcp") => Some(PortProtocol::Tcp),
@@ -338,6 +353,16 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
             format!("{} socket(s): {}", sockets.len(), sockets.join(", "))
         });
         meta.sockets = sockets;
+    }
+    if meta.socket_protocols != socket_protocols {
+        changed.push(if socket_protocols.is_empty() {
+            "subprotocols withdrawn".to_string()
+        } else {
+            let described: Vec<String> =
+                socket_protocols.iter().map(|(path, list)| format!("{path} [{}]", list.join(", "))).collect();
+            format!("subprotocols: {}", described.join("; "))
+        });
+        meta.socket_protocols = socket_protocols;
     }
     if meta.ports != ports {
         changed.push(if ports.is_empty() {
