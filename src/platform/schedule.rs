@@ -9,7 +9,13 @@
 use crate::{config::Config, content::slug::valid_slug, AppState};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 /// How often the scheduler looks for work. Jobs fire at most once per tick,
 /// so this is also the coarsest resolution a schedule really has.
@@ -202,52 +208,61 @@ async fn apps_with_jobs(config: &Config) -> Vec<String> {
     apps
 }
 
-/// Wakes every tick, runs whatever is due, and never runs two of the same job
-/// at once — a slow job is skipped rather than stacked.
-pub fn spawn(state: AppState) {
-    tokio::spawn(async move {
-        let running: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+/// What runs an app's jobs on their schedules. A process starts one, from
+/// `main`, for the data directory it serves: two would each fire every job.
+#[derive(Clone)]
+pub struct Scheduler {
+    state: AppState,
+    /// `app:job` for each job in progress, so a slow one is skipped rather
+    /// than stacked.
+    running: Arc<Mutex<HashSet<String>>>,
+}
 
-        loop {
-            tokio::time::sleep(TICK).await;
-            let at = now();
+impl Scheduler {
+    pub fn new(state: AppState) -> Self {
+        Self {
+            state,
+            running: Arc::default(),
+        }
+    }
 
-            for app in apps_with_jobs(&state.config).await {
-                for (name, job) in read_jobs(&state.config, &app) {
-                    if !is_due(&job, at) {
-                        continue;
-                    }
-                    let key = format!("{app}:{name}");
-                    {
-                        let mut running = running.lock().await;
-                        if !running.insert(key.clone()) {
-                            tracing::warn!(app, job = name, "still running; skipping this turn");
-                            continue;
-                        }
-                    }
+    /// Wakes every tick and starts whatever is due.
+    pub fn spawn(self) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(TICK).await;
+                self.tick(now()).await;
+            }
+        });
+    }
 
-                    let state = state.clone();
-                    let running = running.clone();
-                    tokio::spawn(async move {
-                        let (app_name, job_name) = (
-                            key.split(':').next().unwrap_or_default().to_string(),
-                            key.split(':').nth(1).unwrap_or_default().to_string(),
-                        );
-                        match run_job(&state, &app_name, &job_name).await {
-                            Ok(status) => {
-                                tracing::info!(app = app_name, job = job_name, status, "job ran")
-                            }
-                            Err(error) => {
-                                tracing::warn!(app = app_name, job = job_name, error, "job failed")
-                            }
-                        }
-                        running.lock().await.remove(&key);
-                    });
+    /// Starts every job due at `at`, in Unix seconds, that is not still
+    /// running from an earlier tick. Returns the runs it started, which
+    /// finish on their own; awaiting them is for whoever wants to know when.
+    pub async fn tick(&self, at: u64) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut started = Vec::new();
+        for app in apps_with_jobs(&self.state.config).await {
+            for (name, job) in read_jobs(&self.state.config, &app) {
+                if !is_due(&job, at) {
+                    continue;
                 }
+                let key = format!("{app}:{name}");
+                if !self.running.lock().unwrap().insert(key.clone()) {
+                    tracing::warn!(app, job = name, "still running; skipping this turn");
+                    continue;
+                }
+                let (state, running, app) = (self.state.clone(), self.running.clone(), app.clone());
+                started.push(tokio::spawn(async move {
+                    match run_job(&state, &app, &name).await {
+                        Ok(status) => tracing::info!(app, job = name, status, "job ran"),
+                        Err(error) => tracing::warn!(app, job = name, error, "job failed"),
+                    }
+                    running.lock().unwrap().remove(&key);
+                }));
             }
         }
-    });
+        started
+    }
 }
 
 #[cfg(test)]

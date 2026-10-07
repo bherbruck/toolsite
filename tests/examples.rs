@@ -433,9 +433,21 @@ async fn kitchen_sink_heartbeat_runs_on_the_schedule_and_never_for_a_visitor() {
     let jobs = toolsite::platform::schedule::read_jobs(&config, "kitchen-sink");
     assert!(jobs.contains_key("heartbeat"), "{:?}", jobs.keys());
 
+    // The scheduler is driven at a time of the test's choosing, not the
+    // clock's: a second past a five-minute mark, when the heartbeat is due.
     let state = toolsite::AppState { config: config.clone(), runtime: Runtime::new().unwrap() };
-    let status = toolsite::platform::schedule::run_job(&state, "kitchen-sink", "heartbeat").await.unwrap();
-    assert_eq!(status, "200");
+    let scheduler = toolsite::platform::schedule::Scheduler::new(state);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let at = now / 300 * 300 + 1;
+    let runs = scheduler.tick(at).await;
+    assert_eq!(runs.len(), 1, "the heartbeat was not due a second past its mark");
+    for run in runs {
+        run.await.unwrap();
+    }
+    let jobs = toolsite::platform::schedule::read_jobs(&config, "kitchen-sink");
+    assert_eq!(jobs["heartbeat"].last_status.as_deref(), Some("200"));
+    // Having run, it is not due again until the next mark.
+    assert!(scheduler.tick(at).await.is_empty(), "the heartbeat ran twice for one mark");
     let (_, beats) = call(&config, &s.alice_app, "GET", "/p/kitchen-sink/api/heartbeats", serde_json::Value::Null).await;
     assert_eq!(beats["beats"].as_array().unwrap().len(), 1, "{beats}");
 

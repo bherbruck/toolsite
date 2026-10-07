@@ -405,6 +405,13 @@ async fn main() -> anyhow::Result<()> {
 
     let runtime = Runtime::new()?;
     let app = build_router(config.clone(), runtime.clone());
+    // One scheduler for the process, started here rather than with a
+    // router: anything that builds a second router would fire every job twice.
+    toolsite::platform::schedule::Scheduler::new(toolsite::AppState {
+        config: config.clone(),
+        runtime: runtime.clone(),
+    })
+    .spawn();
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");

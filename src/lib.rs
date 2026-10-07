@@ -270,9 +270,6 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         config: config.clone(),
         runtime,
     };
-    // Nothing fires until something asks the clock, so the scheduler starts
-    // with the router that serves the same apps.
-    crate::platform::schedule::spawn(state.clone());
     let public_router = public_router.with_state(state);
 
     Router::new()
