@@ -1684,14 +1684,21 @@ impl PageHost {
         match outcome {
             Ok((user, invite)) => {
                 let admin = if user.is_admin { " as an admin" } else { "" };
+                // A new account has no authenticator yet; say when the
+                // site will ask them to set one up at first sign-in.
+                let required = if self.config.mfa.policy.requires(&user) {
+                    " (the site requires it, so they set it up at first sign-in)"
+                } else {
+                    ""
+                };
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     match invite {
                         Some(url) => format!(
-                            "created {}{}. Send them this link to choose a password \
+                            "created {}{}, two-step sign-in off{}. Send them this link to choose a password \
                              (good for 48 hours, works once):\n{url}",
-                            user.email, admin
+                            user.email, admin, required
                         ),
-                        None => format!("created {}{} ({})", user.email, admin, user.id),
+                        None => format!("created {}{} ({}), two-step sign-in off{}", user.email, admin, user.id, required),
                     },
                 )]))
             }

@@ -541,7 +541,9 @@ platform never interprets a role. Declare the roles your handler checks
 can pick the right word; it is a hint, and any role can still be granted.
 
 There is no public signup. Accounts are created by the owner, and a person
-sets their own password through a one-time link.
+sets their own password through a one-time link. Site admins (or everyone,
+as the owner sets it) also sign in with a code from an authenticator app;
+that is the platform's, and an app does nothing for it.
 
 ## Row-level access
 

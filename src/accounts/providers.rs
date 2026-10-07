@@ -525,10 +525,10 @@ pub async fn callback(
     let (slug_owned, subject) = (slug.clone(), proven.subject.clone());
     let config_blocking = config.clone();
     let email_blocking = email.clone();
-    let outcome = tokio::task::spawn_blocking(move || -> Result<Result<String, Refused>, String> {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<Result<users::User, Refused>, String> {
         let config = &config_blocking;
         if let Some(user) = users::user_by_identity(config, &slug_owned, &subject) {
-            return Ok(users::start_session(config, &user.id).map_err(|_| Refused::Disabled));
+            return Ok(Ok(user));
         }
         let user = match users::account_at_email(config, &email_blocking)? {
             AtEmail::Active(user) => user,
@@ -537,21 +537,16 @@ pub async fn callback(
             AtEmail::Nobody => return Ok(Err(Refused::NoAccount)),
         };
         users::link_identity(config, &slug_owned, &subject, &user.id)?;
-        Ok(users::start_session(config, &user.id).map_err(|_| Refused::Disabled))
+        Ok(Ok(user))
     })
     .await;
 
     match outcome {
-        Ok(Ok(Ok(token))) => {
+        // A session, unless TOOLSITE_MFA_FOR_PROVIDERS asks for toolsite's
+        // own code as well; the same door a password goes through.
+        Ok(Ok(Ok(user))) => {
             tracing::info!(provider = %slug, %email, "signed in through a provider");
-            (
-                [
-                    (header::SET_COOKIE, users::set_cookie_header(&config, &token)),
-                    (header::CACHE_CONTROL, "no-store".to_string()),
-                ],
-                Redirect::to(&pending.next),
-            )
-                .into_response()
+            crate::accounts::mfa::sign_in(&config, user, crate::accounts::mfa::Primary::Provider, &pending.next).await
         }
         Ok(Ok(Err(Refused::Disabled))) => {
             tracing::warn!(provider = %slug, %email, "sign-in refused: account disabled");

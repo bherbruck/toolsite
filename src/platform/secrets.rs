@@ -6,83 +6,12 @@
 //! asymmetry is the whole point, so it is enforced here rather than left to
 //! each caller to remember.
 
-use crate::{config::Config, content::slug::valid_slug};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit},
-    XChaCha20Poly1305, XNonce,
+use crate::{
+    config::Config,
+    content::slug::valid_slug,
+    seal::{open, seal},
 };
-use rand::Rng;
 use std::{collections::BTreeMap, path::PathBuf};
-
-/// Where the key lives when the environment does not supply one. Under the
-/// dot-directory no slug can name, like the account database.
-fn key_path(config: &Config) -> PathBuf {
-    config.data_dir.join(".site").join("secret.key")
-}
-
-/// The key values are encrypted with.
-///
-/// `TOOLSITE_SECRET_KEY` is the honest option: the key lives somewhere the
-/// data volume is not, so a copy of the volume is not a copy of the secrets.
-/// Without it one is generated beside them, which still protects a backup
-/// that loses only the database file, and is stated plainly rather than
-/// pretended to be more.
-fn key(config: &Config) -> Result<[u8; 32], String> {
-    if let Ok(configured) = std::env::var("TOOLSITE_SECRET_KEY") {
-        let decoded = BASE64
-            .decode(configured.trim())
-            .map_err(|_| "TOOLSITE_SECRET_KEY must be base64".to_string())?;
-        return decoded
-            .try_into()
-            .map_err(|_| "TOOLSITE_SECRET_KEY must decode to 32 bytes".to_string());
-    }
-
-    let path = key_path(config);
-    if let Ok(existing) = std::fs::read(&path) {
-        if let Ok(key) = <[u8; 32]>::try_from(existing.as_slice()) {
-            return Ok(key);
-        }
-    }
-
-    let mut fresh = [0u8; 32];
-    rand::rng().fill_bytes(&mut fresh);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, fresh).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    tracing::info!("generated a key for app settings at .site/secret.key");
-    Ok(fresh)
-}
-
-fn seal(config: &Config, value: &str) -> Result<String, String> {
-    let cipher = XChaCha20Poly1305::new(&key(config)?.into());
-    let mut nonce = [0u8; 24];
-    rand::rng().fill_bytes(&mut nonce);
-    let sealed = cipher
-        .encrypt(XNonce::from_slice(&nonce), value.as_bytes())
-        .map_err(|_| "could not encrypt".to_string())?;
-
-    let mut stored = nonce.to_vec();
-    stored.extend_from_slice(&sealed);
-    Ok(BASE64.encode(stored))
-}
-
-fn open(config: &Config, stored: &str) -> Option<String> {
-    let raw = BASE64.decode(stored).ok()?;
-    if raw.len() < 24 {
-        return None;
-    }
-    let (nonce, sealed) = raw.split_at(24);
-    let cipher = XChaCha20Poly1305::new(&key(config).ok()?.into());
-    let plain = cipher.decrypt(XNonce::from_slice(nonce), sealed).ok()?;
-    String::from_utf8(plain).ok()
-}
 
 /// Beside the app, like the other sidecars, and refused by the public route.
 fn path(config: &Config, app: &str) -> Option<PathBuf> {

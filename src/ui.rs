@@ -523,6 +523,14 @@ dialog .actions { justify-content: flex-end; margin-top: 1rem; }
 }
 .secret code { flex: 1; background: none; padding: 0; overflow-wrap: anywhere; font-size: .85rem; }
 
+/* Two-step sign-in: the QR code stays dark on white in either theme, since
+   that is what a camera reads; recovery codes sit in two columns. */
+.qr { background: #fff; border-radius: var(--radius); padding: .5rem; width: 100%; max-width: 13rem; margin: 0 auto .75rem; }
+.qr svg { display: block; width: 100%; height: auto; }
+.codes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .4rem 1rem; margin: 0 0 .75rem; padding: .6rem .8rem; list-style: none; background: var(--soft); border: 1px solid var(--border); border-radius: var(--radius); }
+.codes li { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; }
+div.column { display: flex; flex-direction: column; gap: var(--gap); }
+
 /* Index header, kept for pages still on `ui::page`. */
 .head {
   display: flex; align-items: flex-start; justify-content: space-between;
@@ -1158,6 +1166,27 @@ pub fn shell(title: &str, sidebar: Markup, body: Markup, script: Option<&str>) -
 
 /// A small form centred in the viewport: sign in, choose a password.
 pub fn form_page(title: &str, body: Markup) -> Markup {
+    form_page_with_script(title, body, None)
+}
+
+/// Copy buttons (`data-copy`) for a page that is not a shell page, such as
+/// recovery codes shown at sign-in.
+pub const COPY_SCRIPT: &str = r#"
+<script>
+document.querySelectorAll('[data-copy]').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const text = document.getElementById(button.dataset.copy)?.innerText || '';
+    try { await navigator.clipboard.writeText(text); } catch {}
+    const was = button.textContent;
+    button.textContent = 'Copied';
+    setTimeout(() => { button.textContent = was; }, 1200);
+  });
+});
+</script>
+"#;
+
+/// `form_page` with a script after the body.
+pub fn form_page_with_script(title: &str, body: Markup, script: Option<&str>) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -1173,7 +1202,12 @@ pub fn form_page(title: &str, body: Markup) -> Markup {
                     ))
                 }
             }
-            body { div."container narrow" { (body) } }
+            body {
+                div."container narrow" { (body) }
+                @if let Some(script) = script {
+                    (PreEscaped(script))
+                }
+            }
         }
     }
 }

@@ -54,6 +54,9 @@ enum UserCommand {
     Disable { email: String },
     /// Let a disabled account back in.
     Enable { email: String },
+    /// Remove someone's two-step sign-in (lost phone and recovery codes),
+    /// and end their sessions. The way back in for the only admin.
+    ResetMfa { email: String },
 }
 
 #[tokio::main]
@@ -266,6 +269,18 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::info!("path mode: apps at /p/<app>/ on the main host; set TOOLSITE_APPS_DOMAIN to give each app its own origin"),
     }
 
+    // Two-step sign-in: required of admins unless the owner says otherwise.
+    let mfa = toolsite::accounts::mfa::Settings::from_env(
+        read(&["TOOLSITE_REQUIRE_MFA"]).as_deref(),
+        read(&["TOOLSITE_MFA_FOR_PROVIDERS"]).as_deref(),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    tracing::info!(
+        required_for = mfa.policy.as_str(),
+        for_providers = mfa.for_providers,
+        "two-step sign-in policy"
+    );
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
 
@@ -406,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
         residents: Arc::new(residents),
         apps,
         handoffs: Mutex::new(HashMap::new()),
+        mfa,
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -493,6 +509,7 @@ fn run_user_command(
         residents: Default::default(),
         apps: None,
         handoffs: Mutex::new(HashMap::new()),
+        mfa: toolsite::accounts::mfa::Settings::off(),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {
@@ -547,9 +564,10 @@ fn run_user_command(
             }
             for account in accounts {
                 println!(
-                    "{:<36} {:<10} {}{}",
+                    "{:<36} {:<10} {:<12} {}{}",
                     account.email,
                     if account.is_active { "active" } else { "disabled" },
+                    if account.mfa { "two-step on" } else { "two-step off" },
                     if account.is_admin { "admin " } else { "" },
                     account.created
                 );
@@ -562,6 +580,14 @@ fn run_user_command(
         ),
         UserCommand::Enable { email } => {
             report(users::set_active(&config, &email, true), "active again")
+        }
+        UserCommand::ResetMfa { email } => {
+            let was_on = toolsite::accounts::mfa::reset(&config, &email).map_err(anyhow::Error::msg)?;
+            println!(
+                "{}; all sessions of {email} ended",
+                if was_on { "two-step sign-in removed" } else { "two-step sign-in was off" }
+            );
+            Ok(())
         }
     }
 }

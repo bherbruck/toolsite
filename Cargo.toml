@@ -47,6 +47,12 @@ chromiumoxide = "0.9.1"
 async-trait = "0.1.92"
 resvg = { version = "0.48", default-features = false, features = ["text"] }
 usvg = { version = "0.48", default-features = false, features = ["text", "writer"] }
+# Two-step sign-in: TOTP is HMAC-SHA1 over a base32 secret; the QR code is
+# drawn as SVG on the server, so no script is needed to show it.
+hmac = "0.13"
+sha1 = "0.11"
+data-encoding = "2"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 
 # build.rs packs examples/ into tarballs the server embeds.
 [build-dependencies]

@@ -281,6 +281,17 @@ pub fn access_token_grant(config: &Config, token: &str) -> Option<(String, Strin
     .flatten()
 }
 
+/// Ends every connection an account's clients hold: its access and refresh
+/// tokens and any code not yet exchanged. What turning on two-step sign-in
+/// does, so a client connected with a password alone has to sign in again
+/// and give a code. Returns how many rows went.
+pub fn revoke_for_user(config: &Config, user_id: &str) -> Result<usize, String> {
+    let conn = open(config)?;
+    let tokens = conn.execute("delete from tokens where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
+    let codes = conn.execute("delete from codes where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
+    Ok(tokens + codes)
+}
+
 /// Expired rows go opportunistically rather than on a timer, as sessions do.
 fn sweep(conn: &Connection) {
     let cutoff = now() as i64;
