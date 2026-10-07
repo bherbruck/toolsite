@@ -78,6 +78,12 @@ Either way the slug, the base path and the package names are set for
 - `mqtt-broker`: an MQTT broker (a fork of rumqttd) running resident. A TCP
   port and a WebSocket with the subprotocol `mqtt`, device tokens as MQTT
   passwords, `on_tick` for keep alive, status saved for requests to read.
+- `tcp-chat`: a line chat over a TCP port, for `nc`. A device token as the
+  first line, framing with a partial line kept in per-connection state, a
+  4 KB line cap, a topic, and a plain HTML page.
+- `syslog`: a UDP receiver. RFC 5424 and RFC 3164 parsed by hand into
+  SQLite, a source allow list in a setting checked at `connect`, a live tail
+  over a WebSocket, and a job that prunes old rows.
 
 ## Publishing
 

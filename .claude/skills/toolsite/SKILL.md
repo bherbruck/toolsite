@@ -74,7 +74,9 @@ back into the conversation either; `curl` it to a file and edit that.
 - `GET <server>/examples` lists working apps to start from or copy a part
   of: `kitchen-sink` (every capability), `orders`, `static-report`,
   `blob-gallery`, `inventory-policies`, `live-board` (live connections),
-  `mqtt-broker` (resident mode, a TCP port, device tokens).
+  `mqtt-broker` (resident mode, a TCP port, device tokens), `tcp-chat`
+  (line framing on a TCP port), `syslog` (a UDP port, a live tail, a prune
+  job).
   `toolsite init <name> --example
   <example>` unpacks one with its slug and base path set.
 

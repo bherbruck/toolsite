@@ -25,8 +25,17 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
 const BASE: &str = "https://site.test";
-const EXAMPLES: [&str; 7] =
-    ["kitchen-sink", "orders", "static-report", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker"];
+const EXAMPLES: [&str; 9] = [
+    "kitchen-sink",
+    "orders",
+    "static-report",
+    "blob-gallery",
+    "inventory-policies",
+    "live-board",
+    "mqtt-broker",
+    "tcp-chat",
+    "syslog",
+];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -303,7 +312,7 @@ async fn every_example_publishes_as_it_ships() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Q3 shipping report"));
     // The rest are not.
-    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker"] {
+    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker", "tcp-chat", "syslog"] {
         let (status, _) = send_text(&config, get(&format!("/p/{name}/"))).await;
         assert_ne!(status, StatusCode::OK, "{name} opened with no account");
     }
@@ -728,8 +737,14 @@ async fn listen(config: &Arc<Config>) -> std::net::SocketAddr {
 /// Connects to `path` inside the board with an app cookie, or answers the
 /// HTTP status the upgrade was refused with.
 async fn board_socket(addr: std::net::SocketAddr, cookie: Option<&str>, path: &str) -> Result<Socket, u16> {
+    app_socket(addr, "live-board", cookie, path).await
+}
+
+/// Connects to `path` inside `app`, or answers the HTTP status the upgrade
+/// was refused with.
+async fn app_socket(addr: std::net::SocketAddr, app: &str, cookie: Option<&str>, path: &str) -> Result<Socket, u16> {
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
-    let mut request = format!("ws://{addr}/p/live-board{path}").into_client_request().unwrap();
+    let mut request = format!("ws://{addr}/p/{app}{path}").into_client_request().unwrap();
     if let Some(cookie) = cookie {
         request.headers_mut().insert("cookie", cookie.parse().unwrap());
     }
@@ -1430,4 +1445,386 @@ async fn mqtt_broker_takes_a_device_off_once_its_token_is_revoked() {
     // Tokens are checked again every 10 seconds.
     assert!(closed_within(&mut stream, Duration::from_secs(13)).await, "a revoked device stayed connected");
     assert!(!closed_within(&mut kept, Duration::from_millis(200)).await, "a device with a live token was closed too");
+}
+
+// --- tcp-chat ------------------------------------------------------------------------
+
+/// A site whose owner gave `app` a free port, as `TOOLSITE_PORTS` would,
+/// with the app published declaring that port in place of `declared`, and
+/// the HTTP side on a real port. `protocol` is "tcp" or "udp".
+async fn on_a_port(app: &str, protocol: &str, declared: u16) -> (TempDir, Arc<Config>, std::net::SocketAddr, u16) {
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        data_dir: dir.path().to_path_buf(),
+        base_url: Some(BASE.to_string()),
+        valid_tokens: vec![TOKEN.to_string()],
+        ports: toolsite::platform::ports::PortMap {
+            bind: "127.0.0.1".parse().unwrap(),
+            mappings: toolsite::platform::ports::parse(&format!("{port}/{protocol}={app}")).unwrap(),
+        },
+        ..Config::local(dir.path().to_path_buf(), "unused")
+    });
+    let manifest = std::fs::read_to_string(root().join("examples").join(app).join("toolsite.toml")).unwrap();
+    let line = format!("port = {declared}");
+    assert!(manifest.contains(&line), "{app} no longer declares {declared}");
+    publish_with(&config, app, &manifest.replace(&line, &format!("port = {port}"))).await;
+    let addr = listen(&config).await;
+    toolsite::platform::ports::listen(config.clone(), Runtime::new().unwrap()).await.unwrap();
+    (dir, config, addr, port)
+}
+
+struct Chat {
+    config: Arc<Config>,
+    port: u16,
+    _dir: TempDir,
+}
+
+/// The chat on a port of its own, its handler already compiled by a first
+/// connection, so the tests' timings measure the chat.
+async fn tcp_chat() -> Chat {
+    let (dir, config, _, port) = on_a_port("tcp-chat", "tcp", 7777).await;
+    drop(Talker::connect_within(port, Duration::from_secs(120)).await);
+    Chat { config, port, _dir: dir }
+}
+
+/// A client on the chat's port, as `nc` is: lines in, lines out.
+struct Talker {
+    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
+
+impl Talker {
+    /// Connected and past the greeting.
+    async fn connect(port: u16) -> Talker {
+        Talker::connect_within(port, Duration::from_secs(5)).await
+    }
+
+    async fn connect_within(port: u16, wait: Duration) -> Talker {
+        let (read, writer) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap().into_split();
+        let mut talker = Talker { reader: tokio::io::BufReader::new(read), writer };
+        assert_eq!(talker.line_within(wait).await.as_deref(), Some("Send: token <device-token>"));
+        talker
+    }
+
+    /// Connected and signed in with a device token of `label`.
+    async fn signed_in(chat: &Chat, label: &str) -> Talker {
+        let (_, token) = toolsite::platform::devices::create(&chat.config, "tcp-chat", label).unwrap();
+        let mut talker = Talker::connect(chat.port).await;
+        talker.write(format!("token {token}\n").as_bytes()).await;
+        assert!(talker.until("Welcome, ").await.contains(label));
+        talker.until(&format!("* {label} joined")).await;
+        talker
+    }
+
+    async fn write(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).await.unwrap();
+    }
+
+    /// The next line, or None at the end of the stream or after 5 seconds.
+    async fn line(&mut self) -> Option<String> {
+        self.line_within(Duration::from_secs(5)).await
+    }
+
+    async fn line_within(&mut self, wait: Duration) -> Option<String> {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        match tokio::time::timeout(wait, self.reader.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => Some(line.trim_end_matches('\n').to_string()),
+            _ => None,
+        }
+    }
+
+    /// The next line that starts with `prefix`, skipping the others.
+    async fn until(&mut self, prefix: &str) -> String {
+        loop {
+            match self.line().await {
+                Some(line) if line.starts_with(prefix) => return line,
+                Some(_) => continue,
+                None => panic!("no line starting with {prefix:?}"),
+            }
+        }
+    }
+
+    /// The server closed the connection, after any lines still on the way.
+    async fn closed(&mut self) -> bool {
+        let mut rest = Vec::new();
+        matches!(tokio::time::timeout(Duration::from_secs(5), self.reader.read_to_end(&mut rest)).await, Ok(Ok(_)))
+    }
+}
+
+#[tokio::test]
+async fn tcp_chat_two_people_see_each_others_lines_and_the_page_lists_them() {
+    let chat = tcp_chat().await;
+    let mut ana = Talker::signed_in(&chat, "ana").await;
+    let mut bo = Talker::signed_in(&chat, "bo").await;
+    assert_eq!(ana.until("* ").await, "* bo joined");
+
+    ana.write(b"hello bo\n").await;
+    assert_eq!(bo.until("<").await, "<ana> hello bo");
+    assert_eq!(ana.until("<").await, "<ana> hello bo", "the sender gets its own line back");
+    bo.write(b"hi ana\r\n").await;
+    assert_eq!(ana.until("<").await, "<bo> hi ana");
+
+    // The page's API lists what was said, oldest first, to a granted person.
+    let reader = person(&chat.config, "reader@example.com");
+    toolsite::accounts::users::grant(&chat.config, "reader@example.com", "tcp-chat", "viewer").unwrap();
+    let cookie = app_cookie(&chat.config, &reader, "tcp-chat").await;
+    let (status, body) = call(&chat.config, &cookie, "GET", "/p/tcp-chat/api/lines", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let said: Vec<String> =
+        body["lines"].as_array().unwrap().iter().map(|l| format!("{} {}", l["nick"], l["text"])).collect();
+    assert_eq!(said, ["\"ana\" \"hello bo\"", "\"bo\" \"hi ana\""]);
+    // And to nobody else: the gate is restricted.
+    let (status, _) = send_text(&chat.config, get("/p/tcp-chat/api/lines")).await;
+    assert_ne!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn tcp_chat_a_line_split_across_writes_arrives_whole_and_two_in_one_write_arrive_apart() {
+    let chat = tcp_chat().await;
+    let mut ana = Talker::signed_in(&chat, "ana").await;
+    let mut bo = Talker::signed_in(&chat, "bo").await;
+
+    // Cut inside the two bytes of the é, too.
+    let rest = "line, caf\u{e9}\n".as_bytes();
+    ana.write(b"half a ").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ana.write(&rest[..10]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ana.write(&rest[10..]).await;
+    assert_eq!(bo.until("<").await, "<ana> half a line, caf\u{e9}");
+
+    ana.write(b"one\ntwo\n").await;
+    assert_eq!(bo.until("<").await, "<ana> one");
+    assert_eq!(bo.until("<").await, "<ana> two");
+}
+
+#[tokio::test]
+async fn tcp_chat_refuses_a_line_over_4_kb_whether_it_ends_or_not() {
+    let chat = tcp_chat().await;
+    let mut ana = Talker::signed_in(&chat, "ana").await;
+    let mut bo = Talker::signed_in(&chat, "bo").await;
+    ana.write(format!("{}\n", "x".repeat(5 * 1024)).as_bytes()).await;
+    assert_eq!(ana.until("error").await, "error: a line is at most 4096 bytes");
+    assert!(ana.closed().await, "a client that sent a 5 KB line stayed connected");
+    assert_eq!(bo.until("* ").await, "* ana left", "the long line reached the room");
+
+    // The same with no end in sight: a buffer may not grow past 4 KB either.
+    let mut cy = Talker::signed_in(&chat, "cy").await;
+    cy.write("y".repeat(3 * 1024).as_bytes()).await;
+    cy.write("y".repeat(2 * 1024).as_bytes()).await;
+    assert_eq!(cy.until("error").await, "error: a line is at most 4096 bytes");
+    assert!(cy.closed().await);
+}
+
+#[tokio::test]
+async fn tcp_chat_closes_a_client_without_a_valid_token() {
+    let chat = tcp_chat().await;
+    let mut bo = Talker::signed_in(&chat, "bo").await;
+    // Another app's token is not this app's.
+    publish(&chat.config, "live-board").await;
+    let (_, foreign) = toolsite::platform::devices::create(&chat.config, "live-board", "eve").unwrap();
+    for first in ["token tsv_not-a-token\n".to_string(), format!("token {foreign}\n"), "hello\n".to_string()] {
+        let mut eve = Talker::connect(chat.port).await;
+        eve.write(first.as_bytes()).await;
+        assert_eq!(eve.until("error").await, "error: the first line is token <device-token>");
+        assert!(eve.closed().await, "{first:?} left the client connected");
+    }
+    bo.write(b"/who\n").await;
+    assert_eq!(bo.until("here: ").await, "here: bo");
+}
+
+#[tokio::test]
+async fn tcp_chat_nick_renames_and_who_lists_everyone_here() {
+    let chat = tcp_chat().await;
+    let mut ana = Talker::signed_in(&chat, "ana").await;
+    let mut bo = Talker::signed_in(&chat, "bo").await;
+    ana.write(b"/nick ana-desk\n").await;
+    assert_eq!(bo.until("* ").await, "* ana is now ana-desk");
+    bo.write(b"/who\n").await;
+    assert_eq!(bo.until("here: ").await, "here: ana-desk, bo");
+    ana.write(b"/nick no spaces!\n").await;
+    assert!(ana.until("error").await.starts_with("error: a nickname is"));
+    ana.write(b"after\n").await;
+    assert_eq!(bo.until("<").await, "<ana-desk> after");
+
+    ana.write(b"/quit\n").await;
+    assert_eq!(ana.until("bye").await, "bye");
+    assert!(ana.closed().await);
+    assert_eq!(bo.until("* ").await, "* ana-desk left");
+    bo.write(b"/who\n").await;
+    assert_eq!(bo.until("here: ").await, "here: bo");
+}
+
+// --- syslog --------------------------------------------------------------------------
+
+struct Syslog {
+    config: Arc<Config>,
+    addr: std::net::SocketAddr,
+    port: u16,
+    /// An app cookie of a person granted the app.
+    cookie: String,
+    _dir: TempDir,
+}
+
+/// The receiver on a UDP port of its own, with one granted person, its
+/// handler already compiled by a first datagram.
+async fn syslog() -> Syslog {
+    let (dir, config, addr, port) = on_a_port("syslog", "udp", 5514).await;
+    let ops = person(&config, "ops@example.com");
+    toolsite::accounts::users::grant(&config, "ops@example.com", "syslog", "viewer").unwrap();
+    let cookie = app_cookie(&config, &ops, "syslog").await;
+    let s = Syslog { config, addr, port, cookie, _dir: dir };
+    datagram(&s, "127.0.0.1", b"<14>warm up").await;
+    stored(&s, "warm up", Duration::from_secs(120)).await;
+    s
+}
+
+/// Sends one datagram from a fresh socket on `from`, so each call is a new
+/// remote.
+async fn datagram(s: &Syslog, from: &str, body: &[u8]) {
+    let socket = tokio::net::UdpSocket::bind((from, 0)).await.unwrap();
+    socket.send_to(body, ("127.0.0.1", s.port)).await.unwrap();
+}
+
+async fn logs(s: &Syslog, query: &str) -> Vec<serde_json::Value> {
+    let (status, body) = call(&s.config, &s.cookie, "GET", &format!("/p/syslog/api/logs?{query}"), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["logs"].as_array().unwrap().clone()
+}
+
+/// The row whose message is `message`, once it is stored.
+async fn stored(s: &Syslog, message: &str, within: Duration) -> serde_json::Value {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(row) = logs(s, "").await.into_iter().find(|r| r["message"] == message) {
+            return row;
+        }
+        assert!(Instant::now() < deadline, "{message:?} was not stored");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn syslog_stores_rfc_5424_and_rfc_3164_with_their_fields_and_filters_them() {
+    let s = syslog().await;
+    let wait = Duration::from_secs(10);
+    datagram(&s, "127.0.0.1", b"<11>1 2026-10-07T09:05:00Z pump-7 modbusd 812 ID47 [ex@1 note=\"a \\] b\"][ex@2 x=\"1\"] \xef\xbb\xbflost contact").await;
+    datagram(&s, "127.0.0.1", b"<134>Oct  7 09:05:00 router-1 dnsmasq[33]: DHCPACK 10.0.0.9\n").await;
+    datagram(&s, "127.0.0.1", b"<13>Oct 17 21:00:00 backup: done").await;
+    datagram(&s, "127.0.0.1", b"<30>1 - - - - - -").await;
+
+    let pump = stored(&s, "lost contact", wait).await;
+    assert_eq!((&pump["host"], &pump["app"], &pump["facility"], &pump["severity"]), (&"pump-7".into(), &"modbusd".into(), &1.into(), &3.into()));
+    assert!(pump["remote"].as_str().unwrap().starts_with("127.0.0.1:"), "{pump}");
+    assert!(pump["received_at"].as_i64().unwrap() > 1_700_000_000);
+
+    let router = stored(&s, "DHCPACK 10.0.0.9", wait).await;
+    assert_eq!((&router["host"], &router["app"], &router["facility"], &router["severity"]), (&"router-1".into(), &"dnsmasq".into(), &16.into(), &6.into()));
+    // A sender that leaves out its host name is named by its address.
+    let backup = stored(&s, "done", wait).await;
+    assert_eq!((&backup["host"], &backup["app"], &backup["severity"]), (&"127.0.0.1".into(), &"backup".into(), &5.into()));
+    let empty = stored(&s, "", wait).await;
+    assert_eq!((&empty["host"], &empty["app"], &empty["facility"], &empty["severity"]), (&"127.0.0.1".into(), &serde_json::Value::Null, &3.into(), &6.into()));
+
+    // error and worse is the pump alone; one host is that host alone.
+    let worst: Vec<_> = logs(&s, "severity=3").await.into_iter().map(|r| r["message"].clone()).collect();
+    assert_eq!(worst, ["lost contact"]);
+    let router_only: Vec<_> = logs(&s, "host=router-1").await.into_iter().map(|r| r["message"].clone()).collect();
+    assert_eq!(router_only, ["DHCPACK 10.0.0.9"]);
+    let (_, hosts) = call(&s.config, &s.cookie, "GET", "/p/syslog/api/hosts", serde_json::Value::Null).await;
+    assert_eq!(hosts["hosts"], serde_json::json!(["127.0.0.1", "pump-7", "router-1"]));
+}
+
+#[tokio::test]
+async fn syslog_drops_a_datagram_from_a_source_outside_allowed_sources() {
+    let s = syslog().await;
+    toolsite::platform::secrets::set(&s.config, "syslog", "ALLOWED_SOURCES", Some(" 10.9.9.9, 127.0.0.2 ")).unwrap();
+    datagram(&s, "127.0.0.1", b"<14>from outside the list").await;
+    datagram(&s, "127.0.0.2", b"<14>from the list").await;
+    stored(&s, "from the list", Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let messages: Vec<_> = logs(&s, "").await.into_iter().map(|r| r["message"].clone()).collect();
+    assert!(!messages.contains(&"from outside the list".into()), "{messages:?}");
+
+    // An empty list lets every source in again.
+    toolsite::platform::secrets::set(&s.config, "syslog", "ALLOWED_SOURCES", Some("")).unwrap();
+    datagram(&s, "127.0.0.1", b"<14>back in").await;
+    stored(&s, "back in", Duration::from_secs(10)).await;
+}
+
+#[tokio::test]
+async fn syslog_tails_a_new_line_live_to_a_signed_in_browser_and_to_nobody_else() {
+    use futures_util::StreamExt;
+    let s = syslog().await;
+    assert!(app_socket(s.addr, "syslog", None, "/tail").await.is_err(), "the tail opened with no account");
+    let mut tail = app_socket(s.addr, "syslog", Some(&s.cookie), "/tail").await.unwrap_or_else(|status| panic!("refused with {status}"));
+    datagram(&s, "127.0.0.1", b"<12>Oct  7 09:05:00 nas-1 smartd[9]: disk 3 failing").await;
+    let frame = tokio::time::timeout(Duration::from_secs(10), tail.next()).await.unwrap().unwrap().unwrap();
+    let row: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+    assert_eq!((&row["host"], &row["app"], &row["severity"], &row["message"]), (&"nas-1".into(), &"smartd".into(), &4.into(), &"disk 3 failing".into()));
+    assert!(row["id"].is_i64(), "{row}");
+}
+
+#[tokio::test]
+async fn syslog_stores_garbage_whole_with_severity_unknown_and_keeps_going() {
+    let s = syslog().await;
+    let wait = Duration::from_secs(10);
+    datagram(&s, "127.0.0.1", b"no priority at all").await;
+    datagram(&s, "127.0.0.1", b"<999>out of range").await;
+    datagram(&s, "127.0.0.1", b"<12").await;
+    datagram(&s, "127.0.0.1", b"\xff\xfe<\x00binary").await;
+    datagram(&s, "127.0.0.1", b"<14>1 2026-10-07T09:05:00Z h a - - [unterminated").await;
+    for message in ["no priority at all", "<999>out of range", "<12"] {
+        let row = stored(&s, message, wait).await;
+        assert_eq!((&row["severity"], &row["facility"], &row["app"]), (&serde_json::Value::Null, &serde_json::Value::Null, &serde_json::Value::Null), "{row}");
+        assert_eq!(row["host"], "127.0.0.1");
+    }
+    stored(&s, "\u{fffd}\u{fffd}<\u{0}binary", wait).await;
+    // A 5424 header with broken structured data keeps its severity and the
+    // rest as the message.
+    let broken = stored(&s, "1 2026-10-07T09:05:00Z h a - - [unterminated", wait).await;
+    assert_eq!(broken["severity"], 6);
+    // Garbage hurt nothing: the next good line is stored as usual.
+    datagram(&s, "127.0.0.1", b"<14>still here").await;
+    stored(&s, "still here", wait).await;
+}
+
+#[tokio::test]
+async fn syslog_prune_deletes_rows_older_than_30_days_on_its_schedule_only() {
+    let s = syslog().await;
+    let (failed, out) = run_sql(
+        &s.config,
+        "syslog",
+        "insert into logs (received_at, remote, host, message) values \
+         (cast(strftime('%s', 'now') as integer) - 31 * 86400, '10.0.0.1:514', 'old', 'a month ago'), \
+         (cast(strftime('%s', 'now') as integer) - 29 * 86400, '10.0.0.1:514', 'old', 'four weeks ago')",
+        None,
+    )
+    .await;
+    assert!(!failed, "{out}");
+
+    // A visitor cannot run it, even forging the header.
+    let request = Request::builder()
+        .uri("/p/syslog/api/prune")
+        .header("cookie", &s.cookie)
+        .header("x-toolsite-scheduled", "prune")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send_text(&s.config, request).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(logs(&s, "host=old").await.len(), 2);
+
+    // A second past 03:15, when the job is due.
+    let state = toolsite::AppState { config: s.config.clone(), runtime: Runtime::new().unwrap() };
+    let scheduler = toolsite::platform::schedule::Scheduler::new(state);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let runs = scheduler.tick(now / 86_400 * 86_400 + 3 * 3600 + 15 * 60 + 1).await;
+    assert_eq!(runs.len(), 1, "prune was not due a second past 03:15");
+    for run in runs {
+        run.await.unwrap();
+    }
+    assert_eq!(toolsite::platform::schedule::read_jobs(&s.config, "syslog")["prune"].last_status.as_deref(), Some("200"));
+    let left: Vec<_> = logs(&s, "host=old").await.into_iter().map(|r| r["message"].clone()).collect();
+    assert_eq!(left, ["four weeks ago"]);
 }

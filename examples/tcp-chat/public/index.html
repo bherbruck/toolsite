@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TCP chat</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 48rem; margin: 2rem auto; padding: 0 1rem; }
+  pre { white-space: pre-wrap; line-height: 1.5; }
+  .at { opacity: 0.6; }
+</style>
+</head>
+<body>
+<h1>TCP chat</h1>
+<p>The last 50 lines. To join, connect with <code>nc HOST 7777</code> and send <code>token &lt;device-token&gt;</code>.</p>
+<pre id="lines">Loading...</pre>
+<script>
+  // Relative, so it resolves under /p/<slug>/ on any site.
+  async function load() {
+    const res = await fetch('api/lines')
+    const { lines } = await res.json()
+    const out = document.getElementById('lines')
+    out.textContent = ''
+    for (const l of lines) {
+      const at = document.createElement('span')
+      at.className = 'at'
+      at.textContent = new Date(l.at * 1000).toLocaleTimeString() + ' '
+      out.append(at, `<${l.nick}> ${l.text}\n`)
+    }
+    if (!lines.length) out.textContent = 'Nothing said yet.'
+  }
+  load()
+  setInterval(load, 5000)
+</script>
+</body>
+</html>

@@ -181,7 +181,7 @@ agent about to build a handler, a schema or a gate.
 hands one over (`?slug=` renames it and sets its base path). They live in
 [`examples/`](examples/): `kitchen-sink` uses every capability, one screen
 each; `orders`, `static-report`, `blob-gallery`, `inventory-policies`,
-`live-board` and `mqtt-broker` are smaller and focused. The same apps are test fixtures: `tests/examples.rs`
+`live-board`, `mqtt-broker`, `tcp-chat` and `syslog` are smaller and focused. The same apps are test fixtures: `tests/examples.rs`
 publishes each one through the router and checks what its README claims.
 
 ## The CLI
@@ -775,6 +775,13 @@ container port), which hands out a `host:port` of Railway's choosing for the
 devices to use. Railway does not route UDP from outside, so a UDP port is
 reachable only from inside its private network, or on a host that routes
 UDP.
+
+Two small examples use the ports. [`examples/tcp-chat`](examples/tcp-chat/)
+is a line chat for `nc`: a device token as the first line, the partial line
+and the nickname in per-connection state, and lines of at most 4 KB, since a
+read is not a line. [`examples/syslog`](examples/syslog/) parses RFC 5424
+and RFC 3164 datagrams into SQLite, refuses sources outside a setting at
+`connect`, and publishes each line to a WebSocket tail.
 
 ### Resident mode
 

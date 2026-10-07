@@ -167,7 +167,17 @@ mod tests {
 
     #[test]
     fn every_example_is_embedded_with_a_description() {
-        for name in ["kitchen-sink", "orders", "static-report", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker"] {
+        for name in [
+            "kitchen-sink",
+            "orders",
+            "static-report",
+            "blob-gallery",
+            "inventory-policies",
+            "live-board",
+            "mqtt-broker",
+            "tcp-chat",
+            "syslog",
+        ] {
             let e = example(name);
             assert!(!e.description.is_empty() && e.description.len() < 300, "{name}: {:?}", e.description);
             assert!(!e.description.contains('\u{2014}'), "{name}: no em-dashes");

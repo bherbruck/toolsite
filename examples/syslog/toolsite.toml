@@ -1,0 +1,22 @@
+slug = "syslog"
+spa = false
+icon = "📜"
+# Only the people an admin grants may open the page or its socket. Senders
+# on the UDP port pass no gate: see ALLOWED_SOURCES in the README.
+gate = "restricted"
+
+# Where senders send. Live only once the site's owner maps the port to this
+# app: TOOLSITE_PORTS=5514/udp=syslog.
+[[socket]]
+protocol = "udp"
+port = 5514
+
+# The page's live tail. Each stored line is published to the topic "log".
+[[socket]]
+path = "/tail"
+
+# Six cron fields, seconds first: 03:15 every day.
+[[job]]
+name = "prune"
+schedule = "0 15 3 * * *"
+path = "/api/prune"

@@ -1,0 +1,12 @@
+slug = "tcp-chat"
+spa = false
+icon = "💬"
+# Only the people an admin grants may open the page. Clients on the TCP
+# port pass no gate; they present a device token instead.
+gate = "restricted"
+
+# The chat. Live only once the site's owner maps the port to this app:
+# TOOLSITE_PORTS=7777=tcp-chat.
+[[socket]]
+protocol = "tcp"
+port = 7777
