@@ -955,12 +955,30 @@ struct Mqtt {
     _dir: TempDir,
 }
 
+/// A port nothing listens on now, for the site to take. Handed out below the
+/// kernel's ephemeral range and never twice in one process: a port bound to 0
+/// and let go can come back as the source port of another test's client
+/// before the site binds it.
+fn free_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let base = 20_000 + (std::process::id() % 40) as u16 * 300;
+    loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = base + n % 300;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        {
+            return port;
+        }
+    }
+}
+
 /// The broker published on a site whose owner gave it a free TCP port, as
 /// `TOOLSITE_PORTS=<port>=mqtt-broker` would, with the HTTP side on a real
 /// port for the WebSocket. The manifest declares 1883; the test declares
 /// the port it was given instead, since 1883 may be taken on this machine.
 async fn mqtt_broker() -> Mqtt {
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = free_port();
     let dir = tempfile::tempdir().unwrap();
     let config = Arc::new(Config {
         data_dir: dir.path().to_path_buf(),
