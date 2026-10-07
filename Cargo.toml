@@ -66,3 +66,18 @@ tokio-tungstenite = "0.30.0"
 # the WebSocket tests open themselves. No TLS: the tests stay on 127.0.0.1.
 rumqttc = { version = "0.25.1", default-features = false }
 wat = "1.255.0"
+
+# Compiling a handler runs Cranelift. Unoptimised, it takes minutes for a
+# large guest on a loaded machine, so tests time out waiting for an app's
+# first reply. Optimise the compiler even in debug builds.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3
