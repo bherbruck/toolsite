@@ -68,6 +68,9 @@ pub struct Config {
     /// Sign-ins on their way from the main host to an app host, by the
     /// one-time code the app host trades for its cookie.
     pub handoffs: Mutex<HashMap<String, crate::accounts::users::HandoffTicket>>,
+    /// Two-step sign-in: who must have it, from `TOOLSITE_REQUIRE_MFA` and
+    /// `TOOLSITE_MFA_FOR_PROVIDERS`, and the clock codes are checked by.
+    pub mfa: crate::accounts::mfa::Settings,
 }
 
 impl Config {
@@ -104,6 +107,7 @@ impl Config {
             residents: self.residents.clone(),
             apps: self.apps.clone(),
             handoffs: Mutex::new(HashMap::new()),
+            mfa: self.mfa.clone(),
         }
     }
 
@@ -133,6 +137,7 @@ impl Config {
             residents: Default::default(),
             apps: None,
             handoffs: Mutex::new(HashMap::new()),
+            mfa: crate::accounts::mfa::Settings::off(),
         }
     }
 }

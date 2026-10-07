@@ -107,7 +107,7 @@ fn site_db_path(config: &Config) -> PathBuf {
     config.data_dir.join(".site").join("auth.db")
 }
 
-fn open(config: &Config) -> Result<Connection, String> {
+pub(crate) fn open(config: &Config) -> Result<Connection, String> {
     // Migrations read `pragma user_version`, which the authorizer refuses, so
     // the schema is brought up to date before the door is closed.
     let mut conn = db::open_unguarded(&site_db_path(config), config.max_db_bytes)?;
@@ -134,7 +134,7 @@ fn now() -> u64 {
 
 /// Sessions are stored hashed, so a leaked database does not hand over live
 /// sessions the way a leaked table of raw tokens would.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
@@ -208,10 +208,12 @@ pub fn sign_up_as(
     })
 }
 
-/// Returns a session token on success. The same message is given whether the
-/// email is unknown or the password is wrong, so this cannot be used to
+/// Checks a password and says whose account it opens. No session comes of
+/// this: what follows a correct password is `mfa::after_primary`'s call,
+/// since the account may still owe a code. The same message is given whether
+/// the email is unknown or the password is wrong, so this cannot be used to
 /// enumerate accounts.
-pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, String), String> {
+pub fn check_password(config: &Config, email: &str, password: &str) -> Result<User, String> {
     let conn = open(config)?;
     let email = normalise(email);
 
@@ -238,16 +240,16 @@ pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, Str
     if !verify_password(&stored, password) {
         return Err("The email or password is not correct.".into());
     }
+    Ok(User { id, email, is_admin })
+}
 
-    let token = crate::content::slug::random_token(48);
-    let expires = now() + SESSION_LIFETIME.as_secs();
-    conn.execute(
-        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, null)",
-        rusqlite::params![hash_token(&token), &id, expires as i64],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok((User { id, email, is_admin }, token))
+/// A password check and a session at once, with no second step. For tests
+/// and tools that stand in for a person who has already proven who they
+/// are; no route calls it, since a route must ask `mfa::after_primary`.
+pub fn log_in(config: &Config, email: &str, password: &str) -> Result<(User, String), String> {
+    let user = check_password(config, email, password)?;
+    let token = start_session(config, &user.id)?;
+    Ok((user, token))
 }
 
 /// Mints a token good for one app, from a proven site session. Returns the
@@ -1060,7 +1062,7 @@ pub fn move_scopes(config: &Config, from: &str, to: &str) -> Result<(), String> 
 /// the `__Host-` prefix, which a browser accepts only from the host itself
 /// with no `Domain`: an app on a sibling host cannot plant a session of its
 /// choosing on the main host by setting a cookie for the parent domain.
-fn site_cookie_name(config: &Config) -> &'static str {
+pub(crate) fn site_cookie_name(config: &Config) -> &'static str {
     if config.apps.is_some() && !secure_flag(config).is_empty() {
         "__Host-ts_session"
     } else {
@@ -1094,7 +1096,7 @@ fn app_host_secure_flag(config: &Config) -> &'static str {
     }
 }
 
-fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
     header?
         .split(';')
         .filter_map(|part| part.trim().split_once('='))
@@ -1125,7 +1127,7 @@ pub fn app_token_from_cookies(config: &Config, header: Option<&str>, app: &str) 
 /// browser drop a Secure cookie on the floor and sign-in would silently do
 /// nothing, so there the flag is left off. The address is the deployment's
 /// own word for how it is reached; nothing from the request decides this.
-fn secure_flag(config: &Config) -> &'static str {
+pub(crate) fn secure_flag(config: &Config) -> &'static str {
     match config.base_url.as_deref() {
         Some(base) if base.starts_with("http://") => "",
         _ => " Secure;",
@@ -1696,16 +1698,14 @@ pub async fn login_submit(
     let next = safe_next(credentials.next.as_deref());
     let worker = config.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        log_in(&worker, &credentials.email, &credentials.password)
+        check_password(&worker, &credentials.email, &credentials.password)
     })
     .await;
 
     match outcome {
-        Ok(Ok((_, token))) => (
-            [(header::SET_COOKIE, set_cookie_header(&config, &token))],
-            Redirect::to(&next),
-        )
-            .into_response(),
+        // The password is right; a session, a code page or a setup page
+        // follows, as the account and the site's policy require.
+        Ok(Ok(user)) => crate::accounts::mfa::sign_in(&config, user, crate::accounts::mfa::Primary::Password, &next).await,
         Ok(Err(message)) => (StatusCode::UNAUTHORIZED, message).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Sign-in failed.").into_response(),
     }
@@ -2078,6 +2078,8 @@ pub struct Account {
     pub created: String,
     pub is_admin: bool,
     pub is_active: bool,
+    /// Two-step sign-in is on.
+    pub mfa: bool,
 }
 
 /// Turns an account off, or back on. Existing sessions are dropped rather
@@ -2108,7 +2110,11 @@ pub fn set_active(config: &Config, email: &str, active: bool) -> Result<(), Stri
 pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
     let conn = open(config)?;
     let mut statement = conn
-        .prepare("select email, created_at, is_admin, disabled_at from users order by email")
+        .prepare(
+            "select email, created_at, is_admin, disabled_at,
+                    exists(select 1 from mfa where mfa.user_id = users.id and mfa.enabled_at is not null)
+               from users order by email",
+        )
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -2120,6 +2126,7 @@ pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
                 created: format!("{} days ago", (now().saturating_sub(created as u64)) / 86_400),
                 is_admin: row.get::<_, i64>(2)? != 0,
                 is_active: row.get::<_, Option<i64>>(3)?.is_none(),
+                mfa: row.get::<_, i64>(4)? != 0,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -2282,14 +2289,11 @@ pub fn invited_account(config: &Config, token: &str) -> Option<User> {
     .ok()
 }
 
-/// Spends an invitation: sets the password and signs the person in. The
-/// invitation is consumed whether or not anything else follows, so a link
-/// works exactly once.
-pub fn accept_invite(
-    config: &Config,
-    token: &str,
-    password: &str,
-) -> Result<(User, String), String> {
+/// Spends an invitation: sets the password. The invitation is consumed
+/// whether or not anything else follows, so a link works exactly once. The
+/// session that follows is `mfa::after_primary`'s to give, since a setup
+/// link is also how someone with two-step sign-in gets back in.
+pub fn accept_invite(config: &Config, token: &str, password: &str) -> Result<User, String> {
     let user = invited_account(config, token).ok_or("This link is not valid.")?;
     if password.chars().count() < 8 {
         return Err("Enter a password of at least 8 characters.".into());
@@ -2305,19 +2309,7 @@ pub fn accept_invite(
     .map_err(|e| e.to_string())?;
     conn.execute("delete from invites where token_hash = ?", [hash_token(token)])
         .map_err(|e| e.to_string())?;
-
-    let session = crate::content::slug::random_token(48);
-    conn.execute(
-        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, null)",
-        rusqlite::params![
-            hash_token(&session),
-            &user.id,
-            (now() + SESSION_LIFETIME.as_secs()) as i64
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok((user, session))
+    Ok(user)
 }
 
 /// Where to send someone to finish setting up. Absolute when the deployment
@@ -2390,12 +2382,12 @@ pub async fn setup_submit(
 
     match outcome {
         // Signed in on the spot: having just proved they hold the link and
-        // chosen the password, asking them to type it again is theatre.
-        Ok(Ok((user, session))) => (
-            [(header::SET_COOKIE, set_cookie_header(&config, &session))],
-            Redirect::to(if user.is_admin { "/admin" } else { "/" }),
-        )
-            .into_response(),
+        // chosen the password, asking them to type it again is theatre. A
+        // code, though, is still owed if the account has two-step sign-in.
+        Ok(Ok(user)) => {
+            let next = if user.is_admin { "/admin" } else { "/" };
+            crate::accounts::mfa::sign_in(&config, user, crate::accounts::mfa::Primary::Password, next).await
+        }
         Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "The password was not set.").into_response(),
     }

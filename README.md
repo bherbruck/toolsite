@@ -1061,6 +1061,7 @@ toolsite user add you@example.com --admin
 toolsite user list
 toolsite user invite someone@example.com     # a fresh link
 toolsite user disable someone@example.com
+toolsite user reset-mfa someone@example.com  # lost phone and recovery codes
 ```
 
 Or remotely, with the CLI against a running server:
@@ -1126,8 +1127,8 @@ breaking it.
 |---|---|
 | `/admin/apps` | The apps you manage, with their gate and whether they ship a handler. Each row opens the app's page. Projects and their permissions are run from the app browser. |
 | `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility), then tabs: Access (who may open it, route rules, people with access), Exports, Settings, Jobs, Notes. |
-| `/admin/accounts/<email>` | One account: the apps they may open (add with a searchable picker, revoke), a fresh setup link shown once, disable or enable. |
-| `/admin/accounts` | Accounts with role and status; disable or re-enable; New account is its own page. |
+| `/admin/accounts/<email>` | One account: the apps they may open (add with a searchable picker, revoke), whether two-step sign-in is on and a reset for it, a fresh setup link shown once, disable or enable. |
+| `/admin/accounts` | Accounts with role, status and two-step sign-in; disable or re-enable; New account is its own page. |
 | `/admin/exports` | Every export token, by app and label. |
 
 Anything that removes or disables asks first. Every action comes back to the
@@ -1142,7 +1143,59 @@ how they sign in (a password, a provider, or both) and, for an account with
 a password, a form to change it. Changing it signs out every other session
 of that account. There is no mailer, so there is no reset email: someone who
 has forgotten their password asks an admin, who issues a new setup link from
-the account's page in the admin.
+the account's page in the admin. The same page turns two-step sign-in on and
+off.
+
+### Two-step sign-in
+
+An account can add a code from an authenticator app (Google Authenticator,
+Microsoft Authenticator, 1Password and the like) to its password. It is TOTP
+(RFC 6238): six digits, a new code every 30 seconds.
+
+- **Turn it on** from `/account`: scan the QR code, or type the key into the
+  app, and enter the first code. Ten recovery codes are shown one time, with
+  copy and download. Each recovery code works one time. Turning it on keeps
+  the session you are using, signs out every other session of the account
+  (app sessions too), and revokes the account's OAuth tokens, so a connected
+  MCP client must sign in again and give a code.
+- **Sign in**: after a correct password, there is no session yet. A pending
+  sign-in, good for 5 minutes and held in its own cookie, leads to a page
+  that takes a code from the app or a recovery code. Only then is the
+  session made. This applies to the sign-in page, to a setup link, to the
+  consent screen an MCP client sends you to, and to the subdomain handoff,
+  which sends a pending sign-in back to sign in rather than open an app.
+- **Limits**: a code works for the current 30 seconds and one step either
+  side, and each step works one time per account. Five wrong codes end a
+  pending sign-in. Ten wrong codes for one account in 15 minutes, across
+  sign-ins, stop that account taking codes until the 15 minutes pass. Each
+  refusal is logged at `warn`, without the code.
+- **Recovery**: from `/account`, get ten new recovery codes (needs a code
+  from the app), or turn it off (needs a code from the app or a recovery
+  code). Someone who lost the phone and the recovery codes asks an admin,
+  whose "Reset two-step sign-in" on the account's page removes it and signs
+  out every session of that person. On the server, `toolsite user reset-mfa
+  <email>` does the same, which is the way back in for the only admin.
+- **At rest**: the shared secret is sealed with the same key as app settings
+  (`TOOLSITE_SECRET_KEY`), and recovery codes are stored as digests keyed
+  with it. Neither is logged, and the secret is not shown again after setup.
+
+**Policy.** `TOOLSITE_REQUIRE_MFA` says who must have it: `admins` (the
+default: site admins), `everyone`, or `off`. Someone the policy covers who
+has not set it up is sent to a setup page after the password and gets no
+session until the first code confirms it, so an existing admin is not locked
+out and sets it up at the next sign-in. Under the policy, turning it off on
+`/account` is refused.
+
+**Providers.** A sign-in through Google, Entra, GitHub or an OIDC issuer
+skips toolsite's code, since the provider asks for its own. Set
+`TOOLSITE_MFA_FOR_PROVIDERS=1` to ask for the code (and for setup, under the
+policy) after the provider too.
+
+**What it does not cover.** Two-step sign-in protects interactive sign-ins
+and new OAuth consents. Credentials that skip sign-in stay as they are: the
+MCP bearer token, per-app export, deploy and device tokens, and OAuth tokens
+issued before. Existing OAuth tokens keep working until they are revoked,
+and turning two-step sign-in on revokes those of that account.
 
 ### Projects and scopes
 
@@ -1532,6 +1585,8 @@ to the browser with one line saying what happened.
 | `PUT /blob/<ticket>` | ticket | A visitor's file, streamed to the app's storage. Minted by the app's handler. |
 | `GET /export/<app>.sqlite` | export token | A snapshot of that app's database, for a reporting tool. |
 | `GET /auth/login`, `/auth/login/<slug>`, `/auth/callback/<slug>`, `/auth/logout`, `/auth/setup`, `/auth/handoff`, `/auth/me` | public | Visitor sign-in: password, provider, one-time setup link, the app handoff, and who am I. |
+| `GET\|POST /auth/mfa`, `GET\|POST /auth/mfa/setup` | pending sign-in | The two-step code page, and the setup the policy requires before a session. |
+| `POST /account/mfa/...` | session and form token | Turn two-step sign-in on or off, and new recovery codes. |
 | `GET /settings/<token>` | link | Where someone pastes an app's settings in. |
 | `GET /admin/...` | admin account | The admin pages. |
 | `GET /guide` | public | How the platform works, for an agent about to build on it. |
@@ -1573,6 +1628,8 @@ is required to serve HTTP.
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where everything is stored. |
 | `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME` and `_ALLOW_DOMAIN`. See Accounts. |
+| `TOOLSITE_REQUIRE_MFA` | no (default `admins`) | Who must have two-step sign-in: `admins` (site admins), `everyone`, or `off`. Someone covered without it sets it up after the password, before any session. See Two-step sign-in. |
+| `TOOLSITE_MFA_FOR_PROVIDERS` | no (default off) | `1`: a sign-in through a provider also asks for toolsite's two-step code. Off, the provider's own second step counts. |
 | `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `restricted` (`granted`, the old name, still works). Set `restricted` for an internal site. |
 | `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
 | `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
@@ -1601,7 +1658,7 @@ is required to serve HTTP.
 | `TOOLSITE_RESIDENT_MAX` | no (default `20`) | The most resident instances that run at once. Each is a thread. |
 | `TOOLSITE_RESIDENT_TOTAL_MB` | no (default `2048`) | The most memory the caps of all running resident instances may add up to. At least `TOOLSITE_RESIDENT_MAX_MB`. |
 | `TOOLSITE_RESIDENT_QUEUE` | no (default `256`) | The connection events that may wait for one resident instance. One more is refused. |
-| `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
+| `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings and two-step sign-in secrets. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
 
@@ -1634,7 +1691,7 @@ myapp/data.db             its SQLite database    (never served)
 myapp/.blobs/data/<key>   a stored file          (only through its handler)
 myapp.notes, .secrets, .jobs, .migrations, .source, .exports
                           sidecars               (never served)
-.site/auth.db             accounts and sessions
+.site/auth.db             accounts, sessions, two-step sign-in (secrets sealed)
 .site/oauth.db            MCP clients' tokens
 .trash/                   what remove_page moved aside
 ```

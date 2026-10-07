@@ -49,6 +49,7 @@ pub(crate) fn is_sensitive(path: &str) -> bool {
         || path.starts_with("/settings/")
         || path == "/authorize"
         || path.starts_with("/auth/setup")
+        || path.starts_with("/auth/mfa")
 }
 
 /// Pages toolsite renders itself, as opposed to what apps publish and the

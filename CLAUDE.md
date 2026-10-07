@@ -35,6 +35,7 @@ Two more that this codebase already leans on:
 main.rs            startup: env -> Config, listener, --stdio
 lib.rs             build_router: every route, assembled in one place
 config.rs          Config shared by every layer
+seal.rs            values sealed at rest with the site key: app settings, two-step secrets
 ui.rs              the theme for pages toolsite serves itself
 
 platform/          the site as its owner uses it
@@ -80,6 +81,7 @@ runtime/           executing an app's own code and data
 
 accounts/          people who USE published apps
   users.rs         accounts, sessions, grants, sign-in routes
+  mfa.rs           two-step sign-in: TOTP, recovery codes, the pending sign-in every session waits on
   providers.rs     signing in through Google, Entra, GitHub or any OIDC issuer
 
 wit/               the contract guests compile against

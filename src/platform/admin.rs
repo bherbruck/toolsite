@@ -1542,13 +1542,14 @@ pub async fn accounts_page(
                     (search_box(&listing, "/admin/accounts", "Search accounts"))
                     section."panel" {
                         table {
-                            thead { tr { th { "Email" } th { "Role" } th { "Status" } th { "Created" } th {} } }
+                            thead { tr { th { "Email" } th { "Role" } th { "Status" } th { "Two-step" } th { "Created" } th {} } }
                             tbody id="list" {
                                 @for account in &listing.rows {
                                     tr data-slug=(account.email.to_lowercase()) {
                                         td { a."row-link" href={ "/admin/accounts/" (urlencoding::encode(&account.email)) } { (account.email) } }
                                         td { @if account.is_admin { span."badge solid" { "admin" } } @else { span."muted small" { "visitor" } } }
                                         td { @if account.is_active { span."badge ok" { "active" } } @else { span."badge warn" { "disabled" } } }
+                                        td { @if account.mfa { span."badge ok" { "on" } } @else { span."muted small" { "off" } } }
                                         td."muted small" { (account.created) }
                                         td."actions-cell" {
                                             @if account.is_active {
@@ -1703,6 +1704,7 @@ async fn render_account_page(
             actions: Some(html! {
                 @if account.is_admin { span."badge solid" { "admin" } } @else { span."badge" { "visitor" } }
                 @if account.is_active { span."badge ok" { "active" } } @else { span."badge warn" { "disabled" } }
+                @if account.mfa { span."badge ok" { "two-step on" } } @else { span."badge" { "two-step off" } }
             }),
             script: None,
             body: html! {
@@ -1735,6 +1737,27 @@ async fn render_account_page(
                         }
                     }
                 }))
+                (ui::panel("Two-step sign-in", None, html! {
+                    @if account.mfa {
+                        p { "Two-step sign-in is on for this account." }
+                        // Inline, so the confirmation is part of the page and
+                        // works without the dialog script.
+                        details {
+                            summary { "Reset two-step sign-in" }
+                            form method="post" action="/admin/mfa-reset" style="margin-top: .75rem" {
+                                (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back))
+                                p."muted" style="font-size: .85rem" {
+                                    "This removes the authenticator app and the recovery codes of " (account.email)
+                                    " and signs out all of their sessions. They sign in with the password only, and set up two-step sign-in again"
+                                    " if the site requires it. Do this only when you are sure who asked."
+                                }
+                                div."actions" { button."danger" type="submit" { "Reset two-step sign-in" } }
+                            }
+                        }
+                    } @else {
+                        p."muted" { "Two-step sign-in is off for this account." }
+                    }
+                }))
                 (ui::panel("Account", None, html! {
                     div."actions" {
                         form method="post" action="/admin/reinvite" {
@@ -1762,6 +1785,41 @@ async fn render_account_page(
             },
         },
     )
+}
+
+#[derive(Deserialize)]
+pub struct MfaReset {
+    token: String,
+    email: String,
+    back: Option<String>,
+}
+
+/// Removes someone's two-step sign-in, for a person who lost their phone
+/// and their recovery codes, and ends all of their sessions.
+pub async fn reset_mfa(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<MfaReset>,
+) -> Response {
+    let admin = match checked(&config, &headers, &form.token).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), "/admin/accounts");
+    let (worker, email) = (config.clone(), form.email.clone());
+    let outcome = tokio::task::spawn_blocking(move || crate::accounts::mfa::reset(&worker, &email)).await;
+    match outcome {
+        Ok(Ok(was_on)) => {
+            tracing::warn!(admin = %admin.email, email = %form.email, was_on, "two-step sign-in reset by an admin; all sessions of the account ended");
+            redirect_flash(
+                &back,
+                true,
+                format!("Two-step sign-in for {} is reset. All of their sessions are signed out.", form.email),
+            )
+        }
+        Ok(Err(message)) => redirect_flash(&back, false, message),
+        Err(_) => redirect_flash(&back, false, "Two-step sign-in was not reset."),
+    }
 }
 
 #[derive(Deserialize)]

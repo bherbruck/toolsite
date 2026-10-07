@@ -3,6 +3,7 @@ pub mod config;
 pub mod content;
 pub mod platform;
 pub mod runtime;
+pub mod seal;
 pub mod ui;
 
 pub use config::Config;
@@ -174,6 +175,13 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         // password if they have one.
         .route("/account", get(platform::account::page))
         .route("/account/password", post(platform::account::change_password))
+        .route("/account/mfa/start", post(platform::account::mfa_start))
+        .route("/account/mfa/confirm", post(platform::account::mfa_confirm))
+        .route("/account/mfa/cancel", post(platform::account::mfa_cancel))
+        .route("/account/mfa/recovery", post(platform::account::mfa_recovery))
+        .route("/account/mfa/off", post(platform::account::mfa_off))
+        .route("/auth/mfa", get(crate::accounts::mfa::code_form).post(crate::accounts::mfa::code_submit))
+        .route("/auth/mfa/setup", get(platform::account::forced_setup_form).post(platform::account::forced_setup_submit))
         .route("/settings/{token}", get(secrets::entry_form))
         .route("/settings", get(secrets::entry_form_query).post(secrets::entry_submit))
         .route(
@@ -194,6 +202,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/users", post(admin::add_account))
         .route("/admin/access", post(admin::change_access))
         .route("/admin/active", post(admin::change_active))
+        .route("/admin/mfa-reset", post(admin::reset_mfa))
         .route("/admin/gate", post(admin::change_gate))
         .route("/admin/rule", post(admin::change_rule))
         .route("/admin/visibility", post(admin::change_visibility))
