@@ -471,7 +471,9 @@ memory past the cap drops the instance and closes all its connections; the
 next connection starts a fresh one after a short pause. Requests and jobs do
 not see the resident instance's memory, only its database and files. A
 handler built for `app-with-connections` also runs resident, without
-`on_tick`. `std::time::Instant` and `SystemTime` work in any handler.
+`on_tick`. `std::time::Instant` and `SystemTime` work in any handler; a
+sleep, a query or a fetch never outlasts the call's wall clock, so a sleep
+longer than what is left wakes early and the call then ends.
 
 ## Access
 

@@ -803,13 +803,21 @@ of sessions or a subscription tree just stays in memory.
   the instance is dropped and every connection it held is closed, since
   what it knew about them is gone. Clients must reconnect. The next
   connection starts a fresh instance after a pause of 1 second, which
-  doubles while it keeps failing, up to 60 seconds.
+  doubles while it keeps failing, up to 60 seconds. Republishing does not
+  end a pause that is running.
 - Publishing a new handler, changing `[resident]`, hiding or removing the
   app drops the instance and closes its connections too.
 - **Memory is lost** on every restart, redeploy and server restart. Save to
   the database what must survive, and rebuild from it on start.
 - One instance per app, in one server process. It does not scale out, and
-  one slow event delays every connection of the app.
+  one slow event delays every connection of the app. At most
+  `TOOLSITE_RESIDENT_QUEUE` events wait for it; one more is refused and its
+  connection closed.
+- A site runs at most `TOOLSITE_RESIDENT_MAX` instances at once, whose
+  memory caps add up to at most `TOOLSITE_RESIDENT_TOTAL_MB`. An instance
+  that would pass either does not start, and its connection is refused.
+- The wall clock holds inside host calls too: a wasi sleep, a query or a
+  `fetch` ends when the call's time does.
 - `on-tick(now-ms)` is for keepalive timeouts and retries. It runs on the
   same instance, between events, every `tick_ms`, only when `tick_ms` is
   set and the handler exports it. Build for the `app-resident` world to
@@ -1470,6 +1478,9 @@ is required to serve HTTP.
 | `TOOLSITE_TCP_SEND_SECONDS` | no (default `10`) | A TCP peer that takes none of a reply for this long is closed. |
 | `TOOLSITE_RESIDENT_MEMORY_MB` | no (default `128`) | Memory cap of a resident app's instance when its `[resident]` block does not set `memory_mb`. See Resident mode. |
 | `TOOLSITE_RESIDENT_MAX_MB` | no (default `512`) | The most memory a resident app may ask for. A larger `memory_mb` is refused at deploy. |
+| `TOOLSITE_RESIDENT_MAX` | no (default `20`) | The most resident instances that run at once. Each is a thread. |
+| `TOOLSITE_RESIDENT_TOTAL_MB` | no (default `2048`) | The most memory the caps of all running resident instances may add up to. At least `TOOLSITE_RESIDENT_MAX_MB`. |
+| `TOOLSITE_RESIDENT_QUEUE` | no (default `256`) | The connection events that may wait for one resident instance. One more is refused. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |

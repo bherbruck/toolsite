@@ -26,6 +26,42 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 static TICKS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Holds what `grow` allocates, so the allocation cannot be optimised away.
 static HOARD: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// What the last `on-tick` saw: the caller, the role, and what `TICK_SQL`
+/// returned through `query-scoped`. A tick has no visitor.
+static TICK_SAW: Mutex<String> = Mutex::new(String::new());
+/// The scoped query each tick runs, set by `tick-sql:<sql>`.
+static TICK_SQL: Mutex<String> = Mutex::new(String::new());
+/// How long each tick sleeps, in ms, set by `slow-ticks:<ms>`.
+static TICK_NAP: AtomicU64 = AtomicU64::new(0);
+
+/// Recurses until the stack runs out. Each frame keeps an array alive so
+/// neither the call nor the frame can be optimised away.
+#[inline(never)]
+fn deep(n: u64) -> u64 {
+    let frame = [n; 32];
+    std::hint::black_box(&frame);
+    if n == 0 {
+        0
+    } else {
+        deep(n - 1).wrapping_add(frame[7])
+    }
+}
+
+/// Who is calling, as identity reports it: `<email>:<role>`, with
+/// `anonymous` and `none` for nobody.
+fn caller() -> String {
+    let who = identity::current_user().map(|u| u.email).unwrap_or_else(|| "anonymous".to_string());
+    let role = identity::current_role().unwrap_or_else(|| "none".to_string());
+    format!("{who}:{role}")
+}
+
+fn scoped_text(sql: &str) -> String {
+    match db::query_scoped(sql, &[]) {
+        Ok(rows) => format!("rows:{}", rows_text(&rows)),
+        Err(db::Error::Denied(m)) => format!("denied:{m}"),
+        Err(db::Error::Failed(m)) => format!("failed:{m}"),
+    }
+}
 
 /// One value out of `a=1&b=2`. Enough for a fixture.
 fn param<'q>(query: &'q str, name: &str) -> &'q str {
@@ -396,6 +432,15 @@ impl Guest for Handler {
     /// (both wasi clocks), `crash` (panics), `grow` (allocates until the
     /// memory cap stops it) and `hang` (never returns).
     ///
+    /// For attacks on resident mode: `who` (identity as this event sees
+    /// it), `scoped:<sql>` and `sql:<sql>` (the database as this event's
+    /// person), `tick-sql:<sql>` and `tick-saw` (what the last tick saw
+    /// running that query), `slow-ticks:<ms>` (each tick sleeps that long),
+    /// `nap:<ms>` (sleeps inside the event), `sleep-forever` (a wasi sleep
+    /// of an hour), `sql-spin` (a query that never ends), `recurse` (until
+    /// the stack runs out), `secret` (whether API_KEY is set) and
+    /// `poke:<conn>` (every connection call aimed at another id).
+    ///
     /// A TCP connection or UDP remote (one with a `remote`) gets
     /// `id:<conn>\n` on connect, and its bytes are commands only when one
     /// whole read is `token <t>\n` (checked with auth.check-token: `ok
@@ -509,6 +554,43 @@ impl Guest for Handler {
                     loop {
                         let _ = db::query("select 1", &[]);
                     }
+                } else if text == "who" {
+                    reply(format!("who:{}", caller()))
+                } else if let Some(sql) = text.strip_prefix("scoped:") {
+                    reply(scoped_text(sql))
+                } else if let Some(sql) = text.strip_prefix("sql:") {
+                    reply(match db::query(sql, &[]) {
+                        Ok(rows) => format!("rows:{}", rows_text(&rows)),
+                        Err(e) => format!("err:{e:?}"),
+                    })
+                } else if let Some(sql) = text.strip_prefix("tick-sql:") {
+                    *TICK_SQL.lock().unwrap() = sql.to_string();
+                    reply("ok".to_string())
+                } else if text == "tick-saw" {
+                    reply(TICK_SAW.lock().unwrap().clone())
+                } else if let Some(ms) = text.strip_prefix("slow-ticks:") {
+                    TICK_NAP.store(ms.parse().unwrap_or(0), Ordering::SeqCst);
+                    reply("ok".to_string())
+                } else if let Some(ms) = text.strip_prefix("nap:") {
+                    std::thread::sleep(std::time::Duration::from_millis(ms.parse().unwrap_or(0)));
+                    reply("awake".to_string())
+                } else if text == "sleep-forever" {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                    reply("awake".to_string())
+                } else if text == "sql-spin" {
+                    let spin = "with recursive c(x) as (select 1 union all select x + 1 from c) select count(*) from c";
+                    reply(format!("{:?}", db::query(spin, &[]).map(|rows| rows.values.len())))
+                } else if text == "recurse" {
+                    reply(deep(u64::MAX).to_string())
+                } else if text == "secret" {
+                    reply(format!("secret:{}", secrets::get("API_KEY").is_some()))
+                } else if let Some(other) = text.strip_prefix("poke:") {
+                    let sent = connections::send(other, &Message::Text("hijack".to_string())).is_ok();
+                    let state = connections::state_get(other, "log").is_some();
+                    let set = connections::state_set(other, "log", Some("hijacked")).is_ok();
+                    let joined = connections::subscribe(other, "hijack").is_ok();
+                    let closed = connections::close(other).is_ok();
+                    reply(format!("send={sent} state={state} set={set} subscribe={joined} close={closed}"))
                 } else {
                     reply(format!("unknown:{text}"))
                 }
@@ -528,6 +610,14 @@ impl Guest for Handler {
             ticks.remove(0);
         }
         ticks.push(now_ms);
+        drop(ticks);
+        let sql = TICK_SQL.lock().unwrap().clone();
+        let scoped = if sql.is_empty() { String::new() } else { scoped_text(&sql) };
+        *TICK_SAW.lock().unwrap() = format!("tick:{} {scoped}", caller());
+        let nap = TICK_NAP.load(Ordering::SeqCst);
+        if nap > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(nap));
+        }
     }
 }
 

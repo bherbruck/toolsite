@@ -187,6 +187,9 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
 /// `apply`, also checking what the manifest asks of the handler against
 /// the handler on the server. What a deploy uses.
 pub async fn apply_checked(config: &Config, runtime: &Runtime, app: &str, toml_text: &str) -> Result<Vec<String>, String> {
+    // Held until the meta is written, so a handler uploaded meanwhile is
+    // checked against the [resident] this writes, not the one before it.
+    let _declaring = config.residents.declaring().await;
     apply_inner(config, Some(runtime), app, toml_text).await
 }
 

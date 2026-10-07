@@ -690,7 +690,12 @@ impl PageHost {
         if !valid_slug(&id) || !self.may_see(&caller, &id).await {
             return Ok(refused());
         }
-        match knowledge::fetch_page(&self.config, &id).await {
+        let app = id.split('/').next().unwrap_or(&id);
+        let manages = match &caller.user {
+            Some(user) => self.held_on(user, app).await == Some(Scope::Admin),
+            None => true,
+        };
+        match knowledge::fetch_page(&self.config, &id, manages).await {
             Some(output) => {
                 let value = serde_json::to_value(output).map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(CallToolResult::structured(value))

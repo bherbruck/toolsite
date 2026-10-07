@@ -237,7 +237,7 @@ async fn a_crash_closes_every_connection_of_the_app_and_the_next_one_starts_fres
         crashed.last_crash.as_deref().is_some_and(|why| why.contains("trapped")),
         "the crash is not reported: {crashed:?}"
     );
-    let metadata = toolsite::platform::knowledge::fetch_page(&site.config, "fragile").await.unwrap().metadata;
+    let metadata = toolsite::platform::knowledge::fetch_page(&site.config, "fragile", true).await.unwrap().metadata;
     assert_eq!(metadata["resident"]["restarts"], 1, "MCP fetch does not report the crash: {metadata}");
 
     let mut fresh = open_after_pause(&site, "fragile").await;

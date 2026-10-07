@@ -5,8 +5,10 @@
 //! * **fuel** — a hard ceiling on executed instructions, so an infinite loop
 //!   dies deterministically rather than pinning a core.
 //! * **epochs** — wall-clock deadline, which catches guests that block without
-//!   burning fuel.
-//! * **memory** — a cap enforced when the guest asks to grow.
+//!   burning fuel. Epochs only interrupt wasm, so every host import that can
+//!   wait (a wasi sleep, a query, a fetch) is cut off at the same deadline.
+//! * **memory** — a cap enforced when the guest asks to grow, counting its
+//!   tables as well as its linear memory.
 //!
 //! A store is built fresh per request. Reusing one would leak state between
 //! requests, and app state belongs in that app's database instead. The one
@@ -23,7 +25,11 @@ use wasmtime::{
     component::{Component, Linker, TypedFunc},
     Config, Engine, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
 };
-use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{
+    clocks::{WasiClocksCtxView, WasiClocksView},
+    p2::{bindings::clocks::monotonic_clock, DynPollable},
+    ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+};
 
 // Generates the host side of wit/toolsite.wit: the `App` world's exported
 // `handle`, and traits for every import we grant.
@@ -83,10 +89,16 @@ impl Default for Guards {
     }
 }
 
+/// What one table element is counted as against the memory cap: a pointer.
+const TABLE_ELEMENT_BYTES: usize = 8;
+
 /// The memory ceiling for one store, counted across every linear memory
-/// the guest has, and how much it holds now.
+/// and every table the guest has, and how much it holds now. A table is
+/// host memory as much as a linear memory is, and with no element limit a
+/// guest could `table.grow` its way to gigabytes the cap never saw.
 struct Limits {
-    /// Tables and instances; memory is counted here instead.
+    /// Instances, tables and memories by count; their sizes are counted
+    /// here instead.
     others: StoreLimits,
     memory_cap: usize,
     memory_used: usize,
@@ -119,7 +131,19 @@ impl ResourceLimiter for Limits {
     }
 
     fn table_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
-        self.others.table_growing(current, desired, maximum)
+        let added = desired.saturating_sub(current).saturating_mul(TABLE_ELEMENT_BYTES);
+        let after = self.memory_used.saturating_add(added);
+        if after > self.memory_cap || !self.others.table_growing(current, desired, maximum)? {
+            return Ok(false);
+        }
+        self.last_growth = added;
+        self.memory_used = after;
+        Ok(true)
+    }
+
+    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.memory_used = self.memory_used.saturating_sub(self.last_growth);
+        Ok(())
     }
 }
 
@@ -145,6 +169,58 @@ pub struct StoreState {
     /// it sends goes straight to that connection; what anyone else sends
     /// there waits until `connect` returns.
     connecting: Option<String>,
+    /// When the current call's wall clock runs out. Epochs stop wasm at this
+    /// point; host imports that wait read it to stop there too.
+    deadline: Instant,
+}
+
+impl StoreState {
+    /// What is left of the current call's wall clock.
+    fn time_left(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+/// wasi's monotonic clock, with every sleep cut off at the call's deadline.
+/// A sleep runs on the host, where epochs cannot reach it: without this a
+/// guest calling `std::thread::sleep` for an hour holds its thread for an
+/// hour. Cut short, the guest wakes early, runs, and the epoch stops it.
+struct DeadlineClock;
+
+impl wasmtime::component::HasData for DeadlineClock {
+    type Data<'a> = DeadlineClockView<'a>;
+}
+
+struct DeadlineClockView<'a> {
+    clocks: WasiClocksCtxView<'a>,
+    left: Duration,
+}
+
+impl monotonic_clock::Host for DeadlineClockView<'_> {
+    fn now(&mut self) -> wasmtime::Result<monotonic_clock::Instant> {
+        self.clocks.now()
+    }
+
+    fn resolution(&mut self) -> wasmtime::Result<monotonic_clock::Duration> {
+        self.clocks.resolution()
+    }
+
+    fn subscribe_duration(
+        &mut self,
+        duration: monotonic_clock::Duration,
+    ) -> wasmtime::Result<wasmtime::component::Resource<DynPollable>> {
+        let left = self.left.as_nanos().min(u64::MAX as u128) as u64;
+        self.clocks.subscribe_duration(duration.min(left))
+    }
+
+    fn subscribe_instant(
+        &mut self,
+        when: monotonic_clock::Instant,
+    ) -> wasmtime::Result<wasmtime::component::Resource<DynPollable>> {
+        let left = self.left.as_nanos().min(u64::MAX as u128) as u64;
+        let latest = self.clocks.now()?.saturating_add(left);
+        self.clocks.subscribe_instant(when.min(latest))
+    }
 }
 
 impl WasiView for StoreState {
@@ -197,7 +273,7 @@ impl self::toolsite::app::db::Host for StoreState {
     ) -> Result<WitRows, WitDbError> {
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
         let identity = self.identity();
-        wit_rows(db::run_as(&self.site, &self.app, identity.as_ref(), &sql, &params))
+        wit_rows(db::run_until(&self.site, &self.app, identity.as_ref(), &sql, &params, Some(self.deadline)))
     }
 
     fn query_scoped(
@@ -211,7 +287,7 @@ impl self::toolsite::app::db::Host for StoreState {
         // by a manifest upload applies to the next request.
         let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
         let scope = db::Scope::of(&meta);
-        wit_rows(db::run_scoped(&self.site, &self.app, identity.as_ref(), &scope, &sql, &params))
+        wit_rows(db::run_scoped_until(&self.site, &self.app, identity.as_ref(), &scope, &sql, &params, Some(self.deadline)))
     }
 }
 
@@ -284,8 +360,13 @@ impl self::toolsite::app::fetch::Host for StoreState {
         // Read per call rather than cached: changing an app's allowlist takes
         // effect on the next request, not the next restart.
         let allow = crate::content::store::read_meta_blocking(&self.site, &self.app).allow_http;
+        // A slow host must not hold the call past its wall clock.
+        let left = self.time_left();
+        if left.is_zero() {
+            return Err("the call ran out of time before the request could be sent".to_string());
+        }
 
-        crate::runtime::outbound::send(&req.method, &req.url, &req.headers, req.body, &allow).map(
+        crate::runtime::outbound::send(&req.method, &req.url, &req.headers, req.body, &allow, left).map(
             |fetched| self::toolsite::app::fetch::Response {
                 status: fetched.status,
                 headers: fetched.headers,
@@ -428,6 +509,17 @@ impl Runtime {
         App::add_to_linker::<_, wasmtime::component::HasSelf<StoreState>>(&mut linker, |state| {
             state
         })?;
+        // The monotonic clock again, over the one wasi linked, so that no
+        // sleep outlasts the call.
+        linker.allow_shadowing(true);
+        monotonic_clock::add_to_linker::<StoreState, DeadlineClock>(&mut linker, |state| {
+            let left = state.time_left();
+            DeadlineClockView {
+                clocks: state.clocks(),
+                left,
+            }
+        })?;
+        linker.allow_shadowing(false);
 
         Ok(Arc::new(Self {
             engine,
@@ -593,6 +685,7 @@ impl Runtime {
             site,
             user,
             connecting: None,
+            deadline: Instant::now(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -638,6 +731,7 @@ impl Runtime {
 /// Fuel and a wall-clock deadline for the next call on `store`, counted
 /// from now.
 fn arm(store: &mut Store<StoreState>, guards: Guards) {
+    store.data_mut().deadline = Instant::now() + guards.wall_clock;
     store.set_fuel(guards.fuel).expect("fuel is enabled");
     let ticks = guards.wall_clock.as_millis().div_ceil(EPOCH_TICK.as_millis());
     store.set_epoch_deadline(ticks.max(1) as u64);
@@ -688,7 +782,7 @@ impl Resident {
         Ok(on_tick.call(&mut self.store, (now_ms,))?)
     }
 
-    /// Bytes of linear memory the instance holds now.
+    /// Bytes of memory the instance holds now, linear memory and tables.
     pub fn memory_bytes(&self) -> usize {
         self.store.data().limits.memory_used
     }
@@ -796,6 +890,32 @@ mod tests {
         // memory.grow reports -1 when refused, so the guest sees a failure
         // instead of the host being asked for unbounded memory.
         assert_eq!(run(&runtime, MEMORY_HOG, guards).unwrap(), -1);
+    }
+
+    /// Grows a table 4096 elements at a time until refused, then answers
+    /// its size.
+    const TABLE_HOG: &str = r#"
+        (module
+          (table 1 funcref)
+          (func (export "run") (result i32)
+            (loop $again
+              (br_if $again (i32.ne (table.grow (ref.null func) (i32.const 4096)) (i32.const -1))))
+            (table.size)))
+    "#;
+
+    #[test]
+    fn a_table_cannot_grow_past_the_memory_cap() {
+        let runtime = runtime();
+        let cap = 2 * 1024 * 1024;
+        let guards = Guards {
+            memory_bytes: cap,
+            ..Guards::default()
+        };
+        // Without a count of its elements a table is host memory the cap
+        // never sees: 4 billion of them is 32 GB.
+        let elements = run(&runtime, TABLE_HOG, guards).unwrap() as usize;
+        assert!(elements > 1, "the table could not grow at all");
+        assert!(elements * TABLE_ELEMENT_BYTES <= cap, "the table grew to {elements} elements under a {cap} byte cap");
     }
 
     #[test]

@@ -534,7 +534,8 @@ fn on_tick(now_ms: u64) { SESSIONS.lock().unwrap().retain(|_, s| s.alive_at(now_
 Memory is lost on a crash, redeploy or server restart: save what matters to
 the database. A crash closes all the app's connections; clients reconnect.
 Requests and jobs still run fresh and share only the database and files.
-`fetch` on the app reports the instance under `metadata.resident`.
+`fetch` on the app reports the instance under `metadata.resident` to whoever
+manages the app. A site runs a limited number of resident instances.
 
 ## Keep the project, and start from it
 

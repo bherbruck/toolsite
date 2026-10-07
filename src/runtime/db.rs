@@ -177,8 +177,32 @@ pub fn run_as(
     sql: &str,
     params: &[Value],
 ) -> Result<SqlOutcome, String> {
+    run_until(config, app, identity, sql, params, None)
+}
+
+/// `run_as`, interrupted at `deadline`. A handler's call has a wall clock,
+/// and a statement runs on the host, where the epoch that enforces it
+/// cannot reach: a recursive CTE with no end would otherwise hold the
+/// thread forever.
+pub fn run_until(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    sql: &str,
+    params: &[Value],
+    deadline: Option<std::time::Instant>,
+) -> Result<SqlOutcome, String> {
     let conn = open_as(config, app, identity)?;
+    if let Some(deadline) = deadline {
+        interrupt_at(&conn, deadline)?;
+    }
     execute(&conn, sql, params, true)
+}
+
+/// Makes SQLite stop the running statement once `deadline` passes.
+fn interrupt_at(conn: &Connection, deadline: std::time::Instant) -> Result<(), String> {
+    conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))
+        .map_err(|e| e.to_string())
 }
 
 /// What a scoped caller may reach, by name. Everything is matched case
@@ -328,6 +352,20 @@ pub fn run_scoped(
     sql: &str,
     params: &[Value],
 ) -> Result<SqlOutcome, String> {
+    run_scoped_until(config, app, identity, scope, sql, params, None)
+}
+
+/// `run_scoped`, interrupted at `deadline` if that comes before its own
+/// wall clock does: what a handler's `query-scoped` gets.
+pub fn run_scoped_until(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    scope: &Scope,
+    sql: &str,
+    params: &[Value],
+    deadline: Option<std::time::Instant>,
+) -> Result<SqlOutcome, String> {
     if scope.readable.is_empty() && scope.writable.is_empty() {
         return Err(format!("{app} declares nothing a person may query"));
     }
@@ -344,9 +382,8 @@ pub fn run_scoped(
     ] {
         conn.set_limit(limit, value).map_err(|e| e.to_string())?;
     }
-    let started = std::time::Instant::now();
-    conn.progress_handler(1_000, Some(move || started.elapsed() > SCOPED_WALL_CLOCK))
-        .map_err(|e| e.to_string())?;
+    let own = std::time::Instant::now() + SCOPED_WALL_CLOCK;
+    interrupt_at(&conn, deadline.map_or(own, |deadline| deadline.min(own)))?;
     let names = Scope {
         readable: scope.readable.clone(),
         writable: scope.writable.clone(),

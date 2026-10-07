@@ -156,17 +156,20 @@ pub struct Fetched {
 
 /// Performs a request a handler asked for, after checking it. Blocking, and
 /// called from inside a blocking task like everything else a guest triggers.
+/// Gives up after `within`, what is left of the guest's call, or `TIMEOUT`,
+/// whichever comes first.
 pub fn send(
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: Vec<u8>,
     allow: &[String],
+    within: Duration,
 ) -> Result<Fetched, String> {
     check(url, allow).map_err(|refusal| refusal.to_string())?;
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(TIMEOUT)
+        .timeout(within.clamp(Duration::from_millis(1), TIMEOUT))
         // Followed by hand below, so each hop is checked. Left to the client
         // a redirect would walk straight past the guard above.
         .redirect(reqwest::redirect::Policy::none())
@@ -324,6 +327,7 @@ mod tests {
             &[],
             Vec::new(),
             &allow(&["api.github.com"]),
+            TIMEOUT,
         )
         .unwrap();
         assert_eq!(fetched.status, 200, "{}", String::from_utf8_lossy(&fetched.body));

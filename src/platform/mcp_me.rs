@@ -204,7 +204,9 @@ impl MeHost {
         if !crate::content::slug::valid_slug(&id) || !self.may_see(&user, &id).await {
             return Ok(refused());
         }
-        match knowledge::fetch_page(&self.config, &id).await {
+        let app = id.split('/').next().unwrap_or(&id);
+        let manages = crate::platform::admin::held_on(&self.config, &user, app).await == Some(crate::accounts::users::Scope::Admin);
+        match knowledge::fetch_page(&self.config, &id, manages).await {
             Some(output) => {
                 let value = serde_json::to_value(output).map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(CallToolResult::structured(value))

@@ -126,7 +126,9 @@ pub fn fetch_guide(config: &Config) -> FetchOutput {
 
 /// One page the caller may open, as text. `None` when there is no page at
 /// the slug; the caller has already decided the slug may be seen.
-pub async fn fetch_page(config: &Config, slug: &str) -> Option<FetchOutput> {
+/// `manages` says whether the caller manages the app, which is what it
+/// takes to see how its resident instance runs and why it last failed.
+pub async fn fetch_page(config: &Config, slug: &str, manages: bool) -> Option<FetchOutput> {
     let path = page_path(config, slug).await?;
     let html = tokio::fs::read_to_string(&path).await.ok()?;
     let title = page_title(&path).await.unwrap_or_else(|| slug.to_string());
@@ -166,7 +168,7 @@ pub async fn fetch_page(config: &Config, slug: &str) -> Option<FetchOutput> {
             "has_handler": config.data_dir.join(&app).join("handler.wasm").is_file(),
             "views": views,
             "open_connections": config.connections.open(&app),
-            "resident": meta.resident.map(|_| config.residents.status(&app).unwrap_or_default()),
+            "resident": meta.resident.filter(|_| manages).map(|_| config.residents.status(&app).unwrap_or_default()),
         }),
     })
 }

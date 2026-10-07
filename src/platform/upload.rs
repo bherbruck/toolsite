@@ -430,6 +430,9 @@ pub(crate) async fn store_for_slug(
                     .into_response();
             }
         };
+        // Held until the handler is written, so a manifest declaring
+        // [resident] cannot be checked against the handler this replaces.
+        let _declaring = config.residents.declaring().await;
         if !takes_connections && crate::content::store::read_meta(config, &app).await.resident.is_some() {
             tracing::warn!(app = %app, "handler rejected: the app runs resident and the handler takes no connections");
             return (

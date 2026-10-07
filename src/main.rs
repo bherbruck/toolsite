@@ -336,10 +336,23 @@ async fn main() -> anyhow::Result<()> {
     if resident_memory > resident_max {
         panic!("TOOLSITE_RESIDENT_MEMORY_MB is {resident_memory}, past TOOLSITE_RESIDENT_MAX_MB of {resident_max}");
     }
-    let residents = toolsite::runtime::resident::Residents::new(resident_memory, resident_max);
+    let mut residents = toolsite::runtime::resident::Residents::new(resident_memory, resident_max);
+    // And what all of them together may take: threads, memory, waiting events.
+    residents.max_instances = count("TOOLSITE_RESIDENT_MAX", residents.max_instances as u64) as usize;
+    residents.total_memory_mb = count("TOOLSITE_RESIDENT_TOTAL_MB", residents.total_memory_mb);
+    residents.queue_depth = count("TOOLSITE_RESIDENT_QUEUE", residents.queue_depth as u64).max(1) as usize;
+    if resident_max > residents.total_memory_mb {
+        panic!(
+            "TOOLSITE_RESIDENT_MAX_MB is {resident_max}, past TOOLSITE_RESIDENT_TOTAL_MB of {}",
+            residents.total_memory_mb
+        );
+    }
     tracing::info!(
         memory_mb = resident_memory,
         max_mb = resident_max,
+        instances = residents.max_instances,
+        total_mb = residents.total_memory_mb,
+        queue = residents.queue_depth,
         "resident apps configuration"
     );
 
