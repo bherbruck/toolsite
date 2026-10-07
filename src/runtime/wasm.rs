@@ -5,8 +5,10 @@
 //! * **fuel** — a hard ceiling on executed instructions, so an infinite loop
 //!   dies deterministically rather than pinning a core.
 //! * **epochs** — wall-clock deadline, which catches guests that block without
-//!   burning fuel. Epochs only interrupt wasm, so every host import that can
-//!   wait (a wasi sleep, a query, a fetch) is cut off at the same deadline.
+//!   burning fuel. Each tick checks the deadline against the clock rather
+//!   than counting ticks, which run slow on a loaded host. Epochs only
+//!   interrupt wasm, so every host import that can wait (a wasi sleep, a
+//!   query, a fetch) is cut off at the same deadline.
 //! * **memory** — a cap enforced when the guest asks to grow, counting its
 //!   tables as well as its linear memory.
 //!
@@ -23,7 +25,8 @@ use std::{
 };
 use wasmtime::{
     component::{Component, Linker, TypedFunc},
-    Config, Engine, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
+    Config, Engine, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    UpdateDeadline,
 };
 use wasmtime_wasi::{
     clocks::{WasiClocksCtxView, WasiClocksView},
@@ -56,8 +59,8 @@ use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Value as Wit
 // the generated path.
 pub use self::toolsite::app::identity::User;
 
-/// How often the epoch ticker advances. Wall-clock deadlines are rounded up to
-/// a multiple of this, so it trades timeout precision against wakeups.
+/// How often the epoch ticker advances. A deadline is noticed at the first
+/// tick after it, so this trades timeout precision against wakeups.
 const EPOCH_TICK: Duration = Duration::from_millis(50);
 
 /// Compiled modules kept in memory. Eviction only costs a recompile, because
@@ -184,7 +187,8 @@ impl StoreState {
 /// wasi's monotonic clock, with every sleep cut off at the call's deadline.
 /// A sleep runs on the host, where epochs cannot reach it: without this a
 /// guest calling `std::thread::sleep` for an hour holds its thread for an
-/// hour. Cut short, the guest wakes early, runs, and the epoch stops it.
+/// hour. Cut short, the guest wakes at the deadline, and the epoch, which
+/// ticked while it slept, stops it at the first instruction it runs.
 struct DeadlineClock;
 
 impl wasmtime::component::HasData for DeadlineClock {
@@ -689,6 +693,15 @@ impl Runtime {
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
+        // Every tick asks the clock. Counting ticks instead would let a call
+        // run past its deadline by however far the ticker fell behind.
+        store.epoch_deadline_callback(|store| {
+            if Instant::now() >= store.data().deadline {
+                Err(Trap::Interrupt.into())
+            } else {
+                Ok(UpdateDeadline::Continue(1))
+            }
+        });
         arm(&mut store, guards);
         store
     }
@@ -733,8 +746,7 @@ impl Runtime {
 fn arm(store: &mut Store<StoreState>, guards: Guards) {
     store.data_mut().deadline = Instant::now() + guards.wall_clock;
     store.set_fuel(guards.fuel).expect("fuel is enabled");
-    let ticks = guards.wall_clock.as_millis().div_ceil(EPOCH_TICK.as_millis());
-    store.set_epoch_deadline(ticks.max(1) as u64);
+    store.set_epoch_deadline(1);
 }
 
 /// An app's handler kept alive between events: its memory, and so whatever
@@ -878,6 +890,30 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "deadline did not fire promptly"
         );
+    }
+
+    #[test]
+    fn a_call_stops_at_its_deadline_however_few_ticks_have_passed() {
+        // A ticker that fell behind under load, as far as the store can
+        // tell: its deadline is here while barely a tick has gone by. Were
+        // the deadline a count of ticks, this would run for the full five
+        // seconds.
+        let runtime = runtime();
+        let wasm = wat::parse_str(INFINITE_LOOP).unwrap();
+        let module = runtime.module(INFINITE_LOOP, &wasm).unwrap();
+        let guards = Guards {
+            fuel: u64::MAX,
+            wall_clock: Duration::from_secs(5),
+            ..Guards::default()
+        };
+        let mut store = runtime.store(test_site(), "test", None, guards);
+        store.data_mut().deadline = Instant::now();
+        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+        let started = Instant::now();
+        let error = run.call(&mut store, ()).unwrap_err();
+        assert_eq!(error.downcast_ref::<wasmtime::Trap>(), Some(&wasmtime::Trap::Interrupt), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "ran on for {:?}", started.elapsed());
     }
 
     #[test]

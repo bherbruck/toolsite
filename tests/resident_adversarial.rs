@@ -202,6 +202,21 @@ async fn closes_within(socket: &mut Socket, within: Duration) -> bool {
     }
 }
 
+/// Waits up to `within` for the socket to close, and says what arrived
+/// before it did, if anything: a word from a guest that should have been
+/// stopped first.
+async fn closes_silently_within(socket: &mut Socket, within: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Err(_) => return Err("still open".to_string()),
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return Ok(()),
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(message))) => return Err(format!("the guest said {message:?}")),
+        }
+    }
+}
+
 async fn closes(socket: &mut Socket) -> bool {
     closes_within(socket, Duration::from_secs(3)).await
 }
@@ -432,10 +447,14 @@ async fn a_wasi_sleep_cannot_hold_a_resident_instance_past_its_wall_clock() {
     let site = site().await;
     resident(&site.config, "sleeper");
     let mut socket = open(&site, "sleeper").await;
+    let wall_clock = Guards::default().wall_clock;
     let started = Instant::now();
     say(&mut socket, "sleep-forever").await;
-    assert!(closes_within(&mut socket, Duration::from_secs(10)).await, "an hour's sleep held the instance");
-    assert!(started.elapsed() < Duration::from_secs(8), "stopped late: {:?}", started.elapsed());
+    // The sleep wakes at the deadline and the call ends there: the guest
+    // never runs on to answer, however far the epoch ticker lags.
+    let closed = closes_silently_within(&mut socket, wall_clock * 2).await;
+    assert_eq!(closed, Ok(()), "the sleep did not end the call at its deadline");
+    assert!(started.elapsed() < wall_clock + Duration::from_secs(1), "stopped late: {:?}", started.elapsed());
     let crashed = status(&site, "sleeper");
     assert!(crashed.last_crash.as_deref().is_some_and(|why| why.contains("time limit")), "{crashed:?}");
     // A short sleep is still a sleep.
@@ -450,13 +469,12 @@ async fn a_wasi_sleep_cannot_hold_a_fresh_event_past_its_wall_clock() {
     let site = site().await;
     app_with(&site.config, "plain-sleeper", HANDLER, None);
     let mut socket = open(&site, "plain-sleeper").await;
+    let wall_clock = Guards::default().wall_clock;
     let started = Instant::now();
     say(&mut socket, "sleep-forever").await;
-    // The sleep wakes at the deadline: the guest answers, or the epoch
-    // stops it first. Either way the event is over within its time.
-    let ended = tokio::time::timeout(Duration::from_secs(10), socket.next()).await.is_ok();
-    assert!(ended, "an hour's sleep held the event");
-    assert!(started.elapsed() < Duration::from_secs(8), "stopped late: {:?}", started.elapsed());
+    let closed = closes_silently_within(&mut socket, wall_clock * 2).await;
+    assert_eq!(closed, Ok(()), "the sleep did not end the event at its deadline");
+    assert!(started.elapsed() < wall_clock + Duration::from_secs(1), "stopped late: {:?}", started.elapsed());
 }
 
 #[tokio::test]
