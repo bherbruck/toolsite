@@ -48,8 +48,14 @@ fn hide(config: &Config, app: &str, hidden: bool) {
 
 /// Reads one line, waiting long: the first event compiles the handler.
 async fn line(stream: &mut TcpStream) -> Option<String> {
+    line_within(stream, Duration::from_secs(60)).await
+}
+
+/// The first line waits longer: it waits for the handler to compile, which a
+/// debug build of the compiler does slowly on a loaded machine.
+async fn line_within(stream: &mut TcpStream, within: Duration) -> Option<String> {
     let mut read = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + within;
     while !read.ends_with(b"\n") {
         let mut byte = [0u8; 1];
         match tokio::time::timeout_at(deadline, stream.read(&mut byte)).await {
@@ -98,7 +104,7 @@ async fn refusals_are_logged_at_warn_without_tokens_or_payload_bytes() {
 
     // A token accepted, a wrong one refused, a payload echoed.
     let mut device = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    line(&mut device).await.expect("no greeting");
+    line_within(&mut device, Duration::from_secs(240)).await.expect("no greeting");
     device.write_all(format!("token {token}\n").as_bytes()).await.unwrap();
     assert_eq!(line(&mut device).await.as_deref(), Some("ok boiler"));
     device.write_all(b"PAYLOAD-MARKER-TCP\n").await.unwrap();

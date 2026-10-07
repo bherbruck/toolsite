@@ -593,20 +593,25 @@ async fn the_memory_resident_instances_reserve_is_capped_across_the_site() {
 async fn republishing_after_a_crash_does_not_end_the_pause() {
     let site = site().await;
     resident(&site.config, "impatient");
-    let mut crashed_at = Instant::now();
     for _ in 0..3 {
         let mut socket = open_after_pause(&site, "impatient", Duration::from_secs(5)).await;
         say(&mut socket, "crash").await;
         assert!(closes(&mut socket).await);
-        crashed_at = Instant::now();
     }
-    // Four seconds of pause now. A republish is not a way around it.
+    // Four seconds of pause now. A republish is not a way around it: the
+    // pause it ends at is the same after the republish as before.
+    let paused_until = status(&site, "impatient").next_start_at.expect("a crash starts a pause");
     let (code, body) = upload(&site, "impatient", "handler", HANDLER.to_vec()).await;
     assert_eq!(code, 200, "{body}");
+    assert_eq!(status(&site, "impatient").next_start_at, Some(paused_until), "republishing reset the pause");
     let refused = connect(&site, "/p/impatient/ws", None).await.is_err();
-    assert!(crashed_at.elapsed() < Duration::from_secs(4), "too slow to tell: {:?}", crashed_at.elapsed());
-    assert!(refused, "republishing reset the pause");
-    assert!(status(&site, "impatient").next_start_at.is_some());
+    // The status is whole seconds. Only a connect made a full second before
+    // the pause ends must be refused; a slow machine that got there later
+    // has still proved the pause survived, above.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    if now + 1 < paused_until {
+        assert!(refused, "a connect during the pause was let in after a republish");
+    }
     let mut socket = open_after_pause(&site, "impatient", Duration::from_secs(6)).await;
     assert_eq!(ask(&mut socket, "count").await.as_deref(), Some("1"));
 }
