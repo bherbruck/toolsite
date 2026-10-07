@@ -31,11 +31,11 @@ pub(crate) async fn receive(
         )
             .into_response();
     };
-    // On an app host, only that app's files.
-    if let Some(axum::Extension(host)) = &host
-        && host.0 != ticket.app
-    {
-        tracing::warn!(host = %host.0, ticket_for = %ticket.app, "blob upload refused: a ticket for another app");
+    // On an app host, only that app's files; in subdomain mode, only on
+    // the app's own host, where the ticket's URL was built.
+    let on_host = host.as_ref().map(|axum::Extension(host)| host.0.as_str());
+    if (config.apps.is_some() || on_host.is_some()) && on_host != Some(ticket.app.as_str()) {
+        tracing::warn!(host = on_host.unwrap_or("the main host"), ticket_for = %ticket.app, "blob upload refused: not on the ticket's app host");
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
     }
 

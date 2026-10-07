@@ -107,7 +107,7 @@ fn origin_of(url: &str) -> Option<String> {
 /// origin, or, with none configured, the host the request was sent to. In
 /// subdomain mode it must be the app's own host, so another app's page,
 /// a sibling on the same site, cannot open the socket as the visitor.
-pub(crate) fn same_origin(config: &crate::Config, app: &str, origin: &str, headers: &axum::http::HeaderMap) -> bool {
+fn same_origin(config: &crate::Config, app: &str, origin: &str, headers: &axum::http::HeaderMap) -> bool {
     let Some(origin) = origin_of(origin) else {
         return false;
     };
@@ -123,6 +123,21 @@ pub(crate) fn same_origin(config: &crate::Config, app: &str, origin: &str, heade
     ["http", "https"]
         .iter()
         .any(|scheme| origin_of(&format!("{scheme}://{host}")).is_some_and(|ours| ours == origin))
+}
+
+/// Whether a request was sent by a page on another origin than the app's.
+/// A browser names the page in `Origin` on every write and every upgrade;
+/// one that leaves it out but says through fetch metadata that the request
+/// crossed sites is treated the same. A client with neither is not a
+/// browser page, and carries no cookie it did not choose to send.
+pub(crate) fn from_foreign_page(config: &crate::Config, app: &str, headers: &axum::http::HeaderMap) -> bool {
+    match headers.get(header::ORIGIN) {
+        Some(origin) => !same_origin(config, app, origin.to_str().unwrap_or(""), headers),
+        None => headers
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|site| site.eq_ignore_ascii_case("same-site") || site.eq_ignore_ascii_case("cross-site")),
+    }
 }
 
 /// Splits `/p/<app>/<rest>` into the app and the path within it.
@@ -155,12 +170,11 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
     // WebSocket hijacking), so a browser's upgrade from any other origin is
     // refused. A client with no Origin is not a browser and carries no
     // cookie it did not choose to send.
-    if let Some(origin) = request.headers().get(header::ORIGIN)
-        && !same_origin(&config, &app, origin.to_str().unwrap_or(""), request.headers())
-    {
+    if from_foreign_page(&config, &app, request.headers()) {
         tracing::warn!(
             app = %app,
-            origin = ?origin,
+            origin = ?request.headers().get(header::ORIGIN),
+            fetch_site = ?request.headers().get("sec-fetch-site"),
             host = ?request.headers().get(header::HOST),
             "403: websocket upgrade from a page on another origin"
         );

@@ -678,3 +678,482 @@ async fn a_socket_opens_only_from_its_own_app_hosts_pages() {
     assert_eq!(connect(MAIN.to_string(), format!("https://{host}")).await, Err(404), "a socket opened on the main host");
     assert_eq!(connect(host.clone(), format!("https://{host}")).await, Ok(()));
 }
+
+// --- adversarial: hosts ----------------------------------------------------
+
+#[tokio::test]
+async fn a_health_check_is_answered_on_any_host_in_either_mode_and_says_nothing_else() {
+    for config in [site().1, path_mode().1] {
+        app(&config, "orders", "public");
+        let host = host_of(&config, "orders");
+        for asked in ["healthcheck.railway.app", MAIN, host.as_str(), "evil.com", "orders.apps.test:1"] {
+            let reply = get(&config, asked, "/healthz", None).await;
+            assert_eq!(reply.status, StatusCode::OK, "{asked}");
+            assert_eq!(reply.body, "ok");
+            let head = send(&config, on(asked, "HEAD", "/healthz").body(Body::empty()).unwrap()).await;
+            assert_eq!(head.status, StatusCode::OK, "HEAD on {asked}");
+        }
+        let bare = send(&config, Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await;
+        assert_eq!(bare.status, StatusCode::OK, "no Host at all");
+    }
+    // Nothing but the health check is answered on an unknown host.
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    for uri in ["/healthz/", "/healthz?x=/p/orders/", "/p/orders/", "/", "/guide", "/healthzx"] {
+        let reply = get(&config, "healthcheck.railway.app", uri, None).await;
+        if uri.starts_with("/healthz?") {
+            assert_eq!(reply.body, "ok");
+            continue;
+        }
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{uri}: {}", reply.body);
+        assert!(reply.header("location").is_none(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_names_two_hosts_is_refused_rather_than_routed_by_either() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    app(&config, "billing", "public");
+    let orders = host_of(&config, "orders");
+    let billing = host_of(&config, "billing");
+
+    // Two Host headers: a proxy may route by one, the server by the other.
+    let twice = Request::builder().uri("/p/billing/api/echo").header("host", &orders).header("host", &billing).body(Body::empty()).unwrap();
+    assert_eq!(send(&config, twice).await.status, StatusCode::BAD_REQUEST);
+    let twice = Request::builder().uri("/p/orders/").header("host", MAIN).header("host", &orders).body(Body::empty()).unwrap();
+    let reply = send(&config, twice).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.header("location").is_none());
+
+    // An absolute-form request line, or an HTTP/2 :authority, that disagrees
+    // with Host.
+    for (uri, host) in [
+        (format!("https://{billing}/p/billing/api/echo"), orders.clone()),
+        ("http://evil.com/p/orders/".to_string(), orders.clone()),
+        (format!("https://{orders}/p/orders/"), MAIN.to_string()),
+    ] {
+        let reply = send(&config, on(&host, "GET", &uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri} with Host {host}: {}", reply.body);
+        assert!(!reply.body.contains("echo") && reply.header("location").is_none());
+    }
+    // Agreeing, or the authority alone as HTTP/2 sends it, is one host.
+    let agreed = send(&config, on(&orders, "GET", &format!("https://{}/p/orders/api/echo", orders.to_uppercase())).body(Body::empty()).unwrap()).await;
+    assert_eq!(agreed.body, "GET /api/echo?");
+    let h2 = send(&config, Request::builder().uri(format!("https://{orders}/p/orders/api/echo")).body(Body::empty()).unwrap()).await;
+    assert_eq!(h2.body, "GET /api/echo?");
+    let h2_evil = send(&config, Request::builder().uri("https://evil.com/p/orders/").body(Body::empty()).unwrap()).await;
+    assert_eq!(h2_evil.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn malformed_and_lookalike_hosts_select_no_app() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    for host in [
+        ".apps.test",
+        "orders..apps.test",
+        "orders.apps.test:",
+        "orders.apps.test:443",
+        "orders.apps.test.:443",
+        "-orders.apps.test",
+        "orders-.apps.test",
+        "or_ders.apps.test",
+        "orders%2eapps.test",
+        "orders.apps.test/evil",
+        "user@orders.apps.test",
+        "orders.apps.test@evil.com",
+        "[::1].apps.test",
+        "xn--rders-3ve.apps.test",
+        "orders.APPS.test.evil.com",
+    ] {
+        let Ok(value) = axum::http::HeaderValue::from_str(host) else { continue };
+        let request = Request::builder().uri("/p/orders/").header("host", value).body(Body::empty()).unwrap();
+        let reply = send(&config, request).await;
+        assert!(
+            reply.status == StatusCode::NOT_FOUND || reply.status == StatusCode::BAD_REQUEST,
+            "{host}: {} {}",
+            reply.status,
+            reply.body
+        );
+        assert!(!reply.body.contains("orders home") && reply.header("location").is_none(), "{host}");
+    }
+}
+
+#[tokio::test]
+async fn a_path_on_an_app_host_never_reaches_another_app_however_it_is_spelled() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    app(&config, "billing", "public");
+    let host = host_of(&config, "orders");
+    for uri in [
+        "/p/orders/../billing/api/echo",
+        "/p/orders/%2E%2E/billing/api/echo",
+        "/p/orders/%2e%2e%2fbilling/api/echo",
+        "/p/orders%2F..%2Fbilling/api/echo",
+        "/p//billing/api/echo",
+        "/P/billing/api/echo",
+        "/p/%62illing/api/echo",
+        "/p/orders/..%5Cbilling/api/echo",
+        "/p/billing%00/api/echo",
+    ] {
+        let reply = get(&config, &host, uri, None).await;
+        assert!(!reply.body.contains("billing"), "{uri}: {} {}", reply.status, reply.body);
+        if let Some(location) = reply.header("location") {
+            assert!(!location.contains("billing"), "{uri} -> {location}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_idna_spelled_name_is_not_issued_as_a_host_that_browsers_would_show_in_unicode() {
+    let (_dir, config) = site();
+    // `xn--pple-43d` is how DNS spells "аpple" with a Cyrillic а.
+    for name in ["xn--pple-43d", "ab--cd"] {
+        app(&config, name, "public");
+        let label = toolsite::content::origins::label_for(&config, name);
+        assert_ne!(label, name);
+        assert!(label.get(2..4) != Some("--"), "{label}");
+        let page = get(&config, &format!("{label}.apps.test"), &format!("/p/{name}/"), None).await;
+        assert_eq!(page.status, StatusCode::OK, "{label}");
+        assert_eq!(get(&config, &format!("{name}.apps.test"), &format!("/p/{name}/"), None).await.status, StatusCode::NOT_FOUND);
+    }
+}
+
+// --- adversarial: labels ---------------------------------------------------
+
+#[tokio::test]
+async fn a_removed_apps_host_is_never_issued_to_another_app_and_comes_back_with_it() {
+    let (_dir, config) = site();
+    app(&config, "Shop", "authenticated");
+    let label = toolsite::content::origins::label_for(&config, "Shop");
+    let old_host = format!("{label}.apps.test");
+    let site_token = person(&config, "someone@example.com");
+    let shop_cookie = sign_in_on_app_host(&config, "Shop", &site_token).await;
+
+    toolsite::platform::trash::remove(&config, "Shop", 1000).unwrap();
+    assert_eq!(get(&config, &old_host, "/p/Shop/", None).await.status, StatusCode::NOT_FOUND);
+
+    // Someone publishes an app named exactly the old label, to inherit the
+    // host: its bookmarks, its storage in the browser, its cookies.
+    app(&config, &label, "public");
+    let squatter = toolsite::content::origins::label_for(&config, &label);
+    assert_ne!(squatter, label, "a removed app's host went to another app");
+    let reply = get(&config, &old_host, &format!("/p/{label}/"), Some(&format!("__Host-ts_app={shop_cookie}"))).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
+    // Nor does the old cookie mean anything on the squatter's own host.
+    let squatter_host = format!("{squatter}.apps.test");
+    let whoami = get(&config, &squatter_host, &format!("/p/{label}/api/whoami"), Some(&format!("__Host-ts_app={shop_cookie}"))).await;
+    assert!(!whoami.body.contains("someone@example.com"), "{}", whoami.body);
+
+    // Put back from the bin, Shop has its own host again.
+    let kept = config.data_dir.join(".trash/1000-Shop");
+    std::fs::rename(kept.join("app"), config.data_dir.join("Shop")).unwrap();
+    std::fs::rename(kept.join("slug.meta"), config.data_dir.join("Shop.meta")).unwrap();
+    assert_eq!(toolsite::content::origins::label_for(&config, "Shop"), label);
+    assert!(get(&config, &old_host, "/p/Shop/", Some(&format!("__Host-ts_app={shop_cookie}"))).await.body.contains("Shop home"));
+    assert!(get(&config, &squatter_host, &format!("/p/{label}/"), None).await.body.contains(&format!("{label} home")));
+}
+
+#[tokio::test]
+async fn an_app_published_again_under_its_name_gets_its_host_back_even_without_its_meta() {
+    let (_dir, config) = site();
+    app(&config, "Shop", "public");
+    let label = toolsite::content::origins::label_for(&config, "Shop");
+    toolsite::platform::trash::remove(&config, "Shop", 1000).unwrap();
+    app(&config, "Shop", "public");
+    assert_eq!(toolsite::content::origins::label_for(&config, "Shop"), label);
+
+    // A meta rewritten by a writer that read it before the label was stored
+    // loses the label; the registry still knows it.
+    let mut meta = toolsite::content::store::read_meta_blocking(&config, "Shop");
+    meta.label = None;
+    toolsite::content::store::write_meta_blocking(&config, "Shop", &meta).unwrap();
+    app(&config, "shop-squat", "public");
+    assert_eq!(toolsite::content::origins::label_for(&config, "Shop"), label);
+}
+
+// --- adversarial: the handoff -----------------------------------------------
+
+#[tokio::test]
+async fn a_handoff_next_with_control_characters_or_backslashes_lands_on_the_apps_root() {
+    let (_dir, config) = site();
+    app(&config, "members", "authenticated");
+    let site_token = person(&config, "someone@example.com");
+    let members = host_of(&config, "members");
+    let session = format!("__Host-ts_session={site_token}");
+    let state = "abcdefghijklmnopqrstuvwxyz012345";
+    for next in [
+        "/p/members/\r\nSet-Cookie: ts_app=x",
+        "/p/members/\u{0}",
+        "/p/members/\\\\evil.com",
+        "/p/members\\..\\admin",
+        "/p/members/ x",
+        "/p/members/\u{e9}",
+        "/p/members/\t//evil.com",
+        "/p/members/%2F%2Fevil.com",
+    ] {
+        let uri = format!("/auth/handoff?app=members&next={}&state={state}", urlencoding::encode(next));
+        let back = get(&config, MAIN, &uri, Some(&session)).await;
+        assert!(back.location().starts_with(&format!("https://{members}/auth/landing?code=")), "{next:?}: {}", back.location());
+        let landing = back.location().strip_prefix(&format!("https://{members}")).unwrap().to_string();
+        let landed = get(&config, &members, &landing, Some(&format!("__Host-ts_handoff={state}"))).await;
+        assert_eq!(landed.status, StatusCode::SEE_OTHER, "{next:?}: {}", landed.body);
+        let location = landed.location();
+        assert!(location == "/p/members/" || location == "/p/members/%2F%2Fevil.com", "{next:?} -> {location}");
+    }
+}
+
+#[tokio::test]
+async fn a_handoff_a_sibling_triggers_with_a_subresource_mints_nothing() {
+    let (_dir, config) = site();
+    app(&config, "members", "authenticated");
+    let site_token = person(&config, "someone@example.com");
+    for (mode, dest) in [("no-cors", "image"), ("cors", "empty"), ("navigate", "iframe"), ("no-cors", "script")] {
+        let request = on(MAIN, "GET", "/auth/handoff?app=members&next=%2Fp%2Fmembers%2F&state=abcdefghijklmnopqrstuvwxyz012345")
+            .header("cookie", format!("__Host-ts_session={site_token}"))
+            .header("sec-fetch-mode", mode)
+            .header("sec-fetch-dest", dest)
+            .header("sec-fetch-site", "same-site")
+            .body(Body::empty())
+            .unwrap();
+        let reply = send(&config, request).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{mode}/{dest}");
+        assert!(reply.header("location").is_none());
+    }
+    assert!(config.handoffs.lock().unwrap().is_empty(), "a code was minted for a request the visitor did not make");
+}
+
+// --- adversarial: cookies --------------------------------------------------
+
+#[tokio::test]
+async fn an_app_handler_cannot_toss_a_platform_cookie_under_any_spelling() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    let host = host_of(&config, "orders");
+    for set in [
+        "=ts_app=forged; Domain=apps.test; Path=/",
+        "=__Host-ts_app=forged; Path=/; Secure",
+        " =ts_handoff=abcdefghijklmnopqrstuvwxyz012345; Domain=apps.test",
+        "__HOST-TS_APP=forged; Path=/; Secure",
+        "__Secure-ts_session=forged; Domain=site.test; Secure",
+        "Ts_Session=forged; Domain=test",
+        "ts_app",
+    ] {
+        let reply = get(&config, &host, &format!("/p/orders/api/set-cookie?{}", urlencoding::encode(set)), None).await;
+        assert_eq!(reply.body, "set");
+        assert!(reply.cookies().is_empty(), "{set:?} reached the browser: {:?}", reply.cookies());
+    }
+    // An app's own cookie is the app's to set.
+    let reply = get(&config, &host, &format!("/p/orders/api/set-cookie?{}", urlencoding::encode("theme=dark; Path=/p/orders/")), None).await;
+    assert_eq!(reply.cookies(), vec!["theme=dark; Path=/p/orders/"]);
+}
+
+#[tokio::test]
+async fn cookies_from_the_other_mode_open_nothing_after_a_switch() {
+    // Path mode to subdomain mode: the bare site cookie and path-scoped app
+    // cookies are no longer read anywhere.
+    let (dir, config) = path_mode();
+    app(&config, "members", "authenticated");
+    let site_token = person(&config, "someone@example.com");
+    let (_, path_app_token, _) = toolsite::accounts::users::create_app_session(&config, &site_token, "members").unwrap();
+    assert_eq!(get(&config, MAIN, "/auth/me", Some(&format!("ts_session={site_token}"))).await.status, StatusCode::OK);
+
+    let subdomain = Arc::new(Config {
+        base_url: Some(BASE.to_string()),
+        apps: Some(AppsDomain::parse("apps.test", Some(BASE), None).unwrap()),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    let host = host_of(&subdomain, "members");
+    assert_eq!(get(&subdomain, MAIN, "/auth/me", Some(&format!("ts_session={site_token}"))).await.status, StatusCode::UNAUTHORIZED);
+    for jar in [format!("ts_app_members={path_app_token}"), format!("ts_app={path_app_token}"), format!("ts_session={site_token}")] {
+        let reply = get(&subdomain, &host, "/p/members/api/whoami", Some(&jar)).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{jar}");
+        // On the main host the old app cookie is not read at all: the path
+        // only redirects.
+        let main = get(&subdomain, MAIN, "/p/members/api/whoami", Some(&jar)).await;
+        assert_eq!(main.status, StatusCode::FOUND);
+        assert!(!main.body.contains("someone@example.com"));
+    }
+
+    // And back: the prefixed cookies of subdomain mode mean nothing in path
+    // mode, and a connector token bound to an app's host is not taken at
+    // the path-mode address.
+    let app_token = sign_in_on_app_host(&subdomain, "members", &site_token).await;
+    let path_again = path_mode_on(dir.path());
+    assert_eq!(get(&path_again, MAIN, "/auth/me", Some(&format!("__Host-ts_session={site_token}"))).await.status, StatusCode::UNAUTHORIZED);
+    let reply = get(&path_again, MAIN, "/p/members/api/whoami", Some(&format!("__Host-ts_app={app_token}"))).await;
+    assert_ne!(reply.status, StatusCode::OK);
+    assert!(!reply.body.contains("someone@example.com"));
+    toolsite::platform::manifest::apply(&path_again, "members", FARM_TOOLS).await.unwrap();
+    let token = bearer(&path_again, "someone@example.com", Some(&format!("https://{host}/p/members/mcp")));
+    let (status, _) = mcp_call(&path_again, MAIN, "/p/members/mcp", &token, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+fn path_mode_on(dir: &std::path::Path) -> Arc<Config> {
+    Arc::new(Config { base_url: Some(BASE.to_string()), ..Config::local(dir.to_path_buf(), TOKEN) })
+}
+
+// --- adversarial: the origin rule --------------------------------------------
+
+#[tokio::test]
+async fn a_write_without_origin_that_says_it_crossed_sites_is_refused() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    let host = host_of(&config, "orders");
+    let post = |site: Option<&str>| {
+        let mut request = on(&host, "POST", "/p/orders/api/echo");
+        if let Some(site) = site {
+            request = request.header("sec-fetch-site", site);
+        }
+        request.body(Body::from("x")).unwrap()
+    };
+    for site in ["same-site", "cross-site", "Cross-Site"] {
+        assert_eq!(send(&config, post(Some(site))).await.status, StatusCode::FORBIDDEN, "{site}");
+    }
+    for site in [Some("same-origin"), Some("none"), None] {
+        assert_eq!(send(&config, post(site)).await.body, "POST /api/echo?", "{site:?}");
+    }
+    // Origin decides when present, whatever fetch metadata says.
+    let forged = on(&host, "POST", "/p/orders/api/echo")
+        .header("origin", "https://billing.apps.test")
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::from("x"))
+        .unwrap();
+    assert_eq!(send(&config, forged).await.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn toolsite_adds_no_cors_permission_that_would_let_a_sibling_read_an_app() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    let host = host_of(&config, "orders");
+    let preflight = send(
+        &config,
+        on(&host, "OPTIONS", "/p/orders/api/echo")
+            .header("origin", "https://billing.apps.test")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let read = send(&config, on(&host, "GET", "/p/orders/api/echo").header("origin", "https://billing.apps.test").body(Body::empty()).unwrap()).await;
+    for reply in [&preflight, &read] {
+        assert!(
+            reply.headers.iter().all(|(name, _)| !name.starts_with("access-control-")),
+            "{:?}",
+            reply.headers
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_socket_without_origin_that_says_it_crossed_sites_is_refused() {
+    use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
+    let (_dir, config) = site();
+    app(&config, "team", "public");
+    let mut meta = toolsite::content::store::read_meta_blocking(&config, "team");
+    meta.sockets = vec!["/ws".into()];
+    toolsite::content::store::write_meta_blocking(&config, "team", &meta).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(config.clone(), Runtime::new().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let host = host_of(&config, "team");
+
+    let connect = |headers: Vec<(&'static str, String)>| {
+        let host = host.clone();
+        async move {
+            let mut request = format!("ws://{addr}/p/team/ws").into_client_request().unwrap();
+            request.headers_mut().insert("host", host.parse().unwrap());
+            for (name, value) in headers {
+                request.headers_mut().insert(name, value.parse().unwrap());
+            }
+            match tokio_tungstenite::connect_async(request).await {
+                Ok(_) => Ok(()),
+                Err(tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+                Err(other) => panic!("connect failed: {other}"),
+            }
+        }
+    };
+    assert_eq!(connect(vec![("sec-fetch-site", "same-site".into()), ("cookie", "__Host-ts_app=x".into())]).await, Err(403));
+    assert_eq!(connect(vec![("sec-fetch-site", "cross-site".into())]).await, Err(403));
+    assert_eq!(connect(vec![("origin", "null".into())]).await, Err(403));
+    assert_eq!(connect(vec![]).await, Ok(()), "a client that is not a browser page");
+}
+
+// --- adversarial: connectors, tickets, the main host ---------------------------
+
+#[tokio::test]
+async fn a_token_for_one_apps_connector_is_refused_at_anothers() {
+    let (_dir, config) = site();
+    for name in ["farm", "barn"] {
+        app(&config, name, "authenticated");
+        toolsite::platform::manifest::apply(&config, name, FARM_TOOLS).await.unwrap();
+    }
+    person(&config, "alice@example.com");
+    let farm = host_of(&config, "farm");
+    let barn = host_of(&config, "barn");
+    let token = bearer(&config, "alice@example.com", Some(&format!("https://{farm}/p/farm/mcp")));
+    let list = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+    assert_eq!(mcp_call(&config, &farm, "/p/farm/mcp", &token, list.clone()).await.0, StatusCode::OK);
+    assert_eq!(mcp_call(&config, &barn, "/p/barn/mcp", &token, list.clone()).await.0, StatusCode::UNAUTHORIZED);
+    // Nor at farm's path on barn's host, nor at the main host's endpoints.
+    assert_eq!(mcp_call(&config, &barn, "/p/farm/mcp", &token, list.clone()).await.0, StatusCode::NOT_FOUND);
+    assert_ne!(mcp_call(&config, MAIN, "/mcp", &token, list.clone()).await.0, StatusCode::OK);
+    assert_ne!(mcp_call(&config, MAIN, "/me/mcp", &token, list).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_browser_upload_ticket_is_refused_on_the_main_host() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    let url = toolsite::runtime::blobs::issue_upload(&config, "orders", "files/a.txt", 0).unwrap();
+    let path = url.split_once("/blob/").map(|(_, t)| format!("/blob/{t}")).unwrap();
+    let reply = send(&config, on(MAIN, "PUT", &path).body(Body::from("x")).unwrap()).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
+    assert!(!config.data_dir.join("orders/.blobs/files/a.txt").exists());
+}
+
+#[tokio::test]
+async fn an_apps_icon_on_the_main_host_cannot_run_as_the_site() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    std::fs::write(
+        config.data_dir.join("orders.icon"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><script>fetch('/admin')</script></svg>"#,
+    )
+    .unwrap();
+    let reply = get(&config, MAIN, "/icon/orders", None).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.header("content-type"), Some("image/svg+xml"));
+    let policy = reply.header("content-security-policy").expect("no policy on an app's SVG");
+    assert!(policy.contains("sandbox") && policy.contains("default-src 'none'"), "{policy}");
+    assert_eq!(reply.header("x-content-type-options"), Some("nosniff"));
+}
+
+#[tokio::test]
+async fn the_main_host_runs_no_app_code_by_any_method_or_spelling() {
+    let (_dir, config) = site();
+    app(&config, "orders", "public");
+    for (method, uri) in [
+        ("GET", "/p/orders/api/echo"),
+        ("HEAD", "/p/orders/api/echo"),
+        ("GET", "/p/orders.icon"),
+        ("GET", "/p/orders/favicon.svg"),
+        ("OPTIONS", "/p/orders/api/echo"),
+        ("PATCH", "/p/orders/api/echo"),
+        ("GET", "/p/%6Frders/api/echo"),
+        ("GET", "/p/orders%2Fapi%2Fecho"),
+        ("GET", "/p/./orders/api/echo"),
+    ] {
+        let reply = send(&config, on(MAIN, method, uri).body(Body::empty()).unwrap()).await;
+        assert!(!reply.body.contains("/api/echo") && !reply.body.contains("orders home"), "{method} {uri}: {}", reply.body);
+        assert!(reply.status == StatusCode::FOUND || reply.status == StatusCode::NOT_FOUND, "{method} {uri}: {}", reply.status);
+        if let Some(location) = reply.header("location") {
+            assert!(location.starts_with("https://orders.apps.test/p/orders"), "{method} {uri} -> {location}");
+        }
+    }
+}

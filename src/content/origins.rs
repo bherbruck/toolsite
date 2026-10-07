@@ -116,13 +116,26 @@ pub fn valid_label(label: &str) -> bool {
         && label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Whether a label has hyphens in its third and fourth places, which IDNA
+/// reserves: `xn--` is how a Unicode name is spelled in DNS, and a browser
+/// shows such a host in Unicode, so an app named `xn--pple-43d` would show
+/// as a host that looks like another name. None is issued as it stands.
+fn idna_reserved(label: &str) -> bool {
+    label.get(2..4) == Some("--")
+}
+
+/// Whether an app's name is a label it may have as it is.
+fn own_label(app: &str) -> bool {
+    valid_label(app) && !idna_reserved(app)
+}
+
 /// The label an app's name would have if nothing else held it, and whether
 /// the name is a label already. A name that is (lower case, no `_`, short
 /// enough) is its own label. Any other is lowered, `_` becomes `-`, and a
 /// suffix from a hash of the exact name is added, so `Orders` and `orders`
 /// and `or_ders` never meet.
 fn derived(app: &str, attempt: u32) -> String {
-    if attempt == 0 && valid_label(app) {
+    if attempt == 0 && own_label(app) {
         return app.to_string();
     }
     let lowered: String = app
@@ -135,11 +148,41 @@ fn derived(app: &str, attempt: u32) -> String {
     }
     let digest = Sha256::digest(format!("{app}\n{attempt}").as_bytes());
     let suffix: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    if base.is_empty() {
-        format!("app-{suffix}")
+    if base.is_empty() || idna_reserved(&base) {
+        let base: String = format!("app-{base}").chars().take(MAX_LABEL - 9).collect();
+        format!("{}-{suffix}", base.trim_end_matches('-'))
     } else {
         format!("{base}-{suffix}")
     }
+}
+
+/// Every label ever issued, and the app it was issued to. A label is never
+/// issued to another app afterwards, even once its app is removed: a host's
+/// bookmarks, its storage in the browser and any cookie still held for it
+/// would otherwise pass to whoever published next under that name. An app
+/// published again under the same name, or put back from `.trash/`, gets
+/// its own label back.
+fn registry_path(config: &Config) -> std::path::PathBuf {
+    config.data_dir.join(".site").join("labels.json")
+}
+
+fn read_registry(config: &Config) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(registry_path(config))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_registry(config: &Config, registry: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    let path = registry_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
+    // Written aside and renamed, so a crash leaves the old list, never half.
+    let partial = path.with_extension("json.partial");
+    std::fs::write(&partial, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, &path).map_err(|e| e.to_string())
 }
 
 /// Every top-level name that can be an app: a directory or a loose page.
@@ -171,9 +214,9 @@ static ASSIGNING: Mutex<()> = Mutex::new(());
 /// app that does not exist yet (an upload URL handed out before the upload)
 /// gets the label it would be assigned, unstored.
 ///
-/// Labels other apps already hold are skipped, and so is a name that is a
-/// label itself and has not been assigned yet, so an app called
-/// `orders-1a2b3c4d` is not later moved off its own name.
+/// Labels other apps hold or ever held are skipped (see `registry_path`),
+/// and so is a name that is a label itself and has not been assigned yet,
+/// so an app called `orders-1a2b3c4d` is not later moved off its own name.
 pub fn label_for(config: &Config, app: &str) -> String {
     if let Some(label) = store::read_meta_blocking(config, app).label.filter(|l| valid_label(l)) {
         return label;
@@ -183,23 +226,37 @@ pub fn label_for(config: &Config, app: &str) -> String {
     if let Some(label) = meta.label.clone().filter(|l| valid_label(l)) {
         return label;
     }
-    let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut registry = read_registry(config);
+    let mut held: std::collections::HashSet<String> =
+        registry.iter().filter(|(_, owner)| owner.as_str() != app).map(|(label, _)| label.clone()).collect();
     for other in app_names(config).into_iter().filter(|other| other != app) {
         match store::read_meta_blocking(config, &other).label {
             Some(label) => {
                 held.insert(label);
             }
-            None if valid_label(&other) => {
+            None if own_label(&other) => {
                 held.insert(other);
             }
             None => {}
         }
     }
-    let label = (0..)
-        .map(|attempt| derived(app, attempt))
-        .find(|label| !held.contains(label))
-        .expect("an unbounded search finds a free label");
+    let label = registry
+        .iter()
+        .find(|(label, owner)| owner.as_str() == app && valid_label(label) && !held.contains(label.as_str()))
+        .map(|(label, _)| label.clone())
+        .unwrap_or_else(|| {
+            (0..)
+                .map(|attempt| derived(app, attempt))
+                .find(|label| !held.contains(label))
+                .expect("an unbounded search finds a free label")
+        });
     if app_exists(config, app) {
+        if registry.get(&label).map(String::as_str) != Some(app) {
+            registry.insert(label.clone(), app.to_string());
+            if let Err(why) = write_registry(config, &registry) {
+                tracing::warn!(app, %why, "the list of issued host labels could not be written");
+            }
+        }
         meta.label = Some(label.clone());
         if let Err(why) = store::write_meta_blocking(config, app, &meta) {
             tracing::warn!(app, %why, "an app's host label could not be stored; it is derived again next time");
@@ -213,9 +270,13 @@ pub fn app_for_label(config: &Config, label: &str) -> Option<String> {
     if !valid_label(label) {
         return None;
     }
-    // Most labels are their app's own name.
+    // Most labels are their app's own name, and every label issued is in
+    // the registry with its app.
     if app_exists(config, label) && label_for(config, label) == label {
         return Some(label.to_string());
+    }
+    if let Some(owner) = read_registry(config).get(label) {
+        return (app_exists(config, owner) && label_for(config, owner) == label).then(|| owner.clone());
     }
     app_names(config)
         .into_iter()
@@ -298,8 +359,13 @@ pub fn classify(config: &Config, host: Option<&str>) -> Host {
     if main_authority(config).is_some_and(|main| main == host) {
         return Host::Main;
     }
+    // `[::1]` or `[::1]:8080`, and nothing after the bracket but a port:
+    // `[::1].apps.test` is not loopback.
     let name = match host.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        Some(rest) => match rest.split_once(']') {
+            Some((name, tail)) if tail.is_empty() || tail.starts_with(':') => name,
+            _ => "",
+        },
         None => host.split(':').next().unwrap_or_default(),
     };
     if matches!(name, "localhost" | "127.0.0.1" | "::1") {
@@ -341,6 +407,10 @@ mod tests {
         let long = "a".repeat(80);
         assert!(derived(&long, 0).len() <= MAX_LABEL && valid_label(&derived(&long, 0)));
         assert!(valid_label(&derived("___", 0)));
+        for spoof in ["xn--pple-43d", "ab--x", "XN--PPLE-43D"] {
+            let label = derived(spoof, 0);
+            assert!(valid_label(&label) && !idna_reserved(&label), "{spoof}: {label}");
+        }
     }
 
     #[test]
@@ -385,6 +455,7 @@ mod tests {
         assert_eq!(classify(&config, Some("ORDERS.APPS.TEST")), Host::App("orders".into()));
         assert_eq!(classify(&config, Some("site.test")), Host::Main);
         assert_eq!(classify(&config, Some("127.0.0.1:8080")), Host::Main);
+        assert_eq!(classify(&config, Some("[::1]:8080")), Host::Main);
         for forged in [
             "evil.com",
             "orders.apps.test.evil.com",
@@ -395,6 +466,9 @@ mod tests {
             "nothing.apps.test",
             "orders_apps.test",
             "site.test.evil.com",
+            "[::1].apps.test",
+            "[::1]x",
+            "localhost.evil.com",
             "",
         ] {
             assert_eq!(classify(&config, Some(forged)), Host::Unknown, "{forged}");

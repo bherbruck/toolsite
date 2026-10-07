@@ -34,14 +34,28 @@ use axum::{
 };
 use std::sync::Arc;
 
-/// The host a request names: `Host`, or the authority of an HTTP/2 URI.
-fn host_of(request: &Request<Body>) -> Option<String> {
-    request
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| request.uri().authority().map(|a| a.as_str().to_string()))
+/// The host a request names: `Host`, or the authority of an HTTP/2 URI or
+/// an absolute-form request line. A request that names two (two `Host`
+/// headers, or a `Host` the authority disagrees with) is refused: a proxy in
+/// front may have routed it by the other one, and which app it reaches must
+/// not depend on which of them a hop believed.
+fn host_of(request: &Request<Body>) -> Result<Option<String>, &'static str> {
+    let mut headers = request.headers().get_all(header::HOST).iter();
+    let header = headers.next();
+    if headers.next().is_some() {
+        return Err("more than one Host header");
+    }
+    let header = match header {
+        Some(value) => Some(value.to_str().map_err(|_| "a Host header that is not text")?.to_string()),
+        None => None,
+    };
+    let authority = request.uri().authority().map(|a| a.as_str().to_string());
+    match (header, authority) {
+        (Some(host), Some(authority)) if !host.eq_ignore_ascii_case(&authority) => {
+            Err("a Host header that disagrees with the request's authority")
+        }
+        (header, authority) => Ok(header.or(authority)),
+    }
 }
 
 /// The app a `/p/` path names: its first segment.
@@ -85,11 +99,22 @@ fn app_host_serves(app: &str, path: &str) -> bool {
         || path.starts_with("/blob/")
 }
 
+/// Answered on any host, in either mode, so a platform's health check
+/// passes whatever `Host` it sends. Says nothing but that the server is up.
+pub const HEALTH_PATH: &str = "/healthz";
+
 pub(crate) async fn route_by_host(State(config): State<Arc<Config>>, mut request: Request<Body>, next: Next) -> Response {
-    if config.apps.is_none() {
+    if config.apps.is_none() || request.uri().path() == HEALTH_PATH {
         return next.run(request).await;
     }
-    let host = host_of(&request);
+    let host = match host_of(&request) {
+        Ok(host) => host,
+        Err(why) => {
+            let header_names: Vec<&str> = request.headers().keys().map(|k| k.as_str()).collect();
+            tracing::warn!(path = %request.uri().path(), headers = ?header_names, "400: {why}");
+            return (StatusCode::BAD_REQUEST, "bad request").into_response();
+        }
+    };
     let lookup = (config.clone(), host.clone());
     let Ok(kind) = tokio::task::spawn_blocking(move || origins::classify(&lookup.0, lookup.1.as_deref())).await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "host lookup failed").into_response();
@@ -138,22 +163,20 @@ pub(crate) async fn route_by_host(State(config): State<Arc<Config>>, mut request
 }
 
 /// A request that could change something, sent by a page on another
-/// origin. A browser sends `Origin` with every such request; a client that
-/// sends none is not a browser and carries no cookie it did not choose to.
+/// origin (see `websocket::from_foreign_page`).
 fn foreign_write(config: &Config, app: &str, request: &Request<Body>) -> Option<Response> {
     if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
         return None;
     }
-    let origin = request.headers().get(header::ORIGIN)?;
-    let theirs = origin.to_str().unwrap_or("");
-    if crate::platform::websocket::same_origin(config, app, theirs, request.headers()) {
+    if !crate::platform::websocket::from_foreign_page(config, app, request.headers()) {
         return None;
     }
     tracing::warn!(
         app,
         method = %request.method(),
         path = %request.uri().path(),
-        origin = ?origin,
+        origin = ?request.headers().get(header::ORIGIN),
+        fetch_site = ?request.headers().get("sec-fetch-site"),
         "403: a request that changes state, from a page on another origin"
     );
     Some((StatusCode::FORBIDDEN, "a page on another origin may not send this request").into_response())

@@ -77,8 +77,15 @@ pub fn without_platform_cookies(header: &str) -> Option<String> {
 /// Such a header is dropped: an app setting `ts_session` could sign a
 /// visitor in as someone else (session fixation) or overwrite another app's
 /// session.
+///
+/// A cookie with an empty name (`=ts_app=x`) counts by its value: a browser
+/// sends it back as the bare value, `ts_app=x`, which the server would read
+/// as a cookie of that name.
 pub fn sets_platform_cookie(set_cookie: &str) -> bool {
-    is_platform_cookie(set_cookie.split(['=', ';']).next().unwrap_or(""))
+    let pair = set_cookie.split(';').next().unwrap_or("");
+    let (name, value) = pair.split_once('=').unwrap_or(("", pair));
+    let name = if name.trim().is_empty() { value } else { name };
+    is_platform_cookie(name.split('=').next().unwrap_or(""))
 }
 
 pub fn app_cookie_name(app: &str) -> String {
@@ -1770,14 +1777,16 @@ fn valid_state(state: &str) -> bool {
 
 /// Where in an app a visitor is sent back to: a path under `/p/<app>`, or
 /// the app's root. Only ever used on the app's own host, so it can name no
-/// other host or app.
+/// other host or app. Printable ASCII only, since it becomes a `Location`
+/// header that a control character would break.
 fn next_within_app(app: &str, next: Option<&str>) -> String {
     let root = format!("/p/{app}");
     match next {
         Some(path)
             if (path == root || path.starts_with(&format!("{root}/")))
                 && !path.contains("//")
-                && !path.contains('\\') =>
+                && !path.contains('\\')
+                && path.chars().all(|c| c.is_ascii_graphic()) =>
         {
             path.to_string()
         }

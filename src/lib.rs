@@ -150,6 +150,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
 
     let mut public_router = Router::new()
         .route("/", get(index))
+        // For a platform's health check, on any host (see `app_hosts`).
+        .route(crate::platform::app_hosts::HEALTH_PATH, get(|| async { "ok" }))
         .route("/favicon.svg", get(crate::content::serve::site_favicon_svg))
         .route("/favicon.ico", get(crate::content::serve::site_favicon_ico))
         .route("/browse/{*path}", get(browse))

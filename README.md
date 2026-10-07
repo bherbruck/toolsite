@@ -186,9 +186,19 @@ TOOLSITE_APPS_DOMAIN=apps.localhost
 ```
 
 A request whose `Host` is not the main host, a loopback name or an app's
-host is answered with 404, so a platform health check must send one of
-those. Railway's checks arrive as `healthcheck.railway.app`, so leave the
-service's health check path empty in subdomain mode.
+host is answered with 404, and one that names two hosts (two `Host`
+headers, or a `Host` that disagrees with the request's authority) with
+400. The one exception is `GET /healthz`, which answers `ok` on any
+host in either mode, so a platform health check passes whatever `Host` it
+sends: on Railway, set the service's health check path to `/healthz`.
+
+A label once issued stays with its app, even after the app is removed:
+another app published later never takes over that host, its bookmarks or
+what the browser stored for it. Publishing again under the same name, or
+putting an app back from `.trash/`, brings its label back. Issued labels are
+kept in `.site/labels.json`. A name spelled the way DNS spells Unicode
+(`xn--...`, or any name with `--` in its third and fourth places) is never
+its own label, since a browser would show that host as some other name.
 
 In subdomain mode a screenshot browser opens the app's own host, by the
 same name a visitor uses, so it must be able to resolve and reach it;
@@ -1333,7 +1343,15 @@ and the main host serves no app content. On top of everything above:
   sibling app's script could send a credentialed POST and the cookie would
   go with it. An app host refuses any request other than GET, HEAD or
   OPTIONS whose `Origin` is present and is not its own, and a socket upgrade
-  from any origin but its own.
+  from any origin but its own. With no `Origin`, a request whose
+  `Sec-Fetch-Site` says `same-site` or `cross-site` is refused the same way.
+- A handler's `Set-Cookie` naming one of toolsite's cookies is dropped under
+  any spelling, an empty name included (`=ts_app=x`, which a browser sends
+  back as `ts_app=x`). So are `Service-Worker-Allowed`, which would let a
+  worker claim more than the app's own path, and `Clear-Site-Data`, which
+  would sign the visitor out of every app; in both modes.
+- Toolsite adds no CORS headers. A handler may answer another origin's
+  request with its own, which is the app's choice.
 - An app session for one app is refused by every other app, and sign-out on
   the main host ends every app host's session with it.
 
@@ -1342,9 +1360,16 @@ still be made to do so by a sibling's script (it cannot read the answer).
 An app that wants POSTs from pages on other sites (a form embedded
 elsewhere) has them refused. On plain http under a name that is not
 `localhost`, browsers do not keep `Secure` cookies, so the `__Host-` prefix
-is not used and a sibling host can set cookies for the parent domain.
-Putting the apps domain on the Public Suffix List would make each app host a
-site of its own, which closes the last two; toolsite does not need it.
+is not used and a sibling host can set cookies for the parent domain,
+`ts_app` included, which signs a visitor in to another app as someone else:
+run subdomain mode over https. Even over https a sibling's script can set
+an app's *own* cookies (any name not toolsite's) for the parent domain, and,
+when the main site shares a registrable domain with the apps domain
+(`example.com` and `apps.example.com`), cookies the main host reads that
+carry no prefix, such as the admin pages' one-time notice. Putting the apps
+domain on the Public Suffix List, or under a registrable domain of its own,
+would make each app host a site of its own, which closes these; toolsite
+does not need it.
 
 ## Row-level access
 

@@ -129,15 +129,24 @@ pub(crate) async fn serve_icon(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
     let content_type = sniff_image_type(&bytes);
+    // An icon is an app's content served on toolsite's own host, and an
+    // SVG may carry script. Opened as a page it would run as the site, so
+    // it is served sandboxed with nothing it may load; in an `<img>`, which
+    // is all the index does with it, an SVG runs no script anyway.
     (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, cache),
+            (header::CONTENT_SECURITY_POLICY, ICON_POLICY),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         bytes,
     )
         .into_response()
 }
+
+/// See `serve_icon`.
+const ICON_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox";
 
 /// Reserved prefix. A bundle that happens to ship `api/config.json` must not
 /// be able to shadow its own handler, so this wins before any file lookup.
@@ -567,13 +576,24 @@ async fn run_handler(
 const BLOB_HEADER: &str = "x-toolsite-blob";
 
 /// A header a handler may not send to a visitor: a `Set-Cookie` naming one
-/// of toolsite's own cookies.
+/// of toolsite's own cookies, or one whose reach is wider than the app.
+///
+/// - `Service-Worker-Allowed` lets a worker served under `/p/<app>/` claim a
+///   wider scope. In path mode that is the whole origin, `/admin` included:
+///   the worker would see, and could answer, every page of toolsite's.
+/// - `Clear-Site-Data` acts on the whole origin, and for cookies on the
+///   whole registrable domain, so an app could sign the visitor out of the
+///   site and of every other app.
 fn refused_response_header(app: &str, name: &str, value: &str) -> bool {
-    let refused = name.eq_ignore_ascii_case("set-cookie") && crate::accounts::users::sets_platform_cookie(value);
-    if refused {
+    if name.eq_ignore_ascii_case("set-cookie") && crate::accounts::users::sets_platform_cookie(value) {
         tracing::warn!(app, "a handler tried to set one of toolsite's own cookies; the header was dropped");
+        return true;
     }
-    refused
+    if name.eq_ignore_ascii_case("service-worker-allowed") || name.eq_ignore_ascii_case("clear-site-data") {
+        tracing::warn!(app, header = name, "a handler sent a header that reaches beyond its app; the header was dropped");
+        return true;
+    }
+    false
 }
 
 async fn serve_blob(
@@ -666,3 +686,26 @@ pub(crate) async fn site_favicon_ico() -> Response {
 // screen. `/token` always hands back the configured client_secret as the
 // access token, which is also what `require_bearer` accepts on `/mcp` — the
 // client_secret is what actually gates the exchange.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_handler_cannot_send_headers_that_reach_beyond_its_app() {
+        for (name, value) in [
+            ("Service-Worker-Allowed", "/"),
+            ("service-worker-allowed", "/admin"),
+            ("Clear-Site-Data", "\"cookies\""),
+            ("set-cookie", "ts_session=x; Path=/"),
+            ("Set-Cookie", "=ts_app=forged; Domain=apps.test; Path=/"),
+            ("set-cookie", "=__Host-ts_app=forged; Path=/; Secure"),
+            ("set-cookie", "TS_APP=forged"),
+        ] {
+            assert!(refused_response_header("a", name, value), "{name}: {value}");
+        }
+        for (name, value) in [("set-cookie", "theme=dark; Path=/p/a/"), ("content-type", "text/html"), ("cache-control", "no-store")] {
+            assert!(!refused_response_header("a", name, value), "{name}: {value}");
+        }
+    }
+}
