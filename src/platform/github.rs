@@ -898,12 +898,12 @@ pub fn record_deployed(config: &Config, app: &str, sha: &str) -> bool {
 }
 
 /// A README for a repository toolsite made, when the project brought none.
-fn readme_for(app: &str, site: &str) -> String {
+fn readme_for(app: &str, page: &str) -> String {
     format!(
         "# {app}\n\nThe source of `{app}` on toolsite, kept here with its history. Publishing the \
          source from toolsite pushes a commit; a push here is pulled back into the app's source \
          archive. Building and publishing happen wherever the agent or the CLI runs:\n\n\
-         ```\ntoolsite deploy --slug {app}\n```\n\nThe app is served at {site}/p/{app}/.\n"
+         ```\ntoolsite deploy --slug {app}\n```\n\nThe app is served at {page}/.\n"
     )
 }
 
@@ -916,10 +916,6 @@ pub async fn create(
     private: bool,
 ) -> Result<RepoLink, String> {
     let app = app_of(config)?;
-    let site = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| config.local_base.clone());
     if !valid_app(app_name) {
         return Err("app must be one path segment of letters, numbers, '-' or '_'".into());
     }
@@ -977,7 +973,7 @@ pub async fn create(
     }
 
     if !files.iter().any(|(path, _)| path.eq_ignore_ascii_case("README.md")) {
-        files.push(("README.md".to_string(), readme_for(app_name, &site).into_bytes()));
+        files.push(("README.md".to_string(), readme_for(app_name, &crate::content::origins::page_url(config, app_name)).into_bytes()));
     }
     let sha = repo
         .commit_tree(&branch, &files, &[], &commit_message(None, &format!("Add {app_name} from toolsite")))

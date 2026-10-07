@@ -1,12 +1,12 @@
 //! Keeps a published app's scripts away from toolsite's own pages.
 //!
-//! Every app is served under `/p/<app>/` on the same origin as `/admin`,
-//! `/account`, the consent screen and the settings entry form. The browser
-//! treats them as one site: an app's script may fetch any of those pages,
-//! frame them, or open them in a window and read the result. That is how a
-//! script in an app could read an admin's form token and act as the admin.
-//! The full fix is a separate origin for apps. Until then this module closes
-//! the paths that do not need one:
+//! In path mode every app is served under `/p/<app>/` on the same origin as
+//! `/admin`, `/account`, the consent screen and the settings entry form. The
+//! browser treats them as one site: an app's script may fetch any of those
+//! pages, frame them, or open them in a window and read the result. That is
+//! how a script in an app could read an admin's form token and act as the
+//! admin. The full fix is a separate origin for apps, which is subdomain
+//! mode. Without it, this module closes the paths that do not need one:
 //!
 //! - A sensitive page is handed only to a top-level navigation, as the
 //!   browser's fetch metadata reports it, or to a request that already
@@ -16,9 +16,11 @@
 //! - Those pages and app pages never share a browsing context group, so a
 //!   window an app opens on `/admin` is not one it can reach into.
 //!
-//! What this does not close: an app's script can still call another app's
-//! API as the visitor, because each app's cookie is scoped by path on one
-//! origin and the browser attaches it to any request to that path.
+//! What this does not close in path mode: an app's script can still call
+//! another app's API as the visitor, because each app's cookie is scoped by
+//! path on one origin and the browser attaches it to any request to that
+//! path. Subdomain mode (`platform::app_hosts`) closes that with an origin
+//! per app; this module still guards the main host's pages there.
 
 use crate::{accounts::users, config::Config};
 use axum::{
@@ -51,7 +53,7 @@ pub(crate) fn is_sensitive(path: &str) -> bool {
 
 /// Pages toolsite renders itself, as opposed to what apps publish and the
 /// machine endpoints (MCP, uploads, exports, webhooks).
-fn is_toolsite_page(path: &str) -> bool {
+pub(crate) fn is_toolsite_page(path: &str) -> bool {
     is_sensitive(path) || path.starts_with("/auth/") || path == "/guide" || path == "/examples"
 }
 

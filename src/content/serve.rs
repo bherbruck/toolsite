@@ -189,25 +189,8 @@ pub(crate) async fn serve_page(
     // site cookie is sent to every path on the origin, so honouring it would
     // let any published app act as the visitor against every other one.
     let visitor = crate::accounts::users::current_app_user(config, app, request.headers()).await;
-    let site_token = crate::accounts::users::token_from_cookies(
-        request
-            .headers()
-            .get(header::COOKIE)
-            .and_then(|value| value.to_str().ok()),
-    );
-    let may_hand_off = crate::accounts::users::is_visitor_navigation(request.headers());
 
-    if let Some(denied) = gate_check(
-        &state.config,
-        app,
-        visitor.as_ref(),
-        site_token.as_deref(),
-        &uri_path,
-        is_api,
-        may_hand_off,
-    )
-    .await
-    {
+    if let Some(denied) = gate_check(&state.config, app, visitor.as_ref(), &uri_path, is_api, request.headers()).await {
         return denied;
     }
 
@@ -310,14 +293,15 @@ pub(crate) async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> 
 /// instead of either redirect, since sending a fetch to an HTML form only
 /// produces a confusing parse error — and because an automatic handoff on a
 /// background request is precisely the hole the app cookie exists to close.
+/// The site session and whether this is the visitor navigating are read
+/// from `headers`; an API call is never handed off whatever they say.
 pub(crate) async fn gate_check(
     config: &Arc<Config>,
     app: &str,
     visitor: Option<&crate::accounts::users::User>,
-    site_token: Option<&str>,
     path: &str,
     is_api: bool,
-    may_hand_off: bool,
+    headers: &axum::http::HeaderMap,
 ) -> Option<Response> {
     // The path within the app, so a rule reads the way its author wrote it:
     // "/admin", not "/p/myapp/admin".
@@ -330,6 +314,11 @@ pub(crate) async fn gate_check(
         return None;
     }
 
+    let site_token = crate::accounts::users::token_from_cookies(
+        config,
+        headers.get(header::COOKIE).and_then(|value| value.to_str().ok()),
+    );
+    let may_hand_off = crate::accounts::users::is_visitor_navigation(headers);
     // Resolved only once the app session has already failed, so a public app
     // costs no database work at all.
     let site_user = match site_token {
@@ -345,6 +334,21 @@ pub(crate) async fn gate_check(
         None => None,
     };
     let next = app_scoped_next(app, path);
+
+    // Subdomain mode: an app host never sees the site session, so whether it
+    // would satisfy the gate is the main host's question. A visitor with no
+    // app session yet goes there to find out; one who has an app session the
+    // gate refuses already has the answer.
+    if config.apps.is_some() {
+        return Some(if is_api || !may_hand_off {
+            let status = if visitor.is_some() { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED };
+            (status, "not permitted").into_response()
+        } else if visitor.is_some() {
+            (StatusCode::FORBIDDEN, "You do not have access to this app.").into_response()
+        } else {
+            crate::accounts::users::begin_handoff(config, app, &next, headers)
+        });
+    }
 
     // Worth a trip through the handoff only if the site session would in fact
     // satisfy this gate — otherwise the answer is already no, and minting a

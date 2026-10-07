@@ -78,11 +78,21 @@ fn take(config: &Config, token: &str) -> Option<PreviewTicket> {
     previews.remove(token)
 }
 
-pub(crate) async fn open(State(config): State<Arc<Config>>, Path(token): Path<String>) -> Response {
+pub(crate) async fn open(
+    State(config): State<Arc<Config>>,
+    host: Option<axum::Extension<crate::content::origins::AppHost>>,
+    Path(token): Path<String>,
+) -> Response {
     let Some(ticket) = take(&config, &token) else {
         tracing::warn!("preview refused: token unknown, expired or already used");
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
+    // Subdomain mode: only on the app's own host, where the cookie it sets
+    // is the app's.
+    if config.apps.is_some() && host.as_ref().map(|axum::Extension(host)| host.0.as_str()) != Some(ticket.app.as_str()) {
+        tracing::warn!(app = %ticket.app, "preview refused: not on the app's own host");
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
     let target = format!("/p/{}{}", ticket.app, ticket.path);
     let Some(user_id) = ticket.user_id else {
         return Redirect::to(&target).into_response();
@@ -115,7 +125,9 @@ pub(crate) async fn open(State(config): State<Arc<Config>>, Path(token): Path<St
 /// is only ever handed to the renderer's own browser.
 fn preview_cookie(config: &Config, app: &str, session: &str, max_age: u64) -> String {
     let cookie = users::set_app_cookie_header(config, app, session, max_age);
-    if config.preview_base.starts_with("http://") {
+    // In subdomain mode the render arrives on the app's host, over the same
+    // scheme as every visitor, so the cookie is exactly theirs.
+    if config.apps.is_none() && config.preview_base.starts_with("http://") {
         cookie.replace(" Secure;", "")
     } else {
         cookie

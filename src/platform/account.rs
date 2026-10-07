@@ -163,6 +163,7 @@ pub async fn change_password(
     }
     // The session to keep is the one that sent this form.
     let Some(session) = users::token_from_cookies(
+        &config,
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok()),

@@ -45,6 +45,7 @@ platform/          the site as its owner uses it
   app_tools.rs     tools an app declares: /p/<app>/mcp, pins, and calls run as the person
   bearer.rs        bearer/x-api-key middleware for /mcp
   shield.rs        keeps app scripts off toolsite's own pages: fetch metadata, framing, COOP
+  app_hosts.rs     subdomain mode at the door: what each host serves, redirects, the Origin rule
   client_oauth.rs  the OAuth server MCP clients sign in through — who may PUBLISH
   oauth_store.rs   its clients, codes and tokens, in .site/oauth.db
   upload.rs        upload tickets and the PUT endpoints they authorise
@@ -66,6 +67,7 @@ content/           what gets published, and how it is served
   store.rs         page/icon/meta paths, titles, visibility, listing
   bundle.rs        tar unpacking, entry classification, traversal defence
   serve.rs         the public site: pages, assets, handler dispatch
+  origins.rs       which origin serves an app: labels, app URLs, which host a request is on
   favicon.rs       an app's favicon drawn from its icon, and the links added to its HTML
   browse.rs        the app browser at / and /browse/<path>: projects and apps, and running projects
 

@@ -86,7 +86,14 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
     };
 
     let me_host_config = host_config.clone();
-    let app_tools_host_config = host_config.clone();
+    // An app's connector answers on the app's own host in subdomain mode,
+    // which no fixed list can name. `app_hosts::route_by_host` admits only
+    // the main host and real app hosts there, which is the same protection.
+    let app_tools_host_config = if config.apps.is_some() {
+        host_config.clone().disable_allowed_hosts()
+    } else {
+        host_config.clone()
+    };
     let mcp_config = config.clone();
     let mcp_runtime = runtime.clone();
     let mcp_service = StreamableHttpService::new(
@@ -220,6 +227,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         // Trades the site session for one scoped to a single app; the only
         // way an app ever sees a visitor.
         .route("/auth/handoff", get(users::handoff))
+        // Subdomain mode: where an app host collects the handoff's code.
+        .route("/auth/landing", get(users::landing))
         // A headless browser's one-time sign-in for a screenshot.
         .route("/preview/{token}", get(crate::platform::preview::open))
         .route(
@@ -299,6 +308,9 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
                 next.run(request).await
             }
         }))
+        // Which host serves what, in subdomain mode. Before the dispatch
+        // above, so a socket or connector on the wrong host never reaches it.
+        .layer(middleware::from_fn_with_state(config.clone(), crate::platform::app_hosts::route_by_host))
         // Outermost, so it sees app responses from every router above and
         // toolsite's own pages before anything else answers them.
         .layer(middleware::from_fn_with_state(config.clone(), crate::platform::shield::shield))

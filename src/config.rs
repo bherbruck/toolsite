@@ -61,6 +61,13 @@ pub struct Config {
     /// Also carries the memory default and ceiling, from
     /// `TOOLSITE_RESIDENT_MEMORY_MB` and `TOOLSITE_RESIDENT_MAX_MB`.
     pub residents: std::sync::Arc<crate::runtime::resident::Residents>,
+    /// Subdomain mode, from `TOOLSITE_APPS_DOMAIN`: each app on a host of
+    /// its own under this domain. `None` is path mode, every app under
+    /// `/p/` on the main host.
+    pub apps: Option<crate::content::origins::AppsDomain>,
+    /// Sign-ins on their way from the main host to an app host, by the
+    /// one-time code the app host trades for its cookie.
+    pub handoffs: Mutex<HashMap<String, crate::accounts::users::HandoffTicket>>,
 }
 
 impl Config {
@@ -95,6 +102,8 @@ impl Config {
             connections: self.connections.clone(),
             ports: self.ports.clone(),
             residents: self.residents.clone(),
+            apps: self.apps.clone(),
+            handoffs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -122,6 +131,8 @@ impl Config {
             connections: std::sync::Arc::new(crate::runtime::connections::Hub::default()),
             ports: Default::default(),
             residents: Default::default(),
+            apps: None,
+            handoffs: Mutex::new(HashMap::new()),
         }
     }
 }

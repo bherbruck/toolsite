@@ -179,10 +179,10 @@ pub fn clean_text(text: &str, allow_lines: bool) -> bool {
     text.chars().all(|c| !c.is_control() || (allow_lines && (c == '\n' || c == '\t')))
 }
 
-/// Where a person adds this app as a connector of its own.
+/// Where a person adds this app as a connector of its own: on the app's
+/// host in subdomain mode.
 pub fn connector_url(config: &Config, app: &str) -> String {
-    let base = config.base_url.as_deref().unwrap_or(&config.local_base);
-    format!("{base}/p/{app}/mcp")
+    format!("{}/p/{app}/mcp", crate::content::origins::app_base(config, app))
 }
 
 /// Checks a schema is an object schema, which is what MCP asks of a tool's
@@ -238,7 +238,7 @@ pub fn to_mcp(config: &Config, app: &str, app_title: &str, project: &str, tool: 
         )
         .with_icons(vec![Icon::new(format!(
             "{}/p/{app}/favicon.svg",
-            config.base_url.as_deref().unwrap_or(&config.local_base)
+            crate::content::origins::app_base(config, app)
         ))
         .with_mime_type("image/svg+xml")]);
     if let Some(output) = tool.output.as_ref().and_then(|o| o.as_object()) {

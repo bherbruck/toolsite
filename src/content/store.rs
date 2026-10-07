@@ -6,11 +6,9 @@ use tokio::fs;
 /// Enough of a page to find its <title> without reading whole artifacts.
 pub(crate) const TITLE_SCAN_BYTES: u64 = 8 * 1024;
 
+/// See `origins::page_url`: on the app's own host in subdomain mode.
 pub(crate) fn page_url(config: &Config, slug: &str) -> String {
-    match &config.base_url {
-        Some(base) => format!("{base}/p/{slug}"),
-        None => format!("/p/{slug}"),
-    }
+    crate::content::origins::page_url(config, slug)
 }
 
 /// The file backing a slug: either the page itself or, for an app root, that
@@ -117,6 +115,10 @@ pub struct PageMeta {
     /// events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident: Option<ResidentMeta>,
+    /// The DNS label of the app's host in subdomain mode, assigned once by
+    /// `origins::label_for` so the host never changes under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// How a resident app's instance runs. Absent values take the site's
@@ -258,6 +260,7 @@ impl Default for PageMeta {
             socket_protocols: Default::default(),
             ports: Vec::new(),
             resident: None,
+            label: None,
         }
     }
 }

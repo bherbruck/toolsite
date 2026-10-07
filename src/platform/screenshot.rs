@@ -388,15 +388,20 @@ pub async fn render(
         return Err(no_browser_message());
     };
     let token = preview::issue(config, app, path, user_id)?;
-    let url = preview_url(config, &token);
+    let url = preview_url(config, app, &token);
     let png = renderer.render(&url, &options).await?;
     tokio::task::spawn_blocking(move || fit(&png))
         .await
         .map_err(|_| "the image step failed".to_string())?
 }
 
-/// The one-time URL a renderer opens, on the base it can reach.
-pub fn preview_url(config: &Config, token: &str) -> String {
+/// The one-time URL a renderer opens, on the base it can reach. In
+/// subdomain mode that is the app's own host, since the cookie it signs in
+/// with belongs to that host and no other.
+pub fn preview_url(config: &Config, app: &str, token: &str) -> String {
+    if config.apps.is_some() {
+        return format!("{}/preview/{token}", crate::content::origins::app_base(config, app));
+    }
     format!("{}/preview/{token}", config.preview_base.trim_end_matches('/'))
 }
 
@@ -511,9 +516,9 @@ mod tests {
     fn the_preview_url_is_built_on_the_preview_base() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::local(dir.path().to_path_buf(), "t");
-        assert_eq!(preview_url(&config, "abc"), "http://127.0.0.1:8080/preview/abc");
+        assert_eq!(preview_url(&config, "app", "abc"), "http://127.0.0.1:8080/preview/abc");
         config.preview_base = "http://toolsite.railway.internal:8080/".to_string();
-        assert_eq!(preview_url(&config, "abc"), "http://toolsite.railway.internal:8080/preview/abc");
+        assert_eq!(preview_url(&config, "app", "abc"), "http://toolsite.railway.internal:8080/preview/abc");
     }
 
     #[test]

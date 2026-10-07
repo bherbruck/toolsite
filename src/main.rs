@@ -254,6 +254,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(app_id = %app.app_id, webhook = app.install_url().is_some(), "github app configured");
     }
 
+    // Subdomain mode: every app on a host of its own. Its scheme and port
+    // come from the base URL, so a wrong pairing is a boot error rather
+    // than links that go nowhere.
+    let apps = read(&["TOOLSITE_APPS_DOMAIN"]).map(|domain| {
+        toolsite::content::origins::AppsDomain::parse(&domain, base_url.as_deref(), read(&["TOOLSITE_APPS_PORT"]).as_deref())
+            .unwrap_or_else(|why| panic!("{why}"))
+    });
+    match &apps {
+        Some(apps) => tracing::info!(domain = %apps.domain, example = %apps.origin("<app>"), "subdomain mode: each app on its own host"),
+        None => tracing::info!("path mode: apps at /p/<app>/ on the main host; set TOOLSITE_APPS_DOMAIN to give each app its own origin"),
+    }
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");
 
@@ -392,6 +404,8 @@ async fn main() -> anyhow::Result<()> {
         connections: Arc::new(toolsite::runtime::connections::Hub::new(socket_limits)),
         ports: port_map,
         residents: Arc::new(residents),
+        apps,
+        handoffs: Mutex::new(HashMap::new()),
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -477,6 +491,8 @@ fn run_user_command(
         connections: Arc::new(toolsite::runtime::connections::Hub::default()),
         ports: Default::default(),
         residents: Default::default(),
+        apps: None,
+        handoffs: Mutex::new(HashMap::new()),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

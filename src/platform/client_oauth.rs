@@ -43,20 +43,26 @@ use std::sync::Arc;
 /// Whether a client may ask for a token for this resource: the publishing
 /// connector, a person's own, or one app's tools at `/p/<app>/mcp`. They
 /// share one sign-in; what a token may do is decided where it is used.
+/// An app's connector is named exactly as `connector_url` builds it: on the
+/// app's own host in subdomain mode, so the path-mode spelling is refused
+/// there.
 pub(crate) fn allowed_resource(config: &Config, resource: &str) -> bool {
     let Some(base) = config.base_url.as_deref() else {
         return false;
     };
-    let Some(path) = resource.trim_end_matches('/').strip_prefix(base) else {
-        return false;
-    };
-    match path {
-        "/mcp" | "/me/mcp" => true,
-        _ => path
-            .strip_prefix("/p/")
-            .and_then(|rest| rest.strip_suffix("/mcp"))
-            .is_some_and(crate::platform::export::valid_app),
+    let resource = resource.trim_end_matches('/');
+    if resource == format!("{base}/mcp") || resource == format!("{base}/me/mcp") {
+        return true;
     }
+    path_of(resource)
+        .and_then(crate::platform::app_tools::connector_app)
+        .is_some_and(|app| resource == crate::platform::app_tools::connector_url(config, app))
+}
+
+/// The path of an absolute URL.
+fn path_of(url: &str) -> Option<&str> {
+    let rest = &url[url.find("://")? + 3..];
+    rest.find('/').map(|i| &rest[i..])
 }
 
 fn issuer(config: &Config) -> &str {
@@ -101,7 +107,7 @@ pub(crate) async fn app_protected_resource_metadata(
     }
     let base = issuer(&config);
     Json(serde_json::json!({
-        "resource": format!("{base}/p/{app}/mcp"),
+        "resource": crate::platform::app_tools::connector_url(&config, &app),
         "authorization_servers": [base],
         "bearer_methods_supported": ["header"],
     }))
@@ -711,14 +717,16 @@ pub(crate) fn token_fits(config: &Config, resource: Option<&str>, endpoint_path:
     let Some(base) = config.base_url.as_deref() else {
         return true;
     };
-    let Some(granted) = resource.strip_prefix(base) else {
-        return false;
-    };
-    match granted {
-        "/mcp" => true,
-        "/me/mcp" => endpoint_path == "/me/mcp" || crate::platform::app_tools::connector_app(endpoint_path).is_some(),
-        other => other == endpoint_path && crate::platform::app_tools::connector_app(other).is_some(),
+    let connector = crate::platform::app_tools::connector_app(endpoint_path);
+    if resource == format!("{base}/mcp") {
+        return true;
     }
+    if resource == format!("{base}/me/mcp") {
+        return endpoint_path == "/me/mcp" || connector.is_some();
+    }
+    // An app's connector, as it is reached: on the app's host in subdomain
+    // mode, so a token bound to the path-mode address is not taken there.
+    connector.is_some_and(|app| resource == crate::platform::app_tools::connector_url(config, app))
 }
 
 #[cfg(test)]

@@ -59,6 +59,11 @@ pub struct BrowseQuery {
 /// One app the viewer may open.
 struct Entry {
     slug: String,
+    /// Where the page opens: `/p/<slug>`, on the app's host in subdomain
+    /// mode.
+    href: String,
+    /// The app's connector link, likewise.
+    connector: String,
     /// The app the slug belongs to: its first segment.
     app: String,
     project: String,
@@ -200,8 +205,21 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
         };
         let tools = viewer.is_some() && *slug == app && !crate::platform::app_tools::read(config, &app).is_empty();
         let pinned = tools && pins.contains(&app);
+        let (href, connector) = {
+            let (config, slug, app) = (config.clone(), slug.clone(), app.clone());
+            tokio::task::spawn_blocking(move || {
+                (
+                    crate::content::origins::page_href(&config, &slug),
+                    crate::content::origins::page_href(&config, &format!("{app}/mcp")),
+                )
+            })
+            .await
+            .unwrap_or_default()
+        };
         entries.push(Entry {
             slug: slug.clone(),
+            href,
+            connector,
             app,
             project,
             title,
@@ -500,10 +518,10 @@ fn app_menu(entry: &Entry, place: &str, ctx: &Ctx) -> Markup {
             span."row-tools" {
                 (menu_button(&id, &format!("Actions for {}", entry.slug)))
                 div."menu" popover id=(id) role="menu" style={ "position-anchor:--" (id) } {
-                    a role="menuitem" href={ "/p/" (entry.slug) "/" } target="_blank" rel="noopener" { "Open" }
+                    a role="menuitem" href={ (entry.href) "/" } target="_blank" rel="noopener" { "Open" }
                     @if entry.tools {
                         (pin_form(&entry.app, entry.pinned, ctx, "menuitem"))
-                        button type="button" role="menuitem" data-copy-link={ "/p/" (entry.app) "/mcp" } {
+                        button type="button" role="menuitem" data-copy-link=(entry.connector) {
                             "Copy connector link"
                         }
                     }
@@ -632,7 +650,7 @@ fn app_row(entry: &Entry, show_path: bool, ctx: &Ctx) -> Markup {
         div."row app" data-slug=(entry.slug.to_lowercase()) data-title=(entry.label().to_lowercase()) data-menu=[menu] {
             span."chev-space" {}
             (icon_markup(&entry.icon))
-            a."row-name" href={ "/p/" (entry.slug) } { (entry.label()) }
+            a."row-name" href=(entry.href) { (entry.label()) }
             span."row-meta" {
                 @if show_path && !entry.project.is_empty() { code { (entry.project) } " · " }
                 @if entry.title.is_some() { (entry.slug) }
@@ -684,7 +702,7 @@ fn app_tile(entry: &Entry, show_path: bool, ctx: &Ctx) -> Markup {
     let menu = entry.scope.is_some_and(|scope| scope >= Scope::Editor).then(|| menu_id("app", "tile", &entry.slug));
     html! {
         li."tile" data-slug=(entry.slug.to_lowercase()) data-title=(entry.label().to_lowercase()) data-menu=[menu] {
-            a."card" href={ "/p/" (entry.slug) } {
+            a."card" href=(entry.href) {
                 (icon_markup(&entry.icon))
                 span."meta" {
                     span."title" { (entry.label()) }

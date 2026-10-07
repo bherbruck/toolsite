@@ -51,6 +51,14 @@ Without the CLI, the same thing by hand:
     # src/index.css: replace everything with  @import "tailwindcss";
     npm run build && tar -czf - -C dist . | curl -f -T - '<upload-url>?bundle&spa'
 
+A site may serve each app from a host of its own, `<label>.apps.<domain>`
+(subdomain mode), still at the path `/p/<app>/`. The same build works on
+both kinds of site if it never names the site's address: use relative URLs,
+or `window.location.origin`, for its own API, sockets and connector link.
+`create_upload` and `list_pages` print the app's real URL; the main site's
+`/p/<app>/` redirects there. On such a site a POST from another origin's
+page is refused, so an app cannot take form posts from pages elsewhere.
+
 ## Start from an example
 
 Working apps live at `<server>/examples`, each with a README that says what

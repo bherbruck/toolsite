@@ -71,11 +71,7 @@ pub async fn handler_scaffold(
             .into_response();
     }
 
-    let base = config
-        .base_url
-        .as_deref()
-        .unwrap_or(&config.local_base)
-        .to_string();
+    let page = crate::content::origins::page_url(&config, &app);
     let crate_name = format!("{app}_handler").replace('-', "_");
     let readme = format!(
         r#"# {app} handler
@@ -95,7 +91,7 @@ Add migrations/002_*.sql for the next schema change rather than editing 001:
 each file runs once, so an edited one never reaches a database that already
 ran it.
 
-It then answers every request under {base}/p/{app}/api/, and any route with no
+It then answers every request under {page}/api/, and any route with no
 file behind it.
 
 The handler sees the path relative to this app, with /api still on it, and

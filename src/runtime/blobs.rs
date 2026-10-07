@@ -545,12 +545,13 @@ pub fn issue_upload(config: &Config, app: &str, key: &str, max_bytes: u64) -> Re
             expires_at: now + UPLOAD_TTL,
         },
     );
-    Ok(upload_url(config, &ticket))
+    Ok(upload_url(config, app, &ticket))
 }
 
-pub fn upload_url(config: &Config, ticket: &str) -> String {
-    let base = config.base_url.as_deref().unwrap_or(&config.local_base);
-    format!("{base}/blob/{ticket}")
+/// On the app's own host in subdomain mode, so the page that asked for it
+/// PUTs to its own origin.
+pub fn upload_url(config: &Config, app: &str, ticket: &str) -> String {
+    format!("{}/blob/{ticket}", crate::content::origins::app_base(config, app))
 }
 
 /// Spends a ticket. Nothing for one that is unknown or expired, and the same

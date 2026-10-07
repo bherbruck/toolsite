@@ -910,6 +910,14 @@ fn verify(
     if !response.status().is_success() {
         bail!("published, but {page} answered {}", response.status());
     }
+    // A site in subdomain mode redirects to the app's own host; that is
+    // the address to print. A gated app ends at a sign-in page instead, and
+    // the address asked for still leads to the app from there.
+    let page = if response.url().path().starts_with(&format!("/p/{}", project.slug)) {
+        response.url().to_string()
+    } else {
+        page
+    };
     let html = response.text().unwrap_or_default();
 
     // The base-path mistake: absolute /assets/... URLs that resolve above the

@@ -4,6 +4,7 @@
 pub mod browse;
 pub mod bundle;
 pub mod favicon;
+pub mod origins;
 pub mod serve;
 pub mod slug;
 pub mod store;

@@ -193,9 +193,12 @@ pub(crate) async fn require_app_caller(
         "401: no account token for an app's tools"
     );
     let mut response = StatusCode::UNAUTHORIZED.into_response();
-    if let Some(base) = config.base_url.as_deref()
-        && let Ok(value) =
-            format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/p/{app}/mcp""#).parse()
+    if config.base_url.is_some()
+        && let Ok(value) = format!(
+            r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource/p/{app}/mcp""#,
+            crate::content::origins::app_base(&config, &app)
+        )
+        .parse()
     {
         response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
     }

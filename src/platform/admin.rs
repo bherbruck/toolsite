@@ -546,6 +546,8 @@ async fn app_names(config: &Config) -> Vec<String> {
 
 struct AppRow {
     app: String,
+    /// Where the app opens: on its own host in subdomain mode.
+    href: String,
     title: Option<String>,
     gate: String,
     follows_default: bool,
@@ -570,6 +572,7 @@ async fn app_row(config: &Config, app: &str) -> AppRow {
     let effective = crate::content::store::effective_gate(config, app, "/").await;
     AppRow {
         app: app.to_string(),
+        href: crate::content::origins::page_href(config, app),
         title,
         gate: effective.gate.clone(),
         follows_default: effective.source != crate::content::store::GateSource::App,
@@ -707,7 +710,7 @@ pub async fn apps_page(
                                         td."muted small" {
                                             @if let Some(modified) = row.modified { (crate::content::store::relative_time(modified)) }
                                         }
-                                        td."actions-cell" { a."btn quiet sm" href={ "/p/" (row.app) "/" } target="_blank" { "Open" } }
+                                        td."actions-cell" { a."btn quiet sm" href={ (row.href) "/" } target="_blank" { "Open" } }
                                     }
                                 }
                             }

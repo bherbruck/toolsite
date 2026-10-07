@@ -104,11 +104,16 @@ fn origin_of(url: &str) -> Option<String> {
 }
 
 /// Whether an upgrade's `Origin` is this site: the configured base URL's
-/// origin, or, with none configured, the host the request was sent to.
-fn same_origin(config: &crate::Config, origin: &str, headers: &axum::http::HeaderMap) -> bool {
+/// origin, or, with none configured, the host the request was sent to. In
+/// subdomain mode it must be the app's own host, so another app's page,
+/// a sibling on the same site, cannot open the socket as the visitor.
+pub(crate) fn same_origin(config: &crate::Config, app: &str, origin: &str, headers: &axum::http::HeaderMap) -> bool {
     let Some(origin) = origin_of(origin) else {
         return false;
     };
+    if config.apps.is_some() {
+        return origin_of(&crate::content::origins::app_base(config, app)).is_some_and(|ours| ours == origin);
+    }
     if let Some(base) = config.base_url.as_deref() {
         return origin_of(base).is_some_and(|base| base == origin);
     }
@@ -151,7 +156,7 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
     // refused. A client with no Origin is not a browser and carries no
     // cookie it did not choose to send.
     if let Some(origin) = request.headers().get(header::ORIGIN)
-        && !same_origin(&config, origin.to_str().unwrap_or(""), request.headers())
+        && !same_origin(&config, &app, origin.to_str().unwrap_or(""), request.headers())
     {
         tracing::warn!(
             app = %app,
@@ -163,12 +168,11 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
     }
 
     let visitor = users::current_app_user(&config, &app, request.headers()).await;
-    let site_token = users::token_from_cookies(request.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()));
     let path = request.uri().path().trim_end_matches('/').to_string();
     // The refusal any API request gets: no redirect, since a socket cannot
     // follow one.
     if let Some(denied) =
-        crate::content::serve::gate_check(&config, &app, visitor.as_ref(), site_token.as_deref(), &path, true, false).await
+        crate::content::serve::gate_check(&config, &app, visitor.as_ref(), &path, true, request.headers()).await
     {
         tracing::warn!(app = %app, path = %within, signed_in = visitor.is_some(), "websocket refused: no access to this path");
         return denied;

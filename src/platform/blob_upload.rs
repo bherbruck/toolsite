@@ -18,6 +18,7 @@ use axum::{
 
 pub(crate) async fn receive(
     State(state): State<AppState>,
+    host: Option<axum::Extension<crate::content::origins::AppHost>>,
     Path(ticket): Path<String>,
     request: Request<Body>,
 ) -> Response {
@@ -30,6 +31,13 @@ pub(crate) async fn receive(
         )
             .into_response();
     };
+    // On an app host, only that app's files.
+    if let Some(axum::Extension(host)) = &host
+        && host.0 != ticket.app
+    {
+        tracing::warn!(host = %host.0, ticket_for = %ticket.app, "blob upload refused: a ticket for another app");
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    }
 
     let content_type = request
         .headers()

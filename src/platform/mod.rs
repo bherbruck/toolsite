@@ -6,6 +6,7 @@
 
 pub mod account;
 pub mod admin;
+pub mod app_hosts;
 pub mod app_tools;
 pub mod bearer;
 pub mod blob_upload;

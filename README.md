@@ -136,6 +136,67 @@ INFO toolsite: auth configuration bearer_auth=true oauth_auth=true base_url="htt
 INFO toolsite: storage configuration blobs="local" max_db_mb=4096 max_blob_mb=4096
 ```
 
+### Subdomain mode
+
+By default every app is served at `<site>/p/<app>/`, on one origin with
+every other app and with toolsite's own pages (path mode). That needs no
+DNS, but the browser treats all of it as one origin: a script in one app can
+send requests to another app as the visitor. See "Two modes: what each
+protects" under Gates.
+
+Subdomain mode gives each app an origin of its own. Set:
+
+```
+TOOLSITE_BASE_URL=https://example.com
+TOOLSITE_APPS_DOMAIN=apps.example.com
+```
+
+and each app is served from `https://<label>.apps.example.com/p/<app>/`.
+The path does not change, so a build made with base `/p/<app>/` works as it
+is. The label is the app's name when that is already a DNS label (lower
+case letters, digits and `-`, at most 63 characters); any other name is
+lowered, `_` becomes `-`, and a short hash of the exact name is added, so
+`Orders` and `orders` never share a host. A label is stored in the app's
+meta the first time it is used, and does not change when the app moves to
+another project.
+
+The main host then serves toolsite and no app content. A link to
+`<site>/p/<app>/...` from before still works: a page navigation is sent to
+the same path and query on the app's host. Anything else under `/p/` on the
+main host (a POST, a socket, an MCP call) is refused. An app host serves
+only its own app; toolsite's pages opened there go to the main host, and
+everything else is 404, as is any host that is neither the site nor one of
+its apps.
+
+DNS: a wildcard record `*.apps.example.com` pointing at the service, beside
+the record for the main domain. The main domain must not be under the apps
+domain; the server refuses to start if it is. On Railway, add
+`example.com` and `*.apps.example.com` as two custom domains on the service
+and create the records it shows for each (for the wildcard, a CNAME and the
+certificate's `_acme-challenge` CNAME). A `*.up.railway.app` address cannot
+carry a wildcard, so subdomain mode needs a domain of your own.
+
+The scheme comes from `TOOLSITE_BASE_URL`, and so does the port when it
+names one; `TOOLSITE_APPS_PORT` overrides the port. To try it on one
+machine, `*.localhost` names resolve to loopback in Chrome and Firefox:
+
+```
+TOOLSITE_BASE_URL=http://localhost:8080
+TOOLSITE_APPS_DOMAIN=apps.localhost
+```
+
+A request whose `Host` is not the main host, a loopback name or an app's
+host is answered with 404, so a platform health check must send one of
+those. Railway's checks arrive as `healthcheck.railway.app`, so leave the
+service's health check path empty in subdomain mode.
+
+In subdomain mode a screenshot browser opens the app's own host, by the
+same name a visitor uses, so it must be able to resolve and reach it;
+`TOOLSITE_PREVIEW_BASE` is not used. Connectors for an app's tools are at
+`https://<label>.apps.example.com/p/<app>/mcp`, and a token issued for the
+path-mode address is not accepted there; reconnect such a connector once.
+Switching modes signs everyone out once, since the cookies change name.
+
 Every MCP request also leaves one line: the method, the tool, the client,
 the protocol version, who, and the status. Never the arguments.
 
@@ -1212,17 +1273,21 @@ Signing in happens at `/auth/login`; a handler sees the visitor through
 `identity.current-user` and cannot forge it.
 
 Sessions come in two tiers. The site session proves who someone is; an app
-session, in a cookie scoped to `/p/<app>/`, is the only thing that satisfies a
-gate. `/auth/handoff` mints the second from the first, and refuses to do so
-for anything the browser reports as a background fetch.
+session, in a cookie scoped to `/p/<app>/` (in subdomain mode, a host-only
+cookie of the app's host), is the only thing that satisfies a gate.
+`/auth/handoff` mints the second from the first, and refuses to do so for
+anything the browser reports as a background fetch.
 
-### One origin: what is protected and what is not
+### Two modes: what each protects
 
-Every app is served under `/p/<app>/` on the same origin as `/admin`,
-`/account`, the consent screen and the settings entry form. The browser
-treats them as one site, and anyone who can publish an app, including a
-deploy-token holder or someone who can push to an app's repository, can put
-a script there. Protected now:
+Anyone who can publish an app, including a deploy-token holder or someone
+who can push to an app's repository, can put a script in it. What that
+script can reach depends on the mode.
+
+**Path mode** (the default). Every app is served under `/p/<app>/` on the
+same origin as every other app and as `/admin`, `/account`, the consent
+screen and the settings entry form. The browser treats them as one origin.
+Protected:
 
 - toolsite's own pages (`/`, `/browse`, `/admin`, `/account`, `/authorize`,
   `/settings`, `/auth/setup`) are handed out only to a navigation in a tab,
@@ -1239,13 +1304,47 @@ a script there. Protected now:
 - App code never sees toolsite's cookies, cannot set them, and a socket
   upgrade from another site is refused.
 
-Not protected yet: a script in one app can send requests to another app's
-`/p/<other>/...` as the visitor, because each app's cookie is scoped by path
-on one origin and the browser attaches it to any request to that path. It
-can also walk the visitor through the handoff to get that cookie. The full
-fix is a separate origin for apps, a subdomain per app or one apps host
-apart from the admin host. Until then, treat every app on a site as trusted
-with every visitor's access to every other app on it.
+Not protected in path mode: a script in one app can send requests to
+another app's `/p/<other>/...` as the visitor, because each app's cookie is
+scoped by path on one origin and the browser attaches it to any request to
+that path. It can also walk the visitor through the handoff to get that
+cookie. In path mode, treat every app on a site as trusted with every
+visitor's access to every other app on it.
+
+**Subdomain mode** (`TOOLSITE_APPS_DOMAIN`). Each app has its own origin,
+and the main host serves no app content. On top of everything above:
+
+- An app's script cannot read another app's pages, storage or responses,
+  or toolsite's: each is another origin, and none of them allows it.
+- Each app host has its own session cookie, host-only (no `Domain`),
+  `HttpOnly`, `SameSite=Lax`, and `Secure` with the `__Host-` prefix over
+  https. The browser never sends it to another host, and a sibling host
+  cannot plant one, since a `__Host-` cookie cannot be set for a parent
+  domain. The main host's session cookie is `__Host-ts_session` for the same
+  reason.
+- Sign-in on an app host goes through the main host: the app host sends the
+  visitor to `/auth/handoff` with a nonce it also keeps in its own cookie;
+  the main host mints the app session and sends a one-time code, good for a
+  minute, to that app's host, built from the configuration and the app's
+  stored label, never from the request. The app host takes the code only
+  with the matching nonce, so a code cannot land on another app or another
+  host, or in a browser that did not ask for it.
+- Hosts under one apps domain are still one *site* to the browser, so a
+  sibling app's script could send a credentialed POST and the cookie would
+  go with it. An app host refuses any request other than GET, HEAD or
+  OPTIONS whose `Origin` is present and is not its own, and a socket upgrade
+  from any origin but its own.
+- An app session for one app is refused by every other app, and sign-out on
+  the main host ends every app host's session with it.
+
+Not protected in subdomain mode: an app that changes state on a GET can
+still be made to do so by a sibling's script (it cannot read the answer).
+An app that wants POSTs from pages on other sites (a form embedded
+elsewhere) has them refused. On plain http under a name that is not
+`localhost`, browsers do not keep `Secure` cookies, so the `__Host-` prefix
+is not used and a sibling host can set cookies for the parent domain.
+Putting the apps domain on the Public Suffix List would make each app host a
+site of its own, which closes the last two; toolsite does not need it.
 
 ## Row-level access
 
@@ -1469,6 +1568,8 @@ is required to serve HTTP.
 | Variable | Required | Description |
 |---|---|---|
 | `TOOLSITE_BASE_URL` | if clients sign in | Base URL of the deployment, e.g. `https://host.com`. Turns the OAuth server on and is what upload URLs are built from. A bare host gets `https://` prepended; stray quotes are stripped. Without it, published URLs come back relative. |
+| `TOOLSITE_APPS_DOMAIN` | no | Subdomain mode: each app on its own host, `<label>.<domain>`, e.g. `apps.example.com`. Needs `TOOLSITE_BASE_URL` (for the scheme) and a wildcard DNS record. See Subdomain mode. |
+| `TOOLSITE_APPS_PORT` | no | The port app hosts are reached on, when it is not the base URL's. For local testing. |
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where everything is stored. |
 | `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME` and `_ALLOW_DOMAIN`. See Accounts. |

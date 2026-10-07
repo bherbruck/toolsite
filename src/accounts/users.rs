@@ -14,9 +14,11 @@
 //! credential, and the host strips every `ts_` cookie before app code sees a
 //! request. It does not stop a script in app A from *sending* a request to
 //! `/p/<appB>/`: on one origin the browser attaches B's cookie to it, so A
-//! can act as the visitor towards B. Only a separate origin for apps closes
-//! that; see `platform::shield` for what is closed until then. Access to an
-//! app is granted by the handoff, never assumed from being signed in.
+//! can act as the visitor towards B. Subdomain mode closes that: each app
+//! has its own host and a host-only cookie there, which the handoff sets
+//! through a one-time code (see `handoff_to_app_host`). In path mode see
+//! `platform::shield` for what is closed. Access to an app is granted by the
+//! handoff, never assumed from being signed in.
 
 use crate::{config::Config, content::slug::valid_slug, runtime::db};
 use argon2::{
@@ -47,7 +49,14 @@ pub const SESSION_COOKIE: &str = "ts_session";
 /// app session, the admin flash. Every one starts `ts_`, and an app may
 /// neither read them nor set them.
 pub fn is_platform_cookie(name: &str) -> bool {
-    name.trim().starts_with("ts_")
+    // `__Host-ts_app` is ours too: the prefix only tells the browser how
+    // to keep the cookie.
+    let name = name.trim().to_ascii_lowercase();
+    let name = name
+        .strip_prefix("__host-")
+        .or_else(|| name.strip_prefix("__secure-"))
+        .unwrap_or(&name);
+    name.starts_with("ts_")
 }
 
 /// A `Cookie` header with toolsite's own cookies taken out, or `None` when
@@ -1047,6 +1056,44 @@ pub fn move_scopes(config: &Config, from: &str, to: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// The site session cookie's name. In subdomain mode over TLS it carries
+/// the `__Host-` prefix, which a browser accepts only from the host itself
+/// with no `Domain`: an app on a sibling host cannot plant a session of its
+/// choosing on the main host by setting a cookie for the parent domain.
+fn site_cookie_name(config: &Config) -> &'static str {
+    if config.apps.is_some() && !secure_flag(config).is_empty() {
+        "__Host-ts_session"
+    } else {
+        SESSION_COOKIE
+    }
+}
+
+/// The app session cookie's name on an app host, where the host already
+/// says which app it is. `__Host-` for the same reason as the site's.
+fn app_host_cookie_name(config: &Config) -> &'static str {
+    match &config.apps {
+        Some(apps) if apps.secure() => "__Host-ts_app",
+        _ => "ts_app",
+    }
+}
+
+/// The cookie that ties a handoff to the browser that began it. See
+/// `begin_handoff`.
+fn handoff_cookie_name(config: &Config) -> &'static str {
+    match &config.apps {
+        Some(apps) if apps.secure() => "__Host-ts_handoff",
+        _ => "ts_handoff",
+    }
+}
+
+/// `Secure;` for an app host's cookies, when the browser will keep one.
+fn app_host_secure_flag(config: &Config) -> &'static str {
+    match &config.apps {
+        Some(apps) if apps.secure() => " Secure;",
+        _ => "",
+    }
+}
+
 fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
     header?
         .split(';')
@@ -1055,16 +1102,22 @@ fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
-/// Reads the site session cookie out of a Cookie header.
-pub fn token_from_cookies(header: Option<&str>) -> Option<String> {
-    cookie_value(header, SESSION_COOKIE)
+/// Reads the site session cookie out of a Cookie header. An app host never
+/// receives it, being another host, and nothing there asks for it.
+pub fn token_from_cookies(config: &Config, header: Option<&str>) -> Option<String> {
+    cookie_value(header, site_cookie_name(config))
 }
 
-/// Reads one app's session cookie. A request under `/p/appB/` never carries
-/// app A's cookie, so this returns nothing for a script asking on another
-/// app's behalf.
-pub fn app_token_from_cookies(header: Option<&str>, app: &str) -> Option<String> {
-    cookie_value(header, &app_cookie_name(app))
+/// Reads one app's session cookie. In path mode a request under `/p/appB/`
+/// never carries app A's cookie, so this returns nothing for a script
+/// asking on another app's behalf. In subdomain mode the cookie belongs to
+/// the app's host, and a token minted for another app fails the scope test
+/// wherever it is presented.
+pub fn app_token_from_cookies(config: &Config, header: Option<&str>, app: &str) -> Option<String> {
+    match &config.apps {
+        Some(_) => cookie_value(header, app_host_cookie_name(config)),
+        None => cookie_value(header, &app_cookie_name(app)),
+    }
 }
 
 /// `Secure` whenever the site is reached over TLS, which is every real
@@ -1081,15 +1134,25 @@ fn secure_flag(config: &Config) -> &'static str {
 
 pub fn set_cookie_header(config: &Config, token: &str) -> String {
     format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax;{} Max-Age={}",
+        "{}={token}; Path=/; HttpOnly; SameSite=Lax;{} Max-Age={}",
+        site_cookie_name(config),
         secure_flag(config),
         SESSION_LIFETIME.as_secs()
     )
 }
 
 /// Scoped to the app's own subtree. Everything else matches the site cookie:
-/// out of reach of script, and never sent over plain HTTP.
+/// out of reach of script, and never sent over plain HTTP. In subdomain mode
+/// it is a host-only cookie of the app's host: no `Domain`, so no other
+/// host is ever sent it.
 pub fn set_app_cookie_header(config: &Config, app: &str, token: &str, max_age: u64) -> String {
+    if config.apps.is_some() {
+        return format!(
+            "{name}={token}; Path=/; HttpOnly; SameSite=Lax;{secure} Max-Age={max_age}",
+            name = app_host_cookie_name(config),
+            secure = app_host_secure_flag(config),
+        );
+    }
     format!(
         "{name}={token}; Path={path}; HttpOnly; SameSite=Lax;{secure} Max-Age={max_age}",
         name = app_cookie_name(app),
@@ -1100,7 +1163,8 @@ pub fn set_app_cookie_header(config: &Config, app: &str, token: &str, max_age: u
 
 pub fn clear_cookie_header(config: &Config) -> String {
     format!(
-        "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax;{} Max-Age=0",
+        "{}=; Path=/; HttpOnly; SameSite=Lax;{} Max-Age=0",
+        site_cookie_name(config),
         secure_flag(config)
     )
 }
@@ -1390,12 +1454,27 @@ mod tests {
     #[test]
     fn the_session_cookie_is_read_from_a_crowded_header() {
         let crowded = Some("theme=dark; ts_session=abc123; ts_app_notes=def456; other=1");
-        assert_eq!(token_from_cookies(crowded).unwrap(), "abc123");
-        assert_eq!(app_token_from_cookies(crowded, "notes").unwrap(), "def456");
+        let (_dir, config) = config();
+        assert_eq!(token_from_cookies(&config, crowded).unwrap(), "abc123");
+        assert_eq!(app_token_from_cookies(&config, crowded, "notes").unwrap(), "def456");
         // A neighbour's cookie is not this app's, even in the same header.
-        assert!(app_token_from_cookies(crowded, "invoices").is_none());
-        assert!(token_from_cookies(Some("theme=dark")).is_none());
-        assert!(token_from_cookies(None).is_none());
+        assert!(app_token_from_cookies(&config, crowded, "invoices").is_none());
+        assert!(token_from_cookies(&config, Some("theme=dark")).is_none());
+        assert!(token_from_cookies(&config, None).is_none());
+    }
+
+    #[test]
+    fn a_prefixed_cookie_of_toolsites_is_still_toolsites() {
+        // An app host's session is `__Host-ts_app`: kept from the handler
+        // that would read it and from a handler that would set it.
+        for name in ["__Host-ts_app", "__host-ts_session", "__Secure-ts_handoff", "ts_app_notes", " ts_session"] {
+            assert!(is_platform_cookie(name), "{name}");
+        }
+        for name in ["theme", "__Host-theme", "app_ts_", "__Host-"] {
+            assert!(!is_platform_cookie(name), "{name}");
+        }
+        assert_eq!(without_platform_cookies("__Host-ts_app=s; theme=dark; __Host-ts_handoff=n").as_deref(), Some("theme=dark"));
+        assert!(sets_platform_cookie("__Host-ts_app=forged; Path=/; Secure"));
     }
 
     #[test]
@@ -1634,6 +1713,7 @@ pub async fn login_submit(
 
 pub async fn logout(State(config): State<Arc<Config>>, headers: HeaderMap) -> Response {
     if let Some(token) = token_from_cookies(
+        &config,
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok()),
@@ -1659,6 +1739,88 @@ pub async fn me(State(config): State<Arc<Config>>, headers: HeaderMap) -> Respon
 pub struct HandoffParams {
     app: String,
     next: Option<String>,
+    /// Subdomain mode only: the nonce the app host put in its handoff
+    /// cookie, which the code is bound to.
+    state: Option<String>,
+}
+
+/// A sign-in on its way from the main host to an app host. The app session
+/// is minted on the main host, where the site session is; the app host gets
+/// it by presenting the code, once, within a minute, from the browser that
+/// holds the matching handoff cookie.
+pub struct HandoffTicket {
+    pub app: String,
+    token: String,
+    max_age: u64,
+    /// Within the app's path, starting `/p/<app>`.
+    next: String,
+    state: String,
+    expires_at: std::time::Instant,
+}
+
+/// How long a code waits for the app host to collect it.
+const HANDOFF_TTL: Duration = Duration::from_secs(60);
+/// How long the app host waits for the visitor to come back signed in.
+const HANDOFF_STATE_LIFETIME: Duration = Duration::from_secs(600);
+
+/// A nonce as `begin_handoff` makes them.
+fn valid_state(state: &str) -> bool {
+    (20..=64).contains(&state.len()) && state.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Where in an app a visitor is sent back to: a path under `/p/<app>`, or
+/// the app's root. Only ever used on the app's own host, so it can name no
+/// other host or app.
+fn next_within_app(app: &str, next: Option<&str>) -> String {
+    let root = format!("/p/{app}");
+    match next {
+        Some(path)
+            if (path == root || path.starts_with(&format!("{root}/")))
+                && !path.contains("//")
+                && !path.contains('\\') =>
+        {
+            path.to_string()
+        }
+        _ => format!("{root}/"),
+    }
+}
+
+/// Subdomain mode: sends a visitor on an app host to the main host to be
+/// signed in. A nonce goes both in the redirect and in a host-only cookie
+/// here, and the code the main host hands back is good only alongside that
+/// cookie. Without it, someone could collect a code for their own account
+/// and walk a victim's browser to the landing with it, signing the victim
+/// into the app as them. An existing nonce is reused, so two tabs signing
+/// in at once do not undo each other.
+pub fn begin_handoff(config: &Config, app: &str, next: &str, headers: &HeaderMap) -> Response {
+    let state = cookie_value(
+        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()),
+        handoff_cookie_name(config),
+    )
+    .filter(|state| valid_state(state))
+    .unwrap_or_else(|| crate::content::slug::random_token(32));
+    let base = config.base_url.as_deref().unwrap_or(&config.local_base);
+    let target = format!(
+        "{base}/auth/handoff?app={}&next={}&state={state}",
+        urlencoding::encode(app),
+        urlencoding::encode(next)
+    );
+    (
+        [
+            (
+                header::SET_COOKIE,
+                format!(
+                    "{}={state}; Path=/; HttpOnly; SameSite=Lax;{} Max-Age={}",
+                    handoff_cookie_name(config),
+                    app_host_secure_flag(config),
+                    HANDOFF_STATE_LIFETIME.as_secs()
+                ),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        Redirect::to(&target),
+    )
+        .into_response()
 }
 
 /// Trades a site session for a session scoped to one app.
@@ -1702,6 +1864,10 @@ pub async fn handoff(
             .into_response();
     }
 
+    if config.apps.is_some() {
+        return handoff_to_app_host(config, params, headers).await;
+    }
+
     let sign_in = || {
         Redirect::to(&format!(
             "/auth/login?next={}",
@@ -1710,6 +1876,7 @@ pub async fn handoff(
         .into_response()
     };
     let Some(site_token) = token_from_cookies(
+        &config,
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok()),
@@ -1738,10 +1905,144 @@ pub async fn handoff(
     }
 }
 
+/// The handoff in subdomain mode, on the main host: mints the app session
+/// from the site session and sends a one-time code for it to the app's own
+/// host. The host is built from the configuration and the app's stored
+/// label, never from anything in the request, so a code cannot be sent to
+/// another app or another host.
+async fn handoff_to_app_host(config: Arc<Config>, params: HandoffParams, headers: HeaderMap) -> Response {
+    let app = params.app.clone();
+    let Some(state) = params.state.clone().filter(|state| valid_state(state)) else {
+        tracing::warn!(app = %app, "handoff refused: no state from the app host");
+        return (StatusCode::BAD_REQUEST, "Open the app again to sign in.").into_response();
+    };
+    if !valid_app_scope(&app)
+        || !crate::content::store::app_exists(&config, &app).await
+        || crate::content::store::is_hidden(&config, &app).await
+    {
+        tracing::warn!(app = %app, "handoff refused: no such app");
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let next = next_within_app(&app, params.next.as_deref());
+    let Some(site_token) = token_from_cookies(&config, headers.get(header::COOKIE).and_then(|v| v.to_str().ok())) else {
+        // Back here once signed in, with the same state, so the app host's
+        // cookie still matches.
+        let again = format!(
+            "/auth/handoff?app={}&next={}&state={state}",
+            urlencoding::encode(&app),
+            urlencoding::encode(&next)
+        );
+        return Redirect::to(&format!("/auth/login?next={}", urlencoding::encode(&again))).into_response();
+    };
+    let lookup = (config.clone(), site_token.clone());
+    let Some(user) = tokio::task::spawn_blocking(move || site_session_user(&lookup.0, &lookup.1)).await.ok().flatten() else {
+        let again = format!(
+            "/auth/handoff?app={}&next={}&state={state}",
+            urlencoding::encode(&app),
+            urlencoding::encode(&next)
+        );
+        return Redirect::to(&format!("/auth/login?next={}", urlencoding::encode(&again))).into_response();
+    };
+    // Not worth a session for an app that would refuse this person: the app
+    // would learn of a visitor it turned away.
+    let within = next.strip_prefix(&format!("/p/{app}")).unwrap_or("/").to_string();
+    let gate = crate::content::store::effective_gate(&config, &app, &within).await.gate;
+    if !crate::content::serve::admits(&config, &gate, &app, Some(&user)).await {
+        tracing::warn!(app = %app, email = %user.email, "handoff refused: the gate does not admit this account");
+        return (StatusCode::FORBIDDEN, "You do not have access to this app.").into_response();
+    }
+    let worker = (config.clone(), app.clone());
+    let minted = tokio::task::spawn_blocking(move || create_app_session(&worker.0, &site_token, &worker.1)).await;
+    let (token, max_age) = match minted {
+        Ok(Ok((_, token, max_age))) => (token, max_age),
+        Ok(Err(_)) => return Redirect::to(&format!("/auth/login?next={}", urlencoding::encode(&next))).into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "handoff failed").into_response(),
+    };
+    let code = crate::content::slug::random_token(40);
+    {
+        let now = std::time::Instant::now();
+        let mut handoffs = config.handoffs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        handoffs.retain(|_, ticket| ticket.expires_at > now);
+        handoffs.insert(
+            code.clone(),
+            HandoffTicket { app: app.clone(), token, max_age, next, state, expires_at: now + HANDOFF_TTL },
+        );
+    }
+    let lookup = (config.clone(), app.clone());
+    let Ok(origin) = tokio::task::spawn_blocking(move || crate::content::origins::app_base(&lookup.0, &lookup.1)).await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "handoff failed").into_response();
+    };
+    ([(header::CACHE_CONTROL, "no-store")], Redirect::to(&format!("{origin}/auth/landing?code={code}"))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct LandingParams {
+    code: String,
+}
+
+/// `GET /auth/landing?code=` on an app host: the end of a handoff. Trades
+/// the code for the app's host-only cookie, if the code was minted for this
+/// app and this browser holds the handoff cookie it was bound to.
+pub async fn landing(
+    State(config): State<Arc<Config>>,
+    host: Option<axum::Extension<crate::content::origins::AppHost>>,
+    Query(params): Query<LandingParams>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(axum::Extension(crate::content::origins::AppHost(host_app))) = host else {
+        tracing::warn!("landing refused: not on an app host");
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let ticket = {
+        let now = std::time::Instant::now();
+        let mut handoffs = config.handoffs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        handoffs.retain(|_, ticket| ticket.expires_at > now);
+        handoffs.remove(&params.code)
+    };
+    let Some(ticket) = ticket else {
+        tracing::warn!(app = %host_app, "landing refused: code unknown, expired or already used");
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "This sign-in link was already used or has expired. <a href=\"/p/{}/\">Open the app again</a>.",
+                crate::content::slug::escape_html(&host_app)
+            )),
+        )
+            .into_response();
+    };
+    if ticket.app != host_app {
+        tracing::warn!(host = %host_app, code_for = %ticket.app, "landing refused: a code for another app");
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let held = cookie_value(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()), handoff_cookie_name(&config));
+    if held.as_deref() != Some(ticket.state.as_str()) {
+        tracing::warn!(app = %host_app, has_cookie = held.is_some(), "landing refused: the code was not begun in this browser");
+        return (StatusCode::FORBIDDEN, "This sign-in was begun in another browser. Open the app again.").into_response();
+    }
+    let mut response = Redirect::to(&ticket.next).into_response();
+    let headers = response.headers_mut();
+    for cookie in [
+        set_app_cookie_header(&config, &ticket.app, &ticket.token, ticket.max_age),
+        format!(
+            "{}=; Path=/; HttpOnly; SameSite=Lax;{} Max-Age=0",
+            handoff_cookie_name(&config),
+            app_host_secure_flag(&config)
+        ),
+    ] {
+        if let Ok(value) = header::HeaderValue::from_str(&cookie) {
+            headers.append(header::SET_COOKIE, value);
+        }
+    }
+    headers.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    headers.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    response
+}
+
 /// Resolves the caller from their *site* session cookie, if any. Says who the
 /// person is; says nothing about what they may reach.
 pub async fn current_site_user(config: &Arc<Config>, headers: &HeaderMap) -> Option<User> {
     let token = token_from_cookies(
+        config,
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok()),
@@ -1757,6 +2058,7 @@ pub async fn current_site_user(config: &Arc<Config>, headers: &HeaderMap) -> Opt
 /// This is what an app's gate and its `identity.current-user` import run on.
 pub async fn current_app_user(config: &Arc<Config>, app: &str, headers: &HeaderMap) -> Option<User> {
     let token = app_token_from_cookies(
+        config,
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok()),
