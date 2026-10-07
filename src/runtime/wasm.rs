@@ -96,6 +96,10 @@ pub struct StoreState {
     /// Established by the host from a verified session, never from anything
     /// the guest or its client claimed.
     user: Option<User>,
+    /// The connection whose `connect` event this sandbox runs, if any. What
+    /// it sends goes straight to that connection; what anyone else sends
+    /// there waits until `connect` returns.
+    connecting: Option<String>,
 }
 
 impl WasiView for StoreState {
@@ -257,11 +261,11 @@ fn hub_message(message: WitMessage) -> crate::runtime::connections::Message {
 /// host, so an id from another app names nothing here.
 impl self::toolsite::app::connections::Host for StoreState {
     fn send(&mut self, conn: String, message: WitMessage) -> Result<(), String> {
-        self.site.connections.send(&self.app, &conn, hub_message(message))
+        self.site.connections.send(&self.app, &conn, hub_message(message), self.connecting.as_deref())
     }
 
     fn close(&mut self, conn: String) -> Result<(), String> {
-        self.site.connections.close(&self.app, &conn)
+        self.site.connections.close(&self.app, &conn, self.connecting.as_deref())
     }
 
     fn subscribe(&mut self, conn: String, topic: String) -> Result<(), String> {
@@ -273,7 +277,7 @@ impl self::toolsite::app::connections::Host for StoreState {
     }
 
     fn publish(&mut self, topic: String, message: WitMessage) -> Result<u32, String> {
-        self.site.connections.publish(&self.app, &topic, hub_message(message))
+        self.site.connections.publish(&self.app, &topic, hub_message(message), self.connecting.as_deref())
     }
 
     fn state_get(&mut self, conn: String, key: String) -> Option<String> {
@@ -473,6 +477,9 @@ impl Runtime {
             return Ok(None);
         };
         let mut store = self.store(site, app, user, guards);
+        if matches!(event, ConnectionEvent::Connect(_)) {
+            store.data_mut().connecting = Some(conn.to_string());
+        }
         let instance = handler.instance_pre().instantiate(&mut store)?;
         let call = instance
             .get_typed_func::<(String, ConnectionEvent), (Result<(), String>,)>(&mut store, &export)?;
@@ -525,6 +532,7 @@ impl Runtime {
             app: app.to_string(),
             site,
             user,
+            connecting: None,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);

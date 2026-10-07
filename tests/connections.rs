@@ -208,6 +208,19 @@ async fn the_handler_can_send_close_subscribe_and_publish() {
 }
 
 #[tokio::test]
+async fn what_connect_sends_and_publishes_arrives_in_the_order_it_was_sent() {
+    let site = site(connections::Limits { rate_per_app: 100_000, ..connections::Limits::default() }).await;
+    app(&site.config, "board");
+    // Many times over, since an order kept by luck holds most of the time.
+    for n in 0..200 {
+        let (mut socket, _) = open(&site, &format!("/p/board/ws?ordered=o{n}"), None).await;
+        for expected in ["1", "2", "3"] {
+            assert_eq!(next_text(&mut socket).await.as_deref(), Some(expected), "connection {n}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_connect_the_handler_refuses_never_becomes_a_socket() {
     let site = site(connections::Limits::default()).await;
     app(&site.config, "picky");
@@ -623,6 +636,20 @@ async fn settles_at(config: &Config, app: &str, open: usize) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+#[tokio::test]
+async fn over_tcp_a_send_a_publish_and_a_send_arrive_in_the_order_they_were_made() {
+    let port = free_tcp_port();
+    let site = site_with_ports(connections::Limits { rate_per_app: 100_000, ..connections::Limits::default() }, &format!("{port}=broker")).await;
+    app_on(&site.config, "broker", &[tcp(port)]);
+    let (mut device, _) = Device::open(port).await;
+    for n in 0..100 {
+        device.say("ordered t\n").await;
+        for expected in ["1", "2", "3"] {
+            assert_eq!(device.line().await.as_deref(), Some(expected), "round {n}");
+        }
+    }
 }
 
 #[tokio::test]

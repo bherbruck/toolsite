@@ -420,6 +420,15 @@ impl Guest for Handler {
                     }
                 }
                 connections::send(&conn, &Message::Text(format!("id:{conn}")))?;
+                // Send, publish to a topic this connection joined, send: the
+                // three must arrive in that order.
+                let ordered = param(&info.query, "ordered");
+                if !ordered.is_empty() {
+                    connections::subscribe(&conn, ordered)?;
+                    connections::send(&conn, &Message::Text("1".to_string()))?;
+                    connections::publish(ordered, &Message::Text("2".to_string()))?;
+                    connections::send(&conn, &Message::Text("3".to_string()))?;
+                }
                 Ok(())
             }
             Event::Message(Message::Binary(bytes)) => {
@@ -498,6 +507,11 @@ fn on_device(conn: String, remote: String, event: Event) -> Result<(), String> {
                 reply(format!("{}\n", connections::state_get(&conn, "log").unwrap_or_default()))
             } else if text == "close\n" {
                 connections::close(&conn)
+            } else if let Some(topic) = text.strip_prefix("ordered ").and_then(|t| t.strip_suffix('\n')) {
+                connections::subscribe(&conn, topic)?;
+                reply("1\n".to_string())?;
+                connections::publish(topic, &Message::Binary(b"2\n".to_vec()))?;
+                reply("3\n".to_string())
             } else if let Some(args) = text.strip_prefix("amplify ").and_then(|t| t.strip_suffix('\n')) {
                 // An app that answers a small request with a lot: what a
                 // forged source address would turn on a victim.

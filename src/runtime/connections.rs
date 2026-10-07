@@ -8,6 +8,13 @@
 //! host side, so one app can never reach another app's connections, even
 //! with an id it guessed.
 //!
+//! Everything bound for one connection goes through one queue, in the
+//! order it was sent. Until its `connect` event returns, only that event
+//! reaches it: what other events send or publish to it meanwhile is held,
+//! and follows once it is accepted. So a handler can join a topic, read a
+//! snapshot and send it, and know the snapshot arrives before anything
+//! published on the topic, with nothing published in between lost.
+//!
 //! Delivery is best effort: nothing is stored and nothing is replayed. A
 //! connection that falls behind is cut off rather than buffered without
 //! bound; its browser reconnects and asks the app for what it missed.
@@ -127,6 +134,9 @@ struct Connection {
     /// freeing its place sooner would let a peer that never reads hold
     /// sockets past every ceiling.
     tx: Option<mpsc::Sender<Outgoing>>,
+    /// Some while its `connect` event runs: what others send it waits here,
+    /// counted against the same queue.
+    held: Option<Vec<Outgoing>>,
     state: HashMap<String, String>,
 }
 
@@ -342,6 +352,7 @@ impl Hub {
                 remote,
                 topics: HashSet::new(),
                 tx: Some(tx),
+                held: Some(Vec::new()),
                 state: HashMap::new(),
             },
         );
@@ -366,9 +377,11 @@ impl Hub {
         }
     }
 
-    /// Queues `out` for each id, without waiting. A connection whose queue
+    /// Queues `out` for each id, without waiting. `from` is the connection
+    /// whose `connect` event is sending, if any; a connection still
+    /// connecting holds what anyone else sends it. A connection whose queue
     /// is full is cut off: dropping its sender ends its transport loop.
-    fn deliver(inner: &mut Inner, app: &str, ids: &[String], out: &Outgoing) -> u32 {
+    fn deliver(inner: &mut Inner, app: &str, ids: &[String], out: &Outgoing, from: Option<&str>) -> u32 {
         let Some(entry) = inner.apps.get_mut(app) else {
             return 0;
         };
@@ -377,16 +390,46 @@ impl Hub {
             if let Some(connection) = entry.connections.get_mut(id)
                 && let Some(tx) = &connection.tx
             {
-                match tx.try_send(out.clone()) {
-                    Ok(()) => reached += 1,
-                    Err(_) => {
-                        tracing::warn!(app, "a connection fell behind and was closed");
-                        connection.tx = None;
+                let queued = match &mut connection.held {
+                    Some(held) if from != Some(id.as_str()) => {
+                        let room = held.len() < tx.capacity();
+                        if room {
+                            held.push(out.clone());
+                        }
+                        room
                     }
+                    _ => tx.try_send(out.clone()).is_ok(),
+                };
+                if queued {
+                    reached += 1;
+                } else {
+                    tracing::warn!(app, "a connection fell behind and was closed");
+                    connection.tx = None;
+                    connection.held = None;
                 }
             }
         }
         reached
+    }
+
+    /// Marks one of `app`'s connections accepted: its `connect` event
+    /// returned, so what was held for it follows what that event sent.
+    pub fn accept(&self, app: &str, id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(connection) = inner.apps.get_mut(app).and_then(|entry| entry.connections.get_mut(id)) else {
+            return;
+        };
+        let held = connection.held.take().unwrap_or_default();
+        let Some(tx) = &connection.tx else {
+            return;
+        };
+        for out in held {
+            if tx.try_send(out).is_err() {
+                tracing::warn!(app, "a connection fell behind and was closed");
+                connection.tx = None;
+                return;
+            }
+        }
     }
 
     fn check_message(message: &Message) -> Result<(), String> {
@@ -399,8 +442,9 @@ impl Hub {
         Ok(())
     }
 
-    /// Sends one message to one of `app`'s connections.
-    pub fn send(&self, app: &str, id: &str, message: Message) -> Result<(), String> {
+    /// Sends one message to one of `app`'s connections. `from` is the
+    /// connection whose `connect` event is calling, if any.
+    pub fn send(&self, app: &str, id: &str, message: Message, from: Option<&str>) -> Result<(), String> {
         Self::check_message(&message)?;
         let mut inner = self.inner.lock().unwrap();
         let entry = inner
@@ -409,7 +453,7 @@ impl Hub {
             .filter(|entry| entry.connections.contains_key(id))
             .ok_or_else(|| format!("no open connection {id}"))?;
         entry.spend(app, self.limits.rate_per_app)?;
-        match Self::deliver(&mut inner, app, &[id.to_string()], &Outgoing::Message(message)) {
+        match Self::deliver(&mut inner, app, &[id.to_string()], &Outgoing::Message(message), from) {
             1 => Ok(()),
             _ => Err(format!("connection {id} fell behind and was closed")),
         }
@@ -417,13 +461,13 @@ impl Hub {
 
     /// Ends one of `app`'s connections. Its transport sends the close, and
     /// the handler still gets the connection's `close` event.
-    pub fn close(&self, app: &str, id: &str) -> Result<(), String> {
+    pub fn close(&self, app: &str, id: &str, from: Option<&str>) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
         let open = inner.apps.get(app).is_some_and(|entry| entry.connections.contains_key(id));
         if !open {
             return Err(format!("no open connection {id}"));
         }
-        Self::deliver(&mut inner, app, &[id.to_string()], &Outgoing::Close);
+        Self::deliver(&mut inner, app, &[id.to_string()], &Outgoing::Close, from);
         Ok(())
     }
 
@@ -454,8 +498,9 @@ impl Hub {
     }
 
     /// Sends `message` to `app`'s connections on `topic`, and returns how
-    /// many it reached. Called from a handler, so it never waits.
-    pub fn publish(&self, app: &str, topic: &str, message: Message) -> Result<u32, String> {
+    /// many it reached. Called from a handler, so it never waits. `from` is
+    /// as for `send`.
+    pub fn publish(&self, app: &str, topic: &str, message: Message, from: Option<&str>) -> Result<u32, String> {
         valid_topic(topic)?;
         Self::check_message(&message)?;
         let mut inner = self.inner.lock().unwrap();
@@ -469,7 +514,7 @@ impl Hub {
             .filter(|(_, connection)| connection.topics.contains(topic))
             .map(|(id, _)| id.clone())
             .collect();
-        Ok(Self::deliver(&mut inner, app, &ids, &Outgoing::Message(message)))
+        Ok(Self::deliver(&mut inner, app, &ids, &Outgoing::Message(message), from))
     }
 
     /// Where one of `app`'s connections comes from, as "ip:port", when it is
@@ -517,7 +562,7 @@ impl Hub {
         let ids: Vec<String> = inner.apps.get(app).map(|entry| entry.connections.keys().cloned().collect()).unwrap_or_default();
         if !ids.is_empty() {
             tracing::info!(app, open = ids.len(), "closing the app's connections");
-            Self::deliver(&mut inner, app, &ids, &Outgoing::Close);
+            Self::deliver(&mut inner, app, &ids, &Outgoing::Close, None);
         }
     }
 
@@ -533,6 +578,74 @@ mod tests {
 
     fn text(s: &str) -> Message {
         Message::Text(s.to_string())
+    }
+
+    /// A connection whose `connect` event has returned.
+    fn accepted(hub: &Arc<Hub>, app: &str, user: Option<&str>) -> (Registration, mpsc::Receiver<Outgoing>) {
+        let (registration, rx) = hub.register(app, user).unwrap();
+        hub.accept(app, &registration.id);
+        (registration, rx)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<Outgoing>) -> Vec<Outgoing> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn what_connect_sends_arrives_in_the_order_it_was_sent() {
+        let hub = Arc::new(Hub::new(Limits { rate_per_app: 10_000, ..Limits::default() }));
+        let (conn, mut rx) = hub.register("board", None).unwrap();
+        let me = Some(conn.id.as_str());
+        hub.subscribe("board", &conn.id, "who").unwrap();
+        hub.send("board", &conn.id, text("1"), me).unwrap();
+        assert_eq!(hub.publish("board", "who", text("2"), me).unwrap(), 1);
+        hub.send("board", &conn.id, text("3"), me).unwrap();
+        hub.accept("board", &conn.id);
+        let got = drain(&mut rx);
+        assert_eq!(got, ["1", "2", "3"].map(|n| Outgoing::Message(text(n))));
+    }
+
+    #[test]
+    fn what_others_publish_during_connect_follows_what_connect_sent() {
+        let hub = Arc::new(Hub::new(Limits { rate_per_app: 10_000, ..Limits::default() }));
+        let (old, mut old_rx) = accepted(&hub, "board", None);
+        let (conn, mut rx) = hub.register("board", None).unwrap();
+        let me = Some(conn.id.as_str());
+        hub.subscribe("board", &conn.id, "who").unwrap();
+        // Another event, such as the close of this person's last tab,
+        // publishes between the join and the snapshot.
+        assert_eq!(hub.publish("board", "who", text("from elsewhere"), None).unwrap(), 1);
+        assert!(rx.try_recv().is_err(), "a connection still connecting heard another event");
+        hub.send("board", &conn.id, text("snapshot"), me).unwrap();
+        hub.accept("board", &conn.id);
+        assert_eq!(drain(&mut rx), ["snapshot", "from elsewhere"].map(|m| Outgoing::Message(text(m))));
+        // An accepted connection hears others at once, and nothing twice.
+        hub.subscribe("board", &old.id, "who").unwrap();
+        hub.publish("board", "who", text("later"), None).unwrap();
+        assert_eq!(drain(&mut rx), [Outgoing::Message(text("later"))]);
+        assert_eq!(drain(&mut old_rx), [Outgoing::Message(text("later"))]);
+    }
+
+    #[test]
+    fn what_is_held_during_connect_counts_against_the_queue_and_goes_if_it_is_refused() {
+        let hub = Arc::new(Hub::new(Limits { rate_per_app: 10_000, ..Limits::default() }));
+        let (conn, mut rx) = hub.register("board", None).unwrap();
+        hub.subscribe("board", &conn.id, "a").unwrap();
+        hub.send("board", &conn.id, text("own"), Some(&conn.id)).unwrap();
+        for n in 1..QUEUE {
+            assert_eq!(hub.publish("board", "a", text(&n.to_string()), None).unwrap(), 1);
+        }
+        // The queue is full counting what is held: the next one cuts it off.
+        assert_eq!(hub.publish("board", "a", text("one too many"), None).unwrap(), 0);
+        hub.accept("board", &conn.id);
+        assert_eq!(drain(&mut rx), [Outgoing::Message(text("own"))], "a cut connection got what was held");
+
+        // A refused connect: what was held goes with it.
+        let (refused, mut rx) = hub.register("board", None).unwrap();
+        hub.subscribe("board", &refused.id, "a").unwrap();
+        hub.publish("board", "a", text("x"), None).unwrap();
+        drop(refused);
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]
@@ -551,18 +664,18 @@ mod tests {
     #[tokio::test]
     async fn a_publish_reaches_its_topic_on_its_app_and_nowhere_else() {
         let hub = Arc::new(Hub::default());
-        let (orders, mut orders_rx) = hub.register("shop", None).unwrap();
-        let (_stock, mut stock_rx) = hub.register("shop", None).unwrap();
-        let (other, mut other_rx) = hub.register("ledger", None).unwrap();
+        let (orders, mut orders_rx) = accepted(&hub, "shop", None);
+        let (_stock, mut stock_rx) = accepted(&hub, "shop", None);
+        let (other, mut other_rx) = accepted(&hub, "ledger", None);
         hub.subscribe("shop", &orders.id, "orders").unwrap();
         hub.subscribe("ledger", &other.id, "orders").unwrap();
-        assert_eq!(hub.publish("shop", "orders", text("hello")).unwrap(), 1);
+        assert_eq!(hub.publish("shop", "orders", text("hello"), None).unwrap(), 1);
         assert_eq!(orders_rx.try_recv().unwrap(), Outgoing::Message(text("hello")));
         assert!(stock_rx.try_recv().is_err());
         assert!(other_rx.try_recv().is_err());
         // Another app's id is no handle on this one.
-        assert!(hub.send("ledger", &orders.id, text("x")).is_err());
-        assert!(hub.close("ledger", &orders.id).is_err());
+        assert!(hub.send("ledger", &orders.id, text("x"), None).is_err());
+        assert!(hub.close("ledger", &orders.id, None).is_err());
         assert!(hub.subscribe("ledger", &orders.id, "a").is_err());
         assert_eq!(hub.state_get("ledger", &orders.id, "k"), None);
     }
@@ -572,8 +685,8 @@ mod tests {
         let hub = Arc::new(Hub::default());
         let (conn, _rx) = hub.register("shop", None).unwrap();
         let big = text(&"x".repeat(MAX_MESSAGE_BYTES + 1));
-        assert!(hub.publish("shop", "orders", big.clone()).unwrap_err().contains("bytes"));
-        assert!(hub.send("shop", &conn.id, big).unwrap_err().contains("bytes"));
+        assert!(hub.publish("shop", "orders", big.clone(), None).unwrap_err().contains("bytes"));
+        assert!(hub.send("shop", &conn.id, big, None).unwrap_err().contains("bytes"));
     }
 
     #[test]
@@ -619,9 +732,9 @@ mod tests {
     #[tokio::test]
     async fn closing_an_app_ends_every_connection_it_holds_and_no_other_apps() {
         let hub = Arc::new(Hub::default());
-        let (_a, mut a_rx) = hub.register("shop", None).unwrap();
-        let (_b, mut b_rx) = hub.register("shop", None).unwrap();
-        let (_c, mut c_rx) = hub.register("ledger", None).unwrap();
+        let (_a, mut a_rx) = accepted(&hub, "shop", None);
+        let (_b, mut b_rx) = accepted(&hub, "shop", None);
+        let (_c, mut c_rx) = accepted(&hub, "ledger", None);
         hub.close_app("shop");
         assert_eq!(a_rx.try_recv().unwrap(), Outgoing::Close);
         assert_eq!(b_rx.try_recv().unwrap(), Outgoing::Close);
@@ -632,9 +745,9 @@ mod tests {
     fn messages_past_the_rate_are_refused() {
         let hub = Arc::new(Hub::new(Limits { rate_per_app: 2, ..Limits::default() }));
         let (conn, _rx) = hub.register("shop", None).unwrap();
-        assert!(hub.publish("shop", "a", text("1")).is_ok());
-        assert!(hub.send("shop", &conn.id, text("2")).is_ok());
-        assert!(hub.publish("shop", "a", text("3")).is_err());
+        assert!(hub.publish("shop", "a", text("1"), None).is_ok());
+        assert!(hub.send("shop", &conn.id, text("2"), None).is_ok());
+        assert!(hub.publish("shop", "a", text("3"), None).is_err());
     }
 
     #[test]
@@ -643,10 +756,10 @@ mod tests {
         let (slow, _rx) = hub.register("shop", Some("u1")).unwrap();
         hub.subscribe("shop", &slow.id, "a").unwrap();
         for n in 0..QUEUE {
-            hub.publish("shop", "a", text(&n.to_string())).unwrap();
+            hub.publish("shop", "a", text(&n.to_string()), None).unwrap();
         }
-        assert_eq!(hub.publish("shop", "a", text("one too many")).unwrap(), 0);
-        assert!(hub.send("shop", &slow.id, text("x")).is_err(), "a cut connection still takes messages");
+        assert_eq!(hub.publish("shop", "a", text("one too many"), None).unwrap(), 0);
+        assert!(hub.send("shop", &slow.id, text("x"), None).is_err(), "a cut connection still takes messages");
         // Still holding its socket until the transport lets go, so it still
         // counts against the ceilings.
         assert_eq!(hub.open("shop"), 1);

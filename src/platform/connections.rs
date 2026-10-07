@@ -156,14 +156,18 @@ pub async fn open(
         Err(e) => return Err(Refusal::Failed(e.to_string())),
     }
     match deliver(&state, &app, &visitor, &registration.id, ConnectionEvent::Connect(info)).await {
-        Ok(Some(Ok(()))) => Ok(Session {
+        Ok(Some(Ok(()))) => {
+            // What other events sent while `connect` ran follows what it sent.
+            state.config.connections.accept(&app, &registration.id);
+            Ok(Session {
             state,
             app,
             door,
             visitor,
             registration,
             outgoing,
-        }),
+        })
+        }
         Ok(Some(Err(reason))) => Err(Refusal::Refused(reason)),
         Ok(None) => Err(Refusal::NotOffered),
         Err(why) => Err(Refusal::Failed(why)),
@@ -219,7 +223,7 @@ pub async fn run<T: Transport>(mut transport: T, session: Session) {
                     Err(why) => {
                         tracing::warn!(app = %app, "connection closed: the handler failed: {why}");
                         if !closing {
-                            let _ = state.config.connections.close(&app, &conn);
+                            let _ = state.config.connections.close(&app, &conn, None);
                         }
                     }
                     _ => {}
