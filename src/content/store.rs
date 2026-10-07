@@ -107,6 +107,21 @@ pub struct PageMeta {
     /// the app with `TOOLSITE_PORTS`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortSocket>,
+    /// Present when the app runs resident, from `[resident]` in
+    /// toolsite.toml: one long-lived instance takes all its connection
+    /// events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident: Option<ResidentMeta>,
+}
+
+/// How a resident app's instance runs. Absent values take the site's
+/// defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct ResidentMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_ms: Option<u64>,
 }
 
 /// How a port carries bytes.
@@ -236,6 +251,7 @@ impl Default for PageMeta {
             access_salt: None,
             sockets: Vec::new(),
             ports: Vec::new(),
+            resident: None,
         }
     }
 }
@@ -296,11 +312,13 @@ pub async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io
     Ok(())
 }
 
-/// A hidden app keeps no live connection open: retraction takes effect on
-/// the sockets now, not at their next check.
+/// A hidden app keeps no live connection open, and no resident instance:
+/// retraction takes effect on the sockets now, not at their next check.
 fn close_if_hidden(config: &Config, slug: &str, meta: &PageMeta) {
     if meta.hidden {
-        config.connections.close_app(slug.split('/').next().unwrap_or(slug));
+        let app = slug.split('/').next().unwrap_or(slug);
+        config.connections.close_app(app);
+        config.residents.stop(app);
     }
 }
 

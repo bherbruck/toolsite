@@ -12,8 +12,9 @@
 
 use crate::{
     config::Config,
-    content::store::{read_meta, write_meta, PageMeta, PathRule, Policy, PortProtocol, PortSocket},
+    content::store::{read_meta, write_meta, PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
     platform::schedule,
+    runtime::{resident, wasm::Runtime},
 };
 use serde::Deserialize;
 
@@ -64,6 +65,22 @@ pub struct Manifest {
     /// wholesale: what the block does not name is withdrawn.
     #[serde(default)]
     pub access: Option<Access>,
+    /// One long-lived instance for all of the app's connection events.
+    /// Declared wholesale: without the block, the app runs fresh per event.
+    #[serde(default)]
+    pub resident: Option<ResidentDecl>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidentDecl {
+    pub enabled: bool,
+    /// The instance's memory cap. Absent takes the site's default.
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
+    /// How often `on-tick` runs. Absent means never.
+    #[serde(default)]
+    pub tick_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +181,16 @@ fn meta_snapshot(meta: &PageMeta) -> PageMeta {
 /// Applies a manifest to one app, reporting what changed so a deploy says
 /// what it did rather than only that it finished.
 pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<String>, String> {
+    apply_inner(config, None, app, toml_text).await
+}
+
+/// `apply`, also checking what the manifest asks of the handler against
+/// the handler on the server. What a deploy uses.
+pub async fn apply_checked(config: &Config, runtime: &Runtime, app: &str, toml_text: &str) -> Result<Vec<String>, String> {
+    apply_inner(config, Some(runtime), app, toml_text).await
+}
+
+async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml_text: &str) -> Result<Vec<String>, String> {
     let manifest: Manifest = toml::from_str(toml_text).map_err(|e| {
         // serde names the offending key, which is the whole value here: the
         // difference between [[job]] and [[jobs]] is invisible otherwise.
@@ -172,7 +199,8 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
              allow_http, roles, [[route]] (path, gate), [[job]] (name, schedule, path), \
              [access] views, [[access.table]] (table, view, where, owner, write), \
              [[tool]] (name, title, description, path, read_only, destructive, idempotent, \
-             open_world, input, output), [[socket]] (path, or protocol = \"tcp\" | \"udp\" and port)."
+             open_world, input, output), [[socket]] (path, or protocol = \"tcp\" | \"udp\" and port), \
+             [resident] (enabled, memory_mb, tick_ms)."
         )
     })?;
 
@@ -251,6 +279,11 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
         }
     }
 
+    let resident = match &manifest.resident {
+        Some(declared) if declared.enabled => Some(check_resident(config, runtime, app, declared).await?),
+        _ => None,
+    };
+
     let mut changed = Vec::new();
     let mut meta = read_meta(config, app).await;
 
@@ -322,6 +355,22 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
             format!("{} port(s): {}", ports.len(), described.join(", "))
         });
         meta.ports = ports;
+    }
+
+    let resident_changed = meta.resident != resident;
+    if resident_changed {
+        changed.push(match &resident {
+            None => "resident mode withdrawn".to_string(),
+            Some(declared) => {
+                let settings = config.residents.settings(declared.memory_mb, declared.tick_ms);
+                let mut text = format!("resident, {} MB", settings.memory_bytes / (1024 * 1024));
+                if let Some(tick) = settings.tick {
+                    text.push_str(&format!(", tick every {} ms", tick.as_millis()));
+                }
+                text
+            }
+        });
+        meta.resident = resident;
     }
 
     // Declared wholesale: a route removed from the file is removed here.
@@ -410,6 +459,11 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
     write_meta(config, app, &meta)
         .await
         .map_err(|e| e.to_string())?;
+    if resident_changed {
+        // The instance running now was started with the old settings, or
+        // should not run at all.
+        config.residents.stop(app);
+    }
 
     if let Some(icon) = manifest.icon {
         let path = config.data_dir.join(format!("{app}.icon"));
@@ -455,6 +509,49 @@ pub async fn apply(config: &Config, app: &str, toml_text: &str) -> Result<Vec<St
     }
 
     Ok(changed)
+}
+
+/// Checks a `[resident]` block: its numbers are in range, and, given a
+/// runtime, the handler on the server, if there is one yet, takes
+/// connections. A handler uploaded later is checked against the block when
+/// it arrives.
+async fn check_resident(
+    config: &Config,
+    runtime: Option<&Runtime>,
+    app: &str,
+    declared: &ResidentDecl,
+) -> Result<ResidentMeta, String> {
+    let max = config.residents.max_memory_mb;
+    if let Some(memory) = declared.memory_mb
+        && !(1..=max).contains(&memory)
+    {
+        return Err(format!("[resident] memory_mb must be 1 to {max} on this site (TOOLSITE_RESIDENT_MAX_MB), got {memory}"));
+    }
+    if let Some(tick) = declared.tick_ms
+        && !(resident::MIN_TICK_MS..=resident::MAX_TICK_MS).contains(&tick)
+    {
+        return Err(format!(
+            "[resident] tick_ms must be {} to {}, got {tick}",
+            resident::MIN_TICK_MS,
+            resident::MAX_TICK_MS
+        ));
+    }
+    if let Some(runtime) = runtime
+        && let Some(wasm) = crate::content::serve::handler_wasm(config, app).await
+    {
+        let takes = runtime.takes_connections(app, &wasm).map_err(|e| format!("could not read the handler: {e:#}"))?;
+        if !takes {
+            return Err(format!(
+                "[resident] needs a handler that exports on-connection (the app-with-connections or app-resident \
+                 world), and the handler of {app} does not. Resident mode keeps one instance for connection events \
+                 only."
+            ));
+        }
+    }
+    Ok(ResidentMeta {
+        memory_mb: declared.memory_mb,
+        tick_ms: declared.tick_ms,
+    })
 }
 
 /// Turns declared tools into stored ones, checking everything first: a
@@ -696,6 +793,47 @@ mod tests {
         assert!(apply(&config, "app", "[[job]]\nname = \"x\"\ncron = \"0 0 3 * * *\"\npath = \"/a\"\n")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn resident_mode_is_refused_for_a_handler_without_on_connection() {
+        let (_t, config) = config();
+        let dir = config.data_dir.join("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("handler.wasm"), include_bytes!("../../tests/fixtures/legacy-handler.wasm")).unwrap();
+        let runtime = Runtime::new().unwrap();
+        let error = apply_checked(&config, &runtime, "old", "[resident]\nenabled = true\n").await.unwrap_err();
+        assert!(error.contains("on-connection"), "the reason should name the export: {error}");
+        assert!(read_meta(&config, "old").await.resident.is_none());
+
+        // Off is always allowed.
+        apply_checked(&config, &runtime, "old", "[resident]\nenabled = false\n").await.unwrap();
+
+        std::fs::write(dir.join("handler.wasm"), include_bytes!("../../tests/fixtures/handler.wasm")).unwrap();
+        // A fresh runtime: the other has the old handler cached by name.
+        let fresh = Runtime::new().unwrap();
+        apply_checked(&config, &fresh, "old", "[resident]\nenabled = true\ntick_ms = 500\n").await.unwrap();
+        assert_eq!(
+            read_meta(&config, "old").await.resident,
+            Some(ResidentMeta { memory_mb: None, tick_ms: Some(500) })
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_numbers_out_of_range_are_refused() {
+        let (_t, config) = config();
+        for (manifest, says) in [
+            ("[resident]\nenabled = true\nmemory_mb = 513\n", "memory_mb must be 1 to 512"),
+            ("[resident]\nenabled = true\nmemory_mb = 0\n", "memory_mb must be 1 to 512"),
+            ("[resident]\nenabled = true\ntick_ms = 99\n", "tick_ms must be 100 to 60000"),
+            ("[resident]\nenabled = true\ntick_ms = 60001\n", "tick_ms must be 100 to 60000"),
+            ("[resident]\nenabled = true\nticks = 5\n", "ticks"),
+        ] {
+            let error = apply(&config, "app", manifest).await.unwrap_err();
+            assert!(error.contains(says), "{manifest:?}: {error}");
+        }
+        // A handler not uploaded yet is checked when it arrives.
+        apply(&config, "app", "[resident]\nenabled = true\nmemory_mb = 512\n").await.unwrap();
     }
 
     #[tokio::test]

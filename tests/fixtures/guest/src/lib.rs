@@ -3,8 +3,11 @@
 
 wit_bindgen::generate!({
     path: "../../../wit",
-    world: "app-with-connections",
+    world: "app-resident",
 });
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use toolsite::app::auth;
 use toolsite::app::blobs;
@@ -15,6 +18,14 @@ use toolsite::app::fetch;
 use toolsite::app::secrets;
 
 struct Handler;
+
+/// Kept in the instance's memory. Run fresh per event, every `count` says
+/// 1; run resident, it counts across events and connections.
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+/// What each `on-tick` was told, oldest first, the last 1000.
+static TICKS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Holds what `grow` allocates, so the allocation cannot be optimised away.
+static HOARD: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// One value out of `a=1&b=2`. Enough for a fixture.
 fn param<'q>(query: &'q str, name: &str) -> &'q str {
@@ -380,6 +391,11 @@ impl Guest for Handler {
     /// `echo:<x>`, `log`, `cookie`, `close`, `sub:<topic>`, `unsub:<topic>`,
     /// `publish:<topic>:<data>`. A binary frame is echoed back.
     ///
+    /// For resident mode: `count` (a counter kept in memory, incremented
+    /// and sent back), `ticks` (how many `on-tick` calls it saw), `clock`
+    /// (both wasi clocks), `crash` (panics), `grow` (allocates until the
+    /// memory cap stops it) and `hang` (never returns).
+    ///
     /// A TCP connection or UDP remote (one with a `remote`) gets
     /// `id:<conn>\n` on connect, and its bytes are commands only when one
     /// whole read is `token <t>\n` (checked with auth.check-token: `ok
@@ -462,6 +478,37 @@ impl Guest for Handler {
                     reply("ok".to_string())
                 } else if let Some((topic, data)) = text.strip_prefix("publish:").and_then(|r| r.split_once(':')) {
                     connections::publish(topic, &Message::Text(data.to_string())).map(|_| ())
+                } else if text == "count" {
+                    reply((COUNTER.fetch_add(1, Ordering::SeqCst) + 1).to_string())
+                } else if text == "ticks" {
+                    reply(format!("ticks:{}", TICKS.lock().unwrap().len()))
+                } else if text == "clock" {
+                    // Both wasi clocks, read inside the sandbox.
+                    let wall = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let started = std::time::Instant::now();
+                    let mut spin: u64 = 0;
+                    for n in 0..10_000u64 {
+                        spin = spin.wrapping_add(std::hint::black_box(n));
+                    }
+                    std::hint::black_box(spin);
+                    let later = std::time::Instant::now();
+                    reply(format!("wall:{wall} monotonic:{}", later >= started))
+                } else if text == "crash" {
+                    panic!("the handler crashed on purpose")
+                } else if text == "grow" {
+                    // Past any cap a test sets: 1 MB at a time, touched, kept.
+                    loop {
+                        HOARD.lock().unwrap().push(vec![1u8; 1024 * 1024]);
+                    }
+                } else if text == "hang" {
+                    // Slow host calls rather than a spin, so the event runs
+                    // out of time before it runs out of fuel.
+                    loop {
+                        let _ = db::query("select 1", &[]);
+                    }
                 } else {
                     reply(format!("unknown:{text}"))
                 }
@@ -472,6 +519,15 @@ impl Guest for Handler {
                 connections::publish("closed", &Message::Text(format!("{who}:{log}"))).map(|_| ())
             }
         }
+    }
+
+    /// Notes each tick, so a test can count them with `ticks`.
+    fn on_tick(now_ms: u64) {
+        let mut ticks = TICKS.lock().unwrap();
+        if ticks.len() >= 1000 {
+            ticks.remove(0);
+        }
+        ticks.push(now_ms);
     }
 }
 

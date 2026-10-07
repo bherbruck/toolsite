@@ -2756,6 +2756,27 @@ async fn an_admin_mints_a_token_on_the_exports_page_and_sees_it_once() {
 }
 
 #[tokio::test]
+async fn the_connections_tab_shows_a_resident_apps_instance() {
+    let (_dir, config) = server();
+    write_page(&config, "broker/index", "<h1>broker</h1>");
+    toolsite::accounts::users::sign_up_as(&config, "owner@example.com", "correct horse", true).unwrap();
+    let session = sign_in(&config, "owner@example.com", "correct horse");
+
+    let (_, page, _) = send(&config, get_as("/admin/apps/broker/connections", &session)).await;
+    assert!(!page.contains("Resident instance"), "a plain app shows a resident panel");
+
+    let mut meta = toolsite::content::store::read_meta_blocking(&config, "broker");
+    meta.resident = Some(toolsite::content::store::ResidentMeta { memory_mb: Some(64), tick_ms: Some(250) });
+    toolsite::content::store::write_meta_blocking(&config, "broker", &meta).unwrap();
+    let (status, page, _) = send(&config, get_as("/admin/apps/broker/connections", &session)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.contains("Resident instance"), "{page}");
+    assert!(page.contains("not running; the next connection starts it"), "{page}");
+    assert!(page.contains("0.0 MB of 64.0 MB"), "{page}");
+    assert!(page.contains("every 250 ms"), "{page}");
+}
+
+#[tokio::test]
 async fn an_admin_mints_a_device_token_on_the_connections_tab_and_sees_it_once() {
     let (_dir, config) = server();
     write_page(&config, "broker/index", "<h1>broker</h1>");

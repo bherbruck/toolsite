@@ -671,7 +671,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Read one app or page as text, by the id search returned: the page's visible words, then the notes kept with the app, with metadata about access and what it declares. 'guide' returns the platform guide.",
+        description = "Read one app or page as text, by the id search returned: the page's visible words, then the notes kept with the app, with metadata about access and what it declares. The metadata also counts open connections and, for an app that runs resident, reports its instance: running_since, restarts, last_crash, memory_bytes and memory_limit_bytes. 'guide' returns the platform guide.",
         annotations(title = "Fetch", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
         output_schema = rmcp::handler::server::tool::schema_for_output::<FetchOutput>()
     )]

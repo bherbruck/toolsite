@@ -165,6 +165,8 @@ pub async fn fetch_page(config: &Config, slug: &str) -> Option<FetchOutput> {
             "updated": modified,
             "has_handler": config.data_dir.join(&app).join("handler.wasm").is_file(),
             "views": views,
+            "open_connections": config.connections.open(&app),
+            "resident": meta.resident.map(|_| config.residents.status(&app).unwrap_or_default()),
         }),
     })
 }

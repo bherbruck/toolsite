@@ -681,7 +681,8 @@ The rules:
   for what it missed.
 - A handler opts in by building for the `app-with-connections` world, which
   adds the `on-connection` export to `app`. A handler built for `app` keeps
-  working, and its app refuses upgrades with 501.
+  working, and its app refuses upgrades with 501. To keep state in memory
+  across events, see Resident mode below.
 
 Connections live in one server process. Toolsite runs as one instance, so
 that is all of them; a deployment with several instances would need a shared
@@ -768,6 +769,59 @@ container port), which hands out a `host:port` of Railway's choosing for the
 devices to use. Railway does not route UDP from outside, so a UDP port is
 reachable only from inside its private network, or on a host that routes
 UDP.
+
+### Resident mode
+
+Each event normally runs in a fresh instance, so a handler keeps nothing in
+memory between events. That suits most apps, and the database is the place
+for state. Some server software is built around state in memory: a broker's
+sessions and subscriptions, a game's world, a protocol's state machine.
+For that, an app can run **resident**:
+
+```toml
+[resident]
+enabled = true
+memory_mb = 256   # optional; the default is TOOLSITE_RESIDENT_MEMORY_MB
+tick_ms = 1000    # optional; calls on-tick this often, 100 to 60000
+```
+
+The app then gets one long-lived instance, started by its first connection
+event. Every connection event of the app, from every connection and every
+transport, runs on that instance, one at a time, in the order they arrive.
+Statics and the heap last from one event to the next, so a counter, a map
+of sessions or a subscription tree just stays in memory.
+
+- Only connection events reach it. Requests and jobs still run in fresh
+  instances. They share the database and files with the resident instance,
+  not its memory.
+- Each call gets the usual fuel and wall-clock deadline. The memory cap
+  holds for the whole life of the instance: `memory_mb`, at most
+  `TOOLSITE_RESIDENT_MAX_MB`.
+- The instance has exactly the imports a fresh one has. The connection
+  limits, the rate limits and the order rule above all still apply.
+- If a call traps, runs out of time or fuel, or grows memory past the cap,
+  the instance is dropped and every connection it held is closed, since
+  what it knew about them is gone. Clients must reconnect. The next
+  connection starts a fresh instance after a pause of 1 second, which
+  doubles while it keeps failing, up to 60 seconds.
+- Publishing a new handler, changing `[resident]`, hiding or removing the
+  app drops the instance and closes its connections too.
+- **Memory is lost** on every restart, redeploy and server restart. Save to
+  the database what must survive, and rebuild from it on start.
+- One instance per app, in one server process. It does not scale out, and
+  one slow event delays every connection of the app.
+- `on-tick(now-ms)` is for keepalive timeouts and retries. It runs on the
+  same instance, between events, every `tick_ms`, only when `tick_ms` is
+  set and the handler exports it. Build for the `app-resident` world to
+  export it; a handler built for `app-with-connections` runs resident
+  without ticks. The wasi clocks work as well, so `Instant::now()` and
+  `SystemTime::now()` are fine in a handler.
+
+`[resident]` needs a handler that exports `on-connection`. A deploy is
+refused if the handler on the server does not, and a handler without it is
+refused for an app that runs resident. The app's Connections tab on
+`/admin` shows the instance: running since, memory used, restarts and the
+last failure. The MCP `fetch` tool reports the same in its metadata.
 
 ## Notes for the next session
 
@@ -1414,6 +1468,8 @@ is required to serve HTTP.
 | `TOOLSITE_UDP_PER_SECOND` | no (default `100`) | Datagrams one IP address may send to a port each second. The rest are dropped. |
 | `TOOLSITE_UDP_QUEUED_BYTES` | no (default `8388608`) | Bytes of datagrams waiting for the handler on one UDP port, across its remotes. The rest are dropped. |
 | `TOOLSITE_TCP_SEND_SECONDS` | no (default `10`) | A TCP peer that takes none of a reply for this long is closed. |
+| `TOOLSITE_RESIDENT_MEMORY_MB` | no (default `128`) | Memory cap of a resident app's instance when its `[resident]` block does not set `memory_mb`. See Resident mode. |
+| `TOOLSITE_RESIDENT_MAX_MB` | no (default `512`) | The most memory a resident app may ask for. A larger `memory_mb` is refused at deploy. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |

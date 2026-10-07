@@ -105,7 +105,9 @@ fn guest_user(visitor: &Option<User>) -> Option<GuestUser> {
 }
 
 /// Runs one event through the app's handler, reading the handler from disk
-/// as a request does, so a redeploy takes effect on the next event.
+/// as a request does, so a redeploy takes effect on the next event. An app
+/// that runs resident gets it on its one long-lived instance, in the order
+/// events from all its connections arrive; any other gets a fresh one.
 async fn deliver(
     state: &AppState,
     app: &str,
@@ -113,6 +115,20 @@ async fn deliver(
     conn: &str,
     event: ConnectionEvent,
 ) -> Result<Option<Result<(), String>>, String> {
+    if let Some(resident) = crate::content::store::read_meta(&state.config, app).await.resident {
+        // Read only when the instance starts: a queued event holds no copy.
+        if !crate::content::serve::has_handler(&state.config, app).await {
+            return Ok(None);
+        }
+        let settings = state.config.residents.settings(resident.memory_mb, resident.tick_ms);
+        let load = crate::content::serve::handler_wasm_blocking;
+        return state
+            .config
+            .residents
+            .deliver(&state.runtime, &state.config, load, app, settings, guest_user(visitor), conn, event, Guards::default())
+            .await
+            .map(Some);
+    }
     let Some(wasm) = crate::content::serve::handler_wasm(&state.config, app).await else {
         return Ok(None);
     };

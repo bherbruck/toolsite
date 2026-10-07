@@ -280,6 +280,19 @@ pub(crate) async fn serve_page(
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
+/// Whether the app has a handler, without reading it.
+pub(crate) async fn has_handler(config: &Config, app: &str) -> bool {
+    valid_slug(app) && fs::metadata(config.data_dir.join(app).join("handler.wasm")).await.is_ok_and(|m| m.is_file())
+}
+
+/// `handler_wasm` for a blocking thread.
+pub(crate) fn handler_wasm_blocking(config: &Config, app: &str) -> Option<Vec<u8>> {
+    if !valid_slug(app) {
+        return None;
+    }
+    std::fs::read(config.data_dir.join(app).join("handler.wasm")).ok()
+}
+
 pub(crate) async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
     if !valid_slug(app) {
         return None;

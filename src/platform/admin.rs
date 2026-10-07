@@ -1305,6 +1305,9 @@ fn render_connections_tab(
             }
             p."muted small" { "Open connections now: " (config.connections.open(app)) }
         }))
+        @if let Some(declared) = &meta.resident {
+            (render_resident(config, app, declared))
+        }
         (ui::panel("Device tokens", Some("A device token lets a device connect over TCP or UDP. One token names one app. The token opens nothing over HTTP."), html! {
             @if tokens.is_empty() {
                 p."muted" { "No device tokens. Create one below." }
@@ -1448,6 +1451,41 @@ fn render_notes_tab(app: &str, notes: Option<&str>, token: &str, back: &str) -> 
                 (hidden("token", token)) (hidden("app", app)) (hidden("back", back))
                 textarea name="notes" rows="14" placeholder="No notes." { (notes.unwrap_or("")) }
                 div."actions end" { button type="submit" { "Save notes" } }
+            }
+        }))
+    }
+}
+
+/// The resident instance: whether it runs, how much memory it holds, and
+/// why it last failed.
+fn render_resident(config: &Config, app: &str, declared: &crate::content::store::ResidentMeta) -> Markup {
+    let settings = config.residents.settings(declared.memory_mb, declared.tick_ms);
+    let status = config.residents.status(app).unwrap_or_default();
+    let mb = |bytes: u64| format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
+    html! {
+        (ui::panel("Resident instance", Some("One long-lived instance takes every connection event of this app, so it keeps state in memory. Requests and jobs still run in fresh instances. A restart or a redeploy loses the memory."), html! {
+            table {
+                tbody {
+                    tr { td { "State" } td {
+                        @match (status.running_since, status.next_start_at) {
+                            (Some(since), _) => { "running since " (ago(since)) }
+                            (None, Some(_)) => { "stopped after a failure; the next connection starts it after a pause" }
+                            (None, None) => { "not running; the next connection starts it" }
+                        }
+                    } }
+                    tr { td { "Memory" } td { (mb(status.memory_bytes)) " of " (mb(settings.memory_bytes as u64)) } }
+                    tr { td { "Connections it holds" } td { (status.connections) } }
+                    tr { td { "Tick" } td {
+                        @match settings.tick { Some(tick) => { "every " (tick.as_millis()) " ms" } None => { "none" } }
+                    } }
+                    tr { td { "Restarts after a failure" } td { (status.restarts) } }
+                    tr { td { "Last failure" } td {
+                        @match (&status.last_crash, status.last_crash_at) {
+                            (Some(reason), Some(at)) => { (reason) " " span."muted small" { (ago(at)) } }
+                            _ => { "none" }
+                        }
+                    } }
+                }
             }
         }))
     }

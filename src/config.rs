@@ -56,6 +56,11 @@ pub struct Config {
     /// TCP and UDP ports the site's owner mapped to apps, from
     /// `TOOLSITE_PORTS`. Empty means no port beyond HTTP is opened.
     pub ports: crate::platform::ports::PortMap,
+    /// Apps that run resident: one long-lived instance each, shared like
+    /// `connections` so every copy of this config reaches the same ones.
+    /// Also carries the memory default and ceiling, from
+    /// `TOOLSITE_RESIDENT_MEMORY_MB` and `TOOLSITE_RESIDENT_MAX_MB`.
+    pub residents: std::sync::Arc<crate::runtime::resident::Residents>,
 }
 
 impl Config {
@@ -89,6 +94,7 @@ impl Config {
             preview_base: self.preview_base.clone(),
             connections: self.connections.clone(),
             ports: self.ports.clone(),
+            residents: self.residents.clone(),
         }
     }
 
@@ -115,6 +121,7 @@ impl Config {
             preview_base: "http://127.0.0.1:8080".to_string(),
             connections: std::sync::Arc::new(crate::runtime::connections::Hub::default()),
             ports: Default::default(),
+            residents: Default::default(),
         }
     }
 }

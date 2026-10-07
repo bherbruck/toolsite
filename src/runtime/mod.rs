@@ -7,4 +7,5 @@ pub mod db;
 pub mod connections;
 pub mod migrate;
 pub mod outbound;
+pub mod resident;
 pub mod wasm;

@@ -518,6 +518,24 @@ connection per remote address. `connections::remote(&conn)` gives
 `app_device_tokens(app, "create", label)` and check what the device sends
 with `auth::check_token(token)`, which returns the label or `None`.
 
+To keep state in memory across events (a broker's sessions, a game), add
+`[resident]` with `enabled = true` (optional `memory_mb`, `tick_ms` 100 to
+60000). One long-lived instance then takes every connection event of the
+app, one at a time in arrival order, so statics last between events. Build
+for `world: "app-resident"` to add `fn on_tick(now_ms: u64)` for keepalive
+timeouts:
+
+```rust
+static SESSIONS: Mutex<BTreeMap<String, Session>> = Mutex::new(BTreeMap::new());
+// on_connection: insert on Connect, feed on Message, remove on Close.
+fn on_tick(now_ms: u64) { SESSIONS.lock().unwrap().retain(|_, s| s.alive_at(now_ms)); }
+```
+
+Memory is lost on a crash, redeploy or server restart: save what matters to
+the database. A crash closes all the app's connections; clients reconnect.
+Requests and jobs still run fresh and share only the database and files.
+`fetch` on the app reports the instance under `metadata.resident`.
+
 ## Keep the project, and start from it
 
 A bundle cannot be turned back into the sources that built it, so publish the

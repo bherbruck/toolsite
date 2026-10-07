@@ -9,7 +9,9 @@
 //! * **memory** — a cap enforced when the guest asks to grow.
 //!
 //! A store is built fresh per request. Reusing one would leak state between
-//! requests, and app state belongs in that app's database instead.
+//! requests, and app state belongs in that app's database instead. The one
+//! exception is an app that asks to run resident: `Resident` is one store
+//! kept for all of its connection events, under the same guards per call.
 
 use crate::{config::Config as SiteConfig, runtime::db};
 use std::{
@@ -18,19 +20,20 @@ use std::{
     time::{Duration, Instant},
 };
 use wasmtime::{
-    component::{Component, Linker},
-    Config, Engine, Module, Store, StoreLimits, StoreLimitsBuilder,
+    component::{Component, Linker, TypedFunc},
+    Config, Engine, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
 };
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 // Generates the host side of wit/toolsite.wit: the `App` world's exported
 // `handle`, and traits for every import we grant.
 //
-// `app-with-connections` is the same world plus an `on-connection` export.
-// A component either has that export or it does not, and the component
-// model has no optional exports, so the host looks for it on the compiled
-// component and calls it by name. Binding only `app` is what keeps every
-// handler built before connections existed linking unchanged.
+// `app-with-connections` is the same world plus an `on-connection` export,
+// and `app-resident` adds `on-tick` to that. A component either has such an
+// export or it does not, and the component model has no optional exports,
+// so the host looks for each on the compiled component and calls it by
+// name. Binding only `app` is what keeps every handler built before
+// connections existed linking unchanged.
 wasmtime::component::bindgen!({
     path: "wit",
     world: "app",
@@ -57,6 +60,8 @@ const MAX_CACHED_MODULES: usize = 32;
 
 /// The export a component built for `app-with-connections` adds.
 const ON_CONNECTION: &str = "on-connection";
+/// The export a component built for `app-resident` adds.
+const ON_TICK: &str = "on-tick";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Guards {
@@ -78,10 +83,50 @@ impl Default for Guards {
     }
 }
 
+/// The memory ceiling for one store, counted across every linear memory
+/// the guest has, and how much it holds now.
+struct Limits {
+    /// Tables and instances; memory is counted here instead.
+    others: StoreLimits,
+    memory_cap: usize,
+    memory_used: usize,
+    /// The bytes the last allowed growth added, taken back if it failed.
+    last_growth: usize,
+    /// A refused growth traps rather than returning -1 to the guest. A
+    /// resident instance that cannot grow is better restarted than left to
+    /// carry on after its allocator failed.
+    trap_on_refusal: bool,
+}
+
+impl ResourceLimiter for Limits {
+    fn memory_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        let after = self.memory_used.saturating_sub(current).saturating_add(desired);
+        if after > self.memory_cap || maximum.is_some_and(|max| desired > max) {
+            if self.trap_on_refusal {
+                wasmtime::bail!("memory limit: the guest asked for {after} bytes, past its cap of {}", self.memory_cap);
+            }
+            return Ok(false);
+        }
+        self.last_growth = desired.saturating_sub(current);
+        self.memory_used = after;
+        Ok(true)
+    }
+
+    /// A growth the limit allowed but the system could not make.
+    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.memory_used = self.memory_used.saturating_sub(self.last_growth);
+        Ok(())
+    }
+
+    fn table_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        self.others.table_growing(current, desired, maximum)
+    }
+}
+
 /// What every guest store carries. Capabilities get added here as they are
 /// granted; anything absent is something the guest simply cannot do.
 pub struct StoreState {
-    limits: StoreLimits,
+    limits: Limits,
     /// A guest compiled for wasm32-wasip2 imports wasi through Rust's std
     /// whether it uses it or not, so wasi has to be linked. What matters is
     /// that this context grants nothing: no preopened directory, no
@@ -394,11 +439,11 @@ impl Runtime {
 
     /// Checks that bytes really are a component satisfying our world, so a
     /// broken handler is rejected at upload rather than on a visitor's first
-    /// request.
-    pub fn validate(&self, wasm: &[u8]) -> anyhow::Result<()> {
+    /// request. Says whether it exports `on-connection`.
+    pub fn validate(&self, wasm: &[u8]) -> anyhow::Result<bool> {
         let component = Component::new(&self.engine, wasm)?;
         AppPre::new(self.linker.instantiate_pre(&component)?)?;
-        Ok(())
+        Ok(component.get_export_index(None, ON_CONNECTION).is_some())
     }
 
     /// Forgets an app's compiled handler, so the next request picks up what
@@ -522,10 +567,25 @@ impl Runtime {
         user: Option<User>,
         guards: Guards,
     ) -> Store<StoreState> {
+        self.store_with(site, app, user, guards, false)
+    }
+
+    fn store_with(
+        &self,
+        site: Arc<SiteConfig>,
+        app: &str,
+        user: Option<User>,
+        guards: Guards,
+        trap_on_refusal: bool,
+    ) -> Store<StoreState> {
         let state = StoreState {
-            limits: StoreLimitsBuilder::new()
-                .memory_size(guards.memory_bytes)
-                .build(),
+            limits: Limits {
+                others: StoreLimitsBuilder::new().build(),
+                memory_cap: guards.memory_bytes,
+                memory_used: 0,
+                last_growth: 0,
+                trap_on_refusal,
+            },
             // Deliberately empty: no dirs, no env, no network, no stdio.
             wasi: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
@@ -536,11 +596,101 @@ impl Runtime {
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
-        store.set_fuel(guards.fuel).expect("fuel is enabled");
-
-        let ticks = guards.wall_clock.as_millis().div_ceil(EPOCH_TICK.as_millis());
-        store.set_epoch_deadline(ticks.max(1) as u64);
+        arm(&mut store, guards);
         store
+    }
+
+    /// One long-lived instance of an app's handler, for an app that runs
+    /// resident. Fails if the handler does not export `on-connection`.
+    /// `memory_bytes` is its ceiling for the whole of its life; fuel and
+    /// time are `Guards`, given again for each call.
+    pub fn resident(
+        &self,
+        site: Arc<SiteConfig>,
+        app: &str,
+        wasm: &[u8],
+        memory_bytes: usize,
+        guards: Guards,
+    ) -> anyhow::Result<Resident> {
+        let handler = self.handler(app, wasm)?;
+        let component = handler.instance_pre().component();
+        let Some(on_connection) = component.get_export_index(None, ON_CONNECTION) else {
+            anyhow::bail!("the handler does not export on-connection, which an app that runs resident needs");
+        };
+        let on_tick = component.get_export_index(None, ON_TICK);
+        let guards = Guards { memory_bytes, ..guards };
+        let mut store = self.store_with(site, app, None, guards, true);
+        let instance = handler.instance_pre().instantiate(&mut store)?;
+        let on_connection = instance
+            .get_typed_func::<(String, ConnectionEvent), (Result<(), String>,)>(&mut store, &on_connection)?;
+        let on_tick = match on_tick {
+            Some(export) => Some(instance.get_typed_func::<(u64,), ()>(&mut store, &export)?),
+            None => None,
+        };
+        Ok(Resident {
+            store,
+            on_connection,
+            on_tick,
+        })
+    }
+}
+
+/// Fuel and a wall-clock deadline for the next call on `store`, counted
+/// from now.
+fn arm(store: &mut Store<StoreState>, guards: Guards) {
+    store.set_fuel(guards.fuel).expect("fuel is enabled");
+    let ticks = guards.wall_clock.as_millis().div_ceil(EPOCH_TICK.as_millis());
+    store.set_epoch_deadline(ticks.max(1) as u64);
+}
+
+/// An app's handler kept alive between events: its memory, and so whatever
+/// it keeps in statics, lasts from one call to the next. It has exactly the
+/// imports a fresh instance has. After any error from a call the instance
+/// is in an unknown state and must be dropped.
+pub struct Resident {
+    store: Store<StoreState>,
+    on_connection: TypedFunc<(String, ConnectionEvent), (Result<(), String>,)>,
+    on_tick: Option<TypedFunc<(u64,), ()>>,
+}
+
+impl Resident {
+    /// Runs one connection event, as `user`, under fresh fuel and time.
+    pub fn connection_event(
+        &mut self,
+        user: Option<User>,
+        conn: &str,
+        event: ConnectionEvent,
+        guards: Guards,
+    ) -> anyhow::Result<Result<(), String>> {
+        let state = self.store.data_mut();
+        state.user = user;
+        state.connecting = matches!(event, ConnectionEvent::Connect(_)).then(|| conn.to_string());
+        arm(&mut self.store, guards);
+        let (answer,) = self.on_connection.call(&mut self.store, (conn.to_string(), event))?;
+        Ok(answer)
+    }
+
+    /// Whether the handler exports `on-tick`.
+    pub fn ticks(&self) -> bool {
+        self.on_tick.is_some()
+    }
+
+    /// Calls `on-tick`, as nobody, under fresh fuel and time. Does nothing
+    /// for a handler without it.
+    pub fn tick(&mut self, now_ms: u64, guards: Guards) -> anyhow::Result<()> {
+        let Some(on_tick) = self.on_tick else {
+            return Ok(());
+        };
+        let state = self.store.data_mut();
+        state.user = None;
+        state.connecting = None;
+        arm(&mut self.store, guards);
+        Ok(on_tick.call(&mut self.store, (now_ms,))?)
+    }
+
+    /// Bytes of linear memory the instance holds now.
+    pub fn memory_bytes(&self) -> usize {
+        self.store.data().limits.memory_used
     }
 }
 

@@ -328,6 +328,21 @@ async fn main() -> anyhow::Result<()> {
         "live connections configuration"
     );
 
+    // Resident apps: the memory one gets when its manifest does not say,
+    // and the most one may ask for.
+    let resident_defaults = toolsite::runtime::resident::Residents::default();
+    let resident_max = count("TOOLSITE_RESIDENT_MAX_MB", resident_defaults.max_memory_mb);
+    let resident_memory = count("TOOLSITE_RESIDENT_MEMORY_MB", resident_defaults.default_memory_mb);
+    if resident_memory > resident_max {
+        panic!("TOOLSITE_RESIDENT_MEMORY_MB is {resident_memory}, past TOOLSITE_RESIDENT_MAX_MB of {resident_max}");
+    }
+    let residents = toolsite::runtime::resident::Residents::new(resident_memory, resident_max);
+    tracing::info!(
+        memory_mb = resident_memory,
+        max_mb = resident_max,
+        "resident apps configuration"
+    );
+
     // TCP and UDP ports beyond HTTP, each given to one app by the site's
     // owner: `1883=mqtt-broker,5514/udp=syslog`. A bad map is a startup
     // error, not a device that cannot connect.
@@ -363,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
         preview_base,
         connections: Arc::new(toolsite::runtime::connections::Hub::new(socket_limits)),
         ports: port_map,
+        residents: Arc::new(residents),
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -440,6 +456,7 @@ fn run_user_command(
         preview_base: "http://127.0.0.1:8080".to_string(),
         connections: Arc::new(toolsite::runtime::connections::Hub::default()),
         ports: Default::default(),
+        residents: Default::default(),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

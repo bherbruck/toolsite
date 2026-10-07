@@ -427,6 +427,52 @@ Event::Message(Message::Binary(bytes)) => {
 }
 ```
 
+### Resident mode: state in memory
+
+Each event normally runs in a fresh instance, so statics reset every time.
+For server software that keeps its state in memory (a broker, a game, a
+protocol state machine), add `[resident]` to `toolsite.toml`. The app then
+gets one long-lived instance for all its connection events, one at a time
+in arrival order across every connection, so its memory lasts between them:
+
+```toml
+[resident]
+enabled = true
+memory_mb = 256   # optional cap; the site sets the default and the ceiling
+tick_ms = 1000    # optional: call on_tick this often (100 to 60000)
+```
+
+```rust
+wit_bindgen::generate!({ path: "wit", world: "app-resident" });
+
+static SESSIONS: Mutex<BTreeMap<String, Session>> = Mutex::new(BTreeMap::new());
+
+impl Guest for Handler {
+    // handle(...) as usual: requests still run in fresh instances.
+    fn on_connection(conn: String, event: Event) -> Result<(), String> {
+        let mut sessions = SESSIONS.lock().unwrap();
+        match event {
+            Event::Connect(_) => { sessions.insert(conn, Session::default()); Ok(()) }
+            Event::Message(message) => sessions.get_mut(&conn).map_or(Ok(()), |s| s.feed(message)),
+            Event::Close => { sessions.remove(&conn); Ok(()) }
+        }
+    }
+
+    fn on_tick(now_ms: u64) {
+        // Drop sessions whose keepalive ran out.
+        SESSIONS.lock().unwrap().retain(|_, s| s.alive_at(now_ms));
+    }
+}
+```
+
+The memory is lost on a crash, a redeploy and a server restart, so save to
+the database what must survive. A trap, a call past its time or fuel, or
+memory past the cap drops the instance and closes all its connections; the
+next connection starts a fresh one after a short pause. Requests and jobs do
+not see the resident instance's memory, only its database and files. A
+handler built for `app-with-connections` also runs resident, without
+`on_tick`. `std::time::Instant` and `SystemTime` work in any handler.
+
 ## Access
 
 People are given access in a grid of View, Edit and Manage on a project or an
