@@ -221,6 +221,39 @@ async fn what_connect_sends_and_publishes_arrives_in_the_order_it_was_sent() {
 }
 
 #[tokio::test]
+async fn a_publish_from_elsewhere_while_connect_runs_arrives_after_what_connect_sent() {
+    let site = site(connections::Limits::default()).await;
+    app(&site.config, "board");
+    let (status, body) = api(&site, "board", "sql?q=create%20table%20gate%20(n%20integer)", "").await;
+    assert_eq!(status, 200, "{body}");
+
+    // Holding the database stops the next connect after it joins `t` and
+    // before its first send, which is where the race lives.
+    let db = rusqlite::Connection::open(site.config.data_dir.join("board/data.db")).unwrap();
+    db.execute_batch("begin immediate").unwrap();
+    let url = format!("ws://{}/p/board/ws?topic=t&gate=1", site.addr);
+    let connecting = tokio::spawn(async move { tokio_tungstenite::connect_async(url).await.unwrap().0 });
+
+    // Another event publishes on `t` until it reaches the waiting connection.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let (_, body) = api(&site, "board", "publish?topic=t", "from elsewhere").await;
+        if body == "reached 1" {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the connect never joined the topic");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    db.execute_batch("commit").unwrap();
+
+    let mut socket = connecting.await.unwrap();
+    let first = next_text(&mut socket).await.unwrap();
+    assert!(first.starts_with("id:"), "something overtook what connect sent: {first}");
+    assert_eq!(next_text(&mut socket).await.as_deref(), Some("from elsewhere"), "what was held was lost");
+    assert!(quiet(&mut socket).await);
+}
+
+#[tokio::test]
 async fn a_connect_the_handler_refuses_never_becomes_a_socket() {
     let site = site(connections::Limits::default()).await;
     app(&site.config, "picky");

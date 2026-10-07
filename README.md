@@ -639,13 +639,21 @@ events, in the same component that answers requests:
 - **`message`**: a text or binary frame, at most 64 KB.
 - **`close`**: the connection ended, from either side.
 
-Events for one connection run one at a time, in order. Each runs in a fresh
+Events for one connection run one at a time, in order. What a connection's
+`connect` sends or publishes reaches it before anything other events send
+it, so a snapshot sent after `subscribe` is never overtaken. Each runs in a fresh
 instance like a request, with the database, files, settings and identity
 as usual. The `connections` import acts on connections by id: `send`,
 `close`, `subscribe`, `unsubscribe`, `publish` to a topic, and
 `state-get` / `state-set` for up to 64 KB kept per connection between its
 events. These imports work from an ordinary request and from a scheduled
 job too, so an API write can tell the open sockets about it.
+
+Everything a `connect` event sends or publishes reaches the connection
+before anything else does: what other events send it meanwhile follows in
+order once it is accepted (and is dropped if it is refused), so a snapshot
+sent after `subscribe` is never overtaken and nothing published in between
+is lost.
 
 The rules:
 

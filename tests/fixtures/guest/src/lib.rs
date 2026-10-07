@@ -419,6 +419,12 @@ impl Guest for Handler {
                         connections::subscribe(&conn, &decode(topic))?;
                     }
                 }
+                // Waits on the app's database between joining and the first
+                // send, so a test holding the database can make another event
+                // publish to this connection at exactly that point.
+                if param(&info.query, "gate") == "1" {
+                    db::query("insert into gate values (1)", &[]).map_err(|e| format!("{e:?}"))?;
+                }
                 connections::send(&conn, &Message::Text(format!("id:{conn}")))?;
                 // Send, publish to a topic this connection joined, send: the
                 // three must arrive in that order.

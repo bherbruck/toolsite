@@ -366,6 +366,9 @@ as usual.
    `connections::send(conn, ...)` answers one connection;
    `state_get` / `state_set` keep up to 64 KB per connection between its
    events; `publish("user:<id>", ...)` reaches one person's connections.
+   Everything `connect` sends or publishes reaches the connection before
+   anything else does, so a snapshot sent after `subscribe` is never
+   overtaken and nothing published in between is lost.
 
 3. Connect from the page, reconnect with backoff, and refetch on every
    (re)connect, since nothing is replayed:
