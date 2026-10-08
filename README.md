@@ -384,6 +384,16 @@ derived from the extension (JS, CSS, JSON, wasm, fonts, images). With `&spa`,
 paths matching no file fall back to the app's `index.html`; without it, they
 404.
 
+A build file named for its content, the way Vite emits
+`assets/index-BqLnBTZ0.js`, is served with `max-age=31536000, immutable`:
+a new build gives changed content a new name, so the old one never goes
+stale. It is `public` on a public app and `private` behind a gate, so a
+shared cache never hands one person's copy to another. Only files in an
+`assets/` directory whose names end in `-<8-character hash>` or carry a
+`.<hex hash>.` qualify. Everything else, `index.html` included, has no
+lifetime and carries an `ETag`, so a browser asks again and gets a 304 when
+nothing changed.
+
 **Set the base path before building.** Apps are served from `/p/<slug>/`,
 never the domain root, so a default config emits `/assets/…` URLs that 404:
 the page loads and renders blank. `create_upload` prints these with the real

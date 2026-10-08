@@ -271,6 +271,77 @@ async fn bundle_assets_are_served_with_a_real_content_type() {
     }
 }
 
+fn header_of(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+}
+
+fn revalidate(uri: &str, etag: &str) -> Request<Body> {
+    Request::builder().uri(uri).header("if-none-match", etag).body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn a_build_file_named_for_its_content_is_kept_for_good_and_the_rest_revalidate() {
+    let (_dir, config) = server();
+    let assets = config.data_dir.join("bundle/assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(config.data_dir.join("bundle/index.html"), r#"<script src="assets/index-BqLnBTZ0.js"></script>"#).unwrap();
+    std::fs::write(assets.join("index-BqLnBTZ0.js"), "console.log(1)").unwrap();
+    std::fs::write(assets.join("logo.svg"), "<svg/>").unwrap();
+
+    // The hashed file: a year, and anyone may keep it, since the app is public.
+    let (status, _, headers) = send(&config, get("/p/bundle/assets/index-BqLnBTZ0.js")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header_of(&headers, "cache-control").as_deref(), Some("public, max-age=31536000, immutable"));
+
+    // The page that names it, and a file whose name says nothing of its
+    // content: no lifetime, as before, but a validator, so asking again
+    // costs a 304 rather than the bytes.
+    for path in ["/p/bundle/", "/p/bundle/assets/logo.svg"] {
+        let (status, _, headers) = send(&config, get(path)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(header_of(&headers, "cache-control"), None, "{path} was given a lifetime");
+        let etag = header_of(&headers, "etag").unwrap_or_else(|| panic!("{path} has no validator"));
+        let (status, body, headers) = send(&config, revalidate(path, &etag)).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED, "{path}");
+        assert!(body.is_empty(), "{path} sent its bytes with the 304");
+        assert_eq!(header_of(&headers, "etag").as_deref(), Some(etag.as_str()));
+    }
+
+    // A new build changes the page, and the old validator gets the new page.
+    let (_, _, headers) = send(&config, get("/p/bundle/")).await;
+    let old = header_of(&headers, "etag").unwrap();
+    std::fs::write(config.data_dir.join("bundle/index.html"), r#"<script src="assets/index-Zz9xYw8V.js"></script>"#).unwrap();
+    let (status, body, headers) = send(&config, revalidate("/p/bundle/", &old)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("index-Zz9xYw8V.js"), "the old page came back: {body}");
+    assert_ne!(header_of(&headers, "etag"), Some(old));
+}
+
+#[tokio::test]
+async fn a_gated_apps_build_files_are_kept_by_the_visitors_browser_alone() {
+    let (_dir, config) = server();
+    write_page(&config, "members/index", "<h1>members</h1>");
+    std::fs::create_dir_all(config.data_dir.join("members/assets")).unwrap();
+    std::fs::write(config.data_dir.join("members/assets/index-BqLnBTZ0.js"), "console.log(1)").unwrap();
+    gate(&config, "members", "authenticated");
+    account(&config, "someone@example.com", "correct horse battery");
+    let site = sign_in(&config, "someone@example.com", "correct horse battery");
+    let (app_token, _) = hand_off(&config, &site, "members").await;
+
+    // A shared cache must not hand one person's copy to the next.
+    let (status, _, headers) =
+        send(&config, get_as_app("/p/members/assets/index-BqLnBTZ0.js", "members", &app_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header_of(&headers, "cache-control").as_deref(), Some("private, max-age=31536000, immutable"));
+
+    // And a validator opens nothing: the gate answers before any 304 does.
+    for path in ["/p/members/", "/p/members/assets/index-BqLnBTZ0.js"] {
+        let (status, ..) = send(&config, revalidate(path, "*")).await;
+        assert_ne!(status, StatusCode::NOT_MODIFIED, "{path} confirmed itself past the gate");
+        assert_ne!(status, StatusCode::OK, "{path} leaked past the gate");
+    }
+}
+
 #[tokio::test]
 async fn client_routes_only_fall_back_to_index_when_the_app_asked_for_it() {
     let (_dir, config) = server();
