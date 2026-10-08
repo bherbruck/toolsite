@@ -177,6 +177,7 @@ mod tests {
             "mqtt-broker",
             "tcp-chat",
             "syslog",
+            "duckdb-report",
         ] {
             let e = example(name);
             assert!(!e.description.is_empty() && e.description.len() < 300, "{name}: {:?}", e.description);

@@ -1,0 +1,18 @@
+slug = "duckdb-report"
+spa = false
+icon = "🦆"
+
+# Any signed-in account may open the page. The handler then asks for a
+# grant before it hands over a data file: a file has no row-level policy,
+# so the check that decides who gets it is the handler's.
+gate = "authenticated"
+
+# What the handler checks with current-role. Any grant opens the files.
+roles = ["analyst"]
+
+# Six cron fields, seconds first: every night at 02:00 UTC. Run it at once
+# from the admin page, or with the app_jobs tool, to make the first file.
+[[job]]
+name = "build-report"
+schedule = "0 0 2 * * *"
+path = "/api/build"

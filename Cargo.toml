@@ -66,6 +66,9 @@ tokio-tungstenite = "0.30.0"
 # the WebSocket tests open themselves. No TLS: the tests stay on 127.0.0.1.
 rumqttc = { version = "0.25.1", default-features = false }
 wat = "1.255.0"
+# Reads back the Parquet file the duckdb-report example's job writes, to
+# prove its footer parses and its rows are all there.
+parquet = { version = "57", default-features = false, features = ["snap"] }
 
 # Compiling a handler runs Cranelift. Unoptimised, it takes minutes for a
 # large guest on a loaded machine, so tests time out waiting for an app's

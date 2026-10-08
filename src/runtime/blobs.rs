@@ -69,6 +69,7 @@ pub struct Entry {
 
 /// Credentials for an S3-compatible bucket. Railway's buckets hand out
 /// exactly these five values.
+#[derive(Clone)]
 pub struct S3 {
     bucket: Bucket,
     credentials: Credentials,
@@ -108,6 +109,10 @@ pub struct Blobs {
     pub backend: Backend,
     /// Ceiling on one blob. Zero means none.
     pub max_bytes: u64,
+    /// Ceiling on one file a guest writes in pieces, which may be set
+    /// higher than `max_bytes` for a deployment whose jobs write large
+    /// exports. Zero means none.
+    pub max_write_bytes: u64,
 }
 
 impl Blobs {
@@ -115,6 +120,7 @@ impl Blobs {
         Self {
             backend: Backend::Local,
             max_bytes,
+            max_write_bytes: max_bytes,
         }
     }
 
@@ -130,6 +136,7 @@ impl Blobs {
                 }),
             },
             max_bytes: self.max_bytes,
+            max_write_bytes: self.max_write_bytes,
         }
     }
 
@@ -715,6 +722,371 @@ pub async fn open(config: &Config, app: &str, key: &str) -> Result<(Entry, ByteS
     }
 }
 
+// --- writing in pieces, for guests -------------------------------------------
+
+/// Writers one call may hold open at once. Each may keep a part's worth of
+/// bytes in memory on S3, so this bounds what a call can make the host hold.
+pub const MAX_OPEN_WRITERS: usize = 4;
+/// S3 takes a multipart upload in parts of at least 5 MiB, all but the last.
+/// Ten thousand parts of this size is 80 GB, past any ceiling a deployment
+/// would set.
+const S3_PART_BYTES: usize = 8 * 1024 * 1024;
+const S3_MAX_PARTS: usize = 10_000;
+/// A temp file older than this was left by a process that died mid-write.
+const STALE_TEMP: Duration = Duration::from_secs(24 * 3600);
+
+/// A file a guest writes in pieces. Nothing appears under the key until
+/// `finish`: on the volume the bytes go to a temp file under the app's
+/// hidden `.blobs/tmp/` and are renamed into place; on S3 they go up as a
+/// multipart upload, completed at the end. Dropped unfinished, it throws
+/// away what it wrote, so a call that traps leaves nothing behind.
+pub struct Writer {
+    key: String,
+    content_type: String,
+    written: u64,
+    cap: u64,
+    /// `None` once finished or abandoned.
+    sink: Option<Sink>,
+}
+
+enum Sink {
+    Local {
+        file: std::fs::File,
+        temp: PathBuf,
+        data: PathBuf,
+        meta: PathBuf,
+    },
+    S3 {
+        s3: Box<S3>,
+        object: String,
+        /// Begun when the first full part is ready. A file smaller than a
+        /// part is one plain PUT at the end and never starts one.
+        upload: Option<String>,
+        etags: Vec<String>,
+        buffer: Vec<u8>,
+    },
+}
+
+impl Writer {
+    pub fn open(config: &Config, app: &str, key: &str, content_type: &str) -> Result<Writer, Error> {
+        valid_key(key)?;
+        let content_type = clean_content_type(content_type);
+        let sink = match &config.blobs.backend {
+            Backend::Local => {
+                let (data, meta) = local_paths(config, app, key)?;
+                let temp_dir = app_root(config, app)?.join("tmp");
+                std::fs::create_dir_all(&temp_dir).map_err(|e| Error::Failed(format!("write: {e}")))?;
+                sweep_stale(&temp_dir);
+                let temp = temp_dir.join(format!("{}.part", crate::content::slug::random_token(16)));
+                let file = std::fs::File::create(&temp).map_err(|e| Error::Failed(format!("write: {e}")))?;
+                Sink::Local { file, temp, data, meta }
+            }
+            Backend::S3(s3) => Sink::S3 {
+                s3: Box::new(s3.clone()),
+                object: s3_key(app, key),
+                upload: None,
+                etags: Vec::new(),
+                buffer: Vec::new(),
+            },
+        };
+        Ok(Writer {
+            key: key.to_string(),
+            content_type,
+            written: 0,
+            cap: config.blobs.max_write_bytes,
+            sink: Some(sink),
+        })
+    }
+
+    /// Adds bytes. Past the ceiling, or on any failure, the writer is
+    /// abandoned and what it wrote is gone.
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.sink.is_none() {
+            return Err(Error::Failed("this writer is closed".into()));
+        }
+        let after = self.written.saturating_add(bytes.len() as u64);
+        if self.cap > 0 && after > self.cap {
+            self.abort();
+            return Err(Error::TooLarge(after));
+        }
+        let outcome = match self.sink.as_mut().expect("checked above") {
+            Sink::Local { file, .. } => {
+                std::io::Write::write_all(file, bytes).map_err(|e| Error::Failed(format!("write: {e}")))
+            }
+            Sink::S3 { s3, object, upload, etags, buffer } => {
+                buffer.extend_from_slice(bytes);
+                let mut outcome = Ok(());
+                while buffer.len() >= S3_PART_BYTES {
+                    let rest = buffer.split_off(S3_PART_BYTES);
+                    let part = std::mem::replace(buffer, rest);
+                    if let Err(error) = s3_upload_part(s3, object, &self.content_type, upload, etags, part) {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+                outcome
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                self.written = after;
+                Ok(())
+            }
+            Err(error) => {
+                self.abort();
+                Err(error)
+            }
+        }
+    }
+
+    /// Puts the whole file under its key at once.
+    pub fn finish(mut self) -> Result<Entry, Error> {
+        let Some(sink) = self.sink.take() else {
+            return Err(Error::Failed("this writer is closed".into()));
+        };
+        let entry = Entry {
+            key: self.key.clone(),
+            size: self.written,
+            content_type: self.content_type.clone(),
+        };
+        match sink {
+            Sink::Local { file, temp, data, meta } => {
+                let io = |e: std::io::Error| Error::Failed(format!("write: {e}"));
+                let placed = (|| {
+                    file.sync_all().map_err(io)?;
+                    drop(file);
+                    for path in [&data, &meta] {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).map_err(io)?;
+                        }
+                    }
+                    std::fs::rename(&temp, &data).map_err(io)?;
+                    std::fs::write(&meta, &self.content_type).map_err(io)
+                })();
+                if placed.is_err() {
+                    let _ = std::fs::remove_file(&temp);
+                }
+                placed.map(|()| entry)
+            }
+            Sink::S3 { s3, object, mut upload, mut etags, buffer } => {
+                let outcome = if upload.is_none() {
+                    s3_put_whole(&s3, &object, &self.content_type, buffer)
+                } else {
+                    s3_upload_part(&s3, &object, &self.content_type, &mut upload, &mut etags, buffer)
+                        .and_then(|()| s3_complete(&s3, &object, upload.as_deref().unwrap_or_default(), &etags))
+                };
+                if outcome.is_err()
+                    && let Some(upload) = upload
+                {
+                    s3_abort(&s3, &object, &upload);
+                }
+                outcome.map(|()| entry)
+            }
+        }
+    }
+
+    /// Throws away what was written. Safe to call twice.
+    pub fn abort(&mut self) {
+        match self.sink.take() {
+            Some(Sink::Local { file, temp, .. }) => {
+                drop(file);
+                let _ = std::fs::remove_file(&temp);
+            }
+            Some(Sink::S3 { s3, object, upload: Some(upload), .. }) => {
+                // reqwest's blocking client may not run on an async worker,
+                // which is where a store could in principle be dropped.
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    std::thread::spawn(move || s3_abort(&s3, &object, &upload));
+                } else {
+                    s3_abort(&s3, &object, &upload);
+                }
+            }
+            Some(Sink::S3 { upload: None, .. }) | None => {}
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+/// Removes temp files a dead process left. Best effort: a failure here
+/// costs disk, never a write.
+fn sweep_stale(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_TEMP);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn s3_put_whole(s3: &S3, object: &str, content_type: &str, body: Vec<u8>) -> Result<(), Error> {
+    let mut action = s3.bucket.put_object(Some(&s3.credentials), object);
+    action.headers_mut().insert("content-type", content_type.to_string());
+    let response = s3_client()?
+        .put(action.sign(S3_SIGN_TTL))
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .map_err(|e| Error::Failed(format!("put: {}", reason(&e))))?;
+    if !response.status().is_success() {
+        return Err(s3_failure("put", response.status()));
+    }
+    Ok(())
+}
+
+/// Sends one part, starting the multipart upload first if this is the
+/// first.
+fn s3_upload_part(
+    s3: &S3,
+    object: &str,
+    content_type: &str,
+    upload: &mut Option<String>,
+    etags: &mut Vec<String>,
+    part: Vec<u8>,
+) -> Result<(), Error> {
+    if etags.len() >= S3_MAX_PARTS {
+        return Err(Error::TooLarge((etags.len() * S3_PART_BYTES + part.len()) as u64));
+    }
+    let client = s3_client()?;
+    if upload.is_none() {
+        let mut action = s3.bucket.create_multipart_upload(Some(&s3.credentials), object);
+        action.headers_mut().insert("content-type", content_type.to_string());
+        let response = client
+            .post(action.sign(S3_SIGN_TTL))
+            .header("content-type", content_type)
+            .send()
+            .map_err(|e| Error::Failed(format!("begin upload: {}", reason(&e))))?;
+        if !response.status().is_success() {
+            return Err(s3_failure("begin upload", response.status()));
+        }
+        let text = response.text().map_err(|e| Error::Failed(format!("begin upload: {}", reason(&e))))?;
+        let parsed = rusty_s3::actions::CreateMultipartUpload::parse_response(&text)
+            .map_err(|e| Error::Failed(format!("begin upload: could not parse the bucket's answer: {e}")))?;
+        *upload = Some(parsed.upload_id().to_string());
+    }
+    let upload_id = upload.as_deref().expect("set above");
+    let number = (etags.len() + 1) as u16;
+    let url = s3.bucket.upload_part(Some(&s3.credentials), object, number, upload_id).sign(S3_SIGN_TTL);
+    let response = client
+        .put(url)
+        .body(part)
+        .send()
+        .map_err(|e| Error::Failed(format!("upload part: {}", reason(&e))))?;
+    if !response.status().is_success() {
+        return Err(s3_failure("upload part", response.status()));
+    }
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::Failed("upload part: the bucket gave no ETag".into()))?;
+    etags.push(etag.to_string());
+    Ok(())
+}
+
+fn s3_complete(s3: &S3, object: &str, upload_id: &str, etags: &[String]) -> Result<(), Error> {
+    let action = s3.bucket.complete_multipart_upload(
+        Some(&s3.credentials),
+        object,
+        upload_id,
+        etags.iter().map(String::as_str),
+    );
+    let url = action.sign(S3_SIGN_TTL);
+    let response = s3_client()?
+        .post(url)
+        .body(action.body())
+        .send()
+        .map_err(|e| Error::Failed(format!("complete upload: {}", reason(&e))))?;
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    // S3 can answer 200 and put the failure in the body.
+    if !status.is_success() || text.contains("<Error>") {
+        return Err(Error::Failed(format!("complete upload: bucket answered {status}")));
+    }
+    Ok(())
+}
+
+fn s3_abort(s3: &S3, object: &str, upload_id: &str) {
+    let url = s3.bucket.abort_multipart_upload(Some(&s3.credentials), object, upload_id).sign(S3_SIGN_TTL);
+    let outcome = s3_client().and_then(|client| {
+        client.delete(url).send().map_err(|e| Error::Failed(reason(&e)))
+    });
+    match outcome {
+        Ok(response) if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND => {}
+        Ok(response) => tracing::warn!(object, status = %response.status(), "could not abandon a multipart upload; a bucket lifecycle rule will have to"),
+        Err(error) => tracing::warn!(object, %error, "could not abandon a multipart upload; a bucket lifecycle rule will have to"),
+    }
+}
+
+/// The writers one guest call holds, by handle. Lives in the call's store,
+/// so a handle means nothing to another call or another app; emptied, and
+/// so every writer abandoned, when the call ends.
+#[derive(Default)]
+pub struct Writers {
+    open: std::collections::HashMap<u64, Writer>,
+}
+
+impl Writers {
+    pub fn open(&mut self, config: &Config, app: &str, key: &str, content_type: &str) -> Result<u64, Error> {
+        if self.open.len() >= MAX_OPEN_WRITERS {
+            return Err(Error::Failed(format!("at most {MAX_OPEN_WRITERS} writers may be open at once")));
+        }
+        let writer = Writer::open(config, app, key, content_type)?;
+        // Random rather than counted, so a handle carried from another call
+        // cannot happen to name one of this call's writers.
+        let mut handle = rand::random::<u64>();
+        while handle == 0 || self.open.contains_key(&handle) {
+            handle = rand::random::<u64>();
+        }
+        self.open.insert(handle, writer);
+        Ok(handle)
+    }
+
+    pub fn append(&mut self, handle: u64, bytes: &[u8]) -> Result<(), Error> {
+        let writer = self.open.get_mut(&handle).ok_or_else(unknown_writer)?;
+        let outcome = writer.append(bytes);
+        if outcome.is_err() {
+            self.open.remove(&handle);
+        }
+        outcome
+    }
+
+    pub fn finish(&mut self, handle: u64) -> Result<Entry, Error> {
+        self.open.remove(&handle).ok_or_else(unknown_writer)?.finish()
+    }
+
+    pub fn abort(&mut self, handle: u64) {
+        self.open.remove(&handle);
+    }
+
+    /// Abandons every writer still open: the end of a call.
+    pub fn abort_all(&mut self) {
+        self.open.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.open.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+}
+
+fn unknown_writer() -> Error {
+    Error::Failed("no such writer in this call".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1275,7 @@ mod tests {
             blobs: Blobs {
                 backend: Backend::S3(s3),
                 max_bytes: 0,
+                max_write_bytes: 0,
             },
             ..Config::local(dir.path().to_path_buf(), "t")
         };
@@ -938,5 +1311,286 @@ mod tests {
         }
         assert!(stat(&config, &app, "dir/a.txt").unwrap().is_none());
         assert_eq!(get(&config, &app, "dir/a.txt").unwrap_err(), Error::NotFound);
+    }
+
+    // --- writing in pieces ---------------------------------------------------
+
+    fn temps(dir: &tempfile::TempDir, app: &str) -> usize {
+        std::fs::read_dir(dir.path().join(app).join(".blobs/tmp")).map(|d| d.count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_file_written_in_pieces_appears_whole_and_only_at_finish() {
+        let (dir, config) = config();
+        let mut writer = Writer::open(&config, "app", "out/report.csv", "text/csv").unwrap();
+        writer.append(b"a,b\n").unwrap();
+        writer.append(b"1,2\n").unwrap();
+        writer.append(b"").unwrap();
+        assert!(stat(&config, "app", "out/report.csv").unwrap().is_none(), "visible before finish");
+        assert!(list(&config, "app", "").unwrap().is_empty(), "listed before finish");
+        let entry = writer.finish().unwrap();
+        assert_eq!((entry.key.as_str(), entry.size, entry.content_type.as_str()), ("out/report.csv", 8, "text/csv"));
+        let blob = get(&config, "app", "out/report.csv").unwrap();
+        assert_eq!((blob.body.as_slice(), blob.content_type.as_str()), (&b"a,b\n1,2\n"[..], "text/csv"));
+        assert_eq!(temps(&dir, "app"), 0, "temp left behind");
+    }
+
+    #[test]
+    fn finishing_a_writer_replaces_the_file_under_its_key_at_once() {
+        let (_dir, config) = config();
+        put(&config, "app", "data.bin", "text/plain", b"old").unwrap();
+        let mut writer = Writer::open(&config, "app", "data.bin", "text/plain").unwrap();
+        writer.append(b"new and longer").unwrap();
+        assert_eq!(get(&config, "app", "data.bin").unwrap().body, b"old", "the old file changed mid-write");
+        writer.finish().unwrap();
+        assert_eq!(get(&config, "app", "data.bin").unwrap().body, b"new and longer");
+    }
+
+    #[test]
+    fn an_abandoned_writer_leaves_no_file_and_no_temp() {
+        let (dir, config) = config();
+        let mut aborted = Writer::open(&config, "app", "a.txt", "text/plain").unwrap();
+        aborted.append(b"never stored").unwrap();
+        aborted.abort();
+        aborted.abort();
+        assert!(aborted.append(b"more").is_err(), "an aborted writer took more bytes");
+        {
+            let mut dropped = Writer::open(&config, "app", "b.txt", "text/plain").unwrap();
+            dropped.append(b"never stored either").unwrap();
+        }
+        assert!(stat(&config, "app", "a.txt").unwrap().is_none());
+        assert!(stat(&config, "app", "b.txt").unwrap().is_none());
+        assert_eq!(temps(&dir, "app"), 0, "temp left behind");
+    }
+
+    #[test]
+    fn the_write_ceiling_stops_a_writer_and_throws_its_bytes_away() {
+        let (dir, config) = config();
+        let config = Config {
+            blobs: Blobs { max_write_bytes: 10, ..Blobs::local(0) },
+            ..config
+        };
+        let mut writer = Writer::open(&config, "app", "big.bin", "application/octet-stream").unwrap();
+        writer.append(b"123456").unwrap();
+        assert_eq!(writer.append(b"789012").unwrap_err(), Error::TooLarge(12));
+        assert!(writer.append(b"1").is_err(), "a writer past its ceiling took more bytes");
+        assert!(writer.finish().is_err(), "a writer past its ceiling finished");
+        assert!(stat(&config, "app", "big.bin").unwrap().is_none());
+        assert_eq!(temps(&dir, "app"), 0, "temp left behind");
+    }
+
+    #[test]
+    fn the_write_ceiling_may_be_set_above_the_blob_ceiling() {
+        let (_dir, config) = config();
+        let config = Config {
+            blobs: Blobs { max_write_bytes: 100, ..Blobs::local(4) },
+            ..config
+        };
+        assert_eq!(put(&config, "app", "put.bin", "text/plain", b"12345").unwrap_err(), Error::TooLarge(5));
+        let mut writer = Writer::open(&config, "app", "written.bin", "text/plain").unwrap();
+        writer.append(&[1u8; 50]).unwrap();
+        assert_eq!(writer.finish().unwrap().size, 50);
+    }
+
+    #[test]
+    fn a_writer_key_cannot_leave_the_apps_blob_directory() {
+        let (dir, config) = config();
+        for key in ["../victim/pwned", "../../etc/passwd", "/etc/passwd", ".hidden", "a/.b", "a//b", "", "a\\b", "tmp/../../x"] {
+            assert!(matches!(Writer::open(&config, "app", key, "text/plain"), Err(Error::InvalidKey(_))), "{key:?} was accepted");
+        }
+        assert!(Writer::open(&config, "../victim", "x", "text/plain").is_err(), "an app name escaped");
+        assert!(!dir.path().join("victim").exists());
+        assert_eq!(temps(&dir, "app"), 0);
+    }
+
+    #[test]
+    fn a_call_holds_a_few_writers_and_ending_it_abandons_them_all() {
+        let (dir, config) = config();
+        let mut writers = Writers::default();
+        let handles: Vec<u64> = (0..MAX_OPEN_WRITERS)
+            .map(|n| writers.open(&config, "app", &format!("w{n}.txt"), "text/plain").unwrap())
+            .collect();
+        assert!(matches!(writers.open(&config, "app", "one-too-many.txt", "text/plain"), Err(Error::Failed(_))));
+        for handle in &handles {
+            writers.append(*handle, b"partial").unwrap();
+        }
+        assert_eq!(temps(&dir, "app"), MAX_OPEN_WRITERS);
+        // A number this call never handed out names nothing.
+        let stranger = (1..).find(|n| !handles.contains(n)).unwrap();
+        assert!(writers.append(stranger, b"x").is_err());
+        assert!(writers.finish(stranger).is_err());
+        writers.abort_all();
+        assert!(writers.is_empty());
+        assert_eq!(temps(&dir, "app"), 0, "temps outlived the call");
+        for n in 0..MAX_OPEN_WRITERS {
+            assert!(stat(&config, "app", &format!("w{n}.txt")).unwrap().is_none());
+        }
+        // A finished handle is spent.
+        let handle = writers.open(&config, "app", "done.txt", "text/plain").unwrap();
+        writers.finish(handle).unwrap();
+        assert!(writers.finish(handle).is_err(), "a handle finished twice");
+    }
+
+    // --- writing in pieces to a bucket -------------------------------------
+
+    /// Enough of S3 to take objects and multipart uploads, in this process
+    /// on a loopback port, recording what it was asked.
+    #[derive(Default)]
+    struct FakeBucket {
+        objects: std::collections::HashMap<String, (String, Vec<u8>)>,
+        uploads: std::collections::HashMap<String, (String, std::collections::BTreeMap<u16, Vec<u8>>)>,
+        part_sizes: Vec<usize>,
+        aborted: usize,
+        next: usize,
+    }
+
+    type Shared = std::sync::Arc<std::sync::Mutex<FakeBucket>>;
+
+    async fn fake_object(
+        axum::extract::State(state): axum::extract::State<Shared>,
+        method: axum::http::Method,
+        axum::extract::Path(key): axum::extract::Path<String>,
+        axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+        headers: axum::http::HeaderMap,
+        body: Bytes,
+    ) -> axum::response::Response {
+        use axum::{http::StatusCode, response::IntoResponse};
+        const NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+        let mut bucket = state.lock().unwrap();
+        let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        match (method.as_str(), query.get("uploadId")) {
+            ("POST", None) if query.contains_key("uploads") => {
+                bucket.next += 1;
+                let id = format!("upload-{}", bucket.next);
+                bucket.uploads.insert(id.clone(), (content_type, Default::default()));
+                format!("<InitiateMultipartUploadResult xmlns=\"{NS}\"><Bucket>b</Bucket><Key>{key}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>").into_response()
+            }
+            ("PUT", Some(id)) => {
+                let number: u16 = query["partNumber"].parse().unwrap();
+                bucket.part_sizes.push(body.len());
+                let Some((_, parts)) = bucket.uploads.get_mut(id) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                parts.insert(number, body.to_vec());
+                ([("etag", format!("\"part-{number}\""))], "").into_response()
+            }
+            ("POST", Some(id)) => {
+                let text = String::from_utf8_lossy(&body).to_string();
+                let Some((content_type, parts)) = bucket.uploads.remove(id) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                for number in parts.keys() {
+                    assert!(text.contains(&format!("part-{number}")), "part {number} missing from {text}");
+                }
+                let whole: Vec<u8> = parts.into_values().flatten().collect();
+                bucket.objects.insert(key.clone(), (content_type, whole));
+                format!("<CompleteMultipartUploadResult xmlns=\"{NS}\"><Key>{key}</Key></CompleteMultipartUploadResult>").into_response()
+            }
+            ("DELETE", Some(id)) => {
+                bucket.uploads.remove(id);
+                bucket.aborted += 1;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            ("PUT", None) => {
+                bucket.objects.insert(key, (content_type, body.to_vec()));
+                StatusCode::OK.into_response()
+            }
+            _ => StatusCode::NOT_IMPLEMENTED.into_response(),
+        }
+    }
+
+    fn fake_bucket() -> (Shared, S3) {
+        let state: Shared = Default::default();
+        let app = axum::Router::new().route("/b/{*key}", axum::routing::any(fake_object))
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .with_state(state.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let s3 = S3::new(&format!("http://{addr}"), "b", "auto", "key", "secret", true).unwrap();
+        (state, s3)
+    }
+
+    fn bucket_config(s3: S3, max_write_bytes: u64) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            blobs: Blobs { backend: Backend::S3(s3), max_bytes: 0, max_write_bytes },
+            ..Config::local(dir.path().to_path_buf(), "t")
+        };
+        (dir, config)
+    }
+
+    #[test]
+    fn a_small_file_written_in_pieces_goes_to_the_bucket_as_one_put_at_finish() {
+        let (bucket, s3) = fake_bucket();
+        let (_dir, config) = bucket_config(s3, 0);
+        let mut writer = Writer::open(&config, "app", "small.txt", "text/plain").unwrap();
+        writer.append(b"hello ").unwrap();
+        writer.append(b"world").unwrap();
+        assert!(bucket.lock().unwrap().objects.is_empty(), "visible before finish");
+        assert_eq!(writer.finish().unwrap().size, 11);
+        let state = bucket.lock().unwrap();
+        assert_eq!(state.objects["app/small.txt"], ("text/plain".to_string(), b"hello world".to_vec()));
+        assert!(state.part_sizes.is_empty() && state.uploads.is_empty(), "a small file started a multipart upload");
+    }
+
+    #[test]
+    fn a_large_file_goes_up_in_parts_and_appears_in_the_bucket_only_when_completed() {
+        let (bucket, s3) = fake_bucket();
+        let (_dir, config) = bucket_config(s3, 0);
+        let mut writer = Writer::open(&config, "app", "big.parquet", "application/vnd.apache.parquet").unwrap();
+        let mut expected = Vec::new();
+        for n in 0..20u8 {
+            let chunk = vec![n; 1_000_000];
+            writer.append(&chunk).unwrap();
+            expected.extend_from_slice(&chunk);
+        }
+        {
+            let state = bucket.lock().unwrap();
+            assert!(state.objects.is_empty(), "visible before finish");
+            assert_eq!(state.uploads.len(), 1, "no multipart upload under way");
+            assert_eq!(state.part_sizes, [S3_PART_BYTES, S3_PART_BYTES], "parts went up before finish, at the part size");
+        }
+        assert_eq!(writer.finish().unwrap().size, 20_000_000);
+        let state = bucket.lock().unwrap();
+        let (content_type, body) = &state.objects["app/big.parquet"];
+        assert_eq!(content_type, "application/vnd.apache.parquet");
+        assert!(body == &expected, "the parts did not make the file");
+        assert_eq!(state.part_sizes.len(), 3);
+        assert!(state.uploads.is_empty());
+    }
+
+    #[test]
+    fn an_abandoned_bucket_writer_aborts_its_upload_and_stores_nothing() {
+        let (bucket, s3) = fake_bucket();
+        let (_dir, config) = bucket_config(s3, 0);
+        {
+            let mut writer = Writer::open(&config, "app", "half.bin", "application/octet-stream").unwrap();
+            writer.append(&vec![1u8; S3_PART_BYTES + 10]).unwrap();
+            assert_eq!(bucket.lock().unwrap().uploads.len(), 1);
+            // Dropped here, as when the call that held it traps.
+        }
+        let state = bucket.lock().unwrap();
+        assert_eq!(state.aborted, 1, "the upload was not abandoned");
+        assert!(state.uploads.is_empty() && state.objects.is_empty());
+    }
+
+    #[test]
+    fn the_write_ceiling_stops_a_bucket_writer_and_aborts_its_upload() {
+        let (bucket, s3) = fake_bucket();
+        let (_dir, config) = bucket_config(s3, (S3_PART_BYTES + 100) as u64);
+        let mut writer = Writer::open(&config, "app", "big.bin", "application/octet-stream").unwrap();
+        writer.append(&vec![1u8; S3_PART_BYTES + 50]).unwrap();
+        assert!(matches!(writer.append(&[1u8; 51]), Err(Error::TooLarge(_))));
+        let state = bucket.lock().unwrap();
+        assert_eq!(state.aborted, 1);
+        assert!(state.uploads.is_empty() && state.objects.is_empty());
     }
 }

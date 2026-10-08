@@ -89,6 +89,10 @@ Either way the slug, the base path and the package names are set for
 - `tcp-chat`: a line chat over a TCP port, for `nc`. A device token as the
   first line, framing with a partial line kept in per-connection state, a
   4 KB line cap, a topic, and a plain HTML page.
+- `duckdb-report`: heavy analytics in the browser. A job writes a Parquet
+  file with the streaming writer, SQLite keeps one row per file, the handler
+  serves the file to people with a grant, and the page queries it with
+  DuckDB-wasm and draws a chart.
 - `syslog`: a UDP receiver. RFC 5424 and RFC 3164 parsed by hand into
   SQLite, a source allow list in a setting checked at `connect`, a live tail
   over a WebSocket, and a job that prunes old rows.
@@ -191,12 +195,69 @@ goes through guest memory:
 - **Small things from inside.** `put`, `get`, `stat`, `list(prefix)` and
   `delete`. `get` refuses anything over 16 MB rather than truncating it;
   serve those with the header.
+- **Made by the handler or a job.** For a file too big to build in memory, a
+  Parquet file or a long export, write it in pieces:
+
+  ```rust
+  let handle = blobs::writer_open("reports/sales.parquet", "application/vnd.apache.parquet")?;
+  for chunk in chunks {
+      blobs::writer_append(handle, &chunk)?;
+  }
+  let entry = blobs::writer_finish(handle)?; // or blobs::writer_abort(handle)
+  ```
+
+  Nothing shows under the key until `writer_finish`, which puts the whole
+  file there at once. A handle belongs to the call that opened it: when the
+  call returns or traps, any writer not finished is thrown away with what it
+  wrote. A call may hold four at once.
 
 Seeding from a shell: `curl -f -T file '<upload-url>?blob=<key>'`, up to 64 MB
 per PUT, typed by the key's extension.
 
 The ceiling per file is the deployment's, a few GB by default. Where the
 bytes live, the volume or a bucket, is not the app's concern.
+
+## Heavy analytics: files plus DuckDB in the browser
+
+SQLite is where an app keeps its configuration and metadata. It is not
+where millions of rows of history should be scanned on every request, and a
+handler has five seconds. For reports, keep the data in files and let the
+browser do the work:
+
+1. **A job writes the data as a file.** Parquet, written with the streaming
+   writer a row group at a time, into the app's files. SQLite keeps one row
+   per file: key, row count, size, when it was made.
+2. **The page asks the handler for it.** `GET /p/<app>/api/files/<key>`. The
+   handler checks who is asking and that the key is one it means to serve,
+   then answers `x-toolsite-blob: <key>` with an empty body. The platform
+   sends the whole file.
+3. **The page queries it locally.** Read the response as an `ArrayBuffer`,
+   register it with DuckDB-wasm, `db.registerFileBuffer('sales.parquet',
+   new Uint8Array(buffer))`, and run SQL against `'sales.parquet'` in the tab.
+
+DuckDB never fetches a URL itself: no httpfs, no `read_parquet('<url>')`, no
+`ATTACH '<url>'`. Every byte comes through the handler, which is where access
+is decided. Bundle DuckDB with the app (`@duckdb/duckdb-wasm`, its wasm and
+worker imported with `?url`) rather than loading it from a CDN.
+
+**A file has no row-level policy.** Whoever is given the file has every row
+in it. When people should see different rows, write one file per person or
+per role (`reports/role-north/sales.parquet`, `reports/user-<id>.parquet`)
+and have the handler serve only the key that belongs to the caller.
+
+**A `.duckdb` file works the same way.** Build it locally, or in the browser
+(DuckDB-wasm writes one), and upload it with `blobs::upload_url` or
+`curl -f -T report.duckdb '<upload-url>?blob=reports/report.duckdb'`. Deliver
+it through the handler like the Parquet file, register the buffer as
+`report.duckdb`, then `ATTACH 'report.duckdb' AS report (READ_ONLY)`.
+
+**Mind the job's budget.** A job runs with two billion instructions and a
+minute. Encoding Parquet in wasm costs a few thousand instructions a row, so
+one run writes a few hundred thousand rows. More than that is several files,
+one per month say, each made by its own run.
+
+The `duckdb-report` example is all of this: the job, the table, the route
+and a React page with DuckDB and a chart.
 
 ## Schema
 

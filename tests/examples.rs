@@ -25,7 +25,7 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
 const BASE: &str = "https://site.test";
-const EXAMPLES: [&str; 9] = [
+const EXAMPLES: [&str; 10] = [
     "kitchen-sink",
     "orders",
     "static-report",
@@ -35,6 +35,7 @@ const EXAMPLES: [&str; 9] = [
     "mqtt-broker",
     "tcp-chat",
     "syslog",
+    "duckdb-report",
 ];
 
 fn root() -> PathBuf {
@@ -312,7 +313,7 @@ async fn every_example_publishes_as_it_ships() {
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("Q3 shipping report"));
     // The rest are not.
-    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker", "tcp-chat", "syslog"] {
+    for name in ["kitchen-sink", "orders", "blob-gallery", "inventory-policies", "live-board", "mqtt-broker", "tcp-chat", "syslog", "duckdb-report"] {
         let (status, _) = send_text(&config, get(&format!("/p/{name}/"))).await;
         assert_ne!(status, StatusCode::OK, "{name} opened with no account");
     }
@@ -1827,4 +1828,90 @@ async fn syslog_prune_deletes_rows_older_than_30_days_on_its_schedule_only() {
     assert_eq!(toolsite::platform::schedule::read_jobs(&s.config, "syslog")["prune"].last_status.as_deref(), Some("200"));
     let left: Vec<_> = logs(&s, "host=old").await.into_iter().map(|r| r["message"].clone()).collect();
     assert_eq!(left, ["four weeks ago"]);
+}
+
+// --- duckdb-report ------------------------------------------------------------------
+
+/// The README's claims: the job writes a real Parquet file with the
+/// streaming writer and records it in SQLite; the handler hands the whole
+/// file to a person with a grant and refuses everyone else, the platform's
+/// gate holding for no account at all.
+#[tokio::test]
+async fn duckdb_report_job_writes_parquet_that_parses_and_only_a_granted_person_gets_it() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let (_dir, config) = site();
+    publish(&config, "duckdb-report").await;
+    let jobs = toolsite::platform::schedule::read_jobs(&config, "duckdb-report");
+    assert!(jobs.contains_key("build-report"), "{:?}", jobs.keys());
+
+    let state = toolsite::AppState { config: config.clone(), runtime: Runtime::new().unwrap() };
+    let status = toolsite::platform::schedule::run_job(&state, "duckdb-report", "build-report").await.unwrap();
+    assert_eq!(status, "200", "the job failed");
+
+    let ann = person(&config, "ann@example.com");
+    let bo = person(&config, "bo@example.com");
+    toolsite::accounts::users::grant(&config, "ann@example.com", "duckdb-report", "analyst").unwrap();
+    let ann_app = app_cookie(&config, &ann, "duckdb-report").await;
+    let bo_app = app_cookie(&config, &bo, "duckdb-report").await;
+
+    // SQLite holds the file's row and nothing more.
+    let (status, listed) = call(&config, &ann_app, "GET", "/p/duckdb-report/api/files", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let file = listed["files"][0].clone();
+    let key = file["key"].as_str().expect("no file recorded").to_string();
+    assert!(key.starts_with("reports/sales-") && key.ends_with(".parquet"), "{key}");
+    assert_eq!(listed["files"].as_array().unwrap().len(), 1);
+    let (failed, tables) = run_sql(&config, "duckdb-report", "select name from sqlite_master where type = 'table' order by name", None).await;
+    assert!(!failed, "{tables}");
+    assert!(tables.contains("report_file") && !tables.contains("sales"), "{tables}");
+
+    // Ann has a grant: the whole file, as stored.
+    let request = |cookie: Option<&str>| {
+        let mut builder = Request::builder().uri(format!("/p/duckdb-report/api/files/{key}"));
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    let (status, body, headers) = send(&config, request(Some(&ann_app))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len() as u64, file["bytes"].as_u64().unwrap(), "the size SQLite recorded is not the file's");
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    assert_eq!(header("content-type").as_deref(), Some("application/vnd.apache.parquet"));
+    assert_eq!(header("content-length"), Some(body.len().to_string()));
+    assert_eq!(header("x-toolsite-blob"), None, "the pointer leaked to the visitor");
+    assert!(body.starts_with(b"PAR1") && body.ends_with(b"PAR1"), "not a Parquet file");
+
+    // The footer parses natively, with every row and the declared columns.
+    let reader = SerializedFileReader::new(bytes::Bytes::from(body.clone())).expect("the footer did not parse");
+    let meta = reader.metadata();
+    assert_eq!(meta.file_metadata().num_rows(), file["rows"].as_i64().unwrap());
+    assert_eq!(meta.file_metadata().num_rows(), 730 * 25 * 20, "two years of every store selling every product");
+    assert!(meta.num_row_groups() > 1, "written in one row group, not as it went");
+    let columns: Vec<String> = meta.file_metadata().schema_descr().columns().iter().map(|c| c.name().to_string()).collect();
+    assert_eq!(columns, ["day", "region", "store", "product", "units", "revenue"]);
+    let first = reader.get_row_iter(None).unwrap().next().unwrap().unwrap();
+    assert!(first.to_string().contains("Store 01"), "{first}");
+
+    // Bo is signed in but has no grant: the handler refuses him.
+    let (status, body, _) = send(&config, request(Some(&bo_app))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&body));
+    let (status, _) = call(&config, &bo_app, "GET", "/p/duckdb-report/api/files", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // No account at all: the gate refuses before the handler runs.
+    let (status, ..) = send(&config, request(None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Only keys the job recorded are served, whatever else the app keeps.
+    let (status, _) = call(&config, &ann_app, "GET", "/p/duckdb-report/api/files/reports/other.parquet", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A visitor cannot run the job, even forging the header.
+    let forged = Request::builder()
+        .uri("/p/duckdb-report/api/build")
+        .header("cookie", &ann_app)
+        .header("x-toolsite-scheduled", "build-report")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send_text(&config, forged).await.0, StatusCode::FORBIDDEN);
 }

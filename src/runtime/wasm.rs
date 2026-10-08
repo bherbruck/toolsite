@@ -175,6 +175,10 @@ pub struct StoreState {
     /// When the current call's wall clock runs out. Epochs stop wasm at this
     /// point; host imports that wait read it to stop there too.
     deadline: Instant,
+    /// Files this call is writing in pieces. Dropped with the store, which
+    /// abandons any not finished; a resident instance empties it after
+    /// each call.
+    writers: crate::runtime::blobs::Writers,
 }
 
 impl StoreState {
@@ -349,6 +353,22 @@ impl self::toolsite::app::blobs::Host for StoreState {
     fn upload_url(&mut self, key: String, max_bytes: u64) -> Result<String, WitBlobError> {
         crate::runtime::blobs::issue_upload(&self.site, &self.app, &key, max_bytes)
             .map_err(wit_blob_error)
+    }
+
+    fn writer_open(&mut self, key: String, content_type: String) -> Result<u64, WitBlobError> {
+        self.writers.open(&self.site, &self.app, &key, &content_type).map_err(wit_blob_error)
+    }
+
+    fn writer_append(&mut self, handle: u64, bytes: Vec<u8>) -> Result<(), WitBlobError> {
+        self.writers.append(handle, &bytes).map_err(wit_blob_error)
+    }
+
+    fn writer_finish(&mut self, handle: u64) -> Result<WitEntry, WitBlobError> {
+        self.writers.finish(handle).map(wit_entry).map_err(wit_blob_error)
+    }
+
+    fn writer_abort(&mut self, handle: u64) {
+        self.writers.abort(handle);
     }
 }
 
@@ -690,6 +710,7 @@ impl Runtime {
             user,
             connecting: None,
             deadline: Instant::now(),
+            writers: Default::default(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -772,8 +793,9 @@ impl Resident {
         state.user = user;
         state.connecting = matches!(event, ConnectionEvent::Connect(_)).then(|| conn.to_string());
         arm(&mut self.store, guards);
-        let (answer,) = self.on_connection.call(&mut self.store, (conn.to_string(), event))?;
-        Ok(answer)
+        let answer = self.on_connection.call(&mut self.store, (conn.to_string(), event));
+        self.store.data_mut().writers.abort_all();
+        Ok(answer?.0)
     }
 
     /// Whether the handler exports `on-tick`.
@@ -791,7 +813,9 @@ impl Resident {
         state.user = None;
         state.connecting = None;
         arm(&mut self.store, guards);
-        Ok(on_tick.call(&mut self.store, (now_ms,))?)
+        let ticked = on_tick.call(&mut self.store, (now_ms,));
+        self.store.data_mut().writers.abort_all();
+        Ok(ticked?)
     }
 
     /// Bytes of memory the instance holds now, linear memory and tables.

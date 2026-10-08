@@ -252,7 +252,7 @@ agent about to build a handler, a schema or a gate.
 hands one over (`?slug=` renames it and sets its base path). They live in
 [`examples/`](examples/): `kitchen-sink` uses every capability, one screen
 each; `orders`, `static-report`, `blob-gallery`, `inventory-policies`,
-`live-board`, `mqtt-broker`, `tcp-chat` and `syslog` are smaller and focused. The same apps are test fixtures: `tests/examples.rs`
+`live-board`, `mqtt-broker`, `tcp-chat`, `syslog` and `duckdb-report` are smaller and focused. The same apps are test fixtures: `tests/examples.rs`
 publishes each one through the router and checks what its README claims.
 
 ## The CLI
@@ -503,6 +503,21 @@ Bytes never pass through the guest, whose request body is capped at 8 MB:
   answering, the handler has decided the visitor may have it.
 - **Small things.** `put`, `get`, `stat`, `list`, `delete` from inside the
   handler; `get` refuses anything over 16 MB.
+- **Made by the handler or a job.** For a file too big to build in memory, a
+  Parquet file or a long export, write it in pieces:
+
+  ```rust
+  let handle = blobs::writer_open("reports/sales.parquet", "application/vnd.apache.parquet")?;
+  for chunk in chunks {
+      blobs::writer_append(handle, &chunk)?;
+  }
+  let entry = blobs::writer_finish(handle)?; // or blobs::writer_abort(handle)
+  ```
+
+  Nothing shows under the key until `writer_finish`, which puts the whole
+  file there at once. A handle belongs to the call that opened it: when the
+  call returns or traps, any writer not finished is thrown away with what it
+  wrote. A call may hold four at once.
 - **From a shell.** `curl -f -T file '<upload-url>?blob=<key>'`, 64 MB per
   PUT, typed by the key's extension.
 
@@ -519,7 +534,61 @@ Where the bytes live is the deployment's choice, not the app's:
   whose credentials tab says path-style.
 
 One file may be up to `TOOLSITE_MAX_BLOB_MB` (4 GB by default, `0` for no
-ceiling).
+ceiling). A file a handler writes in pieces is held to the same ceiling
+unless `TOOLSITE_MAX_BLOB_WRITE_BYTES` says otherwise, in bytes (`0` for
+none), for a deployment whose jobs write larger exports than an upload
+should be.
+
+How a file written in pieces stays invisible until it is finished: on the
+volume the bytes go to a temp file under the app's hidden `.blobs/tmp/` and
+are renamed into place; a temp file a crashed process left is swept after a
+day. On a bucket they go up as a multipart upload in 8 MB parts, completed
+at finish and aborted when the writer is abandoned; a file smaller than one
+part is a single PUT at finish. An upload a crashed process never aborted
+stays in the bucket until something removes it, so give the bucket a
+lifecycle rule that aborts incomplete multipart uploads after a day.
+
+### Heavy analytics: files plus DuckDB in the browser
+
+SQLite is where an app keeps its configuration and metadata. It is not
+where millions of rows of history should be scanned on every request, and a
+handler has five seconds. For reports, keep the data in files and let the
+browser do the work:
+
+1. **A job writes the data as a file.** Parquet, written with the streaming
+   writer a row group at a time, into the app's files. SQLite keeps one row
+   per file: key, row count, size, when it was made.
+2. **The page asks the handler for it.** `GET /p/<app>/api/files/<key>`. The
+   handler checks who is asking and that the key is one it means to serve,
+   then answers `x-toolsite-blob: <key>` with an empty body. The platform
+   sends the whole file.
+3. **The page queries it locally.** Read the response as an `ArrayBuffer`,
+   register it with DuckDB-wasm, `db.registerFileBuffer('sales.parquet',
+   new Uint8Array(buffer))`, and run SQL against `'sales.parquet'` in the tab.
+
+DuckDB never fetches a URL itself: no httpfs, no `read_parquet('<url>')`, no
+`ATTACH '<url>'`. Every byte comes through the handler, which is where access
+is decided. Bundle DuckDB with the app (`@duckdb/duckdb-wasm`, its wasm and
+worker imported with `?url`) rather than loading it from a CDN.
+
+**A file has no row-level policy.** Whoever is given the file has every row
+in it. When people should see different rows, write one file per person or
+per role (`reports/role-north/sales.parquet`, `reports/user-<id>.parquet`)
+and have the handler serve only the key that belongs to the caller.
+
+**A `.duckdb` file works the same way.** Build it locally, or in the browser
+(DuckDB-wasm writes one), and upload it with `blobs::upload_url` or
+`curl -f -T report.duckdb '<upload-url>?blob=reports/report.duckdb'`. Deliver
+it through the handler like the Parquet file, register the buffer as
+`report.duckdb`, then `ATTACH 'report.duckdb' AS report (READ_ONLY)`.
+
+**Mind the job's budget.** A job runs with two billion instructions and a
+minute. Encoding Parquet in wasm costs a few thousand instructions a row, so
+one run writes a few hundred thousand rows. More than that is several files,
+one per month say, each made by its own run.
+
+The `duckdb-report` example is all of this: the job, the table, the route
+and a React page with DuckDB and a chart.
 
 ## Reaching other services
 
