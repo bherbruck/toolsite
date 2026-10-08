@@ -6,12 +6,14 @@
 //! row. A store never hashes, seals, compares a secret or decides who may do
 //! what: it is handed digests and sealed text and gives them back.
 //!
-//! One implementation so far: `sqlite`, the file `.site/auth.db`. Postgres
-//! joins it next. The methods are synchronous because every caller is:
-//! account functions run on a blocking thread already (`spawn_blocking`, a
-//! wasm host call, the `toolsite user` commands), and an async trait would
-//! send each SQLite call through a second blocking hop to arrive where it
-//! started.
+//! Two implementations: `sqlite`, the file `.site/auth.db` (the default),
+//! and `postgres`, schema `accounts`, when the site runs on `DATABASE_URL`.
+//! The methods are synchronous because every caller is: account functions
+//! run on a blocking thread already (`spawn_blocking`, a wasm host call, the
+//! `toolsite user` commands), and an async trait would send each SQLite call
+//! through a second blocking hop to arrive where it started. The Postgres
+//! store waits on its pool with `state::wait`, which refuses an async
+//! worker thread loudly.
 //!
 //! Single use and replay rest on conditional writes, never on a read and a
 //! later write: `advance_step`, `spend_recovery_code`, `take_invite` and
@@ -19,9 +21,10 @@
 //! moved the row, and that holds the same on both backends under any
 //! number of concurrent callers.
 
+pub mod postgres;
 pub mod sqlite;
 
-use crate::{accounts::users::User, config::Config};
+use crate::{accounts::users::User, config::Config, state::Backend};
 
 /// One account as the admin list shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -196,11 +199,13 @@ pub trait AccountStore: Send + Sync {
     fn delete_pending_for(&self, user_id: &str) -> Result<(), String>;
 }
 
-/// The account store this site keeps accounts in. Cheap: it holds a path,
-/// and opens nothing until a method runs. On either backend for now, since
-/// accounts have not moved to Postgres yet.
+/// The account store this site's backend keeps accounts in. Cheap: it
+/// holds a path or a pool handle, and opens nothing until a method runs.
 pub fn of(config: &Config) -> Box<dyn AccountStore> {
-    Box::new(sqlite::SqliteAccounts::new(config))
+    match &config.stores.backend {
+        Backend::Files => Box::new(sqlite::SqliteAccounts::new(config)),
+        Backend::Postgres(postgres) => Box::new(postgres::PostgresAccounts::new(postgres.pool.clone())),
+    }
 }
 
 #[cfg(test)]

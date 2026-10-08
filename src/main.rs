@@ -112,7 +112,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(Command::User { command }) = cli.command {
         let stores = toolsite::state::Stores { backend, runner: None };
-        return run_user_command(command, data_dir, read(&["TOOLSITE_BASE_URL", "PUBLIC_BASE_URL"]), stores);
+        let base_url = read(&["TOOLSITE_BASE_URL", "PUBLIC_BASE_URL"]);
+        // Account calls block their thread, and on Postgres they wait on
+        // this runtime, which refuses to be waited on from its own worker.
+        return tokio::task::spawn_blocking(move || run_user_command(command, data_dir, base_url, stores)).await?;
     }
 
     // On Postgres this process joins the runner registry and keeps its row

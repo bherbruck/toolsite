@@ -1,11 +1,16 @@
-//! One suite every account store must pass. The rules above the store have
+//! One suite every account store must pass, run on SQLite always and on
+//! Postgres when `TOOLSITE_TEST_DATABASE_URL` names a server
+//! (`scripts/test-postgres.sh` starts one). The rules above the store have
 //! their own tests; these pin what the rules rely on: rows come back as
 //! they went in, one account's rows never answer for another's, and every
 //! single-use write lets exactly one of many concurrent callers through.
 
-use super::{sqlite::SqliteAccounts, AccountStore};
-use crate::{accounts::users::User, config::Config};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use super::{postgres::PostgresAccounts, sqlite::SqliteAccounts, AccountStore};
+use crate::{accounts::users::User, config::Config, state};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    LazyLock,
+};
 
 const NOW: i64 = 1_800_000_000;
 
@@ -370,4 +375,67 @@ fn the_sqlite_store_conforms() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config::local(dir.path().to_path_buf(), "t");
     run(&SqliteAccounts::new(&config));
+}
+
+/// A runtime for the Postgres store to wait on from plain test threads.
+static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    state::keep_runtime(runtime.handle().clone());
+    runtime
+});
+
+/// A pool on a database of its own, with every ladder applied, and its name
+/// for dropping. `None` without a server to use.
+pub(crate) fn postgres_database() -> (deadpool_postgres::Pool, String) {
+    let server = std::env::var("TOOLSITE_TEST_DATABASE_URL")
+        .expect("needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one");
+    let name = format!("t_{}", crate::content::slug::random_token(12).to_lowercase());
+    RUNTIME.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&server, tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+        client.batch_execute(&format!("create database {name}")).await.unwrap();
+        let mut url = url::Url::parse(&server).unwrap();
+        url.set_path(&name);
+        let postgres = state::pg::connect(url.as_str(), 16).await.unwrap();
+        state::pg::migrate(&postgres.pool, state::pg::LADDERS).await.unwrap();
+        (postgres.pool, name)
+    })
+}
+
+pub(crate) fn drop_postgres_database(pool: deadpool_postgres::Pool, name: &str) {
+    let server = std::env::var("TOOLSITE_TEST_DATABASE_URL").unwrap();
+    pool.close();
+    RUNTIME.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&server, tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+        client.batch_execute(&format!("drop database if exists {name} with (force)")).await.unwrap();
+    });
+}
+
+#[test]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+fn the_postgres_store_conforms() {
+    let (pool, name) = postgres_database();
+    run(&PostgresAccounts::new(pool.clone()));
+    drop_postgres_database(pool, &name);
+}
+
+/// Every statement the Postgres store sends is a literal: a value can only
+/// ever arrive as a bound parameter, never spliced into SQL text.
+#[test]
+fn every_postgres_statement_is_a_literal() {
+    let source = include_str!("postgres.rs");
+    let mut calls = 0;
+    for call in [".query(", ".query_opt(", ".query_one(", ".execute(", ".batch_execute("] {
+        for (at, _) in source.match_indices(call) {
+            let argument = source[at + call.len()..].trim_start();
+            assert!(
+                argument.starts_with('"') || argument.starts_with("sql,"),
+                "a statement that is not a literal: {}",
+                &source[at..(at + 120).min(source.len())]
+            );
+            calls += 1;
+        }
+    }
+    assert!(calls > 40, "the scan found only {calls} statements");
 }

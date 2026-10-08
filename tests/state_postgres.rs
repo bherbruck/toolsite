@@ -209,9 +209,9 @@ async fn a_fresh_directory_opened_on_postgres_belongs_to_postgres_after() {
     assert!(matches!(backend, Backend::Postgres(_)));
     assert!(dir.path().join(".site").join(state::MARKER).is_file());
 
-    // Accounts still land in .site/auth.db in this build; the marker keeps
-    // the next Postgres boot from mistaking them for unmigrated state, and
-    // file mode from writing beside a Postgres site.
+    // Accounts live in Postgres now, but an auth.db left beside a claimed
+    // directory (an old file, a copy) is not taken for unmigrated state,
+    // and file mode still refuses to write beside a Postgres site.
     std::fs::write(dir.path().join(".site/auth.db"), b"").unwrap();
     state::open(&settings, dir.path()).await.unwrap();
     let files = Settings { database_url: None, secret_key: None, bucket: false, pool_size: 2 };

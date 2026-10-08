@@ -162,10 +162,12 @@ pub async fn open(settings: &Settings, data_dir: &Path) -> Result<Backend, Strin
     Ok(Backend::Postgres(Arc::new(postgres)))
 }
 
-/// Marks a directory that had nothing to migrate as Postgres's, so the
-/// files this build still writes there (accounts, until they move) are not
-/// later mistaken for a file-mode site. Never replaces a marker the
-/// migration command wrote.
+/// Marks a directory that had nothing to migrate as Postgres's. Accounts
+/// no longer write `.site/auth.db` here, but file mode must still refuse the
+/// directory: started on it, it would come up with no accounts beside a
+/// site whose accounts live in Postgres, and write an `auth.db` the next
+/// Postgres boot would take for unmigrated state. Never replaces a marker
+/// the migration command wrote.
 fn claim(data_dir: &Path) -> Result<(), String> {
     let site = data_dir.join(".site");
     std::fs::create_dir_all(&site).map_err(|e| format!("could not create .site: {e}"))?;
