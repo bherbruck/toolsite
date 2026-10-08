@@ -239,7 +239,8 @@ interface identity {
 /// `x-toolsite-blob: <key>` and an empty body; the platform streams the file
 /// in its place, with the stored content type unless the response set one.
 /// `get` is for things small enough to hold — anything over its ceiling is
-/// refused, not truncated.
+/// refused, not truncated. To make a file bigger than a handler could hold,
+/// write it in pieces with `writer-open`.
 interface blobs {
     record entry {
         key: string,
@@ -278,6 +279,23 @@ interface blobs {
     /// credential: deciding who gets it is the handler's job. `max-bytes` of
     /// zero means the platform's own ceiling.
     upload-url: func(key: string, max-bytes: u64) -> result<string, error>;
+
+    /// Starts a file written in pieces, for output too big to build in
+    /// memory: a Parquet file a row group at a time, a long export. Nothing
+    /// is visible under `key` until `writer-finish`, which puts the whole
+    /// file there at once, replacing any file already stored. The handle is
+    /// good for this call only: when the call ends, a writer not finished is
+    /// abandoned and what it wrote is thrown away. A few writers may be open
+    /// at once; past that, `failed`.
+    writer-open: func(key: string, content-type: string) -> result<u64, error>;
+    /// Adds bytes to the end. Past the platform's ceiling for a written
+    /// file, `too-large` with the size it would have reached, and the
+    /// writer is abandoned.
+    writer-append: func(handle: u64, bytes: list<u8>) -> result<_, error>;
+    /// Stores the file under its key and closes the writer.
+    writer-finish: func(handle: u64) -> result<entry, error>;
+    /// Throws the writer and what it wrote away. Unknown handles are ignored.
+    writer-abort: func(handle: u64);
 }
 
 /// What a request handler sees and returns. Deliberately small: enough to

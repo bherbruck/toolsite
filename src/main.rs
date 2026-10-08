@@ -196,10 +196,23 @@ async fn main() -> anyhow::Result<()> {
             toolsite::runtime::blobs::Blobs {
                 backend: toolsite::runtime::blobs::Backend::S3(s3),
                 max_bytes: max_blob_bytes,
+                max_write_bytes: max_blob_bytes,
             }
         }
         (None, None) => toolsite::runtime::blobs::Blobs::local(max_blob_bytes),
         _ => panic!("set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET together, or neither"),
+    };
+    // A file a handler or job writes in pieces is held to the blob ceiling
+    // unless this says otherwise, in bytes: a job's export may need more
+    // room than an upload should have.
+    let blobs = match read(&["TOOLSITE_MAX_BLOB_WRITE_BYTES"]) {
+        Some(value) => toolsite::runtime::blobs::Blobs {
+            max_write_bytes: value.trim().parse::<u64>().unwrap_or_else(|_| {
+                panic!("TOOLSITE_MAX_BLOB_WRITE_BYTES must be a whole number of bytes (0 for no limit), not {value:?}")
+            }),
+            ..blobs
+        },
+        None => blobs,
     };
 
     // Ways to sign in besides a password: TOOLSITE_LOGIN_<SLUG>_CLIENT_ID and
@@ -308,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
         blobs = blobs.describe(),
         max_db_mb = max_db_bytes / 1024 / 1024,
         max_blob_mb = max_blob_bytes / 1024 / 1024,
+        max_blob_write_mb = blobs.max_write_bytes / 1024 / 1024,
         "storage configuration (0 MB means no ceiling)"
     );
 

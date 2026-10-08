@@ -76,7 +76,8 @@ back into the conversation either; `curl` it to a file and edit that.
   `blob-gallery`, `inventory-policies`, `live-board` (live connections),
   `mqtt-broker` (resident mode, a TCP port, device tokens), `tcp-chat`
   (line framing on a TCP port), `syslog` (a UDP port, a live tail, a prune
-  job).
+  job), `duckdb-report` (a job writing Parquet, queried in the browser with
+  DuckDB).
   `toolsite init <name> --example
   <example>` unpacks one with its slug and base path set.
 
@@ -422,6 +423,20 @@ through guest memory:
 - **Small things from inside.** `put`, `get`, `stat`, `list(prefix)` and
   `delete`. `get` refuses anything over 16 MB rather than truncating it; serve
   those with the header.
+- **Big things from inside.** `writer_open(key, content_type)`, then
+  `writer_append(handle, bytes)` as often as needed, then `writer_finish` (or
+  `writer_abort`). Nothing shows under the key until finish; a handle lives
+  for one call, and anything unfinished when the call ends is thrown away.
+
+**Reports over a lot of rows go in files, not SQLite.** A job writes Parquet
+with the writer and records the key in a table; the page fetches it through a
+handler route that checks the caller and answers `x-toolsite-blob`, then
+hands the bytes to DuckDB-wasm with `registerFileBuffer` and queries in the
+tab. DuckDB never reads a URL itself (no httpfs, no `read_parquet('<url>')`).
+A file has no row-level policy, so per-person data is one file per person or
+role, and the handler serves only the caller's key. A job's budget (two
+billion instructions) writes a few hundred thousand rows a run. See the
+guide's "Heavy analytics" section and the `duckdb-report` example.
 
 Seeding from a shell: `curl -f -T file '<upload-url>?blob=<key>'`, up to
 64 MB per PUT, typed by the key's extension.

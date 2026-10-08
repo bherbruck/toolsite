@@ -197,6 +197,10 @@ pub struct StoreState {
     /// declared access as it stood when the call first used it, with that
     /// scope kept so a batch puts the same authorizer back.
     scoped: Option<(rusqlite::Connection, db::Scope)>,
+    /// Files this call is writing in pieces. Dropped with the store, which
+    /// abandons any not finished; a resident instance empties it after
+    /// each call.
+    writers: crate::runtime::blobs::Writers,
 }
 
 impl StoreState {
@@ -458,6 +462,22 @@ impl self::toolsite::app::blobs::Host for StoreState {
     fn upload_url(&mut self, key: String, max_bytes: u64) -> Result<String, WitBlobError> {
         crate::runtime::blobs::issue_upload(&self.site, &self.app, &key, max_bytes)
             .map_err(wit_blob_error)
+    }
+
+    fn writer_open(&mut self, key: String, content_type: String) -> Result<u64, WitBlobError> {
+        self.writers.open(&self.site, &self.app, &key, &content_type).map_err(wit_blob_error)
+    }
+
+    fn writer_append(&mut self, handle: u64, bytes: Vec<u8>) -> Result<(), WitBlobError> {
+        self.writers.append(handle, &bytes).map_err(wit_blob_error)
+    }
+
+    fn writer_finish(&mut self, handle: u64) -> Result<WitEntry, WitBlobError> {
+        self.writers.finish(handle).map(wit_entry).map_err(wit_blob_error)
+    }
+
+    fn writer_abort(&mut self, handle: u64) {
+        self.writers.abort(handle);
     }
 }
 
@@ -802,6 +822,7 @@ impl Runtime {
             query_rows: guards.query_rows,
             db: None,
             scoped: None,
+            writers: Default::default(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -854,9 +875,10 @@ impl Runtime {
 }
 
 /// Fuel and a wall-clock deadline for the next call on `store`, counted
-/// from now, and no database connection left from the last.
+/// from now, with nothing left from the last: no database connection, no
+/// open writer.
 fn arm(store: &mut Store<StoreState>, guards: Guards) {
-    close_databases(store);
+    end_call(store);
     store.data_mut().deadline = Instant::now() + guards.wall_clock;
     store.data_mut().query_rows = guards.query_rows;
     store.set_fuel(guards.fuel.unwrap_or(u64::MAX)).expect("fuel is enabled");
@@ -864,12 +886,15 @@ fn arm(store: &mut Store<StoreState>, guards: Guards) {
 }
 
 /// Drops the connections a call opened, rolling back whatever transaction
-/// it left open. Every call ends here or in its store's drop, so no
-/// statement ever runs on a connection opened for another call.
-fn close_databases(store: &mut Store<StoreState>) {
+/// it left open, and abandons the files it began writing and never
+/// finished. Every call ends here or in its store's drop, so no statement
+/// ever runs on a connection opened for another call, and no handle
+/// reaches one either.
+fn end_call(store: &mut Store<StoreState>) {
     let state = store.data_mut();
     state.db = None;
     state.scoped = None;
+    state.writers.abort_all();
 }
 
 /// An app's handler kept alive between events: its memory, and so whatever
@@ -897,8 +922,9 @@ impl Resident {
         arm(&mut self.store, guards);
         let outcome = self.on_connection.call(&mut self.store, (conn.to_string(), event));
         // Not left open until the next event: the write lock of a
-        // transaction it began would be held between calls.
-        close_databases(&mut self.store);
+        // transaction it began would be held between calls, and a file it
+        // never finished would wait to be finished by someone else's.
+        end_call(&mut self.store);
         let (answer,) = outcome?;
         Ok(answer)
     }
@@ -919,7 +945,7 @@ impl Resident {
         state.connecting = None;
         arm(&mut self.store, guards);
         let outcome = on_tick.call(&mut self.store, (now_ms,));
-        close_databases(&mut self.store);
+        end_call(&mut self.store);
         Ok(outcome?)
     }
 
@@ -1393,6 +1419,27 @@ mod tests {
         for refused in ["select * from orders", "begin", "attach database ':memory:' as m"] {
             assert!(matches!(scoped_sql(&mut resident, refused), Err(WitDbError::Denied(_))), "{refused} was allowed");
         }
+    }
+
+    #[test]
+    fn a_writer_a_call_left_open_is_gone_by_the_next_call_on_the_same_store() {
+        use super::toolsite::app::blobs::Host as _;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut resident = runtime.store(site_in(&dir), "app", Some(person("u-alice")), Guards::default());
+        let handle = resident.data_mut().writer_open("report.bin".into(), "application/octet-stream".into()).unwrap();
+        resident.data_mut().writer_append(handle, b"alice's half".to_vec()).unwrap();
+        sql(&mut resident, "select 1").unwrap();
+
+        // The next event, someone else's: the handle names nothing, and
+        // nothing of the first call's file was stored.
+        resident.data_mut().user = Some(person("u-bob"));
+        arm(&mut resident, Guards::default());
+        assert!(resident.data_mut().writer_append(handle, b"bob's".to_vec()).is_err());
+        assert!(resident.data_mut().writer_finish(handle).is_err());
+        assert!(resident.data().writers.is_empty());
+        assert!(resident.data().db.is_none());
+        assert!(resident.data_mut().get("report.bin".into()).is_err());
     }
 
     #[test]

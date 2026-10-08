@@ -474,6 +474,109 @@ impl Guest for Handler {
                 }
             }
 
+            // Writes `parts` (comma-separated) as one file, piece by piece.
+            // With `peek=1`, says before finishing whether the key shows yet.
+            "/writer-write" => {
+                let key = param(&req.query, "key");
+                let handle = match blobs::writer_open(key, "text/plain") {
+                    Ok(handle) => handle,
+                    Err(e) => return respond(blob_status(&e), format!("{e:?}")),
+                };
+                for part in decode(param(&req.query, "parts")).split(',') {
+                    if let Err(e) = blobs::writer_append(handle, part.as_bytes()) {
+                        return respond(blob_status(&e), format!("{e:?}"));
+                    }
+                }
+                let seen = if param(&req.query, "peek") == "1" {
+                    let stat = blobs::stat(key).ok().flatten().is_some();
+                    let listed = blobs::list("").map(|l| l.len()).unwrap_or(0);
+                    format!(" before-finish:stat={stat},listed={listed}")
+                } else {
+                    String::new()
+                };
+                match blobs::writer_finish(handle) {
+                    Ok(entry) => respond(200, format!("{}:{}{seen}", entry.size, entry.content_type)),
+                    Err(e) => respond(blob_status(&e), format!("{e:?}")),
+                }
+            }
+
+            // Writes, then thinks better of it.
+            "/writer-abort" => {
+                let handle = match blobs::writer_open(param(&req.query, "key"), "text/plain") {
+                    Ok(handle) => handle,
+                    Err(e) => return respond(blob_status(&e), format!("{e:?}")),
+                };
+                let _ = blobs::writer_append(handle, b"never stored");
+                blobs::writer_abort(handle);
+                let after = blobs::writer_append(handle, b"more");
+                respond(200, format!("aborted; append after: {after:?}"))
+            }
+
+            // Writes, then traps with the writer open.
+            "/writer-trap" => {
+                if let Ok(handle) = blobs::writer_open(param(&req.query, "key"), "text/plain") {
+                    let _ = blobs::writer_append(handle, b"half a file");
+                }
+                panic!("trapped with a writer open");
+            }
+
+            // Leaves a writer open and hands its number out, for a test
+            // that tries it from another call.
+            "/writer-leave-open" => match blobs::writer_open(param(&req.query, "key"), "text/plain") {
+                Ok(handle) => {
+                    let _ = blobs::writer_append(handle, b"left open");
+                    respond(200, handle.to_string())
+                }
+                Err(e) => respond(blob_status(&e), format!("{e:?}")),
+            },
+
+            // Tries a handle this call never opened.
+            "/writer-use" => {
+                let handle: u64 = param(&req.query, "handle").parse().unwrap_or(0);
+                let appended = blobs::writer_append(handle, b"from another call");
+                let finished = blobs::writer_finish(handle);
+                match (appended, finished) {
+                    (Err(a), Err(f)) => respond(403, format!("refused: {a:?} / {f:?}")),
+                    other => respond(200, format!("ACCEPTED {other:?}")),
+                }
+            }
+
+            // Appends 64 KB chunks until the host says stop.
+            "/writer-flood" => {
+                let handle = match blobs::writer_open(param(&req.query, "key"), "application/octet-stream") {
+                    Ok(handle) => handle,
+                    Err(e) => return respond(blob_status(&e), format!("{e:?}")),
+                };
+                let chunk = vec![7u8; 64 * 1024];
+                let mut sent: u64 = 0;
+                loop {
+                    match blobs::writer_append(handle, &chunk) {
+                        Ok(()) => sent += chunk.len() as u64,
+                        Err(e) => {
+                            let finish = blobs::writer_finish(handle);
+                            return respond(blob_status(&e), format!("{e:?} after {sent}; finish: {finish:?}"));
+                        }
+                    }
+                    if sent > 64 * 1024 * 1024 {
+                        return respond(200, "NEVER STOPPED".to_string());
+                    }
+                }
+            }
+
+            // Opens writers until refused, and says how many it got.
+            "/writer-many" => {
+                let mut opened = 0;
+                loop {
+                    match blobs::writer_open(&format!("many/{opened}.txt"), "text/plain") {
+                        Ok(_) => opened += 1,
+                        Err(e) => return respond(200, format!("{opened}:{e:?}")),
+                    }
+                    if opened > 100 {
+                        return respond(200, "NEVER REFUSED".to_string());
+                    }
+                }
+            }
+
             "/secret" => match secrets::get("API_KEY") {
                 Some(value) => respond(200, format!("key={value}")),
                 None => respond(404, "no API_KEY set".to_string()),
