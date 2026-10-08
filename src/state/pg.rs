@@ -35,7 +35,10 @@ pub struct Ladder {
 /// Every ladder this build knows, applied at boot in this order.
 pub const LADDERS: &[Ladder] = &[Ladder {
     store: "state",
-    steps: &[include_str!("../../migrations/postgres/state/001_initial.sql")],
+    steps: &[
+        include_str!("../../migrations/postgres/state/001_initial.sql"),
+        include_str!("../../migrations/postgres/state/002_runner_placement.sql"),
+    ],
 }];
 
 pub struct Postgres {

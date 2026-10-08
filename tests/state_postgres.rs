@@ -72,14 +72,14 @@ async fn the_ladder_applies_once_when_three_runners_boot_together_on_postgres() 
         applied.extend(boot.await.unwrap().expect("a runner failed to migrate"));
     }
     applied.sort();
-    assert_eq!(applied, ["probe/001", "probe/002", "state/001"], "steps applied across the three runners");
+    assert_eq!(applied, ["probe/001", "probe/002", "state/001", "state/002"], "steps applied across the three runners");
 
     let postgres = pg::connect(&url, 1).await.unwrap();
     let client = postgres.pool.get().await.unwrap();
     let probes: i64 = client.query_one("select count(*) from probe.once", &[]).await.unwrap().get(0);
     assert_eq!(probes, 2);
     let recorded: i64 = client.query_one("select count(*) from state.migrations", &[]).await.unwrap().get(0);
-    assert_eq!(recorded, 3);
+    assert_eq!(recorded, 4);
     drop(client);
 
     // A fourth boot later finds nothing to do.
@@ -167,6 +167,23 @@ async fn two_live_runners_refuse_sqlite_apps_until_one_leaves_on_postgres() {
     second.leave(&postgres.pool).await;
     assert!(first.beat(&postgres.pool).await.unwrap().is_empty());
     drop(client);
+    drop(postgres);
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_database_from_the_first_release_climbs_to_the_runner_columns_on_postgres() {
+    let (url, name) = fresh_database().await;
+    let postgres = pg::connect(&url, 1).await.unwrap();
+    const FIRST: &[Ladder] = &[Ladder { store: "state", steps: &[pg::LADDERS[0].steps[0]] }];
+    assert_eq!(pg::migrate(&postgres.pool, FIRST).await.unwrap(), ["state/001"]);
+    // Other stores' ladders may climb alongside; `state` takes only its second step.
+    let climbed = pg::migrate(&postgres.pool, pg::LADDERS).await.unwrap();
+    let state: Vec<&String> = climbed.iter().filter(|step| step.starts_with("state/")).collect();
+    assert_eq!(state, ["state/002"], "{climbed:?}");
+    let runner = Runner::new(&["control", "worker"], "default", None, 8081);
+    assert!(runner.register(&postgres.pool).await.unwrap().is_empty());
     drop(postgres);
     drop_database(&name).await;
 }
