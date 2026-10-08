@@ -3,10 +3,13 @@ WORKDIR /app
 
 # Dependencies change far less often than source, so build them against a stub
 # first and let that layer be reused.
+# Every target Cargo.toml declares needs a file here, or Cargo refuses to read
+# the manifest at all: the benchmark is one.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
+RUN mkdir src benches && echo "fn main() {}" > src/main.rs \
+    && echo "fn main() {}" > benches/handler.rs \
     && cargo build --release \
-    && rm -rf src
+    && rm -rf src benches
 
 # Everything else, deliberately: the build reads more than src/ at compile
 # time — wit/ through the component bindgen macro, migrations/ and templates/
