@@ -755,7 +755,7 @@ Step 1 hook: `build_router` already assembles every route in one place. Step
 1 groups them into `control_routes()` and `worker_routes()` functions with no
 change in behaviour, so step 4 only selects.
 
-### 6.4 Step 5: the edge role
+### 6.4 Edge: toolsite's own router (step 5)
 
 **Why.** Railway's load balancer picks a replica at random, with no
 affinity. A resident app's connections must reach the one worker that holds
