@@ -138,7 +138,7 @@ fn a_runaway_handler_is_killed_by_its_guards() {
     let (_dir, site) = site();
 
     let guards = Guards {
-        fuel: 5_000_000,
+        fuel: Some(5_000_000),
         ..Guards::default()
     };
     let error = runtime
@@ -160,7 +160,7 @@ fn a_wall_clock_deadline_stops_a_spinning_handler() {
     let (_dir, site) = site();
 
     let guards = Guards {
-        fuel: u64::MAX,
+        fuel: None,
         wall_clock: Duration::from_millis(200),
         ..Guards::default()
     };
@@ -271,7 +271,7 @@ async fn a_scheduled_job_runs_the_apps_handler_and_records_what_happened() {
     let status = toolsite::platform::schedule::run_job(&state, "app", "tick")
         .await
         .unwrap();
-    assert_eq!(status, "200");
+    assert_eq!(status, toolsite::platform::schedule::Ran::Finished("200".into()));
 
     // The work actually happened: a second run sees the first one's row.
     toolsite::platform::schedule::run_job(&state, "app", "tick").await.unwrap();

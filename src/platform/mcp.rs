@@ -1769,7 +1769,7 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Schedule an app's handler to run on its own — refreshing a cache, pulling from an API, tidying a table. A job is a cron expression and a path, and firing it calls the same handler a request would, with the same sandbox and limits. Give run_now to trigger one immediately, or no name to list them with when each last ran.",
+        description = "Schedule an app's handler to run on its own — refreshing a cache, pulling from an API, tidying a table. A job is a cron expression and a path, and firing it calls the same handler a request would, with the same sandbox and limits. Give run_now to trigger one immediately (needs Manage; a job already running runs once more when it finishes), or no name to list them with when each last started and finished, how long it took, and whether it is running.",
         annotations(title = "Scheduled jobs", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn app_jobs(
@@ -1783,7 +1783,10 @@ impl PageHost {
             run_now,
         }): Parameters<ScheduleRequest>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
+        // Running a job now spends the app's budget on demand, which is
+        // Manage's call; scheduling one is an edit to the app.
+        let needed = if run_now == Some(true) { Scope::Admin } else { Scope::Editor };
+        if let Err(refused) = self.allowed(&ctx, &app, needed).await {
             return Ok(refused);
         }
         if !valid_slug(&app) {
@@ -1798,9 +1801,12 @@ impl PageHost {
 
         let outcome: Result<String, String> = match (name, schedule, path, run_now) {
             (Some(name), _, _, Some(true)) => {
-                crate::platform::schedule::run_job(&state, &app, &name)
-                    .await
-                    .map(|status| format!("{name} ran: {status}"))
+                crate::platform::schedule::run_job(&state, &app, &name).await.map(|ran| match ran {
+                    crate::platform::schedule::Ran::Finished(status) => format!("{name} ran: {status}"),
+                    crate::platform::schedule::Ran::Queued => {
+                        format!("{name} is running; it runs once more as soon as this run finishes")
+                    }
+                })
             }
             (Some(name), Some(schedule), Some(path), _) => {
                 crate::platform::schedule::set_job(&self.config, &app, &name, &schedule, &path)
@@ -1818,12 +1824,25 @@ impl PageHost {
                 } else {
                     jobs.iter()
                         .map(|(name, job)| {
-                            format!(
-                                "{name}: {} -> {} (last: {})",
+                            let mut line = format!(
+                                "{name}: {} -> {} (last: {}",
                                 job.schedule,
                                 job.path,
                                 job.last_status.as_deref().unwrap_or("never run")
-                            )
+                            );
+                            for (label, value) in [
+                                ("last_started_at", job.last_started_at),
+                                ("last_finished_at", job.last_finished_at),
+                                ("last_duration_ms", job.last_duration_ms),
+                                ("last_skipped_at", job.last_skipped_at),
+                            ] {
+                                if let Some(value) = value {
+                                    line.push_str(&format!(", {label} {value}"));
+                                }
+                            }
+                            let running = self.config.jobs.is_running(&app, name);
+                            line.push_str(&format!(", running {running})"));
+                            line
                         })
                         .collect::<Vec<_>>()
                         .join("\n")

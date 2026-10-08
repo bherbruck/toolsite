@@ -168,6 +168,7 @@ pub async fn fetch_page(config: &Config, slug: &str, manages: bool) -> Option<Fe
             "has_handler": config.data_dir.join(&app).join("handler.wasm").is_file(),
             "views": views,
             "open_connections": config.connections.open(&app),
+            "limits": config.limits.effective(meta.limits.as_ref()).describe(),
             "resident": meta.resident.filter(|_| manages).map(|_| config.residents.status(&app).unwrap_or_default()),
         }),
     })

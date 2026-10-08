@@ -41,6 +41,45 @@ interface db {
     /// policy says `write = true`. Nothing else in the database is reachable,
     /// whatever the SQL says. For an app that lets its own users type SQL.
     query-scoped: func(sql: string, params: list<value>) -> result<rows, error>;
+
+    /// One statement of a batch, with its own bound parameters.
+    record statement {
+        sql: string,
+        params: list<value>,
+    }
+
+    /// Runs every statement in one transaction: all of them, or, if any
+    /// fails, none. Answers the rows each one changed, in order. Same
+    /// database, identity, refusals and time limit as `query`. A statement
+    /// that returns rows (a select, or `returning`) runs and its rows are
+    /// discarded: read with `query`. At most 10,000 statements and 4 MB of
+    /// SQL text in one batch; one statement per entry, and no `begin`,
+    /// `commit` or `savepoint` inside, since the host holds the transaction.
+    batch: func(statements: list<statement>) -> result<list<u64>, error>;
+
+    /// `batch` as the visitor, inside the app's declared access, like
+    /// `query-scoped`: every statement is held to the same views and
+    /// policies, and a write the policy forbids fails the whole batch.
+    batch-scoped: func(statements: list<statement>) -> result<list<u64>, error>;
+}
+
+/// The app's own scheduled jobs, the `[[job]]`s its toolsite.toml declares.
+interface jobs {
+    /// Starts the named job now, in the background, exactly as the schedule
+    /// would: no identity, the job's limits, and its outcome recorded as a
+    /// run. Returns at once; the job's work is not this call's.
+    ///
+    /// One run per job at a time. Asked while that job is running, from a
+    /// request or from the job itself, it queues one more run to start the
+    /// moment the current one finishes, and answers "queued"; asked again
+    /// before then, it is the same one run. So a job can chain stages back
+    /// to back by asking for itself at the end of each. Otherwise it answers
+    /// "started".
+    ///
+    /// Refused when the app declares no job of that name, and past the
+    /// site's rate of starts per app (600 a minute unless its owner says
+    /// otherwise), which counts queued runs too.
+    run: func(name: string) -> result<string, string>;
 }
 
 /// Values the site's owner set for this app: API keys, endpoints, anything
@@ -279,6 +318,7 @@ world app {
     import fetch;
     import connections;
     import auth;
+    import jobs;
 
     export handle: func(req: request) -> response;
 }

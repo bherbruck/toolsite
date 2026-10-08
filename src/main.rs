@@ -399,6 +399,24 @@ async fn main() -> anyhow::Result<()> {
         panic!("TOOLSITE_PORTS maps {} to {}, but that is PORT, where HTTP is served", clash.socket, clash.app);
     }
 
+    // What an app's [limits] may ask for. Defaults in runtime::limits; a
+    // fuel ceiling of `none` meters no fuel and leaves the clock alone.
+    let limits = toolsite::runtime::limits::Ceilings::from_env(|name| read(&[name])).unwrap_or_else(|why| panic!("{why}"));
+    let job_starts = count(
+        "TOOLSITE_JOB_STARTS_PER_MINUTE",
+        toolsite::platform::schedule::DEFAULT_STARTS_PER_MINUTE as u64,
+    ) as usize;
+    tracing::info!(
+        request_fuel = ?limits.request_fuel,
+        request_seconds = limits.request_seconds,
+        job_fuel = ?limits.job_fuel,
+        job_seconds = limits.job_seconds,
+        query_rows = limits.query_rows,
+        memory_mb = limits.memory_mb,
+        job_starts_per_minute = job_starts,
+        "app limit ceilings"
+    );
+
     let config = Arc::new(Config {
         data_dir,
         base_url,
@@ -422,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
         apps,
         handoffs: Mutex::new(HashMap::new()),
         mfa,
+        limits,
+        jobs: Arc::new(toolsite::platform::schedule::Jobs::new(job_starts)),
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -510,6 +530,8 @@ fn run_user_command(
         apps: None,
         handoffs: Mutex::new(HashMap::new()),
         mfa: toolsite::accounts::mfa::Settings::off(),
+        limits: Default::default(),
+        jobs: Default::default(),
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

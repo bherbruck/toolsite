@@ -925,7 +925,7 @@ async fn app_tab_with(
                     .await
                     .unwrap_or_default()
             };
-            render_jobs_tab(&app, &jobs, &token, &back)
+            render_jobs_tab(&config, &app, &jobs, &token, &back, is_admin_here)
         }
         _ => {
             let notes = crate::content::store::read_notes(&config, &app).await;
@@ -1003,6 +1003,12 @@ async fn render_overview(
                         @if meta.allow_http.is_empty() { "none" }
                         @else { @for (i, host) in meta.allow_http.iter().enumerate() { @if i > 0 { ", " } code { (host) } } }
                     }
+                    @let limits = config.limits.effective(meta.limits.as_ref());
+                    @let fuel = |fuel: Option<u64>| fuel.map_or("unmetered".to_string(), |f| format!("{f} fuel"));
+                    dt { "Request limits" }
+                    dd { (limits.request.wall_clock.as_secs()) " s, " (fuel(limits.request.fuel)) ", " (limits.request.memory_bytes / (1024 * 1024)) " MB, " (limits.request.query_rows) " rows a query" }
+                    dt { "Job limits" }
+                    dd { (limits.job.wall_clock.as_secs()) " s, " (fuel(limits.job.fuel)) ", " (limits.job.memory_bytes / (1024 * 1024)) " MB, " (limits.job.query_rows) " rows a query" }
                 }
             }))
             (ui::panel("Visibility", Some("These settings do not delete files. You can change them again on this page."), html! {
@@ -1417,10 +1423,12 @@ fn render_tools_tab(
 }
 
 fn render_jobs_tab(
+    config: &Config,
     app: &str,
     jobs: &std::collections::BTreeMap<String, crate::platform::schedule::Job>,
     token: &str,
     back: &str,
+    is_admin_here: bool,
 ) -> Markup {
     html! {
         (ui::panel("Scheduled jobs", Some("The app declares jobs in toolsite.toml. Each run sends a request to the handler."), html! {
@@ -1428,15 +1436,20 @@ fn render_jobs_tab(
                 p."muted" { "No jobs. The app declares jobs in toolsite.toml." }
             } @else {
                 table {
-                    thead { tr { th { "Name" } th { "Schedule" } th { "Path" } th { "Last run" } th { "Status" } th {} } }
+                    thead { tr { th { "Name" } th { "Schedule" } th { "Path" } th { "Last started" } th { "Took" } th { "Status" } th {} } }
                     tbody {
                         @for (name, job) in jobs {
                             tr {
                                 td { (name) }
                                 td { code { (job.schedule) } }
                                 td { code { (job.path) } }
-                                td."muted small" { @match job.last_run { Some(at) => (ago(at)), None => "never" } }
+                                td."muted small" {
+                                    @match job.last_started_at.or(job.last_run) { Some(at) => (ago(at)), None => "never" }
+                                    @if let Some(at) = job.last_skipped_at { br; "skipped a turn " (ago(at)) }
+                                }
+                                td."muted small" { @match job.last_duration_ms { Some(ms) => { (ms) " ms" } None => "—" } }
                                 td {
+                                    @if config.jobs.is_running(app, name) { span."badge" { "running" } " " }
                                     @match job.last_status.as_deref() {
                                         Some(status) if status.starts_with("ok") || status.starts_with("200") => span."badge ok" { (status) },
                                         Some(status) => span."badge warn" { (status) },
@@ -1444,9 +1457,11 @@ fn render_jobs_tab(
                                     }
                                 }
                                 td."actions-cell" {
-                                    form method="post" action="/admin/job-run" {
-                                        (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("name", name))
-                                        button."quiet sm" type="submit" { "Run job" }
+                                    @if is_admin_here {
+                                        form method="post" action="/admin/job-run" {
+                                            (hidden("token", token)) (hidden("app", app)) (hidden("back", back)) (hidden("name", name))
+                                            button."quiet sm" type="submit" { "Run now" }
+                                        }
                                     }
                                 }
                             }
@@ -2455,12 +2470,20 @@ pub async fn run_job(
     if !valid_slug(&form.app) {
         return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
     }
-    if let Err(response) = checked_app(&state.config, &headers, &form.token, &form.app, Scope::Editor).await {
+    // Running a job spends the app's budget on demand: Manage, not Edit.
+    if let Err(response) = checked_app(&state.config, &headers, &form.token, &form.app, Scope::Admin).await {
         return response;
     }
     let back = back_or(form.back.as_deref(), "/admin/apps");
     match crate::platform::schedule::run_job(&state, &form.app, &form.name).await {
-        Ok(status) => redirect_flash(&back, true, format!("Job {} ran. Status: {status}", form.name)),
+        Ok(crate::platform::schedule::Ran::Finished(status)) => {
+            redirect_flash(&back, true, format!("Job {} ran. Status: {status}", form.name))
+        }
+        Ok(crate::platform::schedule::Ran::Queued) => redirect_flash(
+            &back,
+            true,
+            format!("Job {} is running. It runs once more when this run finishes.", form.name),
+        ),
         Err(message) => redirect_flash(&back, false, format!("Job {} failed. {message}", form.name)),
     }
 }

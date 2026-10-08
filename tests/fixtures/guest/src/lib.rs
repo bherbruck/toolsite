@@ -14,6 +14,7 @@ use toolsite::app::blobs;
 use toolsite::app::db;
 use toolsite::app::connections::{self, Message};
 use toolsite::app::identity;
+use toolsite::app::jobs;
 use toolsite::app::fetch;
 use toolsite::app::secrets;
 
@@ -114,6 +115,45 @@ fn rows_text(rows: &db::Rows) -> String {
         })
         .collect::<Vec<_>>()
         .join(";")
+}
+
+/// A batch from a request body: one statement per line, its parameters
+/// after tabs, each `i:<n>` for an integer, `n` for null, or text.
+fn batch_of(body: &[u8]) -> Vec<db::Statement> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let sql = fields.next().unwrap_or("").to_string();
+            let params = fields
+                .map(|field| match field {
+                    "n" => db::Value::Null,
+                    f if f.starts_with("i:") => db::Value::Integer(f[2..].parse().unwrap_or(0)),
+                    f => db::Value::Text(f.to_string()),
+                })
+                .collect();
+            db::Statement { sql, params }
+        })
+        .collect()
+}
+
+fn batch_response(outcome: Result<Vec<u64>, db::Error>) -> Response {
+    match outcome {
+        Ok(counts) => respond(200, format!("ok:{}", counts.iter().map(u64::to_string).collect::<Vec<_>>().join(","))),
+        Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
+        Err(db::Error::Failed(m)) => respond(500, format!("failed: {m}")),
+    }
+}
+
+/// Notes that a job ran, and as whom, in `marks`.
+fn mark(what: &str) -> Result<(), db::Error> {
+    db::query("create table if not exists marks (what text, who text)", &[])?;
+    db::query(
+        "insert into marks values (?, ?)",
+        &[db::Value::Text(what.to_string()), db::Value::Text(caller())],
+    )?;
+    Ok(())
 }
 
 fn blob_status(error: &blobs::Error) -> u16 {
@@ -241,6 +281,61 @@ impl Guest for Handler {
                 Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
                 Err(db::Error::Failed(m)) => respond(500, format!("failed: {m}")),
             },
+
+            // How many rows a query came back with, and whether it says it
+            // was cut short: `<rows>:<truncated>`.
+            "/sql-count" => match db::query(&decode(param(&req.query, "q")), &[]) {
+                Ok(rows) => respond(200, format!("{}:{}", rows.values.len(), rows.truncated)),
+                Err(e) => respond(500, format!("{e:?}")),
+            },
+            "/scoped-count" => match db::query_scoped(&decode(param(&req.query, "q")), &[]) {
+                Ok(rows) => respond(200, format!("{}:{}", rows.values.len(), rows.truncated)),
+                Err(e) => respond(500, format!("{e:?}")),
+            },
+
+            // A batch from the body, all or nothing: see `batch_of`.
+            "/batch" => batch_response(db::batch(&batch_of(&req.body))),
+            "/batch-scoped" => batch_response(db::batch_scoped(&batch_of(&req.body))),
+
+            // Starts one of the app's jobs: `started` or `queued`, or 409
+            // with the reason.
+            "/jobs-run" => match jobs::run(param(&req.query, "name")) {
+                Ok(how) => respond(200, how),
+                Err(why) => respond(409, why),
+            },
+            // Job routes. `mark` records who it ran as; `nap` sleeps first,
+            // to be caught running; `chain` counts a stage and asks for
+            // itself again until it has run twenty.
+            "/job-mark" => match mark("mark") {
+                Ok(()) => respond(200, "marked".to_string()),
+                Err(e) => respond(500, format!("{e:?}")),
+            },
+            "/job-nap" => {
+                let ms = param(&req.query, "ms").parse().unwrap_or(1500);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                match mark("nap") {
+                    Ok(()) => respond(200, "napped".to_string()),
+                    Err(e) => respond(500, format!("{e:?}")),
+                }
+            }
+            "/chain" => {
+                if let Err(e) = mark("stage") {
+                    return respond(500, format!("{e:?}"));
+                }
+                let stages = match db::query("select count(*) from marks where what = 'stage'", &[]) {
+                    Ok(rows) => match rows.values.first().and_then(|r| r.first()) {
+                        Some(db::Value::Integer(n)) => *n,
+                        _ => 0,
+                    },
+                    Err(e) => return respond(500, format!("{e:?}")),
+                };
+                if stages < 20 {
+                    if let Err(why) = jobs::run("chain") {
+                        return respond(500, why);
+                    }
+                }
+                respond(200, stages.to_string())
+            }
 
             // The host must refuse this, not the guest.
             // Can a guest read the platform's own account tables?
@@ -550,9 +645,14 @@ impl Guest for Handler {
                     }
                 } else if text == "hang" {
                     // Slow host calls rather than a spin, so the event runs
-                    // out of time before it runs out of fuel.
+                    // out of time before it runs out of fuel. Each one does
+                    // its work in SQLite: a `select 1` on the call's kept
+                    // connection is fast enough to spend the fuel first.
                     loop {
-                        let _ = db::query("select 1", &[]);
+                        let _ = db::query(
+                            "with recursive c(i) as (select 1 union all select i + 1 from c where i < 100000) select count(*) from c",
+                            &[],
+                        );
                     }
                 } else if text == "who" {
                     reply(format!("who:{}", caller()))

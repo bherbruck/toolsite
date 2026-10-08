@@ -71,6 +71,12 @@ pub struct Config {
     /// Two-step sign-in: who must have it, from `TOOLSITE_REQUIRE_MFA` and
     /// `TOOLSITE_MFA_FOR_PROVIDERS`, and the clock codes are checked by.
     pub mfa: crate::accounts::mfa::Settings,
+    /// The most an app's `[limits]` may ask for, from the
+    /// `TOOLSITE_MAX_*` variables.
+    pub limits: crate::runtime::limits::Ceilings,
+    /// Jobs in progress and queued, shared like `connections` so the
+    /// scheduler, a person and an app all see one run per job.
+    pub jobs: std::sync::Arc<crate::platform::schedule::Jobs>,
 }
 
 impl Config {
@@ -108,6 +114,8 @@ impl Config {
             apps: self.apps.clone(),
             handoffs: Mutex::new(HashMap::new()),
             mfa: self.mfa.clone(),
+            limits: self.limits.clone(),
+            jobs: self.jobs.clone(),
         }
     }
 
@@ -138,6 +146,8 @@ impl Config {
             apps: None,
             handoffs: Mutex::new(HashMap::new()),
             mfa: crate::accounts::mfa::Settings::off(),
+            limits: Default::default(),
+            jobs: Default::default(),
         }
     }
 }

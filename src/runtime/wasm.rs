@@ -53,7 +53,7 @@ use self::toolsite::app::blobs::{
 };
 use self::toolsite::app::connections::Message as WitMessage;
 pub use self::toolsite::app::connections::{ConnectInfo, Event as ConnectionEvent, Message as ConnectionMessage};
-use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Value as WitValue};
+use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Statement as WitStatement, Value as WitValue};
 // Request and Response already land at module scope from bindgen; User sits
 // under its interface, so re-export it rather than making callers spell out
 // the generated path.
@@ -72,22 +72,31 @@ const ON_CONNECTION: &str = "on-connection";
 /// The export a component built for `app-resident` adds.
 const ON_TICK: &str = "on-tick";
 
-#[derive(Clone, Copy, Debug)]
+/// What one call may use. An app's own come from `runtime::limits`, which
+/// applies its `[limits]` under the site's ceilings; the default is what a
+/// request gets when the app asks for nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Guards {
-    /// Instructions the guest may execute before it is killed.
-    pub fuel: u64,
+    /// Instructions the guest may execute before it is killed. `None`
+    /// meters nothing, leaving the wall clock as the only time limit.
+    pub fuel: Option<u64>,
     /// Ceiling on the guest's linear memory.
     pub memory_bytes: usize,
     /// Wall-clock ceiling, enforced even if the guest never burns fuel.
     pub wall_clock: Duration,
+    /// Rows one `query` or `query-scoped` may return before it says
+    /// `truncated`.
+    pub query_rows: usize,
 }
 
 impl Default for Guards {
     fn default() -> Self {
+        use crate::runtime::limits::*;
         Self {
-            fuel: 200_000_000,
-            memory_bytes: 64 * 1024 * 1024,
-            wall_clock: Duration::from_secs(5),
+            fuel: Some(DEFAULT_REQUEST_FUEL),
+            memory_bytes: (DEFAULT_REQUEST_MEMORY_MB * 1024 * 1024) as usize,
+            wall_clock: Duration::from_secs(DEFAULT_REQUEST_SECONDS),
+            query_rows: DEFAULT_QUERY_ROWS as usize,
         }
     }
 }
@@ -175,16 +184,19 @@ pub struct StoreState {
     /// When the current call's wall clock runs out. Epochs stop wasm at this
     /// point; host imports that wait read it to stop there too.
     deadline: Instant,
+    /// Rows one query may return, from the call's guards.
+    query_rows: usize,
     /// The current call's connection to its database, opened at its first
-    /// query: opening one, and looking up the caller's role to bind into
-    /// it, cost a millisecond, which per statement was most of a query's
-    /// time. The caller's identity and the call's deadline are bound in, so
-    /// it lives exactly as long as the call and `arm` drops it before the
-    /// next, which in a resident instance may be someone else's.
+    /// query or batch: opening one, and looking up the caller's role to
+    /// bind into it, cost a millisecond, which per statement was most of a
+    /// query's time. The caller's identity and the call's deadline are
+    /// bound in, so it lives exactly as long as the call and `arm` drops it
+    /// before the next, which in a resident instance may be someone else's.
     db: Option<rusqlite::Connection>,
-    /// The same for `query-scoped`, behind the app's declared access as it
-    /// stood when the call made its first scoped query.
-    scoped: Option<rusqlite::Connection>,
+    /// The same for `query-scoped` and `batch-scoped`, behind the app's
+    /// declared access as it stood when the call first used it, with that
+    /// scope kept so a batch puts the same authorizer back.
+    scoped: Option<(rusqlite::Connection, db::Scope)>,
 }
 
 impl StoreState {
@@ -286,15 +298,11 @@ impl self::toolsite::app::db::Host for StoreState {
         params: Vec<WitValue>,
     ) -> Result<WitRows, WitDbError> {
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
-        if self.db.is_none() {
-            let identity = self.identity();
-            match db::open_until(&self.site, &self.app, identity.as_ref(), Some(self.deadline)) {
-                Ok(conn) => self.db = Some(conn),
-                Err(error) => return wit_rows(Err(error)),
-            }
+        let max_rows = self.query_rows;
+        match self.kept() {
+            Ok(conn) => wit_rows(db::execute_on(conn, &sql, &params, max_rows)),
+            Err(error) => wit_rows(Err(error)),
         }
-        let conn = self.db.as_ref().expect("opened above");
-        wit_rows(db::execute_on(conn, &sql, &params))
     }
 
     fn query_scoped(
@@ -303,19 +311,96 @@ impl self::toolsite::app::db::Host for StoreState {
         params: Vec<WitValue>,
     ) -> Result<WitRows, WitDbError> {
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
+        let (max_rows, deadline) = (self.query_rows, self.deadline);
+        match self.kept_scoped() {
+            Ok((conn, _)) => wit_rows(db::execute_scoped(conn, &sql, &params, Some(deadline), max_rows)),
+            Err(error) => wit_rows(Err(error)),
+        }
+    }
+
+    fn batch(&mut self, statements: Vec<WitStatement>) -> Result<Vec<u64>, WitDbError> {
+        let statements = batch_of(statements);
+        let conn = match self.kept() {
+            Ok(conn) => conn,
+            Err(error) => return wit_counts(Err(error)),
+        };
+        let began = !conn.is_autocommit();
+        let outcome = db::batch_on(conn, &statements);
+        // A failed batch has rolled back; the connection goes with it, so
+        // nothing it might have left behind, such as an authorizer not put
+        // back, reaches the call's next statement. One the call holds a
+        // transaction on was refused untouched and stays.
+        if outcome.is_err() && !began {
+            self.db = None;
+        }
+        wit_counts(outcome)
+    }
+
+    fn batch_scoped(&mut self, statements: Vec<WitStatement>) -> Result<Vec<u64>, WitDbError> {
+        let statements = batch_of(statements);
+        let deadline = self.deadline;
+        let outcome = match self.kept_scoped() {
+            Ok((conn, scope)) => db::batch_scoped_on(conn, scope, &statements, Some(deadline)),
+            Err(error) => return wit_counts(Err(error)),
+        };
+        // The scope refuses `begin`, so the call never holds a transaction
+        // here: a failed batch takes the connection with it, as in `batch`.
+        if outcome.is_err() {
+            self.scoped = None;
+        }
+        wit_counts(outcome)
+    }
+}
+
+impl StoreState {
+    /// The call's connection for `query` and `batch`, opened at the first.
+    fn kept(&mut self) -> Result<&rusqlite::Connection, String> {
+        if self.db.is_none() {
+            let identity = self.identity();
+            self.db = Some(db::open_until(&self.site, &self.app, identity.as_ref(), Some(self.deadline))?);
+        }
+        Ok(self.db.as_ref().expect("opened above"))
+    }
+
+    /// The call's connection for `query-scoped` and `batch-scoped`, and the
+    /// scope it is behind.
+    fn kept_scoped(&mut self) -> Result<(&rusqlite::Connection, &db::Scope), String> {
         if self.scoped.is_none() {
             let identity = self.identity();
             // Read per call rather than cached, like allow_http: a policy
             // added by a manifest upload applies to the next request.
             let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
             let scope = db::Scope::of(&meta);
-            match db::open_scoped(&self.site, &self.app, identity.as_ref(), &scope) {
-                Ok(conn) => self.scoped = Some(conn),
-                Err(error) => return wit_rows(Err(error)),
-            }
+            let conn = db::open_scoped(&self.site, &self.app, identity.as_ref(), &scope)?;
+            self.scoped = Some((conn, scope));
         }
-        let conn = self.scoped.as_ref().expect("opened above");
-        wit_rows(db::execute_scoped(conn, &sql, &params, Some(self.deadline)))
+        let (conn, scope) = self.scoped.as_ref().expect("opened above");
+        Ok((conn, scope))
+    }
+}
+fn batch_of(statements: Vec<WitStatement>) -> Vec<db::Statement> {
+    statements
+        .into_iter()
+        .map(|statement| db::Statement {
+            sql: statement.sql,
+            params: statement.params.into_iter().map(json_of).collect(),
+        })
+        .collect()
+}
+
+fn wit_counts(outcome: Result<Vec<u64>, String>) -> Result<Vec<u64>, WitDbError> {
+    match outcome {
+        Ok(counts) => Ok(counts),
+        Err(message) if message.contains("not authorized") => Err(WitDbError::Denied(message)),
+        Err(message) => Err(WitDbError::Failed(message)),
+    }
+}
+
+/// Starts one of this app's own jobs: `self.app` comes from the host, so a
+/// name can only ever mean a job this app declared.
+impl self::toolsite::app::jobs::Host for StoreState {
+    fn run(&mut self, name: String) -> Result<String, String> {
+        crate::platform::schedule::start_from_app(&self.site, &self.app, &name)
     }
 }
 
@@ -714,6 +799,7 @@ impl Runtime {
             user,
             connecting: None,
             deadline: Instant::now(),
+            query_rows: guards.query_rows,
             db: None,
             scoped: None,
         };
@@ -772,7 +858,8 @@ impl Runtime {
 fn arm(store: &mut Store<StoreState>, guards: Guards) {
     close_databases(store);
     store.data_mut().deadline = Instant::now() + guards.wall_clock;
-    store.set_fuel(guards.fuel).expect("fuel is enabled");
+    store.data_mut().query_rows = guards.query_rows;
+    store.set_fuel(guards.fuel.unwrap_or(u64::MAX)).expect("fuel is enabled");
     store.set_epoch_deadline(1);
 }
 
@@ -900,7 +987,7 @@ mod tests {
     fn an_infinite_loop_dies_on_fuel_rather_than_running_forever() {
         let runtime = runtime();
         let guards = Guards {
-            fuel: 100_000,
+            fuel: Some(100_000),
             ..Guards::default()
         };
         let error = run(&runtime, INFINITE_LOOP, guards).unwrap_err();
@@ -915,7 +1002,7 @@ mod tests {
     fn a_wall_clock_deadline_applies_even_with_fuel_to_spare() {
         let runtime = runtime();
         let guards = Guards {
-            fuel: u64::MAX,
+            fuel: None,
             wall_clock: Duration::from_millis(100),
             ..Guards::default()
         };
@@ -944,7 +1031,7 @@ mod tests {
         let wasm = wat::parse_str(INFINITE_LOOP).unwrap();
         let module = runtime.module(INFINITE_LOOP, &wasm).unwrap();
         let guards = Guards {
-            fuel: u64::MAX,
+            fuel: None,
             wall_clock: Duration::from_secs(5),
             ..Guards::default()
         };
@@ -1000,7 +1087,7 @@ mod tests {
     fn each_request_gets_a_store_with_its_own_fuel() {
         let runtime = runtime();
         let guards = Guards {
-            fuel: 100_000,
+            fuel: Some(100_000),
             ..Guards::default()
         };
         // A store that ran to exhaustion must not affect the next one.
@@ -1137,6 +1224,175 @@ mod tests {
         // The next call gets its own deadline, not the spent one.
         arm(&mut store, Guards::default());
         sql(&mut store, "select 1").unwrap();
+    }
+
+    // --- batches on the kept connection --------------------------------------
+
+    fn batch(store: &mut Store<StoreState>, statements: &[&str]) -> Result<Vec<u64>, WitDbError> {
+        let statements = statements
+            .iter()
+            .map(|sql| WitStatement { sql: sql.to_string(), params: Vec::new() })
+            .collect();
+        super::toolsite::app::db::Host::batch(store.data_mut(), statements)
+    }
+
+    fn batch_scoped(store: &mut Store<StoreState>, statements: &[&str]) -> Result<Vec<u64>, WitDbError> {
+        let statements = statements
+            .iter()
+            .map(|sql| WitStatement { sql: sql.to_string(), params: Vec::new() })
+            .collect();
+        super::toolsite::app::db::Host::batch_scoped(store.data_mut(), statements)
+    }
+
+    fn scoped_sql(store: &mut Store<StoreState>, sql: &str) -> Result<WitRows, WitDbError> {
+        super::toolsite::app::db::Host::query_scoped(store.data_mut(), sql.to_string(), Vec::new())
+    }
+
+    #[test]
+    fn a_batch_on_a_call_that_already_queried_commits_and_leaves_the_connection_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut store = runtime.store(site_in(&dir), "app", None, Guards::default());
+        sql(&mut store, "create table t (x)").unwrap();
+        sql(&mut store, "insert into t values (1)").unwrap();
+        assert_eq!(batch(&mut store, &["insert into t values (2)", "insert into t values (3)"]).unwrap(), vec![1, 1]);
+        // The same call sees it, and so does the next, on a new connection.
+        assert_eq!(text(&sql(&mut store, "select count(*) from t").unwrap()), "3");
+        arm(&mut store, Guards::default());
+        assert_eq!(text(&sql(&mut store, "select count(*) from t").unwrap()), "3");
+
+        // The batch swapped the authorizer and put it back: the call's later
+        // statements are refused exactly as before it.
+        batch(&mut store, &["insert into t values (4)"]).unwrap();
+        for refused in ["attach database ':memory:' as m", "pragma query_only = 0"] {
+            assert!(matches!(sql(&mut store, refused), Err(WitDbError::Denied(_))), "{refused} was allowed");
+        }
+        // And a failed batch undoes all of itself and leaves the call able
+        // to go on.
+        assert!(batch(&mut store, &["insert into t values (5)", "insert into nowhere values (1)"]).is_err());
+        assert_eq!(text(&sql(&mut store, "select count(*) from t").unwrap()), "4");
+    }
+
+    #[test]
+    fn a_batch_is_refused_while_the_call_holds_a_transaction_and_that_transaction_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut store = runtime.store(site_in(&dir), "app", None, Guards::default());
+        sql(&mut store, "create table t (x)").unwrap();
+        sql(&mut store, "begin").unwrap();
+        sql(&mut store, "insert into t values (1)").unwrap();
+        let error = batch(&mut store, &["insert into t values (2)"]).unwrap_err();
+        assert!(matches!(&error, WitDbError::Failed(m) if m.contains("its own transaction")), "{error:?}");
+        // The guest's transaction is still its own to finish.
+        sql(&mut store, "commit").unwrap();
+        assert_eq!(text(&sql(&mut store, "select group_concat(x) from t").unwrap()), "1");
+        // Once it has, a batch runs.
+        batch(&mut store, &["insert into t values (2)"]).unwrap();
+        assert_eq!(text(&sql(&mut store, "select count(*) from t").unwrap()), "2");
+    }
+
+    #[test]
+    fn a_transaction_statement_the_call_prepared_earlier_cannot_split_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut store = runtime.store(site_in(&dir), "app", None, Guards::default());
+        sql(&mut store, "create table t (x)").unwrap();
+        // Prepared, and so cached, under the call's own authorizer, which
+        // lets a guest end its own transaction.
+        for statement in ["begin", "commit", "savepoint s", "release s"] {
+            sql(&mut store, statement).unwrap();
+        }
+        for split in ["commit", "savepoint s", "release s", "begin"] {
+            let error = batch(&mut store, &["insert into t values (1)", split, "insert into nowhere values (1)"]).unwrap_err();
+            assert!(matches!(&error, WitDbError::Denied(_)), "{split}: {error:?}");
+            assert_eq!(text(&sql(&mut store, "select count(*) from t").unwrap()), "0", "{split} let half a batch commit");
+        }
+    }
+
+    #[test]
+    fn query_rows_applies_on_the_kept_connection_and_each_call_gets_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let three = Guards { query_rows: 3, ..Guards::default() };
+        let mut store = runtime.store(site_in(&dir), "app", None, three);
+        arm(&mut store, three);
+        sql(&mut store, "create table t (x)").unwrap();
+        sql(&mut store, "with recursive c(i) as (select 1 union all select i + 1 from c where i < 10) insert into t select i from c")
+            .unwrap();
+        for _ in 0..2 {
+            let rows = sql(&mut store, "select x from t").unwrap();
+            assert_eq!((rows.values.len(), rows.truncated), (3, true));
+        }
+        // The next call's guards, not the connection's first.
+        arm(&mut store, Guards { query_rows: 7, ..Guards::default() });
+        let rows = sql(&mut store, "select x from t").unwrap();
+        assert_eq!((rows.values.len(), rows.truncated), (7, true));
+        arm(&mut store, Guards { query_rows: 50, ..Guards::default() });
+        let rows = sql(&mut store, "select x from t").unwrap();
+        assert_eq!((rows.values.len(), rows.truncated), (10, false));
+    }
+
+    /// An app named `shop` whose `my_orders` view shows each person their
+    /// own orders and lets them write in their own name.
+    fn shop(site: &SiteConfig) {
+        let policy = crate::content::store::Policy {
+            table: "orders".into(),
+            view: "my_orders".into(),
+            where_: "owner_id = current_user()".into(),
+            owner: Some("owner_id".into()),
+            write: true,
+        };
+        db::run(site, "shop", "create table orders (id integer primary key, owner_id text, total real)", &[]).unwrap();
+        let columns = vec!["id".to_string(), "owner_id".to_string(), "total".to_string()];
+        let keys = crate::runtime::access::Keys { rowid_alias: Some("id".into()), unique: Vec::new(), defaults: Vec::new() };
+        db::run(site, "shop", &crate::runtime::access::generate(&policy, "abc", &columns, &keys), &[]).unwrap();
+        let mut generated = vec!["my_orders".to_string(), "ts_abc_my_orders".to_string()];
+        generated.extend(crate::runtime::access::trigger_names("abc", "my_orders"));
+        let meta = crate::content::store::PageMeta {
+            policies: vec![policy],
+            generated,
+            access_salt: Some("abc".into()),
+            ..Default::default()
+        };
+        crate::content::store::write_meta_blocking(site, "shop", &meta).unwrap();
+    }
+
+    #[test]
+    fn a_resident_batch_scoped_of_one_person_never_lends_its_identity_to_the_next_persons_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = site_in(&dir);
+        shop(&site);
+        let runtime = runtime();
+        let mut resident = runtime.store(site.clone(), "shop", Some(person("u-alice")), Guards::default());
+        for round in 0..5 {
+            resident.data_mut().user = Some(person("u-alice"));
+            arm(&mut resident, Guards::default());
+            assert_eq!(scoped_sql(&mut resident, "select count(*) from my_orders").map(|r| text(&r)).unwrap(), round.to_string());
+            assert_eq!(batch_scoped(&mut resident, &["insert into my_orders (total) values (1)"]).unwrap(), vec![1]);
+
+            // Bob's event on the same instance: none of Alice's rows, and his
+            // writes land in his own name.
+            resident.data_mut().user = Some(person("u-bob"));
+            arm(&mut resident, Guards::default());
+            assert_eq!(text(&scoped_sql(&mut resident, "select count(*) from my_orders").unwrap()), round.to_string());
+            assert_eq!(text(&scoped_sql(&mut resident, "select current_user()").unwrap()), "u-bob");
+            batch_scoped(&mut resident, &["insert into my_orders (total) values (2)"]).unwrap();
+            // A write in Alice's name is refused, batch and all.
+            assert!(batch_scoped(&mut resident, &["insert into my_orders (owner_id, total) values ('u-alice', 9)"]).is_err());
+            // Nor does the plain connection answer for Alice.
+            assert_eq!(text(&sql(&mut resident, "select current_user()").unwrap()), "u-bob");
+        }
+        let owners = db::run(&site, "shop", "select owner_id, count(*), sum(total) from orders group by owner_id order by owner_id", &[]).unwrap();
+        assert_eq!(owners.rows, vec![
+            vec![serde_json::json!("u-alice"), serde_json::json!(5), serde_json::json!(5.0)],
+            vec![serde_json::json!("u-bob"), serde_json::json!(5), serde_json::json!(10.0)],
+        ]);
+
+        // The batch put the scope back: the call's next scoped statement is
+        // held to it as the first was.
+        for refused in ["select * from orders", "begin", "attach database ':memory:' as m"] {
+            assert!(matches!(scoped_sql(&mut resident, refused), Err(WitDbError::Denied(_))), "{refused} was allowed");
+        }
     }
 
     #[test]

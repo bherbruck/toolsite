@@ -69,6 +69,11 @@ pub struct Manifest {
     /// Declared wholesale: without the block, the app runs fresh per event.
     #[serde(default)]
     pub resident: Option<ResidentDecl>,
+    /// More (or less) fuel, time, rows or memory than the defaults, up to
+    /// the site's ceilings. Declared wholesale: without the block, the app
+    /// runs on the defaults.
+    #[serde(default)]
+    pub limits: Option<crate::runtime::limits::Asked>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,7 +212,8 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
              [access] views, [[access.table]] (table, view, where, owner, write), \
              [[tool]] (name, title, description, path, read_only, destructive, idempotent, \
              open_world, input, output), [[socket]] (path, or protocol = \"tcp\" | \"udp\" and port), \
-             [resident] (enabled, memory_mb, tick_ms)."
+             [resident] (enabled, memory_mb, tick_ms), [limits] (request_fuel, request_seconds, \
+             job_fuel, job_seconds, query_rows, memory_mb)."
         )
     })?;
 
@@ -295,6 +301,11 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
         if sockets[..n].contains(path) {
             return Err(format!("socket {path}: declared twice"));
         }
+    }
+
+    let limits = manifest.limits.clone().filter(|asked| !asked.is_empty());
+    if let Some(asked) = &limits {
+        asked.check()?;
     }
 
     let resident = match &manifest.resident {
@@ -399,6 +410,31 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
             }
         });
         meta.resident = resident;
+    }
+
+    if meta.limits != limits {
+        changed.push(match &limits {
+            None => "limits back to the defaults".to_string(),
+            Some(asked) => {
+                let effective = config.limits.effective(Some(asked));
+                let fuel = |fuel: Option<u64>| fuel.map_or("unmetered".to_string(), |f| f.to_string());
+                format!(
+                    "limits: request {} s, fuel {}; job {} s, fuel {}; {} rows a query; {} MB",
+                    effective.request.wall_clock.as_secs(),
+                    fuel(effective.request.fuel),
+                    effective.job.wall_clock.as_secs(),
+                    fuel(effective.job.fuel),
+                    effective.request.query_rows,
+                    effective.request.memory_bytes / (1024 * 1024),
+                )
+            }
+        });
+        meta.limits = limits.clone();
+    }
+    // Said on every deploy that asks past a ceiling, changed or not: the
+    // app is running on less than its author wrote.
+    if let Some(asked) = &limits {
+        changed.extend(config.limits.clamped(asked));
     }
 
     // Declared wholesale: a route removed from the file is removed here.

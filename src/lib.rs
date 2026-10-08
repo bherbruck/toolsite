@@ -58,6 +58,8 @@ impl FromRef<AppState> for Arc<Config> {
 /// Assembles every route. Kept out of `main` so tests can drive the whole
 /// surface in-process instead of over a socket.
 pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
+    // A job an app starts from its handler runs on this runtime.
+    config.jobs.attach(&runtime);
     // rmcp's Streamable HTTP transport validates the inbound `Host` header
     // (DNS-rebinding protection) against an allowlist that defaults to
     // localhost only. Deployed behind a real domain, that must include the
