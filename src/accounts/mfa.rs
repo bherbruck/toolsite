@@ -24,7 +24,10 @@
 //!   Refusals are logged at warn, and the code never is.
 
 use crate::{
-    accounts::users::{self, User},
+    accounts::{
+        store::{self, AccountStore},
+        users::{self, User},
+    },
     config::Config,
     seal,
 };
@@ -35,7 +38,6 @@ use axum::{
 };
 use hmac::{KeyInit, Mac};
 use rand::Rng;
-use rusqlite::{Connection, OptionalExtension};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -239,24 +241,19 @@ fn recovery_hash(config: &Config, user_id: &str, code: &str) -> Result<String, S
 
 /// Replaces the account's recovery codes with ten new ones and returns them
 /// for showing once, as `abcd-efgh`.
-fn new_recovery_codes(config: &Config, conn: &Connection, user_id: &str) -> Result<Vec<String>, String> {
-    conn.execute("delete from recovery_codes where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
-    let mut shown = Vec::with_capacity(RECOVERY_CODE_COUNT);
-    while shown.len() < RECOVERY_CODE_COUNT {
+fn new_recovery_codes(config: &Config, accounts: &dyn AccountStore, user_id: &str) -> Result<Vec<String>, String> {
+    let mut codes: Vec<String> = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    while codes.len() < RECOVERY_CODE_COUNT {
         let mut bytes = [0u8; 8];
         rand::rng().fill_bytes(&mut bytes);
         let code: String = bytes.iter().map(|b| RECOVERY_ALPHABET[(b & 31) as usize] as char).collect();
-        let inserted = conn
-            .execute(
-                "insert or ignore into recovery_codes (code_hash, user_id, used_at) values (?, ?, null)",
-                rusqlite::params![recovery_hash(config, user_id, &code)?, user_id],
-            )
-            .map_err(|e| e.to_string())?;
-        if inserted == 1 {
-            shown.push(format!("{}-{}", &code[..4], &code[4..]));
+        if !codes.contains(&code) {
+            codes.push(code);
         }
     }
-    Ok(shown)
+    let hashes = codes.iter().map(|code| recovery_hash(config, user_id, code)).collect::<Result<Vec<_>, _>>()?;
+    accounts.replace_recovery_codes(user_id, &hashes)?;
+    Ok(codes.iter().map(|code| format!("{}-{}", &code[..4], &code[4..])).collect())
 }
 
 /// What a code turned out to be.
@@ -279,7 +276,7 @@ enum Secret<'a> {
 /// Checks a code for an account and spends it if it is good.
 fn accept(
     config: &Config,
-    conn: &Connection,
+    accounts: &dyn AccountStore,
     user_id: &str,
     code: &str,
     secret: Secret<'_>,
@@ -287,21 +284,11 @@ fn accept(
 ) -> Result<Option<Used>, String> {
     let code = normalise_code(code);
     if code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()) {
-        let row: Option<(String, i64)> = match secret {
-            Secret::Enabled => conn.query_row(
-                "select secret, last_step from mfa where user_id = ? and enabled_at is not null",
-                [user_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ),
-            Secret::Setup(by) => conn.query_row(
-                "select secret, last_step from mfa where user_id = ? and enabled_at is null and begun_by = ?",
-                rusqlite::params![user_id, users::hash_token(by)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ),
-        }
-        .optional()
-        .map_err(|e| e.to_string())?;
-        let Some((sealed, last_step)) = row else {
+        let setup_by = match secret {
+            Secret::Enabled => None,
+            Secret::Setup(by) => Some(users::hash_token(by)),
+        };
+        let Some((sealed, last_step)) = accounts.mfa_secret(user_id, setup_by.as_deref())? else {
             return Ok(None);
         };
         let secret = seal::open(config, &sealed)
@@ -312,22 +299,11 @@ fn accept(
         };
         // Only one request can move the step past this point, so two
         // requests racing with the same code cannot both get in.
-        let moved = conn
-            .execute(
-                "update mfa set last_step = ?1 where user_id = ?2 and last_step < ?1",
-                rusqlite::params![step as i64, user_id],
-            )
-            .map_err(|e| e.to_string())?;
-        return Ok((moved == 1).then_some(Used::App));
+        return Ok(accounts.advance_step(user_id, step as i64)?.then_some(Used::App));
     }
     if allow_recovery && code.len() == 8 {
-        let spent = conn
-            .execute(
-                "update recovery_codes set used_at = ? where code_hash = ? and user_id = ? and used_at is null",
-                rusqlite::params![users_now() as i64, recovery_hash(config, user_id, &code)?, user_id],
-            )
-            .map_err(|e| e.to_string())?;
-        return Ok((spent == 1).then_some(Used::Recovery));
+        let spent = accounts.spend_recovery_code(user_id, &recovery_hash(config, user_id, &code)?, users_now() as i64)?;
+        return Ok(spent.then_some(Used::Recovery));
     }
     Ok(None)
 }
@@ -339,40 +315,27 @@ fn users_now() -> u64 {
         .as_secs()
 }
 
-fn account_locked(config: &Config, conn: &Connection, user_id: &str) -> bool {
+fn account_locked(config: &Config, accounts: &dyn AccountStore, user_id: &str) -> bool {
     let since = config.mfa.clock.now().saturating_sub(ACCOUNT_WINDOW) as i64;
-    conn.query_row(
-        "select count(*) from mfa_failures where user_id = ? and at > ?",
-        rusqlite::params![user_id, since],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|n| n >= MAX_FAILURES_PER_ACCOUNT)
-    .unwrap_or(true)
+    accounts.failures_since(user_id, since).map(|n| n >= MAX_FAILURES_PER_ACCOUNT).unwrap_or(true)
 }
 
-fn record_failure(config: &Config, conn: &Connection, user_id: &str) {
+fn record_failure(config: &Config, accounts: &dyn AccountStore, user_id: &str) {
     let now = config.mfa.clock.now();
-    let _ = conn.execute(
-        "delete from mfa_failures where at <= ?",
-        [now.saturating_sub(ACCOUNT_WINDOW) as i64],
-    );
-    let _ = conn.execute(
-        "insert into mfa_failures (user_id, at) values (?, ?)",
-        rusqlite::params![user_id, now as i64],
-    );
+    let _ = accounts.record_failure(user_id, now as i64, now.saturating_sub(ACCOUNT_WINDOW) as i64);
 }
 
 /// Checks a code from a signed-in person (turning it off, new recovery
 /// codes), under the same per-account limit as sign-in.
-fn accept_from_account(config: &Config, conn: &Connection, user: &User, code: &str, allow_recovery: bool) -> Result<Used, String> {
-    if account_locked(config, conn, &user.id) {
+fn accept_from_account(config: &Config, accounts: &dyn AccountStore, user: &User, code: &str, allow_recovery: bool) -> Result<Used, String> {
+    if account_locked(config, accounts, &user.id) {
         tracing::warn!(email = %user.email, "two-step code refused: too many wrong codes for this account");
         return Err("Too many wrong codes. Wait 15 minutes, then try again.".into());
     }
-    match accept(config, conn, &user.id, code, Secret::Enabled, allow_recovery)? {
+    match accept(config, accounts, &user.id, code, Secret::Enabled, allow_recovery)? {
         Some(used) => Ok(used),
         None => {
-            record_failure(config, conn, &user.id);
+            record_failure(config, accounts, &user.id);
             tracing::warn!(email = %user.email, "two-step code refused on the account page: not correct");
             Err("The code is not correct.".into())
         }
@@ -391,21 +354,9 @@ pub struct Status {
 }
 
 pub fn status(config: &Config, user_id: &str) -> Status {
-    let Ok(conn) = users::open(config) else {
-        return Status::default();
-    };
-    let enabled: Option<bool> = conn
-        .query_row("select enabled_at is not null from mfa where user_id = ?", [user_id], |row| row.get(0))
-        .optional()
-        .ok()
-        .flatten();
-    let recovery_left = conn
-        .query_row(
-            "select count(*) from recovery_codes where user_id = ? and used_at is null",
-            [user_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize;
+    let accounts = store::of(config);
+    let enabled = accounts.mfa_enabled(user_id).ok().flatten();
+    let recovery_left = accounts.recovery_left(user_id).unwrap_or(0);
     Status {
         enabled: enabled == Some(true),
         setting_up: enabled == Some(false),
@@ -421,14 +372,7 @@ pub fn is_enabled(config: &Config, user_id: &str) -> bool {
 /// token of a site session or a pending sign-in) began it. Nothing once it
 /// is confirmed: after that the secret is never shown again.
 pub fn setup_secret(config: &Config, user_id: &str, by: &str) -> Option<String> {
-    let conn = users::open(config).ok()?;
-    let sealed: String = conn
-        .query_row(
-            "select secret from mfa where user_id = ? and enabled_at is null and begun_by = ?",
-            rusqlite::params![user_id, users::hash_token(by)],
-            |row| row.get(0),
-        )
-        .ok()?;
+    let (sealed, _) = store::of(config).mfa_secret(user_id, Some(&users::hash_token(by))).ok()??;
     seal::open(config, &sealed)
 }
 
@@ -444,14 +388,7 @@ pub fn begin_setup(config: &Config, user_id: &str, by: &str) -> Result<String, S
         return Ok(secret);
     }
     let secret = new_secret();
-    let conn = users::open(config)?;
-    conn.execute(
-        "insert into mfa (user_id, secret, enabled_at, last_step, begun_by) values (?1, ?2, null, 0, ?3)
-         on conflict(user_id) do update set secret = excluded.secret, last_step = 0, begun_by = excluded.begun_by
-         where enabled_at is null",
-        rusqlite::params![user_id, seal::seal(config, &secret)?, users::hash_token(by)],
-    )
-    .map_err(|e| e.to_string())?;
+    store::of(config).begin_mfa(user_id, &seal::seal(config, &secret)?, &users::hash_token(by))?;
     Ok(secret)
 }
 
@@ -466,9 +403,7 @@ pub fn owes_setup(config: &Config, user: &User) -> bool {
 }
 
 pub fn cancel_setup(config: &Config, user_id: &str) -> Result<(), String> {
-    let conn = users::open(config)?;
-    conn.execute("delete from mfa where user_id = ? and enabled_at is null", [user_id]).map_err(|e| e.to_string())?;
-    Ok(())
+    store::of(config).cancel_mfa_setup(user_id)
 }
 
 /// Turns it on once setup's secret is in the phone, and ends every session
@@ -476,24 +411,13 @@ pub fn cancel_setup(config: &Config, user_id: &str) -> Result<(), String> {
 /// confirmed, if any), app sessions included: whatever was signed in
 /// without a code now has to sign in with one. Returns the recovery codes,
 /// for showing once.
-fn enable(config: &Config, conn: &Connection, user_id: &str, keep: Option<&str>) -> Result<Vec<String>, String> {
-    let changed = conn
-        .execute(
-            "update mfa set enabled_at = ?, begun_by = null where user_id = ? and enabled_at is null",
-            rusqlite::params![users_now() as i64, user_id],
-        )
-        .map_err(|e| e.to_string())?;
-    if changed != 1 {
+fn enable(config: &Config, accounts: &dyn AccountStore, user_id: &str, keep: Option<&str>) -> Result<Vec<String>, String> {
+    if !accounts.enable_mfa(user_id, users_now() as i64)? {
         return Err("Start setup again.".into());
     }
-    let codes = new_recovery_codes(config, conn, user_id)?;
-    let keep = keep.map(users::hash_token).unwrap_or_default();
-    conn.execute(
-        "delete from sessions where user_id = ? and token_hash != ?",
-        rusqlite::params![user_id, keep],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute("delete from mfa_pending where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
+    let codes = new_recovery_codes(config, accounts, user_id)?;
+    accounts.delete_sessions_for(user_id, keep.map(users::hash_token).as_deref())?;
+    accounts.delete_pending_for(user_id)?;
     Ok(codes)
 }
 
@@ -501,12 +425,12 @@ fn enable(config: &Config, conn: &Connection, user_id: &str, keep: Option<&str>)
 /// site session that sent it, which stays signed in, and which must be the
 /// one that began the setup.
 pub fn confirm_setup(config: &Config, user: &User, code: &str, keep: &str) -> Result<Vec<String>, String> {
-    let conn = users::open(config)?;
-    if accept(config, &conn, &user.id, code, Secret::Setup(keep), false)?.is_none() {
+    let accounts = store::of(config);
+    if accept(config, &*accounts, &user.id, code, Secret::Setup(keep), false)?.is_none() {
         tracing::warn!(email = %user.email, "two-step setup refused: the code is not correct");
         return Err("The code is not correct. Check the time on your phone, then enter the code the app shows now.".into());
     }
-    let codes = enable(config, &conn, &user.id, Some(keep))?;
+    let codes = enable(config, &*accounts, &user.id, Some(keep))?;
     tracing::info!(email = %user.email, "two-step sign-in turned on");
     Ok(codes)
 }
@@ -515,15 +439,15 @@ pub fn confirm_setup(config: &Config, user: &User, code: &str, keep: &str) -> Re
 /// not a recovery code: whoever holds one recovery code should not be able
 /// to mint ten.
 pub fn regenerate_recovery_codes(config: &Config, user: &User, code: &str) -> Result<Vec<String>, String> {
-    let conn = users::open(config)?;
+    let accounts = store::of(config);
     if !is_enabled(config, &user.id) {
         return Err("Two-step sign-in is off.".into());
     }
     if normalise_code(code).len() != 6 {
         return Err("Enter the 6-digit code from your authenticator app.".into());
     }
-    accept_from_account(config, &conn, user, code, false)?;
-    let codes = new_recovery_codes(config, &conn, &user.id)?;
+    accept_from_account(config, &*accounts, user, code, false)?;
+    let codes = new_recovery_codes(config, &*accounts, &user.id)?;
     tracing::info!(email = %user.email, "recovery codes replaced");
     Ok(codes)
 }
@@ -534,24 +458,13 @@ pub fn turn_off(config: &Config, user: &User, code: &str) -> Result<(), String> 
     if config.mfa.policy.requires(user) {
         return Err("This site requires two-step sign-in for your account. You cannot turn it off.".into());
     }
-    let conn = users::open(config)?;
+    let accounts = store::of(config);
     if !is_enabled(config, &user.id) {
         return Err("Two-step sign-in is off.".into());
     }
-    accept_from_account(config, &conn, user, code, true)?;
-    remove(&conn, &user.id)?;
+    accept_from_account(config, &*accounts, user, code, true)?;
+    accounts.remove_mfa(&user.id)?;
     tracing::info!(email = %user.email, "two-step sign-in turned off");
-    Ok(())
-}
-
-fn remove(conn: &Connection, user_id: &str) -> Result<(), String> {
-    for sql in [
-        "delete from mfa where user_id = ?",
-        "delete from recovery_codes where user_id = ?",
-        "delete from mfa_pending where user_id = ?",
-    ] {
-        conn.execute(sql, [user_id]).map_err(|e| e.to_string())?;
-    }
     Ok(())
 }
 
@@ -561,14 +474,16 @@ fn remove(conn: &Connection, user_id: &str) -> Result<(), String> {
 /// account's id, for the caller to revoke its OAuth tokens as well (they are
 /// the platform's), and whether two-step sign-in was on.
 pub fn reset(config: &Config, email: &str) -> Result<(String, bool), String> {
-    let conn = users::open(config)?;
-    let user_id: String = conn
-        .query_row("select id from users where email = ?", [email.trim().to_lowercase()], |row| row.get(0))
-        .map_err(|_| format!("no account for {}", email.trim()))?;
-    let was_on = is_enabled(config, &user_id);
-    remove(&conn, &user_id)?;
-    conn.execute("delete from sessions where user_id = ?", [&user_id]).map_err(|e| e.to_string())?;
-    Ok((user_id, was_on))
+    let accounts = store::of(config);
+    let (user, _) = accounts
+        .account_by_email(&email.trim().to_lowercase())
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("no account for {}", email.trim()))?;
+    let was_on = is_enabled(config, &user.id);
+    accounts.remove_mfa(&user.id)?;
+    accounts.delete_sessions_for(&user.id, None)?;
+    Ok((user.id, was_on))
 }
 
 // --- signing in -----------------------------------------------------------
@@ -606,15 +521,9 @@ pub fn after_primary(config: &Config, user: &User, primary: Primary, next: &str)
 }
 
 fn new_pending(config: &Config, user_id: &str, stage: &str, next: &str) -> Result<String, String> {
-    let conn = users::open(config)?;
     let now = config.mfa.clock.now();
-    let _ = conn.execute("delete from mfa_pending where expires_at < ?", [now as i64]);
     let token = crate::content::slug::random_token(48);
-    conn.execute(
-        "insert into mfa_pending (token_hash, user_id, stage, next, expires_at, failures) values (?, ?, ?, ?, ?, 0)",
-        rusqlite::params![users::hash_token(&token), user_id, stage, next, (now + PENDING_LIFETIME) as i64],
-    )
-    .map_err(|e| e.to_string())?;
+    store::of(config).insert_pending(&users::hash_token(&token), user_id, stage, next, (now + PENDING_LIFETIME) as i64, now as i64)?;
     Ok(token)
 }
 
@@ -623,29 +532,15 @@ pub struct Pending {
     pub user: User,
     pub stage: String,
     pub next: String,
-    failures: i64,
 }
 
-fn load_pending(config: &Config, conn: &Connection, token: &str) -> Option<Pending> {
-    conn.query_row(
-        "select users.id, users.email, users.is_admin, mfa_pending.stage, mfa_pending.next, mfa_pending.failures
-           from mfa_pending join users on users.id = mfa_pending.user_id
-          where mfa_pending.token_hash = ? and mfa_pending.expires_at >= ? and users.disabled_at is null",
-        rusqlite::params![users::hash_token(token), config.mfa.clock.now() as i64],
-        |row| {
-            Ok(Pending {
-                user: User { id: row.get(0)?, email: row.get(1)?, is_admin: row.get::<_, i64>(2)? != 0 },
-                stage: row.get(3)?,
-                next: row.get(4)?,
-                failures: row.get(5)?,
-            })
-        },
-    )
-    .ok()
+fn load_pending(config: &Config, accounts: &dyn AccountStore, token: &str) -> Option<Pending> {
+    let row = accounts.pending(&users::hash_token(token), config.mfa.clock.now() as i64).ok()??;
+    Some(Pending { user: row.user, stage: row.stage, next: row.next })
 }
 
 pub fn pending(config: &Config, token: &str) -> Option<Pending> {
-    load_pending(config, &users::open(config).ok()?, token)
+    load_pending(config, &*store::of(config), token)
 }
 
 /// Why a code did not finish a sign-in.
@@ -693,48 +588,46 @@ pub struct Finished {
 }
 
 /// Counts a wrong code against a pending sign-in, ending it at the limit.
-fn wrong_code(conn: &Connection, token: &str, pending: &Pending, what: &str) -> Refusal {
-    let failures = pending.failures + 1;
+fn wrong_code(accounts: &dyn AccountStore, token: &str, pending: &Pending, what: &str) -> Refusal {
+    let hash = users::hash_token(token);
+    // Counted in the row, so wrong codes sent at once each count.
+    let failures = accounts.fail_pending(&hash).ok().flatten().unwrap_or(MAX_FAILURES_PER_PENDING);
     tracing::warn!(email = %pending.user.email, failures, "{what}: the code is not correct");
     if failures >= MAX_FAILURES_PER_PENDING {
-        let _ = conn.execute("delete from mfa_pending where token_hash = ?", [users::hash_token(token)]);
+        let _ = accounts.delete_pending(&hash);
         tracing::warn!(email = %pending.user.email, "{what}: too many wrong codes, the pending sign-in ended");
         return Refusal::Ended;
     }
-    let _ = conn.execute(
-        "update mfa_pending set failures = ? where token_hash = ?",
-        rusqlite::params![failures, users::hash_token(token)],
-    );
     Refusal::Wrong(MAX_FAILURES_PER_PENDING - failures)
 }
 
-fn finish(conn: &Connection, config: &Config, token: &str, pending: Pending, recovery_codes: Vec<String>) -> Result<Finished, Refusal> {
-    conn.execute("delete from mfa_pending where token_hash = ?", [users::hash_token(token)])
-        .map_err(|e| Refusal::Failed(e.to_string()))?;
+fn finish(accounts: &dyn AccountStore, config: &Config, token: &str, pending: Pending, recovery_codes: Vec<String>) -> Result<Finished, Refusal> {
+    accounts.delete_pending(&users::hash_token(token)).map_err(Refusal::Failed)?;
     let session = users::start_session(config, &pending.user.id).map_err(Refusal::Failed)?;
     Ok(Finished { user: pending.user, session, next: pending.next, recovery_codes })
 }
 
 /// The code page's answer: a code from the app or a recovery code.
 pub fn finish_with_code(config: &Config, token: &str, code: &str) -> Result<Finished, Refusal> {
-    let conn = users::open(config).map_err(Refusal::Failed)?;
-    let pending = load_pending(config, &conn, token).filter(|p| p.stage == "code").ok_or(Refusal::Expired)?;
-    if account_locked(config, &conn, &pending.user.id) {
+    let accounts = store::of(config);
+    let accounts = &*accounts;
+    let pending = load_pending(config, accounts, token).filter(|p| p.stage == "code").ok_or(Refusal::Expired)?;
+    if account_locked(config, accounts, &pending.user.id) {
         tracing::warn!(email = %pending.user.email, "two-step sign-in refused: too many wrong codes for this account");
         return Err(Refusal::Locked);
     }
-    match accept(config, &conn, &pending.user.id, code, Secret::Enabled, true).map_err(Refusal::Failed)? {
+    match accept(config, accounts, &pending.user.id, code, Secret::Enabled, true).map_err(Refusal::Failed)? {
         Some(used) => {
             tracing::info!(
                 email = %pending.user.email,
                 with = if used == Used::Recovery { "a recovery code" } else { "the authenticator app" },
                 "two-step sign-in finished"
             );
-            finish(&conn, config, token, pending, Vec::new())
+            finish(accounts, config, token, pending, Vec::new())
         }
         None => {
-            record_failure(config, &conn, &pending.user.id);
-            Err(wrong_code(&conn, token, &pending, "two-step sign-in refused"))
+            record_failure(config, accounts, &pending.user.id);
+            Err(wrong_code(accounts, token, &pending, "two-step sign-in refused"))
         }
     }
 }
@@ -749,30 +642,27 @@ pub fn pending_setup(config: &Config, token: &str) -> Option<(Pending, String)> 
 /// Finishes a sign-in that the policy held for setup: the first code turns
 /// two-step sign-in on and the session follows.
 pub fn finish_setup(config: &Config, token: &str, code: &str) -> Result<Finished, Refusal> {
-    let conn = users::open(config).map_err(Refusal::Failed)?;
-    let pending = load_pending(config, &conn, token).filter(|p| p.stage == "setup").ok_or(Refusal::Expired)?;
+    let accounts = store::of(config);
+    let accounts = &*accounts;
+    let pending = load_pending(config, accounts, token).filter(|p| p.stage == "setup").ok_or(Refusal::Expired)?;
     // Another sign-in began a setup of its own since this one was shown its
     // secret: this one is over, rather than taking the setup back.
-    let still_ours: bool = conn
-        .query_row(
-            "select count(*) from mfa where user_id = ? and enabled_at is null and begun_by = ?",
-            rusqlite::params![pending.user.id, users::hash_token(token)],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|n| n > 0)
-        .map_err(|e| Refusal::Failed(e.to_string()))?;
+    let still_ours = accounts
+        .mfa_secret(&pending.user.id, Some(&users::hash_token(token)))
+        .map_err(Refusal::Failed)?
+        .is_some();
     if !still_ours {
         tracing::warn!(email = %pending.user.email, "two-step setup refused: another sign-in began setup since");
-        let _ = conn.execute("delete from mfa_pending where token_hash = ?", [users::hash_token(token)]);
+        let _ = accounts.delete_pending(&users::hash_token(token));
         return Err(Refusal::Expired);
     }
-    match accept(config, &conn, &pending.user.id, code, Secret::Setup(token), false).map_err(Refusal::Failed)? {
+    match accept(config, accounts, &pending.user.id, code, Secret::Setup(token), false).map_err(Refusal::Failed)? {
         Some(_) => {
-            let codes = enable(config, &conn, &pending.user.id, None).map_err(Refusal::Failed)?;
+            let codes = enable(config, accounts, &pending.user.id, None).map_err(Refusal::Failed)?;
             tracing::info!(email = %pending.user.email, "two-step sign-in turned on at sign-in, as the site requires");
-            finish(&conn, config, token, pending, codes)
+            finish(accounts, config, token, pending, codes)
         }
-        None => Err(wrong_code(&conn, token, &pending, "two-step setup refused")),
+        None => Err(wrong_code(accounts, token, &pending, "two-step setup refused")),
     }
 }
 

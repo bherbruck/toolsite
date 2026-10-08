@@ -4,4 +4,5 @@
 pub mod mfa;
 pub mod providers;
 pub mod schema;
+pub mod store;
 pub mod users;

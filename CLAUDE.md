@@ -88,6 +88,7 @@ accounts/          people who USE published apps
   users.rs         accounts, sessions, grants, sign-in routes
   mfa.rs           two-step sign-in: TOTP, recovery codes, the pending sign-in every session waits on
   providers.rs     signing in through Google, Entra, GitHub or any OIDC issuer
+  store/           AccountStore: every statement behind users and mfa, on SQLite (.site/auth.db) or Postgres
 
 wit/               the contract guests compile against
 cli/               the `toolsite` command (standalone crate)

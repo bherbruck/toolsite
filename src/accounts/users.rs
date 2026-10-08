@@ -20,19 +20,15 @@
 //! `platform::shield` for what is closed. Access to an app is granted by the
 //! handoff, never assumed from being signed in.
 
-use crate::{config::Config, content::slug::valid_slug, runtime::db};
+use crate::{accounts::store, config::Config, content::slug::valid_slug};
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
-use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
-use std::{
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Sessions last a fortnight; long enough not to nag, short enough that a
 /// stolen cookie expires.
@@ -108,21 +104,6 @@ fn valid_app_scope(app: &str) -> bool {
     valid_slug(app) && !app.contains('/')
 }
 
-/// Lives under a dot-directory, which no slug can name: `valid_slug` refuses
-/// a leading `.`, so no published app can ever collide with it or reach it.
-fn site_db_path(config: &Config) -> PathBuf {
-    config.data_dir.join(".site").join("auth.db")
-}
-
-pub(crate) fn open(config: &Config) -> Result<Connection, String> {
-    // Migrations read `pragma user_version`, which the authorizer refuses, so
-    // the schema is brought up to date before the door is closed.
-    let mut conn = db::open_unguarded(&site_db_path(config), config.max_db_bytes)?;
-    crate::accounts::schema::migrate(&mut conn)?;
-    db::lock_down(&conn)?;
-    Ok(conn)
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct User {
     pub id: String,
@@ -174,17 +155,7 @@ fn verify_password(stored: &str, password: &str) -> bool {
 /// Whether `password` is the active account's current one: what an action
 /// that a stolen session alone must not take asks for.
 pub fn password_matches(config: &Config, user_id: &str, password: &str) -> bool {
-    let Ok(conn) = open(config) else {
-        return false;
-    };
-    let stored: Option<String> = conn
-        .query_row(
-            "select password_hash from users where id = ? and disabled_at is null",
-            [user_id],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten();
+    let stored = store::of(config).password_hash(user_id).ok().flatten().flatten();
     stored.is_some_and(|stored| verify_password(&stored, password))
 }
 
@@ -210,26 +181,15 @@ pub fn sign_up_as(
 
     let hash = hash_password(password)?;
 
-    let conn = open(config)?;
-    let id = crate::content::slug::random_token(16);
-    conn.execute(
-        "insert into users (id, email, password_hash, created_at, is_admin)
-         values (?, ?, ?, ?, ?)",
-        rusqlite::params![&id, &email, &hash, now() as i64, is_admin as i64],
-    )
-    .map_err(|e| {
-        if e.to_string().contains("UNIQUE") {
-            "An account with this email exists.".to_string()
-        } else {
-            e.to_string()
-        }
-    })?;
-
-    Ok(User {
-        id,
+    let user = User {
+        id: crate::content::slug::random_token(16),
         email,
         is_admin,
-    })
+    };
+    if !store::of(config).insert_user(&user, Some(&hash), now() as i64)? {
+        return Err("An account with this email exists.".into());
+    }
+    Ok(user)
 }
 
 /// Checks a password and says whose account it opens. No session comes of
@@ -238,21 +198,12 @@ pub fn sign_up_as(
 /// the email is unknown or the password is wrong, so this cannot be used to
 /// enumerate accounts.
 pub fn check_password(config: &Config, email: &str, password: &str) -> Result<User, String> {
-    let conn = open(config)?;
     let email = normalise(email);
-
-    let found: Option<(String, Option<String>, bool)> = conn
-        .query_row(
-            "select id, password_hash, is_admin from users
-              where email = ? and disabled_at is null",
-            [&email],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
-        )
-        .ok();
+    let found = store::of(config).credentials(&email).ok().flatten();
 
     // A row with no password signed up through a provider, so there is
     // nothing here to verify against.
-    let Some((id, Some(stored), is_admin)) = found else {
+    let Some((user, Some(stored))) = found else {
         // Spend comparable time on an unknown address so timing does not leak
         // which half was wrong.
         if let Ok(salt) = new_salt() {
@@ -264,7 +215,7 @@ pub fn check_password(config: &Config, email: &str, password: &str) -> Result<Us
     if !verify_password(&stored, password) {
         return Err("The email or password is not correct.".into());
     }
-    Ok(User { id, email, is_admin })
+    Ok(user)
 }
 
 /// A password check and a session at once, with no second step. For tests
@@ -290,18 +241,13 @@ pub fn create_app_session(
     if !valid_app_scope(app) {
         return Err("invalid app name".into());
     }
-    let conn = open(config)?;
+    let accounts = store::of(config);
     let now = now();
-    let (id, email, is_admin, site_expires): (String, String, bool, i64) = conn
-        .query_row(
-            "select users.id, users.email, users.is_admin, sessions.expires_at
-               from sessions join users on users.id = sessions.user_id
-              where sessions.token_hash = ? and sessions.expires_at >= ?
-                and sessions.scope is null and users.disabled_at is null",
-            rusqlite::params![hash_token(site_token), now as i64],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0, row.get(3)?)),
-        )
-        .map_err(|_| "not signed in".to_string())?;
+    let (user, site_expires) = accounts
+        .site_session(&hash_token(site_token), now as i64)
+        .ok()
+        .flatten()
+        .ok_or_else(|| "not signed in".to_string())?;
 
     // Never outlives the site session it descends from — and a site session
     // with nothing left to lend hands back nothing, since `Max-Age=0` is a
@@ -312,13 +258,9 @@ pub fn create_app_session(
         return Err("not signed in".into());
     }
     let token = crate::content::slug::random_token(48);
-    conn.execute(
-        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, ?)",
-        rusqlite::params![hash_token(&token), &id, expires as i64, app],
-    )
-    .map_err(|e| e.to_string())?;
+    accounts.insert_session(&hash_token(&token), &user.id, expires as i64, Some(app))?;
 
-    Ok((User { id, email, is_admin }, token, expires.saturating_sub(now)))
+    Ok((user, token, expires.saturating_sub(now)))
 }
 
 /// An app session for an account with no site session behind it: what a
@@ -335,65 +277,30 @@ pub fn create_app_session_for(
     if !valid_app_scope(app) {
         return Err("invalid app name".into());
     }
-    let conn = open(config)?;
-    let active: bool = conn
-        .query_row(
-            "select count(*) from users where id = ? and disabled_at is null",
-            [user_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|n| n > 0)
-        .map_err(|e| e.to_string())?;
-    if !active {
+    let accounts = store::of(config);
+    if accounts.is_active(user_id)? != Some(true) {
         return Err("no such active account".into());
     }
     let now = now();
     let max_age = lifetime.as_secs().min(APP_SESSION_LIFETIME.as_secs()).max(1);
     let token = crate::content::slug::random_token(48);
-    conn.execute(
-        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, ?)",
-        rusqlite::params![hash_token(&token), user_id, (now + max_age) as i64, app],
-    )
-    .map_err(|e| e.to_string())?;
+    accounts.insert_session(&hash_token(&token), user_id, (now + max_age) as i64, Some(app))?;
     Ok((token, max_age))
 }
 
 pub fn log_out(config: &Config, token: &str) -> Result<(), String> {
-    let conn = open(config)?;
-    let hash = hash_token(token);
     // Every app session this person holds descends from a site session, and
     // the browser will not send a `/p/<app>/`-scoped cookie to `/auth/logout`
     // for us to clear, so the server is the only place they can die. Skipping
     // this would leave a scoped cookie working after sign-out.
-    conn.execute(
-        "delete from sessions
-          where scope is not null
-            and user_id = (select user_id from sessions where token_hash = ?)",
-        [&hash],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute("delete from sessions where token_hash = ?", [&hash])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    store::of(config).end_session(&hash_token(token))
 }
 
 /// The account behind an id, if it is still active. What anything holding a
 /// user id across a boundary asks before acting on it, so a disabled account
 /// is refused wherever its id has been remembered.
 pub fn user_by_id(config: &Config, id: &str) -> Option<User> {
-    let conn = open(config).ok()?;
-    conn.query_row(
-        "select id, email, is_admin from users where id = ? and disabled_at is null",
-        [id],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                email: row.get(1)?,
-                is_admin: row.get::<_, i64>(2)? != 0,
-            })
-        },
-    )
-    .ok()
+    store::of(config).user_by_id(id).ok().flatten()
 }
 
 // --- signing in through a provider ---------------------------------------
@@ -406,38 +313,11 @@ pub fn user_by_id(config: &Config, id: &str) -> Option<User> {
 /// a disabled account: a provider login is still a login.
 /// The active account with this email, if there is one.
 pub fn user_by_email(config: &Config, email: &str) -> Option<User> {
-    let conn = open(config).ok()?;
-    conn.query_row(
-        "select id, email, is_admin from users where email = ? and disabled_at is null",
-        [normalise(email)],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                email: row.get(1)?,
-                is_admin: row.get::<_, i64>(2)? != 0,
-            })
-        },
-    )
-    .ok()
+    store::of(config).user_by_email(&normalise(email)).ok().flatten()
 }
 
 pub fn user_by_identity(config: &Config, provider: &str, provider_id: &str) -> Option<User> {
-    let conn = open(config).ok()?;
-    conn.query_row(
-        "select users.id, users.email, users.is_admin
-           from identities join users on users.id = identities.user_id
-          where identities.provider = ? and identities.provider_id = ?
-            and users.disabled_at is null",
-        rusqlite::params![provider, provider_id],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                email: row.get(1)?,
-                is_admin: row.get::<_, i64>(2)? != 0,
-            })
-        },
-    )
-    .ok()
+    store::of(config).user_by_identity(provider, provider_id).ok().flatten()
 }
 
 /// What stands at an email: an active account, a disabled one, or nothing.
@@ -450,34 +330,17 @@ pub enum AtEmail {
 }
 
 pub fn account_at_email(config: &Config, email: &str) -> Result<AtEmail, String> {
-    let conn = open(config)?;
-    let email = normalise(email);
-    let found: Option<(String, bool, Option<i64>)> = conn
-        .query_row(
-            "select id, is_admin, disabled_at from users where email = ?",
-            [&email],
-            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    Ok(match found {
+    Ok(match store::of(config).account_by_email(&normalise(email))? {
         None => AtEmail::Nobody,
-        Some((_, _, Some(_))) => AtEmail::Disabled,
-        Some((id, is_admin, None)) => AtEmail::Active(User { id, email, is_admin }),
+        Some((_, Some(_))) => AtEmail::Disabled,
+        Some((user, None)) => AtEmail::Active(user),
     })
 }
 
 /// Remembers that this provider identity is this account, so the next sign-in
 /// does not depend on the email staying the same.
 pub fn link_identity(config: &Config, provider: &str, provider_id: &str, user_id: &str) -> Result<(), String> {
-    let conn = open(config)?;
-    conn.execute(
-        "insert into identities (provider, provider_id, user_id) values (?, ?, ?)
-         on conflict(provider, provider_id) do update set user_id = excluded.user_id",
-        rusqlite::params![provider, provider_id, user_id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    store::of(config).link_identity(provider, provider_id, user_id)
 }
 
 /// An account with no password, the way an invitation creates one: the
@@ -487,49 +350,26 @@ pub fn create_provider_account(config: &Config, email: &str) -> Result<User, Str
     if !email.contains('@') || email.len() < 3 {
         return Err("Enter a valid email address.".into());
     }
-    let conn = open(config)?;
-    let id = crate::content::slug::random_token(16);
-    conn.execute(
-        "insert into users (id, email, password_hash, created_at, is_admin)
-         values (?, ?, null, ?, 0)",
-        rusqlite::params![&id, &email, now() as i64],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(User {
-        id,
+    let user = User {
+        id: crate::content::slug::random_token(16),
         email,
         is_admin: false,
-    })
+    };
+    if !store::of(config).insert_user(&user, None, now() as i64)? {
+        return Err("An account with this email exists.".into());
+    }
+    Ok(user)
 }
 
 /// Whether the account has a password at all. One made through a provider
 /// does not, and has nothing to change.
 pub fn has_password(config: &Config, user_id: &str) -> bool {
-    let Ok(conn) = open(config) else {
-        return false;
-    };
-    conn.query_row(
-        "select password_hash is not null from users where id = ?",
-        [user_id],
-        |row| row.get::<_, bool>(0),
-    )
-    .unwrap_or(false)
+    store::of(config).has_password(user_id).unwrap_or(false)
 }
 
 /// The providers an account signs in through, by name, for the account page.
 pub fn identities_for(config: &Config, user_id: &str) -> Vec<String> {
-    let Ok(conn) = open(config) else {
-        return Vec::new();
-    };
-    let Ok(mut statement) = conn.prepare(
-        "select provider from identities where user_id = ? order by provider",
-    ) else {
-        return Vec::new();
-    };
-    statement
-        .query_map([user_id], |row| row.get::<_, String>(0))
-        .map(|rows| rows.filter_map(Result::ok).collect())
-        .unwrap_or_default()
+    store::of(config).identities_for(user_id).unwrap_or_default()
 }
 
 /// A person changes their own password: the current one has to be right,
@@ -546,14 +386,12 @@ pub fn change_password(
     if new.chars().count() < 8 {
         return Err("Enter a new password of at least 8 characters.".into());
     }
-    let conn = open(config)?;
-    let stored: Option<String> = conn
-        .query_row(
-            "select password_hash from users where id = ? and disabled_at is null",
-            [user_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| "no such account".to_string())?;
+    let accounts = store::of(config);
+    let stored = accounts
+        .password_hash(user_id)
+        .ok()
+        .flatten()
+        .ok_or_else(|| "no such account".to_string())?;
     let Some(stored) = stored else {
         return Err("This account signs in through a provider. It has no password.".into());
     };
@@ -561,59 +399,35 @@ pub fn change_password(
         return Err("The current password is not correct.".into());
     }
     let hash = hash_password(new)?;
-    conn.execute(
-        "update users set password_hash = ? where id = ?",
-        rusqlite::params![&hash, user_id],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "delete from sessions where user_id = ? and token_hash != ?",
-        rusqlite::params![user_id, hash_token(current_session)],
-    )
-    .map_err(|e| e.to_string())?;
+    accounts.set_password_hash(user_id, &hash)?;
+    accounts.delete_sessions_for(user_id, Some(&hash_token(current_session)))?;
     // A sign-in that got past the old password and waits for its code is
     // something the leak opened too.
-    conn.execute("delete from mfa_pending where user_id = ?", [user_id])
-        .map_err(|e| e.to_string())?;
+    accounts.delete_pending_for(user_id)?;
     Ok(())
 }
 
 /// A site session for an account whose identity was proven some other way
 /// than a password. Refuses a disabled account, like every other door.
 pub fn start_session(config: &Config, user_id: &str) -> Result<String, String> {
-    let conn = open(config)?;
-    let active: bool = conn
-        .query_row(
-            "select disabled_at is null from users where id = ?",
-            [user_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| "no such account".to_string())?;
+    let accounts = store::of(config);
+    let active = accounts
+        .is_active(user_id)
+        .ok()
+        .flatten()
+        .ok_or_else(|| "no such account".to_string())?;
     if !active {
         return Err("This account is disabled.".into());
     }
     let token = crate::content::slug::random_token(48);
     let expires = now() + SESSION_LIFETIME.as_secs();
-    conn.execute(
-        "insert into sessions (token_hash, user_id, expires_at, scope) values (?, ?, ?, null)",
-        rusqlite::params![hash_token(&token), user_id, expires as i64],
-    )
-    .map_err(|e| e.to_string())?;
+    accounts.insert_session(&hash_token(&token), user_id, expires as i64, None)?;
     Ok(token)
 }
 
 /// The apps whose tools this account wants listed on its connector.
 pub fn pins_for(config: &Config, user_id: &str) -> Vec<String> {
-    let Ok(conn) = open(config) else {
-        return Vec::new();
-    };
-    let Ok(mut statement) = conn.prepare("select app from pins where user_id = ? order by app") else {
-        return Vec::new();
-    };
-    statement
-        .query_map([user_id], |row| row.get::<_, String>(0))
-        .map(|rows| rows.filter_map(Result::ok).collect())
-        .unwrap_or_default()
+    store::of(config).pins_for(user_id).unwrap_or_default()
 }
 
 /// Pins or unpins an app's tools for this account. Whether the account may
@@ -623,18 +437,7 @@ pub fn set_pin(config: &Config, user_id: &str, app: &str, pinned: bool) -> Resul
     if !valid_app_scope(app) {
         return Err("invalid app name".into());
     }
-    let conn = open(config)?;
-    if pinned {
-        conn.execute(
-            "insert into pins (user_id, app, created_at) values (?, ?, ?) on conflict(user_id, app) do nothing",
-            rusqlite::params![user_id, app, now() as i64],
-        )
-        .map_err(|e| e.to_string())?;
-    } else {
-        conn.execute("delete from pins where user_id = ? and app = ?", rusqlite::params![user_id, app])
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    store::of(config).set_pin(user_id, app, pinned, now() as i64)
 }
 
 /// Who a *site* session token belongs to. A token scoped to an app is not
@@ -656,80 +459,44 @@ pub fn app_session_user(config: &Config, token: &str, app: &str) -> Option<User>
 
 /// Nothing if the token is unknown, expired, or of the wrong tier.
 fn session_user(config: &Config, token: &str, scope: Option<&str>) -> Option<User> {
-    let conn = open(config).ok()?;
-    // Expired rows are swept opportunistically rather than by a timer.
-    let _ = conn.execute("delete from sessions where expires_at < ?", [now() as i64]);
-
-    conn.query_row(
-        "select users.id, users.email, users.is_admin
-           from sessions join users on users.id = sessions.user_id
-          where sessions.token_hash = ? and sessions.expires_at >= ?
-            and sessions.scope is ? and users.disabled_at is null",
-        rusqlite::params![hash_token(token), now() as i64, scope],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                email: row.get(1)?,
-                is_admin: row.get::<_, i64>(2)? != 0,
-            })
-        },
-    )
-    .ok()
+    store::of(config).session_user(&hash_token(token), scope, now() as i64).ok().flatten()
 }
 
 pub fn grant(config: &Config, email: &str, app: &str, role: &str) -> Result<(), String> {
     if !valid_slug(app) {
         return Err("invalid app name".into());
     }
-    let conn = open(config)?;
+    let accounts = store::of(config);
     let email = normalise(email);
-    let user_id: String = conn
-        .query_row("select id from users where email = ?", [&email], |row| {
-            row.get(0)
-        })
-        .map_err(|_| format!("no account for {email}"))?;
-
-    conn.execute(
-        "insert into grants (user_id, app, role) values (?, ?, ?)
-         on conflict(user_id, app) do update set role = excluded.role",
-        rusqlite::params![user_id, app, role],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    let user_id = account_id(&*accounts, &email)?;
+    accounts.set_grant(&user_id, app, role)
 }
 
 pub fn revoke(config: &Config, email: &str, app: &str) -> Result<(), String> {
-    let conn = open(config)?;
-    let email = normalise(email);
-    conn.execute(
-        "delete from grants where app = ? and user_id in (select id from users where email = ?)",
-        rusqlite::params![app, email],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    let accounts = store::of(config);
+    match accounts.account_by_email(&normalise(email))? {
+        Some((user, _)) => accounts.delete_grant(&user.id, app),
+        None => Ok(()),
+    }
+}
+
+/// The id of the account at an email, active or not.
+fn account_id(accounts: &dyn store::AccountStore, email: &str) -> Result<String, String> {
+    accounts
+        .account_by_email(email)
+        .ok()
+        .flatten()
+        .map(|(user, _)| user.id)
+        .ok_or_else(|| format!("no account for {email}"))
 }
 
 /// What this account was granted on this app, if anything.
 pub fn role_for(config: &Config, user_id: &str, app: &str) -> Option<String> {
-    let conn = open(config).ok()?;
-    conn.query_row(
-        "select role from grants where user_id = ? and app = ?",
-        rusqlite::params![user_id, app],
-        |row| row.get(0),
-    )
-    .ok()
+    store::of(config).grant_of(user_id, app).ok().flatten()
 }
 
 pub fn has_grant(config: &Config, user: &User, app: &str) -> bool {
-    let Ok(conn) = open(config) else {
-        return false;
-    };
-    conn.query_row(
-        "select 1 from grants where user_id = ? and app = ?",
-        rusqlite::params![&user.id, app],
-        |_| Ok(()),
-    )
-    .is_ok()
+    store::of(config).grant_of(&user.id, app).is_ok_and(|role| role.is_some())
 }
 
 // --- platform scopes ----------------------------------------------------
@@ -802,29 +569,19 @@ pub fn grant_scope(
     if !valid_prefix(prefix) {
         return Err("prefix must be empty, or path segments of letters, numbers, '-' or '_'".into());
     }
-    let conn = open(config)?;
+    let accounts = store::of(config);
     let email = normalise(email);
-    let user_id: String = conn
-        .query_row("select id from users where email = ?", [&email], |row| row.get(0))
-        .map_err(|_| format!("no account for {email}"))?;
-    conn.execute(
-        "insert into scopes (user_id, prefix, scope, granted_by, created_at) values (?, ?, ?, ?, ?)
-         on conflict(user_id, prefix) do update set scope = excluded.scope, granted_by = excluded.granted_by",
-        rusqlite::params![user_id, prefix, scope.as_str(), granted_by, now() as i64],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    let user_id = account_id(&*accounts, &email)?;
+    accounts.set_scope(&user_id, prefix, scope.as_str(), granted_by, now() as i64)
 }
 
 pub fn revoke_scope(config: &Config, email: &str, prefix: &str) -> Result<(), String> {
-    let conn = open(config)?;
+    let accounts = store::of(config);
     let email = normalise(email);
-    let changed = conn
-        .execute(
-            "delete from scopes where prefix = ? and user_id in (select id from users where email = ?)",
-            rusqlite::params![prefix, email],
-        )
-        .map_err(|e| e.to_string())?;
+    let changed = match accounts.account_by_email(&email)? {
+        Some((user, _)) => accounts.delete_scope(&user.id, prefix)?,
+        None => 0,
+    };
     if changed == 0 {
         return Err(format!("{email} holds no scope at '{prefix}'"));
     }
@@ -833,31 +590,14 @@ pub fn revoke_scope(config: &Config, email: &str, prefix: &str) -> Result<(), St
 
 /// Every scope row, with the account's email, ordered by prefix then email.
 pub fn list_scopes(config: &Config) -> Result<Vec<ScopeGrant>, String> {
-    let conn = open(config)?;
-    let mut statement = conn
-        .prepare(
-            "select users.email, users.id, scopes.prefix, scopes.scope
-               from scopes join users on users.id = scopes.user_id
-              order by scopes.prefix, users.email",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(rows
-        .filter_map(Result::ok)
-        .filter_map(|(email, user_id, prefix, scope)| {
-            Scope::parse(&scope).map(|scope| ScopeGrant {
-                email,
-                user_id,
-                prefix,
+    Ok(store::of(config)
+        .list_scopes()?
+        .into_iter()
+        .filter_map(|row| {
+            Scope::parse(&row.scope).map(|scope| ScopeGrant {
+                email: row.email,
+                user_id: row.user_id,
+                prefix: row.prefix,
                 scope,
             })
         })
@@ -866,20 +606,12 @@ pub fn list_scopes(config: &Config) -> Result<Vec<ScopeGrant>, String> {
 
 /// The scopes one account holds, by prefix.
 pub fn scopes_for(config: &Config, user_id: &str) -> Vec<(String, Scope)> {
-    let Ok(conn) = open(config) else {
-        return Vec::new();
-    };
-    let Ok(mut statement) = conn.prepare("select prefix, scope from scopes where user_id = ? order by prefix") else {
-        return Vec::new();
-    };
-    statement
-        .query_map([user_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .map(|rows| {
-            rows.filter_map(Result::ok)
-                .filter_map(|(prefix, scope)| Scope::parse(&scope).map(|scope| (prefix, scope)))
-                .collect()
-        })
+    store::of(config)
+        .scopes_for(user_id)
         .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(prefix, scope)| Scope::parse(&scope).map(|scope| (prefix, scope)))
+        .collect()
 }
 
 /// The outermost locked project over `path`, if any. A locked project
@@ -1007,23 +739,7 @@ pub fn holds_below(config: &Config, user: &User, prefix: &str) -> bool {
 /// `to`, in one transaction. Running it again finds nothing to move, so a
 /// rename that stopped halfway can simply be run again.
 pub fn move_scope_tree(config: &Config, from: &str, to: &str) -> Result<usize, String> {
-    let mut conn = open(config)?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let changed = tx
-        .execute(
-            "update or replace scopes set prefix = ?1 || substr(prefix, ?2)
-              where prefix = ?3 or substr(prefix, 1, ?4) = ?5",
-            rusqlite::params![
-                to,
-                (from.len() + 1) as i64,
-                from,
-                (from.len() + 1) as i64,
-                format!("{from}/"),
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(changed)
+    store::of(config).move_scope_tree(from, to)
 }
 
 /// Takes every permission an app held away with it: the access rows at its
@@ -1031,59 +747,16 @@ pub fn move_scope_tree(config: &Config, from: &str, to: &str) -> Result<usize, S
 /// removes the app can keep a copy with the rest of what was removed. A
 /// later app or project at the same path must start with nobody on it.
 pub fn forget_app(config: &Config, app: &str, path: &str) -> Result<serde_json::Value, String> {
-    let mut conn = open(config)?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let rows: Vec<serde_json::Value> = {
-        let mut statement = tx
-            .prepare(
-                "select users.email, scopes.prefix, scopes.scope from scopes join users on users.id = scopes.user_id
-                  where scopes.prefix = ?1 or substr(scopes.prefix, 1, ?2) = ?3",
-            )
-            .map_err(|e| e.to_string())?;
-        let found = statement
-            .query_map(rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")], |row| {
-                Ok(serde_json::json!({ "email": row.get::<_, String>(0)?, "path": row.get::<_, String>(1)?, "scope": row.get::<_, String>(2)? }))
-            })
-            .map_err(|e| e.to_string())?;
-        found.filter_map(Result::ok).collect()
-    };
-    let grants: Vec<serde_json::Value> = {
-        let mut statement = tx
-            .prepare("select users.email, grants.role from grants join users on users.id = grants.user_id where grants.app = ?1")
-            .map_err(|e| e.to_string())?;
-        let found = statement
-            .query_map([app], |row| Ok(serde_json::json!({ "email": row.get::<_, String>(0)?, "role": row.get::<_, String>(1)? })))
-            .map_err(|e| e.to_string())?;
-        found.filter_map(Result::ok).collect()
-    };
-    tx.execute(
-        "delete from scopes where prefix = ?1 or substr(prefix, 1, ?2) = ?3",
-        rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute("delete from grants where app = ?1", [app]).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "app": app, "path": path, "access": rows, "grants": grants }))
+    store::of(config).forget_app(app, path)
 }
 
 /// Removes every scope row at `path` or below it.
 pub fn remove_scope_tree(config: &Config, path: &str) -> Result<usize, String> {
-    let conn = open(config)?;
-    conn.execute(
-        "delete from scopes where prefix = ?1 or substr(prefix, 1, ?2) = ?3",
-        rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")],
-    )
-    .map_err(|e| e.to_string())
+    store::of(config).remove_scope_tree(path)
 }
 
 pub fn move_scopes(config: &Config, from: &str, to: &str) -> Result<(), String> {
-    let conn = open(config)?;
-    conn.execute(
-        "update or replace scopes set prefix = ? where prefix = ?",
-        rusqlite::params![to, from],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    store::of(config).rename_scope(from, to)
 }
 
 /// The site session cookie's name. In subdomain mode over TLS it carries
@@ -1291,7 +964,7 @@ mod tests {
         let (_t, config) = config();
         sign_up(&config, "someone@example.com", "correct horse battery").unwrap();
 
-        let conn = open(&config).unwrap();
+        let conn = crate::accounts::store::sqlite::open(&config).unwrap();
         let stored: String = conn
             .query_row("select password_hash from users", [], |row| row.get(0))
             .unwrap();
@@ -1341,7 +1014,7 @@ mod tests {
         sign_up(&config, "someone@example.com", "correct horse battery").unwrap();
         let (_, token) = log_in(&config, "someone@example.com", "correct horse battery").unwrap();
 
-        let conn = open(&config).unwrap();
+        let conn = crate::accounts::store::sqlite::open(&config).unwrap();
         let stored: String = conn
             .query_row("select token_hash from sessions", [], |row| row.get(0))
             .unwrap();
@@ -1365,7 +1038,7 @@ mod tests {
         sign_up(&config, "someone@example.com", "correct horse battery").unwrap();
         let (_, token) = log_in(&config, "someone@example.com", "correct horse battery").unwrap();
 
-        let conn = open(&config).unwrap();
+        let conn = crate::accounts::store::sqlite::open(&config).unwrap();
         conn.execute("update sessions set expires_at = 1", []).unwrap();
         assert!(site_session_user(&config, &token).is_none());
     }
@@ -1434,7 +1107,7 @@ mod tests {
         let (_, site) = log_in(&config, "someone@example.com", "correct horse battery").unwrap();
 
         // A site session about to expire cannot hand out a longer-lived one.
-        let conn = open(&config).unwrap();
+        let conn = crate::accounts::store::sqlite::open(&config).unwrap();
         let soon = now() + 60;
         conn.execute("update sessions set expires_at = ?", [soon as i64])
             .unwrap();
@@ -2121,67 +1794,36 @@ pub struct Account {
 /// than left to expire, so access ends now; the session lookup also refuses a
 /// disabled account, which covers anything issued in between.
 pub fn set_active(config: &Config, email: &str, active: bool) -> Result<(), String> {
-    let conn = open(config)?;
+    let accounts = store::of(config);
     let email = normalise(email);
-    let changed = conn
-        .execute(
-            "update users set disabled_at = ? where email = ?",
-            rusqlite::params![if active { None } else { Some(now() as i64) }, &email],
-        )
-        .map_err(|e| e.to_string())?;
-    if changed == 0 {
+    let Some(user_id) = accounts.set_disabled(&email, if active { None } else { Some(now() as i64) })? else {
         return Err(format!("no account for {email}"));
-    }
+    };
     if !active {
-        conn.execute(
-            "delete from sessions where user_id in (select id from users where email = ?)",
-            [&email],
-        )
-        .map_err(|e| e.to_string())?;
+        accounts.delete_sessions_for(&user_id, None)?;
     }
     Ok(())
 }
 
 pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
-    let conn = open(config)?;
-    let mut statement = conn
-        .prepare(
-            "select email, created_at, is_admin, disabled_at,
-                    exists(select 1 from mfa where mfa.user_id = users.id and mfa.enabled_at is not null)
-               from users order by email",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| {
-            let created: i64 = row.get(1)?;
-            Ok(Account {
-                email: row.get(0)?,
-                // Whole days is all this needs to convey; anything finer
-                // would mean a date-formatting dependency.
-                created: format!("{} days ago", (now().saturating_sub(created as u64)) / 86_400),
-                is_admin: row.get::<_, i64>(2)? != 0,
-                is_active: row.get::<_, Option<i64>>(3)?.is_none(),
-                mfa: row.get::<_, i64>(4)? != 0,
-            })
+    Ok(store::of(config)
+        .list_users()?
+        .into_iter()
+        .map(|row| Account {
+            email: row.email,
+            // Whole days is all this needs to convey; anything finer
+            // would mean a date-formatting dependency.
+            created: format!("{} days ago", (now().saturating_sub(row.created_at as u64)) / 86_400),
+            is_admin: row.is_admin,
+            is_active: row.disabled_at.is_none(),
+            mfa: row.mfa,
         })
-        .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
+        .collect())
 }
 
 /// Every grant on the site: app, account, role.
 pub fn list_grants(config: &Config) -> Result<Vec<(String, String, String)>, String> {
-    let conn = open(config)?;
-    let mut statement = conn
-        .prepare(
-            "select grants.app, users.email, grants.role
-               from grants join users on users.id = grants.user_id
-              order by grants.app, users.email",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
+    store::of(config).list_grants()
 }
 
 /// A value only this server can produce for this account, used to tie an
@@ -2261,79 +1903,37 @@ pub fn invite(config: &Config, email: &str, is_admin: bool) -> Result<(User, Str
         return Err("Enter a valid email address.".into());
     }
 
-    let conn = open(config)?;
-    let id = crate::content::slug::random_token(16);
-    conn.execute(
-        "insert into users (id, email, password_hash, created_at, is_admin)
-         values (?, ?, null, ?, ?)",
-        rusqlite::params![&id, &email, now() as i64, is_admin as i64],
-    )
-    .map_err(|e| {
-        if e.to_string().contains("UNIQUE") {
-            "An account with this email exists.".to_string()
-        } else {
-            e.to_string()
-        }
-    })?;
+    let accounts = store::of(config);
+    let user = User {
+        id: crate::content::slug::random_token(16),
+        email,
+        is_admin,
+    };
+    if !accounts.insert_user(&user, None, now() as i64)? {
+        return Err("An account with this email exists.".into());
+    }
 
-    let token = new_invite(&conn, &id)?;
-    Ok((
-        User {
-            id,
-            email,
-            is_admin,
-        },
-        token,
-    ))
+    let token = new_invite(&*accounts, &user.id)?;
+    Ok((user, token))
 }
 
 /// Issues a fresh invitation for an existing account, replacing any
 /// outstanding one so an old link stops working.
 pub fn reinvite(config: &Config, email: &str) -> Result<String, String> {
-    let conn = open(config)?;
-    let email = normalise(email);
-    let id: String = conn
-        .query_row("select id from users where email = ?", [&email], |row| {
-            row.get(0)
-        })
-        .map_err(|_| format!("no account for {email}"))?;
-    new_invite(&conn, &id)
+    let accounts = store::of(config);
+    let id = account_id(&*accounts, &normalise(email))?;
+    new_invite(&*accounts, &id)
 }
 
-fn new_invite(conn: &Connection, user_id: &str) -> Result<String, String> {
-    conn.execute("delete from invites where user_id = ?", [user_id])
-        .map_err(|e| e.to_string())?;
+fn new_invite(accounts: &dyn store::AccountStore, user_id: &str) -> Result<String, String> {
     let token = crate::content::slug::random_token(48);
-    conn.execute(
-        "insert into invites (token_hash, user_id, expires_at) values (?, ?, ?)",
-        rusqlite::params![
-            hash_token(&token),
-            user_id,
-            (now() + INVITE_LIFETIME.as_secs()) as i64
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+    accounts.replace_invite(user_id, &hash_token(&token), (now() + INVITE_LIFETIME.as_secs()) as i64)?;
     Ok(token)
 }
 
 /// Who an invitation is for, without spending it.
 pub fn invited_account(config: &Config, token: &str) -> Option<User> {
-    let conn = open(config).ok()?;
-    conn.query_row(
-        "select users.id, users.email, users.is_admin
-           from invites join users on users.id = invites.user_id
-          where invites.token_hash = ? and invites.expires_at >= ?
-            and users.disabled_at is null",
-        rusqlite::params![hash_token(token), now() as i64],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                email: row.get(1)?,
-                is_admin: row.get::<_, i64>(2)? != 0,
-            })
-        },
-    )
-    .ok()
+    store::of(config).invited(&hash_token(token), now() as i64).ok().flatten()
 }
 
 /// Spends an invitation: sets the password. The invitation is consumed
@@ -2345,24 +1945,22 @@ pub fn invited_account(config: &Config, token: &str) -> Option<User> {
 /// every session and pending sign-in of the account ends: whatever the old
 /// password opened closes with it.
 pub fn accept_invite(config: &Config, token: &str, password: &str) -> Result<User, String> {
-    let user = invited_account(config, token).ok_or("This link is not valid.")?;
+    invited_account(config, token).ok_or("This link is not valid.")?;
     if password.chars().count() < 8 {
         return Err("Enter a password of at least 8 characters.".into());
     }
 
     let hash = hash_password(password)?;
 
-    let conn = open(config)?;
-    conn.execute(
-        "update users set password_hash = ? where id = ?",
-        rusqlite::params![&hash, &user.id],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute("delete from invites where token_hash = ?", [hash_token(token)])
-        .map_err(|e| e.to_string())?;
-    for sql in ["delete from sessions where user_id = ?", "delete from mfa_pending where user_id = ?"] {
-        conn.execute(sql, [&user.id]).map_err(|e| e.to_string())?;
-    }
+    // Spent before anything is set, in one conditional write: two requests
+    // with one link cannot both choose the password.
+    let accounts = store::of(config);
+    let user = accounts
+        .take_invite(&hash_token(token), now() as i64)?
+        .ok_or("This link is not valid.")?;
+    accounts.set_password_hash(&user.id, &hash)?;
+    accounts.delete_sessions_for(&user.id, None)?;
+    accounts.delete_pending_for(&user.id)?;
     Ok(user)
 }
 

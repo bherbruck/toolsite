@@ -949,7 +949,7 @@ mod tests {
         run(&config, "app", "create table t (a)", &[]).unwrap();
         // 1 is NORMAL, 2 is FULL.
         assert_eq!(sync(&open_as(&config, "app", None).unwrap()), 1);
-        assert_eq!(sync(&crate::accounts::users::open(&config).unwrap()), 2);
+        assert_eq!(sync(&crate::accounts::store::sqlite::open(&config).unwrap()), 2);
         // No app name reaches the account database's file to relax it.
         for name in [".site", "../.site", ".site/auth"] {
             assert!(open_as(&config, name, None).is_err(), "{name}");
