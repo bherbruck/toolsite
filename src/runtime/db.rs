@@ -45,6 +45,9 @@ const PAGE_SIZE: u64 = 4096;
 /// Cap on rows returned in one call, so a `select *` can't blow up the caller.
 pub(crate) const MAX_ROWS: usize = 1_000;
 const BUSY_TIMEOUT_MS: u32 = 5_000;
+/// Distinct statements a connection keeps prepared. A handler's queries are
+/// a fixed set in its code, so this only has to hold the ones it loops over.
+const STATEMENT_CACHE: usize = 64;
 
 /// Every app gets its own file. The path comes from an already-validated slug
 /// and never from anything a caller supplied verbatim.
@@ -72,9 +75,19 @@ fn deny_escapes(context: AuthContext<'_>) -> Authorization {
 pub(crate) fn open_as(config: &Config, app: &str, identity: Option<&Identity>) -> Result<Connection, String> {
     let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
     let conn = open_unguarded(&path, config.max_db_bytes)?;
+    relax_sync(&conn)?;
     bind_identity(&conn, identity)?;
     lock_down(&conn)?;
     Ok(conn)
+}
+
+/// Commits without waiting for the disk, for an app's own database. Under
+/// WAL this cannot corrupt the file; what a power cut can cost is the last
+/// commits before it. Waiting instead made every row-at-a-time insert an
+/// fsync: 4 ms each on a local disk, which is how a 10,000-row import took
+/// minutes. The account database keeps SQLite's full sync.
+fn relax_sync(conn: &Connection) -> Result<(), String> {
+    conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| e.to_string())
 }
 
 /// Everything `open_at` does except installing the authorizer. Only the
@@ -107,6 +120,7 @@ pub fn open_unguarded(path: &std::path::Path, max_bytes: u64) -> Result<Connecti
         conn.pragma_update(None, "max_page_count", (max_bytes / PAGE_SIZE).max(1) as i64)
             .map_err(|e| e.to_string())?;
     }
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     // Belt and braces alongside the authorizer.
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
         .map_err(|e| e.to_string())?;
@@ -192,14 +206,34 @@ pub fn run_until(
     params: &[Value],
     deadline: Option<std::time::Instant>,
 ) -> Result<SqlOutcome, String> {
+    execute_on(&open_until(config, app, identity, deadline)?, sql, params)
+}
+
+/// The connection `run_until` uses, for a caller with several statements to
+/// run as one identity before one deadline: a handler call keeps it for its
+/// own statements and drops it when the call ends. Never hand it to a call
+/// made as anyone else, since the identity is bound into it.
+pub(crate) fn open_until(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    deadline: Option<std::time::Instant>,
+) -> Result<Connection, String> {
     let conn = open_as(config, app, identity)?;
     if let Some(deadline) = deadline {
         interrupt_at(&conn, deadline)?;
     }
-    execute(&conn, sql, params, true)
+    Ok(conn)
 }
 
-/// Makes SQLite stop the running statement once `deadline` passes.
+/// One statement, or a parameterless script, on a connection from
+/// `open_until`.
+pub(crate) fn execute_on(conn: &Connection, sql: &str, params: &[Value]) -> Result<SqlOutcome, String> {
+    execute(conn, sql, params, true)
+}
+
+/// Makes SQLite stop the running statement once `deadline` passes, and any
+/// later one on this connection at once.
 fn interrupt_at(conn: &Connection, deadline: std::time::Instant) -> Result<(), String> {
     conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))
         .map_err(|e| e.to_string())
@@ -207,6 +241,7 @@ fn interrupt_at(conn: &Connection, deadline: std::time::Instant) -> Result<(), S
 
 /// What a scoped caller may reach, by name. Everything is matched case
 /// insensitively, as SQLite does.
+#[derive(Clone)]
 pub struct Scope {
     /// Views that may be read, by their declared names.
     pub readable: HashSet<String>,
@@ -366,6 +401,19 @@ pub fn run_scoped_until(
     params: &[Value],
     deadline: Option<std::time::Instant>,
 ) -> Result<SqlOutcome, String> {
+    execute_scoped(&open_scoped(config, app, identity, scope)?, sql, params, deadline)
+}
+
+/// The connection `run_scoped_until` uses: bound to `identity`, limited, and
+/// behind `scope`'s authorizer for its whole life. A handler call keeps one
+/// for its scoped statements and drops it when the call ends; like
+/// `open_until`'s, it must never serve a call made as anyone else.
+pub(crate) fn open_scoped(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    scope: &Scope,
+) -> Result<Connection, String> {
     if scope.readable.is_empty() && scope.writable.is_empty() {
         return Err(format!("{app} declares nothing a person may query"));
     }
@@ -374,6 +422,7 @@ pub fn run_scoped_until(
         return Err(format!("{app} has no database yet"));
     }
     let conn = open_unguarded(&path, config.max_db_bytes)?;
+    relax_sync(&conn)?;
     bind_identity(&conn, identity)?;
     for (limit, value) in [
         (Limit::SQLITE_LIMIT_LENGTH, SCOPED_MAX_VALUE_BYTES),
@@ -382,17 +431,23 @@ pub fn run_scoped_until(
     ] {
         conn.set_limit(limit, value).map_err(|e| e.to_string())?;
     }
-    let own = std::time::Instant::now() + SCOPED_WALL_CLOCK;
-    interrupt_at(&conn, deadline.map_or(own, |deadline| deadline.min(own)))?;
-    let names = Scope {
-        readable: scope.readable.clone(),
-        writable: scope.writable.clone(),
-        triggers: scope.triggers.clone(),
-        inner: scope.inner.clone(),
-    };
+    let names = scope.clone();
     conn.authorizer(Some(move |context: AuthContext<'_>| names.authorize(context)))
         .map_err(|e| e.to_string())?;
-    execute(&conn, sql, params, false)
+    Ok(conn)
+}
+
+/// One statement on a connection from `open_scoped`, interrupted at
+/// `deadline` or at its own wall clock, whichever comes first.
+pub(crate) fn execute_scoped(
+    conn: &Connection,
+    sql: &str,
+    params: &[Value],
+    deadline: Option<std::time::Instant>,
+) -> Result<SqlOutcome, String> {
+    let own = std::time::Instant::now() + SCOPED_WALL_CLOCK;
+    interrupt_at(conn, deadline.map_or(own, |deadline| deadline.min(own)))?;
+    execute(conn, sql, params, false)
 }
 
 /// The columns of each named view that exists, for a caller deciding what to
@@ -445,7 +500,10 @@ fn describe(error: rusqlite::Error) -> String {
 }
 
 fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool) -> Result<SqlOutcome, String> {
-    let mut statement = match conn.prepare(sql) {
+    // Cached per connection, which a handler call keeps for all its
+    // statements: a loop of the same query parses it once. The authorizer
+    // ran when it was prepared, and is the same for the connection's life.
+    let mut statement = match conn.prepare_cached(sql) {
         Ok(statement) => statement,
         Err(rusqlite::Error::MultipleStatement) if !params.is_empty() || !scripts => {
             return Err("pass one statement at a time".to_string())
@@ -761,6 +819,45 @@ mod tests {
         // A hand-written view is readable too, and a where on it is fine.
         let totals = scoped(&config, &alice(), &scope, "select total from totals where owner_id = 'u-bob'").unwrap();
         assert_eq!(totals.rows, vec![vec![json!(20.0)]]);
+    }
+
+    #[test]
+    fn kept_scoped_connections_answer_only_for_their_own_person_and_stay_behind_the_scope() {
+        let (_dir, config) = config();
+        let scope = shop(&config, true);
+        let alices = open_scoped(&config, "shop", Some(&alice()), &scope).unwrap();
+        let bobs = open_scoped(&config, "shop", Some(&bob()), &scope).unwrap();
+        let count = "select count(*) from my_orders";
+        for _ in 0..10 {
+            // Each statement on a kept connection, the two people in turn.
+            assert_eq!(execute_scoped(&alices, count, &[], None).unwrap().rows[0], vec![json!(2)]);
+            assert_eq!(execute_scoped(&bobs, count, &[], None).unwrap().rows[0], vec![json!(1)]);
+            // An allowed statement earlier on the connection opens nothing
+            // later on it.
+            for sql in ["select * from orders", "attach database ':memory:' as m", "begin", "pragma table_info(orders)"] {
+                let error = execute_scoped(&alices, sql, &[], None).unwrap_err();
+                assert!(error.contains("not authorized"), "{sql} was allowed: {error}");
+            }
+        }
+        // A write through the view lands as its own person's.
+        execute_scoped(&bobs, "insert into my_orders (total) values (7)", &[], None).unwrap();
+        let owner = run(&config, "shop", "select owner_id from orders where total = 7", &[]).unwrap();
+        assert_eq!(owner.rows[0], vec![json!("u-bob")]);
+    }
+
+    #[test]
+    fn a_kept_scoped_connection_gives_each_statement_the_deadline() {
+        let (_dir, config) = config();
+        let scope = shop(&config, false);
+        let conn = open_scoped(&config, "shop", Some(&alice()), &scope).unwrap();
+        execute_scoped(&conn, "select 1", &[], None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        // Three rows joined to themselves twenty times: billions of rows,
+        // through nothing but the declared view.
+        let joins = (0..20).map(|i| format!("my_orders t{i}")).collect::<Vec<_>>().join(", ");
+        let error = execute_scoped(&conn, &format!("select count(*) from {joins}"), &[], Some(deadline)).unwrap_err();
+        assert!(error.contains("interrupt"), "{error}");
+        assert!(std::time::Instant::now() < deadline + std::time::Duration::from_secs(3));
     }
 
     #[test]

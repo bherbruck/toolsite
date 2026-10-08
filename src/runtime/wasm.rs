@@ -175,6 +175,16 @@ pub struct StoreState {
     /// When the current call's wall clock runs out. Epochs stop wasm at this
     /// point; host imports that wait read it to stop there too.
     deadline: Instant,
+    /// The current call's connection to its database, opened at its first
+    /// query: opening one, and looking up the caller's role to bind into
+    /// it, cost a millisecond, which per statement was most of a query's
+    /// time. The caller's identity and the call's deadline are bound in, so
+    /// it lives exactly as long as the call and `arm` drops it before the
+    /// next, which in a resident instance may be someone else's.
+    db: Option<rusqlite::Connection>,
+    /// The same for `query-scoped`, behind the app's declared access as it
+    /// stood when the call made its first scoped query.
+    scoped: Option<rusqlite::Connection>,
 }
 
 impl StoreState {
@@ -239,7 +249,7 @@ impl WasiView for StoreState {
 impl StoreState {
     /// Who the SQL runs as: the visitor the host established, with their
     /// grant on this app. Looked up per call so a grant changed mid-session
-    /// is seen by the next statement.
+    /// is seen by the next call.
     fn identity(&self) -> Option<db::Identity> {
         let user = self.user.as_ref()?;
         Some(db::Identity {
@@ -276,8 +286,15 @@ impl self::toolsite::app::db::Host for StoreState {
         params: Vec<WitValue>,
     ) -> Result<WitRows, WitDbError> {
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
-        let identity = self.identity();
-        wit_rows(db::run_until(&self.site, &self.app, identity.as_ref(), &sql, &params, Some(self.deadline)))
+        if self.db.is_none() {
+            let identity = self.identity();
+            match db::open_until(&self.site, &self.app, identity.as_ref(), Some(self.deadline)) {
+                Ok(conn) => self.db = Some(conn),
+                Err(error) => return wit_rows(Err(error)),
+            }
+        }
+        let conn = self.db.as_ref().expect("opened above");
+        wit_rows(db::execute_on(conn, &sql, &params))
     }
 
     fn query_scoped(
@@ -286,12 +303,19 @@ impl self::toolsite::app::db::Host for StoreState {
         params: Vec<WitValue>,
     ) -> Result<WitRows, WitDbError> {
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
-        let identity = self.identity();
-        // Read per call rather than cached, like allow_http: a policy added
-        // by a manifest upload applies to the next request.
-        let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
-        let scope = db::Scope::of(&meta);
-        wit_rows(db::run_scoped_until(&self.site, &self.app, identity.as_ref(), &scope, &sql, &params, Some(self.deadline)))
+        if self.scoped.is_none() {
+            let identity = self.identity();
+            // Read per call rather than cached, like allow_http: a policy
+            // added by a manifest upload applies to the next request.
+            let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
+            let scope = db::Scope::of(&meta);
+            match db::open_scoped(&self.site, &self.app, identity.as_ref(), &scope) {
+                Ok(conn) => self.scoped = Some(conn),
+                Err(error) => return wit_rows(Err(error)),
+            }
+        }
+        let conn = self.scoped.as_ref().expect("opened above");
+        wit_rows(db::execute_scoped(conn, &sql, &params, Some(self.deadline)))
     }
 }
 
@@ -690,6 +714,8 @@ impl Runtime {
             user,
             connecting: None,
             deadline: Instant::now(),
+            db: None,
+            scoped: None,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -742,11 +768,21 @@ impl Runtime {
 }
 
 /// Fuel and a wall-clock deadline for the next call on `store`, counted
-/// from now.
+/// from now, and no database connection left from the last.
 fn arm(store: &mut Store<StoreState>, guards: Guards) {
+    close_databases(store);
     store.data_mut().deadline = Instant::now() + guards.wall_clock;
     store.set_fuel(guards.fuel).expect("fuel is enabled");
     store.set_epoch_deadline(1);
+}
+
+/// Drops the connections a call opened, rolling back whatever transaction
+/// it left open. Every call ends here or in its store's drop, so no
+/// statement ever runs on a connection opened for another call.
+fn close_databases(store: &mut Store<StoreState>) {
+    let state = store.data_mut();
+    state.db = None;
+    state.scoped = None;
 }
 
 /// An app's handler kept alive between events: its memory, and so whatever
@@ -772,7 +808,11 @@ impl Resident {
         state.user = user;
         state.connecting = matches!(event, ConnectionEvent::Connect(_)).then(|| conn.to_string());
         arm(&mut self.store, guards);
-        let (answer,) = self.on_connection.call(&mut self.store, (conn.to_string(), event))?;
+        let outcome = self.on_connection.call(&mut self.store, (conn.to_string(), event));
+        // Not left open until the next event: the write lock of a
+        // transaction it began would be held between calls.
+        close_databases(&mut self.store);
+        let (answer,) = outcome?;
         Ok(answer)
     }
 
@@ -791,7 +831,9 @@ impl Resident {
         state.user = None;
         state.connecting = None;
         arm(&mut self.store, guards);
-        Ok(on_tick.call(&mut self.store, (now_ms,))?)
+        let outcome = on_tick.call(&mut self.store, (now_ms,));
+        close_databases(&mut self.store);
+        Ok(outcome?)
     }
 
     /// Bytes of memory the instance holds now, linear memory and tables.
@@ -989,6 +1031,112 @@ mod tests {
             runtime.handlers.lock().unwrap().is_empty(),
             "the previous component survived an upload"
         );
+    }
+
+    // --- one connection per call --------------------------------------------
+
+    fn person(id: &str) -> User {
+        User { id: id.into(), email: format!("{id}@example.com") }
+    }
+
+    fn sql(store: &mut Store<StoreState>, sql: &str) -> Result<WitRows, WitDbError> {
+        super::toolsite::app::db::Host::query(store.data_mut(), sql.to_string(), Vec::new())
+    }
+
+    fn text(rows: &WitRows) -> String {
+        match &rows.values[0][0] {
+            WitValue::Text(t) => t.clone(),
+            WitValue::Integer(i) => i.to_string(),
+            WitValue::Null => "null".into(),
+            WitValue::Real(f) => f.to_string(),
+        }
+    }
+
+    fn site_in(dir: &tempfile::TempDir) -> Arc<SiteConfig> {
+        Arc::new(SiteConfig::local(dir.path().to_path_buf(), "test-token"))
+    }
+
+    #[test]
+    fn a_connection_kept_for_a_call_never_answers_for_another_persons_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut alice = runtime.store(site_in(&dir), "app", Some(person("u-alice")), Guards::default());
+        let mut bob = runtime.store(site_in(&dir), "app", Some(person("u-bob")), Guards::default());
+        // Two people's calls on one app, statement by statement in turn.
+        for _ in 0..20 {
+            assert_eq!(text(&sql(&mut alice, "select current_user()").unwrap()), "u-alice");
+            assert_eq!(text(&sql(&mut bob, "select current_user()").unwrap()), "u-bob");
+        }
+
+        // One store serving two people's calls, as a resident instance does:
+        // the connection opened for the first is gone by the second.
+        let mut resident = runtime.store(site_in(&dir), "app", Some(person("u-alice")), Guards::default());
+        assert_eq!(text(&sql(&mut resident, "select current_email()").unwrap()), "u-alice@example.com");
+        resident.data_mut().user = Some(person("u-bob"));
+        arm(&mut resident, Guards::default());
+        assert_eq!(text(&sql(&mut resident, "select current_email()").unwrap()), "u-bob@example.com");
+        resident.data_mut().user = None;
+        arm(&mut resident, Guards::default());
+        assert_eq!(text(&sql(&mut resident, "select current_user()").unwrap()), "null");
+    }
+
+    #[test]
+    fn a_transaction_a_call_leaves_open_is_rolled_back_and_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut first = runtime.store(site_in(&dir), "app", None, Guards::default());
+        sql(&mut first, "create table t (x)").unwrap();
+        sql(&mut first, "begin").unwrap();
+        sql(&mut first, "insert into t values (1)").unwrap();
+        // The call ends without committing: the next call on the same store
+        // sees nothing of it.
+        arm(&mut first, Guards::default());
+        assert_eq!(text(&sql(&mut first, "select count(*) from t").unwrap()), "0");
+
+        sql(&mut first, "begin").unwrap();
+        sql(&mut first, "insert into t values (2)").unwrap();
+        drop(first);
+        // Nor does another call, which can also write: no lock outlived it.
+        let mut second = runtime.store(site_in(&dir), "app", None, Guards::default());
+        assert_eq!(text(&sql(&mut second, "select count(*) from t").unwrap()), "0");
+        sql(&mut second, "insert into t values (3)").unwrap();
+    }
+
+    #[test]
+    fn a_kept_connection_still_refuses_attach_and_pragmas() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut store = runtime.store(site_in(&dir), "app", None, Guards::default());
+        sql(&mut store, "select 1").unwrap();
+        for refused in [
+            "attach database '../victim/data.db' as v",
+            "attach database ':memory:' as m",
+            "pragma journal_mode = delete",
+            "pragma query_only = 0",
+        ] {
+            assert!(matches!(sql(&mut store, refused), Err(WitDbError::Denied(_))), "{refused} was allowed");
+            // And not once allowed: the second asking is refused too.
+            assert!(matches!(sql(&mut store, refused), Err(WitDbError::Denied(_))), "{refused} was allowed");
+        }
+        sql(&mut store, "select 1").unwrap();
+    }
+
+    #[test]
+    fn a_query_on_a_kept_connection_still_stops_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let guards = Guards { wall_clock: Duration::from_millis(300), ..Guards::default() };
+        let mut store = runtime.store(site_in(&dir), "app", None, guards);
+        sql(&mut store, "select 1").unwrap();
+        let started = Instant::now();
+        let error = sql(&mut store, "with recursive c(i) as (select 1 union all select i + 1 from c) select count(*) from c")
+            .unwrap_err();
+        assert!(matches!(&error, WitDbError::Failed(m) if m.contains("interrupt")), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "ran on for {:?}", started.elapsed());
+
+        // The next call gets its own deadline, not the spent one.
+        arm(&mut store, Guards::default());
+        sql(&mut store, "select 1").unwrap();
     }
 
     #[test]
