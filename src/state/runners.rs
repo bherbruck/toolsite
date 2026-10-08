@@ -4,8 +4,8 @@
 //! Until app databases leave the volume, two live runners mean two writers
 //! on one set of SQLite files. A runner that sees another refuses those
 //! databases (`Stores::sqlite_refusal`) and says so at error, which turns a
-//! silent split brain into a loud one. Later steps route work to a runner by
-//! its `address`.
+//! silent split brain into a loud one. The row also says where the runner is
+//! reachable and what it serves, which an edge reads later to route work.
 
 use deadpool_postgres::Pool;
 use std::{
@@ -14,20 +14,32 @@ use std::{
 };
 
 /// How often a runner says it is alive.
-pub const HEARTBEAT: Duration = Duration::from_secs(10);
-/// How long after its last heartbeat a runner still counts as live.
+pub const HEARTBEAT: Duration = Duration::from_secs(5);
+/// How long after its last heartbeat a runner still counts as live, for
+/// the SQLite guard: generous, since a false "alone" is the costly mistake.
 pub const LIVE_FOR: Duration = Duration::from_secs(30);
 /// Rows of runners gone this long are swept when another registers. They
 /// are process records, not data: nothing reads a dead runner's row.
 const FORGET_AFTER: Duration = Duration::from_secs(60 * 60);
 
+/// The pool a runner is in when `TOOLSITE_POOL` does not say.
+pub const DEFAULT_POOL: &str = "default";
+/// The port other runners reach this one on when `TOOLSITE_INTERNAL_PORT`
+/// does not say.
+pub const DEFAULT_INTERNAL_PORT: u16 = 8081;
+
 pub struct Runner {
     /// Random per process: a restart is a new runner.
     pub id: String,
-    /// What this runner serves. `all` until roles split.
-    pub role: String,
+    /// What this runner serves: `control` and `worker` (`all`) until role
+    /// sets arrive.
+    pub roles: Vec<String>,
+    /// The worker pool it belongs to, from `TOOLSITE_POOL`.
+    pub pool: String,
     /// Where other runners reach this one, from `TOOLSITE_RUNNER_ADDRESS`.
     pub address: Option<String>,
+    /// The port they reach it on, from `TOOLSITE_INTERNAL_PORT`.
+    pub internal_port: u16,
     /// Other live runners at the last heartbeat.
     peers: Mutex<Vec<String>>,
 }
@@ -40,11 +52,13 @@ fn now() -> i64 {
 }
 
 impl Runner {
-    pub fn new(role: &str, address: Option<String>) -> Runner {
+    pub fn new(roles: &[&str], pool: &str, address: Option<String>, internal_port: u16) -> Runner {
         Runner {
             id: crate::content::slug::random_token(12),
-            role: role.to_string(),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+            pool: pool.to_string(),
             address,
+            internal_port,
             peers: Mutex::new(Vec::new()),
         }
     }
@@ -61,10 +75,10 @@ impl Runner {
         let at = now();
         client
             .execute(
-                "insert into state.runners (id, role, address, started_at, heartbeat_at)
-                 values ($1, $2, $3, $4, $4)
+                "insert into state.runners (id, roles, pool, address, internal_port, started_at, heartbeat_at)
+                 values ($1, $2, $3, $4, $5, $6, $6)
                  on conflict (id) do update set heartbeat_at = excluded.heartbeat_at",
-                &[&self.id, &self.role, &self.address, &at],
+                &[&self.id, &self.roles, &self.pool, &self.address, &(self.internal_port as i32), &at],
             )
             .await
             .map_err(|e| format!("could not write this runner's heartbeat: {e}"))?;

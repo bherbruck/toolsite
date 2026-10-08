@@ -119,9 +119,24 @@ async fn main() -> anyhow::Result<()> {
     // fresh, so it knows when it is not the only one.
     let runner = match &backend {
         toolsite::state::Backend::Postgres(postgres) => {
-            let runner = Arc::new(toolsite::state::runners::Runner::new("all", read(&["TOOLSITE_RUNNER_ADDRESS"])));
+            use toolsite::state::runners::{Runner, DEFAULT_INTERNAL_PORT, DEFAULT_POOL};
+            let internal_port = match read(&["TOOLSITE_INTERNAL_PORT"]) {
+                Some(value) => value.trim().parse::<u16>().unwrap_or_else(|_| {
+                    refuse(&format!("TOOLSITE_INTERNAL_PORT must be a port number, not {value:?}"))
+                }),
+                None => DEFAULT_INTERNAL_PORT,
+            };
+            let pool = read(&["TOOLSITE_POOL"]).unwrap_or_else(|| DEFAULT_POOL.into());
+            let runner = Arc::new(Runner::new(&["control", "worker"], pool.trim(), read(&["TOOLSITE_RUNNER_ADDRESS"]), internal_port));
             runner.register(&postgres.pool).await.unwrap_or_else(|why| refuse(&why));
-            tracing::info!(runner = %runner.id, address = runner.address.as_deref().unwrap_or("<unset>"), "registered as a runner");
+            tracing::info!(
+                runner = %runner.id,
+                roles = %runner.roles.join(","),
+                pool = %runner.pool,
+                address = runner.address.as_deref().unwrap_or("<unset>"),
+                internal_port = runner.internal_port,
+                "registered as a runner"
+            );
             runner.clone().spawn(postgres.pool.clone());
             runner.clone().leave_on_shutdown(postgres.pool.clone());
             Some(runner)

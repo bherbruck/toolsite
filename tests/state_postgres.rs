@@ -120,12 +120,12 @@ async fn two_live_runners_refuse_sqlite_apps_until_one_leaves_on_postgres() {
     let postgres = pg::connect(&url, 2).await.unwrap();
     pg::migrate(&postgres.pool, pg::LADDERS).await.unwrap();
 
-    let first = Arc::new(Runner::new("all", Some("10.0.0.1:8080".into())));
+    let first = Arc::new(Runner::new(&["control", "worker"], "default", Some("worker-1.railway.internal".into()), 8081));
     assert!(first.register(&postgres.pool).await.unwrap().is_empty());
     let stores = Stores { backend: Backend::Files, runner: Some(first.clone()) };
     assert!(stores.sqlite_refusal().is_none(), "alone, but refused");
 
-    let second = Runner::new("all", None);
+    let second = Runner::new(&["worker"], "gpu", None, 9000);
     assert_eq!(second.register(&postgres.pool).await.unwrap(), vec![first.id.clone()]);
     assert_eq!(first.beat(&postgres.pool).await.unwrap(), vec![second.id.clone()]);
     let why = stores.sqlite_refusal().expect("two live runners, and SQLite apps still served");
@@ -134,11 +134,24 @@ async fn two_live_runners_refuse_sqlite_apps_until_one_leaves_on_postgres() {
     // The registry holds what each said about itself.
     let client = postgres.pool.get().await.unwrap();
     let row = client
-        .query_one("select role, address from state.runners where id = $1", &[&first.id])
+        .query_one(
+            "select roles, pool, address, internal_port, draining from state.runners where id = $1",
+            &[&first.id],
+        )
         .await
         .unwrap();
-    assert_eq!(row.get::<_, String>(0), "all");
-    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("10.0.0.1:8080"));
+    assert_eq!(row.get::<_, Vec<String>>(0), ["control", "worker"]);
+    assert_eq!(row.get::<_, String>(1), "default");
+    assert_eq!(row.get::<_, Option<String>>(2).as_deref(), Some("worker-1.railway.internal"));
+    assert_eq!(row.get::<_, i32>(3), 8081);
+    assert!(!row.get::<_, bool>(4));
+    let row = client
+        .query_one("select roles, pool, internal_port from state.runners where id = $1", &[&second.id])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Vec<String>>(0), ["worker"]);
+    assert_eq!(row.get::<_, String>(1), "gpu");
+    assert_eq!(row.get::<_, i32>(2), 9000);
 
     // A runner whose heartbeat is older than LIVE_FOR no longer counts.
     client

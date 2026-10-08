@@ -41,7 +41,7 @@ ui.rs              the theme for pages toolsite serves itself
 state/             where platform state lives, below every other layer
   mod.rs           Backend (files, or Postgres with DATABASE_URL), Stores, boot guards, wait()
   pg.rs            the pool and its TLS, redaction, the per-schema ladder runner under an advisory lock
-  runners.rs       the runner registry: a row and a heartbeat per process, so a runner knows it is alone
+  runners.rs       the runner registry: a row and a heartbeat per process (roles, pool, address), so a runner knows it is alone
 
 platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
