@@ -219,13 +219,9 @@ pub(crate) async fn register(
         .filter(|name| !name.is_empty())
         .map(|name| name.chars().take(MAX_NAME_LEN).collect::<String>());
 
-    let uris = uris.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        store::register_client(&config, name.as_deref(), &uris)
-    })
-    .await;
+    let outcome = store::of(&config).register_client(name.as_deref(), uris).await;
     match outcome {
-        Ok(Ok(client)) => (
+        Ok(client) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
                 "client_id": client.id,
@@ -237,11 +233,10 @@ pub(crate) async fn register(
             })),
         )
             .into_response(),
-        Ok(Err(message)) => {
+        Err(message) => {
             tracing::warn!(%message, "registration failed");
             oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
         }
-        Err(_) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     }
 }
 
@@ -302,11 +297,7 @@ async fn validated_client(
     config: &Arc<Config>,
     params: &AuthorizeParams,
 ) -> Result<Client, Response> {
-    let (config, id) = (config.clone(), params.client_id.clone());
-    let client = tokio::task::spawn_blocking(move || store::client(&config, &id))
-        .await
-        .ok()
-        .flatten();
+    let client = store::of(config).client(&params.client_id).await;
     let Some(client) = client else {
         tracing::warn!(client_id = %params.client_id, "authorize refused: unknown client");
         return Err(plain_page(
@@ -520,29 +511,19 @@ pub(crate) async fn authorize_decide(
         return redirect_error(&params, "access_denied");
     }
 
-    let grant_config = config.clone();
-    let (client_id, user_id, redirect_uri, challenge) = (
-        client.id.clone(),
-        admin.id.clone(),
-        params.redirect_uri.clone(),
-        params.code_challenge.clone().unwrap_or_default(),
-    );
+    let challenge = params.code_challenge.clone().unwrap_or_default();
     let resource = params.resource.as_deref().map(normalise_resource);
-    let code = tokio::task::spawn_blocking(move || {
-        store::issue_code(
-            &grant_config,
-            &Grant {
-                client_id: &client_id,
-                user_id: &user_id,
-                redirect_uri: &redirect_uri,
-                code_challenge: &challenge,
-                resource: resource.as_deref(),
-            },
-        )
-    })
-    .await;
+    let code = store::of(&config)
+        .issue_code(&Grant {
+            client_id: &client.id,
+            user_id: &admin.id,
+            redirect_uri: &params.redirect_uri,
+            code_challenge: &challenge,
+            resource: resource.as_deref(),
+        })
+        .await;
     match code {
-        Ok(Ok(code)) => {
+        Ok(code) => {
             tracing::info!(email = %admin.email, client_id = %client.id, "connection approved");
             let mut pairs = vec![("code", code.as_str())];
             if let Some(state) = params.state.as_deref() {
@@ -550,7 +531,10 @@ pub(crate) async fn authorize_decide(
             }
             redirect_with(&params.redirect_uri, &pairs)
         }
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "could not issue a code").into_response(),
+        Err(error) => {
+            tracing::warn!(email = %admin.email, client_id = %client.id, %error, "authorize failed: no code issued");
+            (StatusCode::INTERNAL_SERVER_ERROR, "could not issue a code").into_response()
+        }
     }
 }
 
@@ -618,11 +602,7 @@ pub(crate) async fn token_endpoint(
             let (Some(code), Some(verifier)) = (body.code.clone(), body.code_verifier.clone()) else {
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
             };
-            let redeem_config = config.clone();
-            let redeemed = tokio::task::spawn_blocking(move || store::redeem_code(&redeem_config, &code))
-                .await
-                .ok()
-                .flatten();
+            let redeemed = store::of(&config).redeem_code(&code).await;
             let Some(redeemed) = redeemed else {
                 tracing::warn!(%client_id, "token refused: unknown, expired or spent code");
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
@@ -643,15 +623,15 @@ pub(crate) async fn token_endpoint(
                 tracing::warn!(%client_id, "token refused: account can no longer publish");
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
             };
-            let issue_config = config.clone();
-            let resource = redeemed.resource.clone();
-            let issued = tokio::task::spawn_blocking(move || {
-                store::issue_tokens(&issue_config, &client_id, &user.id, resource.as_deref())
-            })
-            .await;
+            let issued = store::of(&config)
+                .issue_tokens(&client_id, &user.id, redeemed.resource.as_deref())
+                .await;
             match issued {
-                Ok(Ok(issued)) => token_response(issued),
-                _ => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+                Ok(issued) => token_response(issued),
+                Err(error) => {
+                    tracing::warn!(%client_id, %error, "token refused: tokens could not be stored");
+                    oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+                }
             }
         }
         "refresh_token" => {
@@ -660,14 +640,8 @@ pub(crate) async fn token_endpoint(
             };
             // Whose token this is has to be known before it is rotated, so
             // the account check runs first against the live row.
-            let peek_config = config.clone();
-            let (peek_client, peek_token) = (client_id.clone(), refresh_token.clone());
-            let issued = tokio::task::spawn_blocking(move || {
-                store::rotate_refresh(&peek_config, &peek_client, &peek_token)
-            })
-            .await
-            .ok()
-            .flatten();
+            let oauth = store::of(&config);
+            let issued = oauth.rotate_refresh(&client_id, &refresh_token).await;
             let Some(issued) = issued else {
                 tracing::warn!(%client_id, "token refused: unknown, expired or retired refresh token");
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
@@ -675,16 +649,9 @@ pub(crate) async fn token_endpoint(
             // The rotation already spent the old token; if the account has
             // gone, the new pair is left to expire unused and refused on
             // every request in the meantime.
-            let holder_config = config.clone();
-            let access = issued.access_token.clone();
-            let holder = tokio::task::spawn_blocking(move || {
-                store::access_token_holder(&holder_config, &access)
-            })
-            .await
-            .ok()
-            .flatten();
+            let holder = oauth.access_token_grant(&issued.access_token).await;
             match holder {
-                Some((user_id, _)) if publishing_user(&config, &user_id).await.is_some() => {
+                Some((user_id, _, _)) if publishing_user(&config, &user_id).await.is_some() => {
                     token_response(issued)
                 }
                 _ => {
@@ -706,13 +673,7 @@ pub(crate) async fn token_endpoint(
 /// named none. Each endpoint asks `token_fits`
 /// whether that resource lets the token in there.
 pub(crate) async fn token_user_for(config: &Arc<Config>, token: &str) -> Option<(User, Option<String>)> {
-    let (lookup, presented) = (config.clone(), token.to_string());
-    let (user_id, _client, resource) = tokio::task::spawn_blocking(move || {
-        store::access_token_grant(&lookup, &presented)
-    })
-    .await
-    .ok()
-    .flatten()?;
+    let (user_id, _client, resource) = store::of(config).access_token_grant(token).await?;
     publishing_user(config, &user_id).await.map(|user| (user, resource))
 }
 
