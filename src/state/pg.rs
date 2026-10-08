@@ -33,16 +33,23 @@ pub struct Ladder {
 }
 
 /// Every ladder this build knows, applied at boot in this order.
-pub const LADDERS: &[Ladder] = &[Ladder {
-    store: "state",
-    steps: &[
-        include_str!("../../migrations/postgres/state/001_initial.sql"),
-        include_str!("../../migrations/postgres/state/002_runner_placement.sql"),
-    ],
-}, Ladder {
-    store: "accounts",
-    steps: &[include_str!("../../migrations/postgres/accounts/001_initial.sql")],
-}];
+pub const LADDERS: &[Ladder] = &[
+    Ladder {
+        store: "state",
+        steps: &[
+            include_str!("../../migrations/postgres/state/001_initial.sql"),
+            include_str!("../../migrations/postgres/state/002_runner_placement.sql"),
+        ],
+    },
+    Ladder {
+        store: "accounts",
+        steps: &[include_str!("../../migrations/postgres/accounts/001_initial.sql")],
+    },
+    Ladder {
+        store: "oauth",
+        steps: &[include_str!("../../migrations/postgres/oauth/001_initial.sql")],
+    },
+];
 
 pub struct Postgres {
     pub pool: Pool,

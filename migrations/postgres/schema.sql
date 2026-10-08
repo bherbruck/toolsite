@@ -47,6 +47,24 @@ column accounts.users.email text not null
 column accounts.users.id text not null
 column accounts.users.is_admin boolean not null default false
 column accounts.users.password_hash text
+column oauth.clients.created_at bigint not null
+column oauth.clients.id text not null
+column oauth.clients.name text
+column oauth.clients.redirect_uris text not null
+column oauth.codes.client_id text not null
+column oauth.codes.code_challenge text not null
+column oauth.codes.code_hash text not null
+column oauth.codes.expires_at bigint not null
+column oauth.codes.redirect_uri text not null
+column oauth.codes.resource text
+column oauth.codes.user_id text not null
+column oauth.tokens.client_id text not null
+column oauth.tokens.created_at bigint not null
+column oauth.tokens.expires_at bigint not null
+column oauth.tokens.kind text not null
+column oauth.tokens.resource text
+column oauth.tokens.token_hash text not null
+column oauth.tokens.user_id text not null
 column state.migrations.applied_at bigint not null
 column state.migrations.store text not null
 column state.migrations.version integer not null
@@ -81,6 +99,12 @@ constraint accounts.sessions sessions_pkey: PRIMARY KEY (token_hash)
 constraint accounts.sessions sessions_user_id_fkey: FOREIGN KEY (user_id) REFERENCES accounts.users(id)
 constraint accounts.users users_email_key: UNIQUE (email)
 constraint accounts.users users_pkey: PRIMARY KEY (id)
+constraint oauth.clients clients_pkey: PRIMARY KEY (id)
+constraint oauth.codes codes_client_id_fkey: FOREIGN KEY (client_id) REFERENCES oauth.clients(id)
+constraint oauth.codes codes_pkey: PRIMARY KEY (code_hash)
+constraint oauth.tokens tokens_client_id_fkey: FOREIGN KEY (client_id) REFERENCES oauth.clients(id)
+constraint oauth.tokens tokens_kind_check: CHECK ((kind = ANY (ARRAY['access'::text, 'refresh'::text])))
+constraint oauth.tokens tokens_pkey: PRIMARY KEY (token_hash)
 constraint state.migrations migrations_pkey: PRIMARY KEY (store, version)
 constraint state.runners runners_pkey: PRIMARY KEY (id)
 index accounts CREATE INDEX grants_by_app ON accounts.grants USING btree (app)
@@ -102,5 +126,14 @@ index accounts CREATE UNIQUE INDEX scopes_pkey ON accounts.scopes USING btree (u
 index accounts CREATE UNIQUE INDEX sessions_pkey ON accounts.sessions USING btree (token_hash)
 index accounts CREATE UNIQUE INDEX users_email_key ON accounts.users USING btree (email)
 index accounts CREATE UNIQUE INDEX users_pkey ON accounts.users USING btree (id)
+index oauth CREATE INDEX codes_by_client ON oauth.codes USING btree (client_id)
+index oauth CREATE INDEX codes_by_user ON oauth.codes USING btree (user_id)
+index oauth CREATE INDEX codes_expiry ON oauth.codes USING btree (expires_at)
+index oauth CREATE INDEX tokens_by_client ON oauth.tokens USING btree (client_id)
+index oauth CREATE INDEX tokens_by_user ON oauth.tokens USING btree (user_id)
+index oauth CREATE INDEX tokens_expiry ON oauth.tokens USING btree (expires_at)
+index oauth CREATE UNIQUE INDEX clients_pkey ON oauth.clients USING btree (id)
+index oauth CREATE UNIQUE INDEX codes_pkey ON oauth.codes USING btree (code_hash)
+index oauth CREATE UNIQUE INDEX tokens_pkey ON oauth.tokens USING btree (token_hash)
 index state CREATE UNIQUE INDEX migrations_pkey ON state.migrations USING btree (store, version)
 index state CREATE UNIQUE INDEX runners_pkey ON state.runners USING btree (id)
