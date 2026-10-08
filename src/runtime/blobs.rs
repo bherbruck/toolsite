@@ -21,7 +21,7 @@ use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -149,12 +149,13 @@ impl Blobs {
 }
 
 /// One browser upload, minted by a handler. The credential is the URL; it is
-/// scoped to one app and one key, and spent when the upload begins.
+/// scoped to one app and one key, and spent when the upload begins. Kept in
+/// `state::Tickets`, which holds its expiry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UploadTicket {
     pub app: String,
     pub key: String,
     pub max_bytes: u64,
-    pub expires_at: Instant,
 }
 
 // --- keys and names --------------------------------------------------------
@@ -531,7 +532,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
 /// Mints a browser upload for `key`, good once, for fifteen minutes. The URL
 /// is the credential, so it goes to whoever the handler chooses to hand it
 /// to — the platform does not ask again.
-pub fn issue_upload(config: &Config, app: &str, key: &str, max_bytes: u64) -> Result<String, Error> {
+pub async fn issue_upload(config: &Config, app: &str, key: &str, max_bytes: u64) -> Result<String, Error> {
     valid_key(key)?;
     let ceiling = config.blobs.max_bytes;
     let max_bytes = match (max_bytes, ceiling) {
@@ -539,19 +540,13 @@ pub fn issue_upload(config: &Config, app: &str, key: &str, max_bytes: u64) -> Re
         (m, 0) => m,
         (m, c) => m.min(c),
     };
-    let ticket = crate::content::slug::random_token(32);
-    let now = Instant::now();
-    let mut tickets = config.blob_uploads.lock().unwrap();
-    tickets.retain(|_, t| t.expires_at > now);
-    tickets.insert(
-        ticket.clone(),
-        UploadTicket {
-            app: app.to_string(),
-            key: key.to_string(),
-            max_bytes,
-            expires_at: now + UPLOAD_TTL,
-        },
-    );
+    let ticket = UploadTicket { app: app.to_string(), key: key.to_string(), max_bytes };
+    let ticket = config
+        .stores
+        .tickets
+        .put(crate::state::tickets::Kind::BlobUpload, UPLOAD_TTL, &ticket)
+        .await
+        .map_err(Error::Failed)?;
     Ok(upload_url(config, app, &ticket))
 }
 
@@ -564,11 +559,14 @@ pub fn upload_url(config: &Config, app: &str, ticket: &str) -> String {
 /// Spends a ticket. Nothing for one that is unknown or expired, and the same
 /// ticket cannot be spent twice, so an upload URL that leaked after use is
 /// worthless.
-pub fn take_upload(config: &Config, ticket: &str) -> Option<UploadTicket> {
-    let now = Instant::now();
-    let mut tickets = config.blob_uploads.lock().unwrap();
-    tickets.retain(|_, t| t.expires_at > now);
-    tickets.remove(ticket)
+pub async fn take_upload(config: &Config, ticket: &str) -> Option<UploadTicket> {
+    match config.stores.tickets.take(crate::state::tickets::Kind::BlobUpload, ticket).await {
+        Ok(ticket) => ticket,
+        Err(why) => {
+            tracing::error!(%why, "browser upload ticket could not be spent");
+            None
+        }
+    }
 }
 
 // --- streaming API, for the platform --------------------------------------
@@ -1128,7 +1126,8 @@ mod tests {
             assert!(matches!(error, Error::InvalidKey(_)), "{key:?} was accepted: {error}");
             assert!(matches!(get(&config, "app", key), Err(Error::InvalidKey(_))));
             assert!(matches!(delete(&config, "app", key), Err(Error::InvalidKey(_))));
-            assert!(matches!(issue_upload(&config, "app", key, 0), Err(Error::InvalidKey(_))));
+            let issued = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(issue_upload(&config, "app", key, 0));
+            assert!(matches!(issued, Err(Error::InvalidKey(_))));
         }
         assert!(!dir.path().join("victim/pwned").exists());
         assert!(!dir.path().join("etc").exists());
@@ -1198,19 +1197,19 @@ mod tests {
         assert_eq!(clean_content_type("text/plain\r\nx-injected: 1"), DEFAULT_CONTENT_TYPE);
     }
 
-    #[test]
-    fn an_upload_ticket_is_spent_once_and_capped_by_the_platform() {
+    #[tokio::test]
+    async fn an_upload_ticket_is_spent_once_and_capped_by_the_platform() {
         let (_dir, config) = config();
         let config = Config {
             blobs: Blobs::local(100),
             ..config
         };
-        let url = issue_upload(&config, "app", "up.bin", 1_000).unwrap();
+        let url = issue_upload(&config, "app", "up.bin", 1_000).await.unwrap();
         let ticket = url.rsplit('/').next().unwrap();
-        let taken = take_upload(&config, ticket).expect("a fresh ticket");
+        let taken = take_upload(&config, ticket).await.expect("a fresh ticket");
         assert_eq!((taken.app.as_str(), taken.key.as_str(), taken.max_bytes), ("app", "up.bin", 100));
-        assert!(take_upload(&config, ticket).is_none(), "spent twice");
-        assert!(take_upload(&config, "nope").is_none());
+        assert!(take_upload(&config, ticket).await.is_none(), "spent twice");
+        assert!(take_upload(&config, "nope").await.is_none());
     }
 
     #[tokio::test]

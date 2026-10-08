@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{path::PathBuf, sync::Arc};
 use tokio::fs;
 use rmcp::ServiceExt;
 use toolsite::{
@@ -104,14 +100,12 @@ async fn main() -> anyhow::Result<()> {
     // work against the same backend the server does.
     let bucket = read(&["TOOLSITE_BLOB_S3_ENDPOINT", "ENDPOINT"]).is_some()
         && read(&["TOOLSITE_BLOB_S3_BUCKET", "BUCKET"]).is_some();
-    let backend = match toolsite::state::Settings::from_env(|name| read(&[name]), bucket) {
-        Ok(settings) => toolsite::state::open(&settings, &data_dir).await,
-        Err(why) => Err(why),
-    }
-    .unwrap_or_else(|why| refuse(&why));
+    let settings = toolsite::state::Settings::from_env(|name| read(&[name]), bucket).unwrap_or_else(|why| refuse(&why));
+    let backend = toolsite::state::open(&settings, &data_dir).await.unwrap_or_else(|why| refuse(&why));
 
     if let Some(Command::User { command }) = cli.command {
-        let stores = toolsite::state::Stores { backend, runner: None };
+        let stores = toolsite::state::Stores::new(backend, None, settings.secret_key.as_deref())
+            .unwrap_or_else(|why| refuse(&why));
         return run_user_command(command, data_dir, read(&["TOOLSITE_BASE_URL", "PUBLIC_BASE_URL"]), stores);
     }
 
@@ -469,27 +463,22 @@ async fn main() -> anyhow::Result<()> {
         base_url,
         local_base: format!("http://localhost:{port}"),
         valid_tokens,
-        uploads: Mutex::new(HashMap::new()),
-        inline_uploads: Mutex::new(HashMap::new()),
         max_db_bytes,
         blobs,
-        blob_uploads: Mutex::new(HashMap::new()),
         providers,
-        logins: Mutex::new(HashMap::new()),
         default_gate,
         github,
-        previews: Mutex::new(HashMap::new()),
         renderer,
         preview_base,
         connections: Arc::new(toolsite::runtime::connections::Hub::new(socket_limits)),
         ports: port_map,
         residents: Arc::new(residents),
         apps,
-        handoffs: Mutex::new(HashMap::new()),
         mfa,
         limits,
         jobs: Arc::new(toolsite::platform::schedule::Jobs::new(job_starts).with_running_per_app(jobs_running)),
-        stores: toolsite::state::Stores { backend, runner },
+        stores: toolsite::state::Stores::new(backend, runner, settings.secret_key.as_deref())
+            .unwrap_or_else(|why| refuse(&why)),
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -568,23 +557,17 @@ fn run_user_command(
         }),
         local_base: "http://localhost:8080".to_string(),
         valid_tokens: Vec::new(),
-        uploads: Mutex::new(HashMap::new()),
-        inline_uploads: Mutex::new(HashMap::new()),
         max_db_bytes: toolsite::config::DEFAULT_MAX_DB_BYTES,
         blobs: toolsite::runtime::blobs::Blobs::local(toolsite::config::DEFAULT_MAX_BLOB_BYTES),
-        blob_uploads: Mutex::new(HashMap::new()),
         providers: Vec::new(),
-        logins: Mutex::new(HashMap::new()),
         default_gate: "public".to_string(),
         github: None,
-        previews: Mutex::new(HashMap::new()),
         renderer: None,
         preview_base: "http://127.0.0.1:8080".to_string(),
         connections: Arc::new(toolsite::runtime::connections::Hub::default()),
         ports: Default::default(),
         residents: Default::default(),
         apps: None,
-        handoffs: Mutex::new(HashMap::new()),
         mfa: toolsite::accounts::mfa::Settings::off(),
         limits: Default::default(),
         jobs: Default::default(),

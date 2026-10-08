@@ -587,7 +587,7 @@ async fn an_inline_upload_is_judged_again_when_it_finishes() {
 async fn a_preview_link_works_once_for_one_app_and_never_for_a_disabled_account() {
     let w = world().await;
     let fin = user(&w.config, "fin@x.test");
-    let token = toolsite::platform::preview::issue(&w.config, "ledger", "/", Some(&fin.id)).unwrap();
+    let token = toolsite::platform::preview::issue(&w.config, "ledger", "/", Some(&fin.id)).await.unwrap();
     let (status, _, headers) = send(&w.config, get(&format!("/preview/{token}"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let cookie = headers.iter().find(|(k, _)| k == "set-cookie").map(|(_, v)| v.clone()).unwrap_or_default();
@@ -595,7 +595,7 @@ async fn a_preview_link_works_once_for_one_app_and_never_for_a_disabled_account(
     assert!(!cookie.starts_with("ts_session="), "a preview handed out a site session");
     assert_eq!(send(&w.config, get(&format!("/preview/{token}"))).await.0, StatusCode::NOT_FOUND, "replayed");
 
-    let token = toolsite::platform::preview::issue(&w.config, "ledger", "/", Some(&fin.id)).unwrap();
+    let token = toolsite::platform::preview::issue(&w.config, "ledger", "/", Some(&fin.id)).await.unwrap();
     users::set_active(&w.config, "fin@x.test", false).unwrap();
     let (status, _, headers) = send(&w.config, get(&format!("/preview/{token}"))).await;
     assert_ne!(status, StatusCode::SEE_OTHER, "a disabled account was signed in by a preview");
@@ -604,8 +604,8 @@ async fn a_preview_link_works_once_for_one_app_and_never_for_a_disabled_account(
     for bad in ["", "x", "../ledger", "ledger/../yard"] {
         assert_ne!(send(&w.config, get(&format!("/preview/{bad}"))).await.0, StatusCode::SEE_OTHER);
     }
-    assert!(toolsite::platform::preview::issue(&w.config, "ledger", "//evil.test/", None).is_err());
-    assert!(toolsite::platform::preview::issue(&w.config, "../ledger", "/", None).is_err());
+    assert!(toolsite::platform::preview::issue(&w.config, "ledger", "//evil.test/", None).await.is_err());
+    assert!(toolsite::platform::preview::issue(&w.config, "../ledger", "/", None).await.is_err());
 }
 
 #[tokio::test]
@@ -929,16 +929,13 @@ async fn access_waiting_at_an_empty_path_does_not_open_the_app_published_there()
     toolsite::accounts::users::grant_scope(&config, "early@example.com", "later", toolsite::accounts::users::Scope::Viewer, None).unwrap();
 
     // The app arrives through an upload ticket, as an agent publishes.
-    let ticket = "t-later".to_string();
-    config.uploads.lock().unwrap().insert(
-        ticket.clone(),
-        toolsite::platform::upload::UploadTicket {
-            slug: "later".to_string(),
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
-            user: None,
-            project: None,
-        },
-    );
+    let ticket = toolsite::platform::upload::issue_ticket(
+        &config,
+        &toolsite::platform::upload::UploadTicket { slug: "later".to_string(), user: None, project: None },
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
     let request = axum::http::Request::builder()
         .method("PUT")
         .uri(format!("/upload/{ticket}"))

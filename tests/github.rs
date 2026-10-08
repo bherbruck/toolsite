@@ -10,7 +10,7 @@ use axum::{
 };
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tempfile::TempDir;
 use toolsite::{build_router, platform::github::App, platform::upload::UploadTicket, runtime::wasm::Runtime, Config};
@@ -143,13 +143,9 @@ fn store_source(config: &Config, app: &str) {
 }
 
 /// An upload ticket for `slug`, the way create_upload mints one.
-fn upload_ticket(config: &Config, slug: &str) -> String {
-    let ticket = format!("ticket-{}-{}", slug, config.uploads.lock().unwrap().len());
-    config.uploads.lock().unwrap().insert(
-        ticket.clone(),
-        UploadTicket { slug: slug.to_string(), expires_at: Instant::now() + Duration::from_secs(60), user: None, project: None },
-    );
-    ticket
+async fn upload_ticket(config: &Config, slug: &str) -> String {
+    let ticket = UploadTicket { slug: slug.to_string(), user: None, project: None };
+    toolsite::platform::upload::issue_ticket(config, &ticket, Duration::from_secs(60)).await.unwrap()
 }
 
 /// A PUT with no bearer: the ticket in the URL is the credential.
@@ -899,7 +895,7 @@ async fn publishing_source_to_a_linked_app_pushes_one_commit_with_the_publishers
         ("./package.json", br#"{"name":"shop","scripts":{"build":"vite build"}}"#),
         ("./src/App.tsx", b"export default () => <p>phone</p>"),
     ]);
-    let ticket = upload_ticket(&config, "shop");
+    let ticket = upload_ticket(&config, "shop").await;
     let (status, body, _) = send(
         &config,
         put_plain(&format!("/upload/{ticket}?source&message=Fix%20the%20phone%20field%0A%0AIt%20was%20too%20short."), next.clone()),
@@ -924,7 +920,7 @@ async fn publishing_source_to_a_linked_app_pushes_one_commit_with_the_publishers
     assert_eq!(link.deployed.as_ref().map(|d| d.sha.as_str()), Some(head.as_str()), "what was just published is what is live");
 
     // The same archive again: stored, nothing to commit.
-    let ticket = upload_ticket(&config, "shop");
+    let ticket = upload_ticket(&config, "shop").await;
     let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source"), next)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("unchanged"), "{body}");
@@ -932,7 +928,7 @@ async fn publishing_source_to_a_linked_app_pushes_one_commit_with_the_publishers
 
     // The message may also travel as a header.
     let third = tgz(&[("./package.json", b"{}"), ("./src/App.tsx", b"v3")]);
-    let ticket = upload_ticket(&config, "shop");
+    let ticket = upload_ticket(&config, "shop").await;
     let request = Request::builder()
         .method("PUT")
         .uri(format!("/upload/{ticket}?source"))
@@ -986,7 +982,7 @@ async fn a_disconnected_link_does_not_push() {
     send(&config, post_form("/admin/repo", &session, format!("token={token}&action=disconnect&app=shop&back=/admin/apps/shop/repo"))).await;
     assert!(toolsite::platform::github::link(&config, "shop").is_none());
 
-    let ticket = upload_ticket(&config, "shop");
+    let ticket = upload_ticket(&config, "shop").await;
     let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source"), tgz(&[("./package.json", b"{}"), ("./new.js", b"1")]))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!body.contains("pushed to"), "{body}");

@@ -155,10 +155,8 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
 };
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use crate::state::tickets::Kind;
+use std::time::Duration;
 
 /// Long enough to reach someone, short enough that a forgotten link is not a
 /// standing way to rewrite an app's credentials.
@@ -167,33 +165,24 @@ const ENTRY_TTL: Duration = Duration::from_secs(60 * 60);
 /// A link the owner opens to type values in. An agent can create one and pass
 /// it on without ever handling a secret itself, which is the point: values
 /// that never enter a conversation cannot leak from one.
-pub fn create_entry(config: &Config, app: &str) -> Result<String, String> {
+pub async fn create_entry(config: &Config, app: &str) -> Result<String, String> {
     if !valid_slug(app) {
         return Err("invalid app name".into());
     }
-    let token = crate::content::slug::random_token(40);
-    let now = Instant::now();
-    let mut entries = config.uploads.lock().unwrap();
-    entries.retain(|_, t| t.expires_at > now);
-    entries.insert(
-        format!("settings:{token}"),
-        crate::platform::upload::UploadTicket {
-            slug: app.to_string(),
-            expires_at: now + ENTRY_TTL,
-            user: None,
-            project: None,
-        },
-    );
+    let token = config.stores.tickets.put(Kind::SettingsLink, ENTRY_TTL, &app).await?;
 
     let base = config.base_url.as_deref().unwrap_or(&config.local_base);
     Ok(format!("{base}/settings/{token}"))
 }
 
-fn entry_app(config: &Config, token: &str) -> Option<String> {
-    let now = Instant::now();
-    let mut entries = config.uploads.lock().unwrap();
-    entries.retain(|_, t| t.expires_at > now);
-    entries.get(&format!("settings:{token}")).map(|t| t.slug.clone())
+async fn entry_app(config: &Config, token: &str) -> Option<String> {
+    match config.stores.tickets.get(Kind::SettingsLink, token).await {
+        Ok(app) => app,
+        Err(why) => {
+            tracing::error!(%why, "settings link could not be read");
+            None
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -205,7 +194,7 @@ pub async fn entry_form(
     State(state): State<AppState>,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Response {
-    let Some(app) = entry_app(&state.config, &token) else {
+    let Some(app) = entry_app(&state.config, &token).await else {
         return (
             StatusCode::GONE,
             "This link has expired. Ask for a new link.",
@@ -250,7 +239,7 @@ pub async fn entry_submit(
     State(state): State<AppState>,
     Form(form): Form<PastedSettings>,
 ) -> Response {
-    let Some(app) = entry_app(&state.config, &form.token) else {
+    let Some(app) = entry_app(&state.config, &form.token).await else {
         return (StatusCode::GONE, "This link has expired. Ask for a new link.").into_response();
     };
 

@@ -395,7 +395,7 @@ async fn a_person_the_gate_refuses_gets_no_session_for_the_app() {
     .await;
     assert_eq!(back.status, StatusCode::FORBIDDEN);
     assert!(back.header("location").is_none());
-    assert!(config.handoffs.lock().unwrap().is_empty(), "a code was minted for a refused visitor");
+    assert!(config.stores.tickets.live(toolsite::state::tickets::Kind::Handoff).await.unwrap() == 0, "a code was minted for a refused visitor");
 
     // Signed out, the handoff asks for a sign-in and comes back to itself.
     let signed_out = get(&config, MAIN, "/auth/handoff?app=vault&next=%2Fp%2Fvault%2F&state=abcdefghijklmnopqrstuvwxyz012345", None).await;
@@ -606,7 +606,7 @@ async fn a_preview_signs_the_renderer_in_on_the_apps_own_host() {
     let user = toolsite::accounts::users::user_by_email(&config, "reader@example.com").unwrap();
     let host = host_of(&config, "members");
 
-    let token = toolsite::platform::preview::issue(&config, "members", "/", Some(&user.id)).unwrap();
+    let token = toolsite::platform::preview::issue(&config, "members", "/", Some(&user.id)).await.unwrap();
     assert_eq!(
         toolsite::platform::screenshot::preview_url(&config, "members", &token),
         format!("https://{host}/preview/{token}")
@@ -621,7 +621,7 @@ async fn a_preview_signs_the_renderer_in_on_the_apps_own_host() {
     // Not on the main host, and not on another app's host.
     app(&config, "billing", "public");
     for elsewhere in [MAIN.to_string(), host_of(&config, "billing")] {
-        let token = toolsite::platform::preview::issue(&config, "members", "/", Some(&user.id)).unwrap();
+        let token = toolsite::platform::preview::issue(&config, "members", "/", Some(&user.id)).await.unwrap();
         let reply = get(&config, &elsewhere, &format!("/preview/{token}"), None).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{elsewhere}");
         assert!(reply.cookies().is_empty());
@@ -633,14 +633,14 @@ async fn a_browser_upload_url_is_on_the_apps_host_and_only_that_host_takes_it() 
     let (_dir, config) = site();
     app(&config, "orders", "public");
     app(&config, "billing", "public");
-    let url = toolsite::runtime::blobs::issue_upload(&config, "orders", "files/a.txt", 0).unwrap();
+    let url = toolsite::runtime::blobs::issue_upload(&config, "orders", "files/a.txt", 0).await.unwrap();
     let host = host_of(&config, "orders");
     assert!(url.starts_with(&format!("https://{host}/blob/")), "{url}");
     let path = url.strip_prefix(&format!("https://{host}")).unwrap().to_string();
     let wrong = send(&config, on(&host_of(&config, "billing"), "PUT", &path).body(Body::from("x")).unwrap()).await;
     assert_eq!(wrong.status, StatusCode::NOT_FOUND);
 
-    let url = toolsite::runtime::blobs::issue_upload(&config, "orders", "files/a.txt", 0).unwrap();
+    let url = toolsite::runtime::blobs::issue_upload(&config, "orders", "files/a.txt", 0).await.unwrap();
     let path = url.strip_prefix(&format!("https://{host}")).unwrap().to_string();
     let right = send(&config, on(&host, "PUT", &path).header("origin", format!("https://{host}")).body(Body::from("x")).unwrap()).await;
     assert!(right.status.is_success(), "{} {}", right.status, right.body);
@@ -921,7 +921,7 @@ async fn a_handoff_a_sibling_triggers_with_a_subresource_mints_nothing() {
         assert_eq!(reply.status, StatusCode::FORBIDDEN, "{mode}/{dest}");
         assert!(reply.header("location").is_none());
     }
-    assert!(config.handoffs.lock().unwrap().is_empty(), "a code was minted for a request the visitor did not make");
+    assert!(config.stores.tickets.live(toolsite::state::tickets::Kind::Handoff).await.unwrap() == 0, "a code was minted for a request the visitor did not make");
 }
 
 // --- adversarial: cookies --------------------------------------------------
@@ -1110,7 +1110,7 @@ async fn a_token_for_one_apps_connector_is_refused_at_anothers() {
 async fn a_browser_upload_ticket_is_refused_on_the_main_host() {
     let (_dir, config) = site();
     app(&config, "orders", "public");
-    let url = toolsite::runtime::blobs::issue_upload(&config, "orders", "files/a.txt", 0).unwrap();
+    let url = toolsite::runtime::blobs::issue_upload(&config, "orders", "files/a.txt", 0).await.unwrap();
     let path = url.split_once("/blob/").map(|(_, t)| format!("/blob/{t}")).unwrap();
     let reply = send(&config, on(MAIN, "PUT", &path).body(Body::from("x")).unwrap()).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);

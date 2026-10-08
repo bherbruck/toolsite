@@ -11,17 +11,15 @@
 use crate::{
     accounts::users,
     config::Config,
-    content::slug::{random_token, valid_slug},
+    content::slug::valid_slug,
+    state::tickets::Kind,
 };
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 /// A token is spent by the first load; a render that takes longer than this
 /// to start is not coming.
@@ -30,12 +28,13 @@ pub const PREVIEW_TTL: Duration = Duration::from_secs(60);
 /// cookie dies with the browser process anyway.
 const PREVIEW_SESSION: Duration = Duration::from_secs(600);
 
+/// Kept in `state::Tickets`, which holds its expiry and spends it once.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreviewTicket {
     pub app: String,
     /// Within the app, starting with `/`.
     pub path: String,
     pub user_id: Option<String>,
-    pub expires_at: Instant,
 }
 
 /// A path within an app: starts with `/`, no `..`, no scheme, no `//`.
@@ -48,34 +47,25 @@ pub fn valid_path(path: &str) -> bool {
 }
 
 /// Mints a token for one render. Only the screenshot code calls this.
-pub fn issue(config: &Config, app: &str, path: &str, user_id: Option<&str>) -> Result<String, String> {
+pub async fn issue(config: &Config, app: &str, path: &str, user_id: Option<&str>) -> Result<String, String> {
     if !valid_slug(app) || app.contains('/') {
         return Err("invalid app name".into());
     }
     if !valid_path(path) {
         return Err("path must start with '/' and stay within the app".into());
     }
-    let token = random_token(40);
-    let now = Instant::now();
-    let mut previews = config.previews.lock().unwrap();
-    previews.retain(|_, ticket| ticket.expires_at > now);
-    previews.insert(
-        token.clone(),
-        PreviewTicket {
-            app: app.to_string(),
-            path: path.to_string(),
-            user_id: user_id.map(str::to_string),
-            expires_at: now + PREVIEW_TTL,
-        },
-    );
-    Ok(token)
+    let ticket = PreviewTicket { app: app.to_string(), path: path.to_string(), user_id: user_id.map(str::to_string) };
+    config.stores.tickets.put(Kind::Preview, PREVIEW_TTL, &ticket).await
 }
 
-fn take(config: &Config, token: &str) -> Option<PreviewTicket> {
-    let now = Instant::now();
-    let mut previews = config.previews.lock().unwrap();
-    previews.retain(|_, ticket| ticket.expires_at > now);
-    previews.remove(token)
+async fn take(config: &Config, token: &str) -> Option<PreviewTicket> {
+    match config.stores.tickets.take(Kind::Preview, token).await {
+        Ok(ticket) => ticket,
+        Err(why) => {
+            tracing::error!(%why, "preview token could not be spent");
+            None
+        }
+    }
 }
 
 pub(crate) async fn open(
@@ -83,7 +73,7 @@ pub(crate) async fn open(
     host: Option<axum::Extension<crate::content::origins::AppHost>>,
     Path(token): Path<String>,
 ) -> Response {
-    let Some(ticket) = take(&config, &token) else {
+    let Some(ticket) = take(&config, &token).await else {
         tracing::warn!("preview refused: token unknown, expired or already used");
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -162,19 +152,18 @@ mod tests {
         assert!(!valid_path("/https://evil.test"));
     }
 
-    #[test]
-    fn a_token_is_single_use_and_expires() {
+    #[tokio::test]
+    async fn a_token_is_single_use_and_expires() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::local(dir.path().to_path_buf(), "t");
-        let token = issue(&config, "app", "/", None).unwrap();
-        assert!(take(&config, &token).is_some());
-        assert!(take(&config, &token).is_none(), "a token was taken twice");
+        let token = issue(&config, "app", "/", None).await.unwrap();
+        assert!(take(&config, &token).await.is_some());
+        assert!(take(&config, &token).await.is_none(), "a token was taken twice");
 
-        let token = issue(&config, "app", "/", None).unwrap();
-        config.previews.lock().unwrap().get_mut(&token).unwrap().expires_at =
-            Instant::now() - Duration::from_secs(1);
-        assert!(take(&config, &token).is_none(), "an expired token was taken");
-        assert!(issue(&config, "../x", "/", None).is_err());
-        assert!(issue(&config, "a/b", "/", None).is_err());
+        let token = issue(&config, "app", "/", None).await.unwrap();
+        assert!(config.stores.tickets.expire(Kind::Preview, &token).await.unwrap());
+        assert!(take(&config, &token).await.is_none(), "an expired token was taken");
+        assert!(issue(&config, "../x", "/", None).await.is_err());
+        assert!(issue(&config, "a/b", "/", None).await.is_err());
     }
 }

@@ -463,7 +463,8 @@ impl self::toolsite::app::blobs::Host for StoreState {
     }
 
     fn upload_url(&mut self, key: String, max_bytes: u64) -> Result<String, WitBlobError> {
-        crate::runtime::blobs::issue_upload(&self.site, &self.app, &key, max_bytes)
+        // A host call runs on a blocking thread, where a store call waits.
+        crate::state::wait(crate::runtime::blobs::issue_upload(&self.site, &self.app, &key, max_bytes))
             .map_err(wit_blob_error)
     }
 

@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    state::tickets::Kind,
     content::{
         bundle::unpack_bundle,
         slug::valid_slug,
@@ -15,17 +16,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 use tokio::fs;
 
 /// A short-lived, single-slug write capability handed to an agent so it can
 /// `curl -T file.html <url>` instead of pasting page HTML through a tool call.
+/// Kept in `state::Tickets`, which holds its expiry; reusable until then.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UploadTicket {
     pub slug: String,
-    pub expires_at: Instant,
     /// The account that asked for it, when one was signed in. Checked again
     /// when the file arrives, so a scope revoked in between still counts.
     pub user: Option<String>,
@@ -38,6 +37,24 @@ pub(crate) const UPLOAD_TTL: Duration = Duration::from_secs(900);
 pub(crate) const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) const MAX_ICON_BYTES: usize = 1024 * 1024;
+
+/// Mints an upload ticket good for `ttl` and returns its id, the credential
+/// the upload URL carries.
+pub async fn issue_ticket(config: &Config, ticket: &UploadTicket, ttl: Duration) -> Result<String, String> {
+    config.stores.tickets.put(Kind::Upload, ttl, ticket).await
+}
+
+/// The live upload ticket behind `id`. A store that cannot answer is logged
+/// and treated as no ticket: the caller is asked to mint a fresh one.
+async fn live_ticket(config: &Config, id: &str) -> Option<UploadTicket> {
+    match config.stores.tickets.get(Kind::Upload, id).await {
+        Ok(ticket) => ticket,
+        Err(why) => {
+            tracing::error!(%why, "upload ticket could not be read");
+            None
+        }
+    }
+}
 
 pub(crate) fn upload_url(config: &Config, ticket: &str) -> String {
     let base = config.base_url.as_deref().unwrap_or(&config.local_base);
@@ -73,7 +90,7 @@ pub(crate) struct UploadQuery {
 /// What a source upload knows about where it came from. A ticket or MCP
 /// upload is the publisher's act and pushes to a linked repository; a
 /// deploy-token upload comes from a pipeline and never pushes back.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceMeta {
     pub(crate) push: bool,
     pub(crate) message: Option<String>,
@@ -99,7 +116,7 @@ impl SourceMeta {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum UploadKind {
     Page,
     Icon,
@@ -123,20 +140,12 @@ pub(crate) async fn store_upload(
     body: Bytes,
     meta: SourceMeta,
 ) -> Response {
-    let (slug, user, project) = {
-        let now = Instant::now();
-        let mut tickets = config.uploads.lock().unwrap();
-        tickets.retain(|_, t| t.expires_at > now);
-        match tickets.get(ticket) {
-            Some(t) => (t.slug.clone(), t.user.clone(), t.project.clone()),
-            None => {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    "upload ticket unknown or expired; call create_upload again\n",
-                )
-                    .into_response()
-            }
-        }
+    let Some(UploadTicket { slug, user, project }) = live_ticket(config, ticket).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "upload ticket unknown or expired; call create_upload again\n",
+        )
+            .into_response();
     };
 
     let slug = match sub {
@@ -691,7 +700,7 @@ pub(crate) async fn download(
     Query(query): Query<UploadQuery>,
 ) -> Response {
     let config = &state.config;
-    let Some(slug) = ticket_slug(config, &ticket) else {
+    let Some(slug) = live_ticket(config, &ticket).await.map(|t| t.slug) else {
         return (
             StatusCode::UNAUTHORIZED,
             "upload ticket unknown or expired; call create_upload again\n",
@@ -737,12 +746,4 @@ pub(crate) async fn download(
                 .into_response(),
         },
     }
-}
-
-/// The slug a live ticket writes to, sweeping expired ones on the way.
-fn ticket_slug(config: &Config, ticket: &str) -> Option<String> {
-    let now = Instant::now();
-    let mut tickets = config.uploads.lock().unwrap();
-    tickets.retain(|_, t| t.expires_at > now);
-    tickets.get(ticket).map(|t| t.slug.clone())
 }

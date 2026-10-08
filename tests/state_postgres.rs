@@ -72,14 +72,16 @@ async fn the_ladder_applies_once_when_three_runners_boot_together_on_postgres() 
         applied.extend(boot.await.unwrap().expect("a runner failed to migrate"));
     }
     applied.sort();
-    assert_eq!(applied, ["probe/001", "probe/002", "state/001"], "steps applied across the three runners");
+    let mut expected = vec!["probe/001".to_string(), "probe/002".to_string()];
+    expected.extend((1..=pg::LADDERS[0].steps.len()).map(|n| format!("state/{n:03}")));
+    assert_eq!(applied, expected, "steps applied across the three runners");
 
     let postgres = pg::connect(&url, 1).await.unwrap();
     let client = postgres.pool.get().await.unwrap();
     let probes: i64 = client.query_one("select count(*) from probe.once", &[]).await.unwrap().get(0);
     assert_eq!(probes, 2);
     let recorded: i64 = client.query_one("select count(*) from state.migrations", &[]).await.unwrap().get(0);
-    assert_eq!(recorded, 3);
+    assert_eq!(recorded as usize, expected.len());
     drop(client);
 
     // A fourth boot later finds nothing to do.
@@ -122,7 +124,7 @@ async fn two_live_runners_refuse_sqlite_apps_until_one_leaves_on_postgres() {
 
     let first = Arc::new(Runner::new("all", Some("10.0.0.1:8080".into())));
     assert!(first.register(&postgres.pool).await.unwrap().is_empty());
-    let stores = Stores { backend: Backend::Files, runner: Some(first.clone()) };
+    let stores = Stores { backend: Backend::Files, runner: Some(first.clone()), ..Default::default() };
     assert!(stores.sqlite_refusal().is_none(), "alone, but refused");
 
     let second = Runner::new("all", None);

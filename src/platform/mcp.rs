@@ -2,7 +2,7 @@ use crate::{
     accounts::users::{self, Scope},
     config::Config,
     content::{
-        slug::{random_slug, random_token, valid_segment, valid_slug},
+        slug::{random_slug, valid_segment, valid_slug},
         store::{collect_slugs, page_path, page_title, page_url, read_meta, relative_time, write_meta},
     },
     platform::{
@@ -28,7 +28,7 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Instant, SystemTime},
+    time::SystemTime,
 };
 use tokio::fs;
 
@@ -1423,21 +1423,19 @@ impl PageHost {
             Err(refused) => return Ok(refused),
         };
 
-        let ticket = random_token(32);
-        {
-            let now = Instant::now();
-            let mut tickets = self.config.uploads.lock().unwrap();
-            tickets.retain(|_, t| t.expires_at > now);
-            tickets.insert(
-                ticket.clone(),
-                UploadTicket {
-                    slug: slug.clone(),
-                    expires_at: now + UPLOAD_TTL,
-                    user: caller.user.as_ref().map(|user| user.id.clone()),
-                    project: folder,
-                },
-            );
-        }
+        let minted = crate::platform::upload::issue_ticket(
+            &self.config,
+            &UploadTicket { slug: slug.clone(), user: caller.user.as_ref().map(|user| user.id.clone()), project: folder },
+            UPLOAD_TTL,
+        )
+        .await;
+        let ticket = match minted {
+            Ok(ticket) => ticket,
+            Err(why) => {
+                tracing::error!(%why, "upload ticket could not be stored");
+                return Ok(CallToolResult::error(vec![ContentBlock::text("could not create an upload URL; try again")]));
+            }
+        };
 
         let upload = upload_url(&self.config, &ticket);
         let minutes = UPLOAD_TTL.as_secs() / 60;
@@ -1881,6 +1879,7 @@ impl PageHost {
 
         if link.unwrap_or(false) {
             let url = crate::platform::secrets::create_entry(&self.config, &app)
+                .await
                 .map_err(|e| McpError::internal_error(e, None))?;
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Send this to whoever holds the credentials. It lasts an hour, takes one \

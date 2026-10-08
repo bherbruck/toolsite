@@ -35,7 +35,10 @@ pub struct Ladder {
 /// Every ladder this build knows, applied at boot in this order.
 pub const LADDERS: &[Ladder] = &[Ladder {
     store: "state",
-    steps: &[include_str!("../../migrations/postgres/state/001_initial.sql")],
+    steps: &[
+        include_str!("../../migrations/postgres/state/001_initial.sql"),
+        include_str!("../../migrations/postgres/state/002_tickets.sql"),
+    ],
 }];
 
 pub struct Postgres {
@@ -146,7 +149,7 @@ fn describe(config: &tokio_postgres::Config) -> String {
 
 /// An error and every cause under it. `Display` alone on a driver or pool
 /// error prints the kind ("error connecting to server") and drops the reason.
-fn chain(error: &dyn std::error::Error) -> String {
+pub(crate) fn chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {

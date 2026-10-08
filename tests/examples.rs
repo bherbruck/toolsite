@@ -51,7 +51,6 @@ fn site() -> (TempDir, Arc<Config>) {
         base_url: Some(BASE.to_string()),
         local_base: "http://localhost:8080".to_string(),
         valid_tokens: vec![TOKEN.to_string()],
-        uploads: std::sync::Mutex::new(std::collections::HashMap::new()),
         ..Config::local(dir.path().to_path_buf(), "unused")
     });
     (dir, config)
@@ -130,13 +129,9 @@ fn every_fixture_was_built_from_the_example_source_as_it_is_now() {
 
 // --- publishing an example as the CLI does --------------------------------------
 
-fn ticket(config: &Config, slug: &str) -> String {
-    let token = format!("ticket{}", config.uploads.lock().unwrap().len());
-    config.uploads.lock().unwrap().insert(
-        token.clone(),
-        UploadTicket { slug: slug.to_string(), expires_at: Instant::now() + Duration::from_secs(600), user: None, project: None },
-    );
-    token
+async fn ticket(config: &Config, slug: &str) -> String {
+    let ticket = UploadTicket { slug: slug.to_string(), user: None, project: None };
+    toolsite::platform::upload::issue_ticket(config, &ticket, Duration::from_secs(600)).await.unwrap()
 }
 
 async fn upload(config: &Arc<Config>, ticket: &str, flag: &str, body: Vec<u8>) {
@@ -175,7 +170,7 @@ async fn publish(config: &Arc<Config>, name: &str) {
 async fn publish_with(config: &Arc<Config>, name: &str, manifest: &str) {
     let source = root().join("examples").join(name);
     let fixtures = root().join("tests/fixtures/examples");
-    let ticket = ticket(config, name);
+    let ticket = ticket(config, name).await;
     if source.join("migrations").is_dir() {
         upload(config, &ticket, "migrations", migrations_archive(&source.join("migrations"))).await;
     }

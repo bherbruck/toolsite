@@ -506,7 +506,7 @@ async fn the_subdomain_handoff_refuses_to_mint_for_a_pending_sign_in() {
     .await;
     assert_eq!(handoff.status, StatusCode::SEE_OTHER);
     assert!(handoff.location().starts_with("/auth/login"), "the handoff went on: {}", handoff.location());
-    assert!(config.handoffs.lock().unwrap().is_empty(), "a handoff code was minted for a pending sign-in");
+    assert!(config.stores.tickets.live(toolsite::state::tickets::Kind::Handoff).await.unwrap() == 0, "a handoff code was minted for a pending sign-in");
 }
 
 #[tokio::test]

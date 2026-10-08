@@ -7,7 +7,7 @@ use axum::{
 };
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tempfile::TempDir;
 use toolsite::{build_router, platform::upload::UploadTicket, runtime::wasm::Runtime, Config};
@@ -69,18 +69,9 @@ fn write_page(config: &Config, slug: &str, html: &str) {
     std::fs::write(path, html).unwrap();
 }
 
-fn ticket(config: &Config, slug: &str, ttl: Duration) -> String {
-    let token = format!("ticket{}", config.uploads.lock().unwrap().len());
-    config.uploads.lock().unwrap().insert(
-        token.clone(),
-        UploadTicket {
-            slug: slug.to_string(),
-            expires_at: Instant::now() + ttl,
-            user: None,
-            project: None,
-        },
-    );
-    token
+async fn ticket(config: &Config, slug: &str, ttl: Duration) -> String {
+    let ticket = UploadTicket { slug: slug.to_string(), user: None, project: None };
+    toolsite::platform::upload::issue_ticket(config, &ticket, ttl).await.unwrap()
 }
 
 #[tokio::test]
@@ -212,8 +203,8 @@ async fn unlisted_pages_still_serve() {
 #[tokio::test]
 async fn uploads_need_a_live_ticket() {
     let (_dir, config) = server();
-    let good = ticket(&config, "uploaded", Duration::from_secs(60));
-    let expired = ticket(&config, "stale", Duration::from_millis(0));
+    let good = ticket(&config, "uploaded", Duration::from_secs(60)).await;
+    let expired = ticket(&config, "stale", Duration::from_millis(0)).await;
 
     let request = Request::builder()
         .method("PUT")
@@ -242,7 +233,7 @@ async fn uploads_need_a_live_ticket() {
 #[tokio::test]
 async fn a_ticket_cannot_write_outside_its_own_slug() {
     let (_dir, config) = server();
-    let token = ticket(&config, "mine", Duration::from_secs(60));
+    let token = ticket(&config, "mine", Duration::from_secs(60)).await;
 
     for attempt in ["../yours", "..%2fyours", "../../etc/passwd"] {
         let request = Request::builder()
@@ -430,7 +421,7 @@ async fn hiding_an_app_takes_its_handler_down_too() {
 #[tokio::test]
 async fn a_handler_is_validated_when_it_is_uploaded() {
     let (_dir, config) = server();
-    let token = ticket(&config, "app", Duration::from_secs(60));
+    let token = ticket(&config, "app", Duration::from_secs(60)).await;
 
     let bad = Request::builder()
         .method("PUT")
@@ -1543,7 +1534,7 @@ async fn notes_survive_for_the_next_session_but_never_reach_a_visitor() {
 #[tokio::test]
 async fn an_agent_can_fetch_back_the_project_it_published() {
     let (_dir, config) = server();
-    let token = ticket(&config, "myapp", Duration::from_secs(60));
+    let token = ticket(&config, "myapp", Duration::from_secs(60)).await;
 
     // Nothing stored yet: say so, and say what to do about it.
     let (status, body, _) = send(&config, get(&format!("/upload/{token}?source"))).await;
@@ -1571,7 +1562,7 @@ async fn an_agent_can_fetch_back_the_project_it_published() {
 #[tokio::test]
 async fn source_is_never_served_to_a_visitor() {
     let (_dir, config) = server();
-    let token = ticket(&config, "myapp", Duration::from_secs(60));
+    let token = ticket(&config, "myapp", Duration::from_secs(60)).await;
     send(
         &config,
         Request::builder()
@@ -1595,8 +1586,8 @@ async fn source_is_never_served_to_a_visitor() {
 #[tokio::test]
 async fn a_ticket_reads_only_its_own_app() {
     let (_dir, config) = server();
-    let mine = ticket(&config, "mine", Duration::from_secs(60));
-    let theirs = ticket(&config, "theirs", Duration::from_secs(60));
+    let mine = ticket(&config, "mine", Duration::from_secs(60)).await;
+    let theirs = ticket(&config, "theirs", Duration::from_secs(60)).await;
 
     send(
         &config,
@@ -1624,7 +1615,7 @@ async fn a_ticket_reads_only_its_own_app() {
 #[tokio::test]
 async fn an_owner_pastes_settings_through_a_link_the_agent_never_reads() {
     let (_dir, config) = server();
-    let link = toolsite::platform::secrets::create_entry(&config, "scraper").unwrap();
+    let link = toolsite::platform::secrets::create_entry(&config, "scraper").await.unwrap();
     let token = link.rsplit('/').next().unwrap().to_string();
 
     let (status, form, _) = send(&config, get(&format!("/settings/{token}"))).await;
@@ -1662,7 +1653,7 @@ async fn an_owner_pastes_settings_through_a_link_the_agent_never_reads() {
 #[tokio::test]
 async fn a_settings_link_is_scoped_and_expires() {
     let (_dir, config) = server();
-    toolsite::platform::secrets::create_entry(&config, "mine").unwrap();
+    toolsite::platform::secrets::create_entry(&config, "mine").await.unwrap();
 
     let (status, ..) = send(&config, get("/settings/not-a-real-token")).await;
     assert_eq!(status, StatusCode::GONE);
@@ -1696,7 +1687,7 @@ async fn settings_are_absent_from_everything_a_visitor_or_agent_can_fetch() {
     }
 
     // Not in the source archive an agent pulls back either.
-    let ticket = ticket(&config, "scraper", Duration::from_secs(60));
+    let ticket = ticket(&config, "scraper", Duration::from_secs(60)).await;
     send(
         &config,
         Request::builder()
@@ -1854,7 +1845,7 @@ async fn the_scaffold_carries_the_schema_its_handler_expects() {
 #[tokio::test]
 async fn an_unknown_upload_flag_is_refused_not_published() {
     let (_dir, config) = server();
-    let token = ticket(&config, "app", Duration::from_secs(60));
+    let token = ticket(&config, "app", Duration::from_secs(60)).await;
     std::fs::create_dir_all(config.data_dir.join("app")).unwrap();
     std::fs::write(config.data_dir.join("app/index.html"), "<h1>the app</h1>").unwrap();
 
@@ -1905,7 +1896,7 @@ async fn publishing_an_app_replaces_a_page_of_the_same_name() {
     // pushed first, then a bundle at the same slug.
     write_page(&config, "releases", "<!doctype html>slug = \"releases\"");
 
-    let token = ticket(&config, "releases", Duration::from_secs(60));
+    let token = ticket(&config, "releases", Duration::from_secs(60)).await;
     let mut builder = tar::Builder::new(Vec::new());
     let body = b"<!doctype html><title>Release watcher</title>";
     let mut header = tar::Header::new_gnu();
@@ -1980,7 +1971,6 @@ fn public_server() -> (TempDir, Arc<Config>) {
         base_url: Some(BASE.to_string()),
         local_base: "http://localhost:8080".to_string(),
         valid_tokens: Vec::new(),
-        uploads: std::sync::Mutex::new(std::collections::HashMap::new()),
         ..Config::local(dir.path().to_path_buf(), "unused")
     });
     (dir, config)
@@ -2570,7 +2560,7 @@ async fn stored_files_are_not_reachable_as_assets_only_through_the_handler() {
 async fn an_agent_seeds_a_file_through_its_upload_ticket() {
     let (_dir, config) = server();
     publish_handler(&config, "app");
-    let ticket = ticket(&config, "app", Duration::from_secs(60));
+    let ticket = ticket(&config, "app", Duration::from_secs(60)).await;
 
     let (status, body, _) = send(
         &config,
@@ -3961,7 +3951,6 @@ fn scoped_site() -> (TempDir, Arc<Config>) {
         base_url: Some(BASE.to_string()),
         local_base: "http://localhost:8080".to_string(),
         valid_tokens: vec![TOKEN.to_string()],
-        uploads: std::sync::Mutex::new(std::collections::HashMap::new()),
         ..Config::local(dir.path().to_path_buf(), "unused")
     });
     (dir, config)
@@ -4967,7 +4956,7 @@ async fn a_bundle_in_chunks_out_of_order_serves_exactly_as_the_put_does() {
     assert!(archive.len() > 2 * 70_000, "the archive is too small to need three chunks");
 
     // The PUT path.
-    let ticket = ticket(&config, "via-put", Duration::from_secs(60));
+    let ticket = ticket(&config, "via-put", Duration::from_secs(60)).await;
     let (status, put_reply, _) = send(
         &config,
         Request::builder().method("PUT").uri(format!("/upload/{ticket}?bundle&spa")).body(Body::from(archive.clone())).unwrap(),
@@ -5121,7 +5110,7 @@ async fn a_preview_token_signs_a_browser_in_once_with_an_app_cookie() {
         _ => panic!("no account"),
     };
 
-    let token = toolsite::platform::preview::issue(&config, "members", "/", Some(&user.id)).unwrap();
+    let token = toolsite::platform::preview::issue(&config, "members", "/", Some(&user.id)).await.unwrap();
     let (status, _, headers) = send(&config, get(&format!("/preview/{token}"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), "/p/members/");
@@ -5143,15 +5132,15 @@ async fn a_preview_token_signs_a_browser_in_once_with_an_app_cookie() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // With no account it only redirects, and sets nothing.
-    let token = toolsite::platform::preview::issue(&config, "members", "/x?y=1", None).unwrap();
+    let token = toolsite::platform::preview::issue(&config, "members", "/x?y=1", None).await.unwrap();
     let (status, _, headers) = send(&config, get(&format!("/preview/{token}"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), "/p/members/x?y=1");
     assert!(!headers.iter().any(|(k, _)| k == "set-cookie"));
 
     // Expired is gone.
-    let token = toolsite::platform::preview::issue(&config, "members", "/", None).unwrap();
-    config.previews.lock().unwrap().get_mut(&token).unwrap().expires_at = Instant::now() - Duration::from_secs(1);
+    let token = toolsite::platform::preview::issue(&config, "members", "/", None).await.unwrap();
+    assert!(config.stores.tickets.expire(toolsite::state::tickets::Kind::Preview, &token).await.unwrap());
     let (status, ..) = send(&config, get(&format!("/preview/{token}"))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
@@ -5166,7 +5155,7 @@ async fn without_a_browser_the_screenshot_tool_says_what_to_set() {
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("TOOLSITE_BROWSER") && text.contains("WITH_BROWSER"), "{text}");
     // No preview token is left behind by a refused render.
-    assert!(config.previews.lock().unwrap().is_empty());
+    assert_eq!(config.stores.tickets.live(toolsite::state::tickets::Kind::Preview).await.unwrap(), 0);
 
     // Options are checked before anything runs.
     let result = mcp_tool_raw(&config, "/mcp", TOKEN, "screenshot", serde_json::json!({"slug": "app", "width": 100})).await;
@@ -5254,7 +5243,13 @@ async fn the_screenshot_tool_hands_the_renderer_a_preview_url_on_the_preview_bas
     assert_eq!((*width, *full_page), (1600, true));
     // The token in that URL is a live one-time sign-in for this app and path.
     let token = url.rsplit('/').next().unwrap();
-    let ticket = config.previews.lock().unwrap().get(token).map(|t| (t.app.clone(), t.path.clone()));
+    let ticket = config
+        .stores
+        .tickets
+        .get::<toolsite::platform::preview::PreviewTicket>(toolsite::state::tickets::Kind::Preview, token)
+        .await
+        .unwrap()
+        .map(|t| (t.app, t.path));
     assert_eq!(ticket, Some(("app".to_string(), "/reports".to_string())));
 
     // An image block, scaled to the output width, and a line that says what it is.
@@ -6978,7 +6973,7 @@ async fn a_manifest_upload_with_tools_says_where_they_are_live() {
     let (_dir, config) = scoped_site();
     write_page(&config, "farm/index", "<title>Farm</title>");
     publish_handler(&config, "farm");
-    let upload = ticket(&config, "farm", Duration::from_secs(60));
+    let upload = ticket(&config, "farm", Duration::from_secs(60)).await;
     let request = Request::builder()
         .method("PUT")
         .uri(format!("/upload/{upload}?manifest"))
@@ -6988,7 +6983,7 @@ async fn a_manifest_upload_with_tools_says_where_they_are_live() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains(&format!("Tools are live at {BASE}/p/farm/mcp")), "{body}");
 
-    let upload = ticket(&config, "farm", Duration::from_secs(60));
+    let upload = ticket(&config, "farm", Duration::from_secs(60)).await;
     let request = Request::builder()
         .method("PUT")
         .uri(format!("/upload/{upload}?manifest"))
