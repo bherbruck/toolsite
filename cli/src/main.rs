@@ -855,33 +855,46 @@ fn sql_archive(dir: &Path) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
-/// Everything except what a package manager or compiler can restore.
+/// Everything except what a package manager or compiler can restore, at
+/// any depth: a project's handler crate keeps its own `target`, and its
+/// front end its own `node_modules`.
 ///
-/// Build output is kept deliberately: for a project with no build step the
-/// dist directory *is* the source, and dropping it would send back an archive
-/// with the app missing from it.
+/// A `dist` is skipped only beside a `package.json`, where a build makes it
+/// again. Without one, for a project with no build step, the dist directory
+/// *is* the source, and dropping it would send back an archive with the app
+/// missing from it.
 fn project_archive(dir: &Path) -> Result<Vec<u8>> {
-    const SKIP: [&str; 3] = ["node_modules", "target", ".git"];
-
     let mut builder = tar::Builder::new(Vec::new());
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if SKIP.contains(&name.as_str()) {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            builder.append_dir_all(&name, &path)?;
-        } else {
-            builder.append_path_with_name(&path, &name)?;
-        }
-    }
+    append_source(&mut builder, dir, Path::new(""))?;
     let tar = builder.into_inner()?;
 
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut encoder, &tar)?;
     Ok(encoder.finish()?)
+}
+
+fn append_source(builder: &mut tar::Builder<Vec<u8>>, dir: &Path, within: &Path) -> Result<()> {
+    const SKIP: [&str; 3] = ["node_modules", "target", ".git"];
+    let built = dir.join("package.json").is_file();
+    let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if SKIP.contains(&text.as_ref()) || (built && text == "dist") {
+            continue;
+        }
+        let path = entry.path();
+        let inside = within.join(&name);
+        // Not followed through a link: a link to a parent would never end.
+        if entry.file_type()?.is_dir() {
+            builder.append_dir(&inside, &path)?;
+            append_source(builder, &path, &inside)?;
+        } else {
+            builder.append_path_with_name(&path, &inside)?;
+        }
+    }
+    Ok(())
 }
 
 /// The slug recorded in toolsite.toml, if there is one.
@@ -1036,6 +1049,54 @@ mod tests {
         assert_eq!(json_scalar("hello".into()), json!("hello"));
         // A quoted-looking number is still text if it cannot parse.
         assert_eq!(json_scalar("42abc".into()), json!("42abc"));
+    }
+
+    #[test]
+    fn the_source_archive_leaves_out_what_a_build_restores_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for file in [
+            "package.json",
+            "src/App.tsx",
+            "dist/index.html",
+            "node_modules/react/index.js",
+            "handler/Cargo.toml",
+            "handler/src/lib.rs",
+            "handler/target/release/big.wasm",
+            "handler/node_modules/x.js",
+            "web/package.json",
+            "web/dist/app.js",
+            "web/node_modules/y.js",
+            "vendor/.git/HEAD",
+            "static/dist/index.html",
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, file).unwrap();
+        }
+
+        let bytes = project_archive(root).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        let mut names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.header().entry_type().is_file())
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        // A dist with no package.json beside it is the app itself, and stays.
+        assert_eq!(
+            names,
+            [
+                "handler/Cargo.toml",
+                "handler/src/lib.rs",
+                "package.json",
+                "src/App.tsx",
+                "static/dist/index.html",
+                "web/package.json",
+            ]
+        );
     }
 
     #[test]

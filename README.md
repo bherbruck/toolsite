@@ -1088,8 +1088,9 @@ toolsite fetch             # a later session unpacks the project and carries on
 
 Over HTTP that is `PUT <upload-url>?source` and `GET <upload-url>?source`: the
 same ticket, both directions, scoped to the same slug. `node_modules`,
-`target` and `.git` are left out; build output is kept, because a project with
-no build step has nothing else.
+`target` and `.git` are left out at any depth, and so is a `dist` beside a
+`package.json`, which a build makes again. A `dist` with no `package.json`
+beside it is kept, because a project with no build step has nothing else.
 
 Nothing stored beside an app is reachable under `/p/`: not `.source`, not
 `.notes`, not `.meta`, not `.exports`, not `.devices`, not `.blobs/`. If a visitor should be
