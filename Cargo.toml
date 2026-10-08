@@ -67,6 +67,11 @@ tokio-tungstenite = "0.30.0"
 rumqttc = { version = "0.25.1", default-features = false }
 wat = "1.255.0"
 
+# A handler's cost against native, per workload: `cargo bench --bench handler`.
+[[bench]]
+name = "handler"
+harness = false
+
 # Compiling a handler runs Cranelift. Unoptimised, it takes minutes for a
 # large guest on a loaded machine, so tests time out waiting for an app's
 # first reply. Optimise the compiler even in debug builds.
