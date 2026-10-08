@@ -538,10 +538,20 @@ async fn an_app_runs_only_a_few_jobs_at_once_however_they_are_started() {
     // Another app starts at once.
     assert_eq!(run_now(&site, "other", "nap").await, (200, "started".into()));
 
-    assert!(until(Duration::from_secs(60), || !(0..6).any(|n| site.config.jobs.is_running("greedy", &format!("nap{n}")))).await);
-    // Two runs, and nap0's one queued rerun: never more than two at a time.
+    // Two runs, and nap0's one queued rerun, never more than two at a time.
+    // Watched until all three have marked, rather than until nothing runs:
+    // a slot can be free a moment before the run that held it has written.
+    let mut most = 0;
+    let all_marked = until(Duration::from_secs(60), || {
+        most = most.max((0..6).filter(|n| site.config.jobs.is_running("greedy", &format!("nap{n}"))).count());
+        marks(&site.config, "greedy", "nap") >= 3
+    })
+    .await;
     let jobs = schedule::read_jobs(&site.config, "greedy");
-    assert_eq!(marks(&site.config, "greedy", "nap"), 3, "{:?}", (jobs.get("nap0"), jobs.get("nap1")));
+    assert!(all_marked, "{} marks: {:?}", marks(&site.config, "greedy", "nap"), (jobs.get("nap0"), jobs.get("nap1")));
+    assert!(most <= 2, "{most} of the app's jobs ran at once");
+    assert!(until(Duration::from_secs(60), || !(0..6).any(|n| site.config.jobs.is_running("greedy", &format!("nap{n}")))).await);
+    assert_eq!(marks(&site.config, "greedy", "nap"), 3, "a run beyond the two and the queued one");
     // With the slots free again, the next asks start.
     assert_eq!(run_now(&site, "greedy", "nap2").await, (200, "started".into()));
 }

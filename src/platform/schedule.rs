@@ -270,7 +270,15 @@ fn write_jobs(config: &Config, app: &str, jobs: &BTreeMap<String, Job>) -> Resul
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(jobs).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    // Written beside and renamed over, never rewritten in place: readers
+    // take no lock, and one that opened the file mid-write would read it
+    // empty and decide the app has no jobs at all.
+    let temp = path.with_extension(format!("jobs.{}.tmp", std::process::id()));
+    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        e.to_string()
+    })
 }
 
 /// Changes one job's record under the file lock. Nothing happens if the job
