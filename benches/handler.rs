@@ -7,7 +7,8 @@
 //!
 //! `BENCH_RUNS` sets the repetitions per route (default 3); the median is
 //! reported, since a loaded machine makes the mean meaningless.
-//! `BENCH_ROUTES=page,write` runs only those.
+//! `BENCH_ROUTES=page,write` runs only those. The database carries a
+//! production-sized schema besides the table the routes use.
 
 #[path = "../tests/fixtures/bench/src/work.rs"]
 mod work;
@@ -26,10 +27,13 @@ const APP: &str = "bench";
 
 /// Generous enough that no workload is cut short: the point is what each
 /// costs, not where the production ceilings sit.
+/// Rows per query stay at the production default, so paging costs what it
+/// does for a real app.
 const GUARDS: Guards = Guards {
-    fuel: 50_000_000_000,
+    fuel: Some(50_000_000_000),
     memory_bytes: 256 * 1024 * 1024,
     wall_clock: Duration::from_secs(600),
+    query_rows: 1_000,
 };
 
 struct Native(rusqlite::Connection);
@@ -77,7 +81,32 @@ fn seed(config: &Config) {
            select 'product-' || (i % 400), 'ingredient-' || (i % 1300), (i % 97) * 0.25, (i % 31) * 1.5 from c;",
     )
     .unwrap();
+    // The rest of a real app's schema, at the size of one in production:
+    // SQLite parses all of it on a connection's first statement.
+    let mut schema = String::new();
+    for t in 0..SCHEMA_TABLES {
+        schema += &format!(
+            "create table t{t} (id integer primary key, name text, amount real, ref integer, updated_at text);
+             create index t{t}_name on t{t} (name);
+             create trigger t{t}_stamp after update on t{t} begin
+               update t{t} set updated_at = datetime('now') where id = new.id;
+             end;"
+        );
+        if t % 2 == 0 {
+            schema += &format!(
+                "create index t{t}_ref on t{t} (ref, amount);
+                 create trigger t{t}_guard before insert on t{t} when new.amount < 0 begin
+                   select raise(abort, 'negative amount');
+                 end;"
+            );
+        }
+    }
+    conn.execute_batch(&schema).unwrap();
 }
+
+/// 100 tables, 150 indexes, 150 triggers: about the size of the schema
+/// whose app prompted this.
+const SCHEMA_TABLES: usize = 100;
 
 /// What the pieces of one host round trip cost on their own, each averaged
 /// over many repetitions.
@@ -96,6 +125,14 @@ fn attribute(site: &Config, user: &User) {
     }));
     each("open and close the app database", 500, Box::new(|| {
         toolsite::runtime::db::open_unguarded(&path, site.max_db_bytes).unwrap();
+    }));
+    each("open, run select 1, close (parses the schema)", 500, Box::new(|| {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.query_row("select 1", [], |_| Ok(())).unwrap();
+    }));
+    each("run_as select 1 (the old per-query path)", 500, Box::new(|| {
+        let who = toolsite::runtime::db::Identity { user_id: user.id.clone(), email: user.email.clone(), role: None };
+        toolsite::runtime::db::run_as(site, APP, Some(&who), "select 1", &[]).unwrap();
     }));
     let conn = toolsite::runtime::db::open_unguarded(&path, site.max_db_bytes).unwrap();
     let lookup = "select qty, cost from formulation where id = ?";
@@ -161,7 +198,7 @@ fn main() {
 
     let path = site.data_dir.join(APP).join("data.db");
     let only = std::env::var("BENCH_ROUTES").unwrap_or_default();
-    for route in ["page", "lookup", "cpu", "write"] {
+    for route in ["trivial", "page", "lookup", "cpu", "write"] {
         if !only.is_empty() && !only.split(',').any(|r| r == route) {
             continue;
         }
@@ -188,6 +225,7 @@ fn main() {
                         "page" => work::page(&mut db),
                         "lookup" => work::lookup(&mut db),
                         "cpu" => work::cpu(),
+                        "trivial" => work::trivial(&mut db),
                         _ => work::write(&mut db),
                     };
                     started.elapsed()

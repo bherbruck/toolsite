@@ -56,6 +56,15 @@ pub fn page(db: &mut impl Db) -> String {
     format!("rows={seen} products={} sum={sum:.3}", totals.len())
 }
 
+/// Statements that do nothing, so all that is measured is the round trip.
+pub fn trivial(db: &mut impl Db) -> String {
+    let mut sum = 0.0;
+    for _ in 0..1_000 {
+        sum += db.query("select 1", &[])[0][0].f();
+    }
+    format!("sum={sum}")
+}
+
 /// Many small indexed reads.
 pub fn lookup(db: &mut impl Db) -> String {
     let mut sum = 0.0;

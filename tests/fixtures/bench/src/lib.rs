@@ -48,6 +48,7 @@ impl Guest for Handler {
             "/page" => work::page(&mut Host),
             "/lookup" => work::lookup(&mut Host),
             "/cpu" => work::cpu(),
+            "/trivial" => work::trivial(&mut Host),
             "/write" => work::write(&mut Host),
             "/noop" => String::new(),
             _ => return Response { status: 404, headers: Vec::new(), body: Vec::new() },
