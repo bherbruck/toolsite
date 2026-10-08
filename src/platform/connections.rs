@@ -17,7 +17,7 @@ use crate::{
     content::store::PortSocket,
     runtime::{
         connections::{Message, Outgoing, Registration},
-        wasm::{ConnectInfo, ConnectionEvent, ConnectionMessage, Guards, User as GuestUser},
+        wasm::{ConnectInfo, ConnectionEvent, ConnectionMessage, User as GuestUser},
     },
     AppState,
 };
@@ -117,7 +117,10 @@ async fn deliver(
     conn: &str,
     event: ConnectionEvent,
 ) -> Result<Option<Result<(), String>>, String> {
-    if let Some(resident) = crate::content::store::read_meta(&state.config, app).await.resident {
+    let meta = crate::content::store::read_meta(&state.config, app).await;
+    // Each event is a call like a request, with the request's limits.
+    let guards = state.config.limits.effective(meta.limits.as_ref()).request;
+    if let Some(resident) = meta.resident {
         // Read only when the instance starts: a queued event holds no copy.
         if !crate::content::serve::has_handler(&state.config, app).await {
             return Ok(None);
@@ -127,7 +130,7 @@ async fn deliver(
         return state
             .config
             .residents
-            .deliver(&state.runtime, &state.config, load, app, settings, guest_user(visitor), conn, event, Guards::default())
+            .deliver(&state.runtime, &state.config, load, app, settings, guest_user(visitor), conn, event, guards)
             .await
             .map(Some);
     }
@@ -137,7 +140,7 @@ async fn deliver(
     let (runtime, config, app, user, conn) =
         (state.runtime.clone(), state.config.clone(), app.to_string(), guest_user(visitor), conn.to_string());
     tokio::task::spawn_blocking(move || {
-        runtime.connection_event(config, &app, &wasm, user, &conn, event, Guards::default())
+        runtime.connection_event(config, &app, &wasm, user, &conn, event, guards)
     })
     .await
     .map_err(|e| e.to_string())?

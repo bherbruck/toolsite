@@ -208,7 +208,7 @@ For when the CLI isn't installed, or there is no shell at all.
 | `set_icon(slug, icon)` | Emoji, inline `<svg>`, or `data:` URI. Optional; pages without one get a generated badge. |
 | `run_sql(app, sql, params?)` | Schema and seed work against one app's database. MCP only; never reachable from a published page. |
 | `app_migrations(app, files?)` | The app's schema as numbered `.sql` files, applied once each in order. Omit `files` to see what ran. |
-| `app_jobs(app, name?, schedule?, path?, run_now?)` | Scheduled work. Cron with seconds first; fires the app's own handler at a path. |
+| `app_jobs(app, name?, schedule?, path?, run_now?)` | Scheduled work. Cron with seconds first; fires the app's own handler at a path. `run_now` needs Manage; a running job runs once more when it finishes. |
 | `app_settings(app, name?, value?, link?)` | API keys the handler reads. Pass `link: true` for a URL the owner pastes into; never ask for a secret directly. |
 | `app_notes(slug, notes?)` | Markdown kept with an app for the next session. Reads when `notes` is omitted. |
 | `app_repo(app, action, repo?, branch?, directory?, installation?, public?)` | `status`, `installations`, `discover`, `create`, `import`, `sync`, `disconnect`. See [A repository](#a-repository). |
@@ -316,6 +316,24 @@ a wall-clock deadline. One that loops forever is killed and returns 500. Because
 instances are never reused, **state must live in the database or in files,
 never in globals or statics.** A request body into a handler is capped at
 8 MB; a file that big or bigger goes through [Files](#files).
+
+**Limits.** By default a request gets 5 s, 64 MB and 1,000 rows a query, a job
+60 s and 128 MB. Ask for more under `[limits]` in toolsite.toml
+(`request_seconds`, `request_fuel`, `job_seconds`, `job_fuel`, `query_rows`,
+`memory_mb`); the site's ceilings (by default 60 s, 900 s, 50,000 rows,
+1024 MB) clamp anything higher, and the deploy output says "asked for X, the
+site allows Y". `fetch` metadata shows the `limits` an app runs under.
+
+**Many writes:** `db::batch(&[db::Statement { sql, params }])` runs every
+statement in one transaction, all or nothing, and returns rows changed per
+statement (at most 10,000 statements, 4 MB of SQL; select rows are
+discarded). `db::batch_scoped` is the same through the declared access.
+
+**Jobs from the app:** `jobs::run("name")` starts one of the app's declared
+jobs in the background, no identity, job limits, and returns `started`.
+While that job runs it returns `queued` and the job runs once more right
+after, so a staged job asks for itself at the end of each stage and the
+stages run back to back. 600 starts a minute per app.
 
 ### Minimal Rust handler
 
@@ -447,10 +465,14 @@ roles = ["viewer", "editor"]   # what the handler checks; a hint for whoever gra
 path = "/triage"
 gate = "authenticated"
 
-[[job]]                        # six cron fields, seconds first
+[[job]]                        # six cron fields, seconds first; */10 * * * * * is every 10 s
 name = "rollup"
 schedule = "0 0 3 * * *"
 path = "/api/rollup"
+
+[limits]                       # optional, clamped to the site's ceilings
+job_seconds = 600
+query_rows = 10000
 ```
 
 `toolsite deploy` applies it; otherwise `curl -f -T toolsite.toml

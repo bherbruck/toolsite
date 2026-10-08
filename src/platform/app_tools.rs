@@ -390,9 +390,10 @@ pub async fn call(
         body: body.into_bytes(),
     };
     let visitor = user.map(|user| crate::runtime::wasm::User { id: user.id, email: user.email });
+    let guards = crate::runtime::limits::of(config, app).await.request;
     let (runtime, config, owned_app) = (runtime.clone(), config.clone(), app.to_string());
     let outcome = tokio::task::spawn_blocking(move || {
-        runtime.handle(config, &owned_app, &wasm, visitor, request, crate::runtime::wasm::Guards::default())
+        runtime.handle(config, &owned_app, &wasm, visitor, request, guards)
     })
     .await;
     let response = match outcome {

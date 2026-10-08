@@ -164,6 +164,29 @@ Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
 wall-clock deadline. State must live in the database. A global does not
 survive the request that set it.
 
+Defaults: a request gets 5 s, 64 MB and 1,000 rows a query; a job 60 s and
+128 MB. Heavy work asks for more in toolsite.toml, up to the site's ceilings
+(by default 60 s a request, 900 s a job, 50,000 rows, 1024 MB); a value past
+a ceiling is clamped and the deploy says so:
+
+```toml
+[limits]
+request_seconds = 20
+job_seconds = 600
+query_rows = 10000
+memory_mb = 512        # also request_fuel, job_fuel
+```
+
+Many writes: `db::batch(&[Statement { sql, params }, ...])` runs them in one
+transaction, all or nothing, and returns rows changed per statement. Up to
+10,000 statements and 4 MB of SQL; rows a select returns are discarded.
+`db::batch_scoped` does the same through the app's declared access.
+
+Work in stages: `jobs::run("name")` starts a declared job now, in the
+background, with no user. Called while that job runs (from the job itself
+too) it queues one more run right after, so a job chains its stages by
+asking for itself at the end of each: `started` or `queued`.
+
 The host sets `x-toolsite-scheduled` on a job run and `x-toolsite-tool` on an
 app tool call. Client copies of any `x-toolsite-*` header are stripped, so
 each means what it says.
@@ -225,10 +248,13 @@ roles = ["viewer", "editor"]  # what the handler checks; a hint for whoever gran
 path = "/admin"
 gate = "restricted"
 
-[[job]]                    # six cron fields, seconds first
+[[job]]                    # six cron fields, seconds first; */10 * * * * * is every 10 s
 name = "refresh"
 schedule = "0 */5 * * * *"
 path = "/api/refresh"
+
+[limits]                   # optional; clamped to the site's ceilings
+job_seconds = 600
 ```
 
 Routes, jobs and tools are replaced wholesale, so deleting a line removes the

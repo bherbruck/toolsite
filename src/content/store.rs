@@ -115,6 +115,11 @@ pub struct PageMeta {
     /// events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident: Option<ResidentMeta>,
+    /// What the app's `[limits]` asked for, before the site's ceilings:
+    /// `runtime::limits` clamps per call, so a raised ceiling applies
+    /// without a redeploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::runtime::limits::Asked>,
     /// The DNS label of the app's host in subdomain mode, assigned once by
     /// `origins::label_for` so the host never changes under it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +266,7 @@ impl Default for PageMeta {
             ports: Vec::new(),
             resident: None,
             label: None,
+            limits: None,
         }
     }
 }

@@ -437,9 +437,10 @@ Requests are then resolved in a fixed order:
 The guest sees the path relative to its app (`/api/echo`, not
 `/p/myapp/api/echo`), so a handler never needs to know where it is mounted.
 
-**What a handler can and cannot do.** It gets five imports and nothing else:
-`db.query`, bound to its own app's database with parameters bound rather than
-interpolated; `blobs`, its own files; `identity.current-user` and
+**What a handler can and cannot do.** It gets these imports and nothing else:
+`db.query` and `db.batch`, bound to its own app's database with parameters
+bound rather than interpolated; `blobs`, its own files; `jobs.run`, its own
+declared jobs; `identity.current-user` and
 `current-role`, which it cannot forge; `secrets.get`, settings the owner
 entered; and `fetch.send`, only to hosts the app declared. It gets no
 filesystem, no environment, no sockets, and no clock beyond what the world
@@ -451,6 +452,54 @@ Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
 wall-clock deadline. A handler that loops forever is killed and returns 500;
 the server keeps serving. Because instances are never reused, state must live
 in the database.
+
+### Limits
+
+What one call may use, and what an app gets without asking:
+
+| | Request | Job | Most an app may ask for |
+|---|---|---|---|
+| Wall clock | 5 s | 60 s | 60 s a request, 900 s a job |
+| Fuel (instructions) | 200,000,000 | 2,000,000,000 | 2,000,000,000 a request, 100,000,000,000 a job |
+| Memory | 64 MB | 128 MB | 1024 MB |
+| Rows one query returns | 1,000 | 1,000 | 50,000 |
+
+An app that needs more says so in its toolsite.toml:
+
+```toml
+[limits]
+request_seconds = 20
+job_seconds = 600
+job_fuel = 50000000000
+query_rows = 10000
+memory_mb = 512
+```
+
+Every key is optional; one left out keeps its default. A value past the site's
+ceiling is clamped, not refused, and the deploy says so: `[limits]
+job_seconds: asked for 3600, the site allows 900`. The site's owner sets the
+ceilings with `TOOLSITE_MAX_REQUEST_FUEL`, `TOOLSITE_MAX_REQUEST_SECONDS`,
+`TOOLSITE_MAX_JOB_FUEL`, `TOOLSITE_MAX_JOB_SECONDS`, `TOOLSITE_MAX_QUERY_ROWS`
+and `TOOLSITE_MAX_MEMORY_MB`; a ceiling below a default lowers the default
+too, and a fuel ceiling of `none` meters no fuel, leaving the wall clock as
+the only time limit. What the app asked is stored, and clamped per call, so a
+raised ceiling applies without a redeploy. `memory_mb` covers requests and
+jobs; a resident instance has its own under `[resident]`. `query_rows`
+applies to `query` and `query-scoped` alike. The app's admin page and its
+`fetch` metadata (`limits`) show what it runs under now.
+
+### Writing many rows: db.batch
+
+`db.batch(statements)` runs a list of statements, each `{ sql, params }` with
+its own bound parameters, in one transaction: all of them, or, if any fails,
+none. It answers the rows each statement changed, in order. It has
+`db.query`'s refusals (no `attach`, no `pragma`) and its deadline, and
+refuses `begin`, `commit` and `savepoint` inside, since the host holds the
+transaction. One statement per entry. A statement that returns rows (a
+`select`, or `returning`) runs and its rows are discarded; read with `query`.
+At most 10,000 statements and 4 MB of SQL text a batch.
+`db.batch-scoped` is the same as the visitor, held to the app's declared
+access like `query-scoped`: a write the policy forbids fails the whole batch.
 
 ## An app's schema
 
@@ -570,15 +619,31 @@ toolsite job myapp refresh --remove
 ```
 
 Six cron fields, seconds first: `0 */5 * * * *` is every five minutes,
-`0 0 3 * * *` is 03:00 daily. A bad expression is refused when you set it
-rather than silently never firing. The app's Jobs tab on `/admin` shows the
-same list with the last run and its status, and a Run now button.
+`*/10 * * * * *` every ten seconds, `0 0 3 * * *` is 03:00 daily. The
+scheduler sleeps until the next job is due, to the second, and wakes when
+jobs change, so a schedule fires when it says. A bad expression is refused
+when you set it rather than silently never firing. The app's Jobs tab on
+`/admin` shows the same list with when each last started, how long it took,
+its status and whether it is running, and to someone who manages the app, a
+Run now button. Running a job by hand, there or with `app_jobs` `run_now`,
+takes Manage on the app; scheduling one takes Edit.
 
 The handler sees an `x-toolsite-scheduled` header naming the job, so a route
 can behave differently when nobody is waiting on the other end. A job that
 missed its turn while the server was down fires once when it comes back, not
-once per missed interval, and a job still running when its next turn arrives
-is skipped rather than stacked.
+once per missed interval. A job runs once at a time: one still running when
+its next turn arrives is skipped rather than stacked, and the skip recorded.
+Jobs run under the job limits (see Limits).
+
+**Starting a job from the app.** `jobs.run(name)` starts one of the app's
+declared jobs now, in the background, as the schedule would: no signed-in
+user, the job's limits, recorded as a run. It answers `started`. Asked while
+that job is running, from a request or from the job itself, it queues one
+more run for the moment the current one finishes and answers `queued`; more
+asks before then are the same one run. So a job that works in stages asks
+for itself at the end of each, and the next stage starts with no gap. An app
+may start 600 a minute (`TOOLSITE_JOB_STARTS_PER_MINUTE`), queued runs
+included; it can never name another app's job.
 
 ## Settings
 
@@ -1711,6 +1776,13 @@ is required to serve HTTP.
 | `TOOLSITE_RESIDENT_MAX` | no (default `20`) | The most resident instances that run at once. Each is a thread. |
 | `TOOLSITE_RESIDENT_TOTAL_MB` | no (default `2048`) | The most memory the caps of all running resident instances may add up to. At least `TOOLSITE_RESIDENT_MAX_MB`. |
 | `TOOLSITE_RESIDENT_QUEUE` | no (default `256`) | The connection events that may wait for one resident instance. One more is refused. |
+| `TOOLSITE_MAX_REQUEST_SECONDS` | no (default `60`) | The most wall clock an app's `[limits]` may ask for a request. See Limits. |
+| `TOOLSITE_MAX_REQUEST_FUEL` | no (default `2000000000`) | The most fuel a request may ask for. `none` meters no fuel for requests. |
+| `TOOLSITE_MAX_JOB_SECONDS` | no (default `900`) | The most wall clock a job may ask for. |
+| `TOOLSITE_MAX_JOB_FUEL` | no (default `100000000000`) | The most fuel a job may ask for. `none` meters no fuel for jobs. |
+| `TOOLSITE_MAX_QUERY_ROWS` | no (default `50000`) | The most rows one `query` may return when an app asks. |
+| `TOOLSITE_MAX_MEMORY_MB` | no (default `1024`) | The most memory a request or job may ask for. |
+| `TOOLSITE_JOB_STARTS_PER_MINUTE` | no (default `600`) | Jobs one app may start through `jobs.run` in a minute, queued reruns included. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings and two-step sign-in secrets. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |

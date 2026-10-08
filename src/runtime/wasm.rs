@@ -53,7 +53,7 @@ use self::toolsite::app::blobs::{
 };
 use self::toolsite::app::connections::Message as WitMessage;
 pub use self::toolsite::app::connections::{ConnectInfo, Event as ConnectionEvent, Message as ConnectionMessage};
-use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Value as WitValue};
+use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Statement as WitStatement, Value as WitValue};
 // Request and Response already land at module scope from bindgen; User sits
 // under its interface, so re-export it rather than making callers spell out
 // the generated path.
@@ -72,22 +72,31 @@ const ON_CONNECTION: &str = "on-connection";
 /// The export a component built for `app-resident` adds.
 const ON_TICK: &str = "on-tick";
 
-#[derive(Clone, Copy, Debug)]
+/// What one call may use. An app's own come from `runtime::limits`, which
+/// applies its `[limits]` under the site's ceilings; the default is what a
+/// request gets when the app asks for nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Guards {
-    /// Instructions the guest may execute before it is killed.
-    pub fuel: u64,
+    /// Instructions the guest may execute before it is killed. `None`
+    /// meters nothing, leaving the wall clock as the only time limit.
+    pub fuel: Option<u64>,
     /// Ceiling on the guest's linear memory.
     pub memory_bytes: usize,
     /// Wall-clock ceiling, enforced even if the guest never burns fuel.
     pub wall_clock: Duration,
+    /// Rows one `query` or `query-scoped` may return before it says
+    /// `truncated`.
+    pub query_rows: usize,
 }
 
 impl Default for Guards {
     fn default() -> Self {
+        use crate::runtime::limits::*;
         Self {
-            fuel: 200_000_000,
-            memory_bytes: 64 * 1024 * 1024,
-            wall_clock: Duration::from_secs(5),
+            fuel: Some(DEFAULT_REQUEST_FUEL),
+            memory_bytes: (DEFAULT_REQUEST_MEMORY_MB * 1024 * 1024) as usize,
+            wall_clock: Duration::from_secs(DEFAULT_REQUEST_SECONDS),
+            query_rows: DEFAULT_QUERY_ROWS as usize,
         }
     }
 }
@@ -175,6 +184,8 @@ pub struct StoreState {
     /// When the current call's wall clock runs out. Epochs stop wasm at this
     /// point; host imports that wait read it to stop there too.
     deadline: Instant,
+    /// Rows one query may return, from the call's guards.
+    query_rows: usize,
 }
 
 impl StoreState {
@@ -277,7 +288,7 @@ impl self::toolsite::app::db::Host for StoreState {
     ) -> Result<WitRows, WitDbError> {
         let params: Vec<serde_json::Value> = params.into_iter().map(json_of).collect();
         let identity = self.identity();
-        wit_rows(db::run_until(&self.site, &self.app, identity.as_ref(), &sql, &params, Some(self.deadline)))
+        wit_rows(db::run_until(&self.site, &self.app, identity.as_ref(), &sql, &params, Some(self.deadline), self.query_rows))
     }
 
     fn query_scoped(
@@ -291,7 +302,47 @@ impl self::toolsite::app::db::Host for StoreState {
         // by a manifest upload applies to the next request.
         let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
         let scope = db::Scope::of(&meta);
-        wit_rows(db::run_scoped_until(&self.site, &self.app, identity.as_ref(), &scope, &sql, &params, Some(self.deadline)))
+        wit_rows(db::run_scoped_until(&self.site, &self.app, identity.as_ref(), &scope, &sql, &params, Some(self.deadline), self.query_rows))
+    }
+
+    fn batch(&mut self, statements: Vec<WitStatement>) -> Result<Vec<u64>, WitDbError> {
+        let statements = batch_of(statements);
+        let identity = self.identity();
+        wit_counts(db::batch_until(&self.site, &self.app, identity.as_ref(), &statements, Some(self.deadline)))
+    }
+
+    fn batch_scoped(&mut self, statements: Vec<WitStatement>) -> Result<Vec<u64>, WitDbError> {
+        let statements = batch_of(statements);
+        let identity = self.identity();
+        let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
+        let scope = db::Scope::of(&meta);
+        wit_counts(db::batch_scoped_until(&self.site, &self.app, identity.as_ref(), &scope, &statements, Some(self.deadline)))
+    }
+}
+
+fn batch_of(statements: Vec<WitStatement>) -> Vec<db::Statement> {
+    statements
+        .into_iter()
+        .map(|statement| db::Statement {
+            sql: statement.sql,
+            params: statement.params.into_iter().map(json_of).collect(),
+        })
+        .collect()
+}
+
+fn wit_counts(outcome: Result<Vec<u64>, String>) -> Result<Vec<u64>, WitDbError> {
+    match outcome {
+        Ok(counts) => Ok(counts),
+        Err(message) if message.contains("not authorized") => Err(WitDbError::Denied(message)),
+        Err(message) => Err(WitDbError::Failed(message)),
+    }
+}
+
+/// Starts one of this app's own jobs: `self.app` comes from the host, so a
+/// name can only ever mean a job this app declared.
+impl self::toolsite::app::jobs::Host for StoreState {
+    fn run(&mut self, name: String) -> Result<String, String> {
+        crate::platform::schedule::start_from_app(&self.site, &self.app, &name)
     }
 }
 
@@ -690,6 +741,7 @@ impl Runtime {
             user,
             connecting: None,
             deadline: Instant::now(),
+            query_rows: guards.query_rows,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -745,7 +797,8 @@ impl Runtime {
 /// from now.
 fn arm(store: &mut Store<StoreState>, guards: Guards) {
     store.data_mut().deadline = Instant::now() + guards.wall_clock;
-    store.set_fuel(guards.fuel).expect("fuel is enabled");
+    store.data_mut().query_rows = guards.query_rows;
+    store.set_fuel(guards.fuel.unwrap_or(u64::MAX)).expect("fuel is enabled");
     store.set_epoch_deadline(1);
 }
 
@@ -858,7 +911,7 @@ mod tests {
     fn an_infinite_loop_dies_on_fuel_rather_than_running_forever() {
         let runtime = runtime();
         let guards = Guards {
-            fuel: 100_000,
+            fuel: Some(100_000),
             ..Guards::default()
         };
         let error = run(&runtime, INFINITE_LOOP, guards).unwrap_err();
@@ -873,7 +926,7 @@ mod tests {
     fn a_wall_clock_deadline_applies_even_with_fuel_to_spare() {
         let runtime = runtime();
         let guards = Guards {
-            fuel: u64::MAX,
+            fuel: None,
             wall_clock: Duration::from_millis(100),
             ..Guards::default()
         };
@@ -902,7 +955,7 @@ mod tests {
         let wasm = wat::parse_str(INFINITE_LOOP).unwrap();
         let module = runtime.module(INFINITE_LOOP, &wasm).unwrap();
         let guards = Guards {
-            fuel: u64::MAX,
+            fuel: None,
             wall_clock: Duration::from_secs(5),
             ..Guards::default()
         };
@@ -958,7 +1011,7 @@ mod tests {
     fn each_request_gets_a_store_with_its_own_fuel() {
         let runtime = runtime();
         let guards = Guards {
-            fuel: 100_000,
+            fuel: Some(100_000),
             ..Guards::default()
         };
         // A store that ran to exhaustion must not affect the next one.

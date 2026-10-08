@@ -42,8 +42,10 @@ pub fn bind_identity(conn: &Connection, identity: Option<&Identity>) -> Result<(
 
 /// SQLite's own page size; the ceiling is expressed to it in pages.
 const PAGE_SIZE: u64 = 4096;
-/// Cap on rows returned in one call, so a `select *` can't blow up the caller.
-pub(crate) const MAX_ROWS: usize = 1_000;
+/// Cap on rows returned in one call, so a `select *` can't blow up the
+/// caller. A handler's own cap comes from its guards, which an app may raise
+/// under `[limits]`; this one is for the platform's own callers.
+pub(crate) const MAX_ROWS: usize = crate::runtime::limits::DEFAULT_QUERY_ROWS as usize;
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
 /// Every app gets its own file. The path comes from an already-validated slug
@@ -177,7 +179,7 @@ pub fn run_as(
     sql: &str,
     params: &[Value],
 ) -> Result<SqlOutcome, String> {
-    run_until(config, app, identity, sql, params, None)
+    run_until(config, app, identity, sql, params, None, MAX_ROWS)
 }
 
 /// `run_as`, interrupted at `deadline`. A handler's call has a wall clock,
@@ -191,12 +193,13 @@ pub fn run_until(
     sql: &str,
     params: &[Value],
     deadline: Option<std::time::Instant>,
+    max_rows: usize,
 ) -> Result<SqlOutcome, String> {
     let conn = open_as(config, app, identity)?;
     if let Some(deadline) = deadline {
         interrupt_at(&conn, deadline)?;
     }
-    execute(&conn, sql, params, true)
+    execute(&conn, sql, params, true, max_rows)
 }
 
 /// Makes SQLite stop the running statement once `deadline` passes.
@@ -352,11 +355,12 @@ pub fn run_scoped(
     sql: &str,
     params: &[Value],
 ) -> Result<SqlOutcome, String> {
-    run_scoped_until(config, app, identity, scope, sql, params, None)
+    run_scoped_until(config, app, identity, scope, sql, params, None, MAX_ROWS)
 }
 
 /// `run_scoped`, interrupted at `deadline` if that comes before its own
 /// wall clock does: what a handler's `query-scoped` gets.
+#[allow(clippy::too_many_arguments)]
 pub fn run_scoped_until(
     config: &Config,
     app: &str,
@@ -365,7 +369,23 @@ pub fn run_scoped_until(
     sql: &str,
     params: &[Value],
     deadline: Option<std::time::Instant>,
+    max_rows: usize,
 ) -> Result<SqlOutcome, String> {
+    let conn = open_scoped(config, app, identity, scope, deadline)?;
+    install_scope(&conn, scope)?;
+    execute(&conn, sql, params, false, max_rows)
+}
+
+/// The app's database as a scoped caller gets it, short of the authorizer:
+/// the identity bound, the size limits set and the clock running. The
+/// authorizer goes on last, so the host can still open a transaction.
+fn open_scoped(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    scope: &Scope,
+    deadline: Option<std::time::Instant>,
+) -> Result<Connection, String> {
     if scope.readable.is_empty() && scope.writable.is_empty() {
         return Err(format!("{app} declares nothing a person may query"));
     }
@@ -384,6 +404,12 @@ pub fn run_scoped_until(
     }
     let own = std::time::Instant::now() + SCOPED_WALL_CLOCK;
     interrupt_at(&conn, deadline.map_or(own, |deadline| deadline.min(own)))?;
+    Ok(conn)
+}
+
+/// Puts `scope`'s authorizer on a connection: from here on, only what the
+/// app declared is reachable.
+fn install_scope(conn: &Connection, scope: &Scope) -> Result<(), String> {
     let names = Scope {
         readable: scope.readable.clone(),
         writable: scope.writable.clone(),
@@ -391,8 +417,122 @@ pub fn run_scoped_until(
         inner: scope.inner.clone(),
     };
     conn.authorizer(Some(move |context: AuthContext<'_>| names.authorize(context)))
-        .map_err(|e| e.to_string())?;
-    execute(&conn, sql, params, false)
+        .map_err(|e| e.to_string())
+}
+
+/// One statement of a batch and its bound parameters.
+#[derive(Debug, Clone)]
+pub struct Statement {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
+/// The most statements one batch may hold, and the most SQL text across
+/// them: enough for a forecast's worth of rows, not enough to hold the
+/// database's write lock for long on parsing alone.
+pub const MAX_BATCH_STATEMENTS: usize = 10_000;
+pub const MAX_BATCH_SQL_BYTES: usize = 4 * 1024 * 1024;
+
+fn check_batch(statements: &[Statement]) -> Result<(), String> {
+    if statements.len() > MAX_BATCH_STATEMENTS {
+        return Err(format!(
+            "a batch holds at most {MAX_BATCH_STATEMENTS} statements, got {}",
+            statements.len()
+        ));
+    }
+    let bytes: usize = statements.iter().map(|s| s.sql.len()).sum();
+    if bytes > MAX_BATCH_SQL_BYTES {
+        return Err(format!("a batch holds at most {MAX_BATCH_SQL_BYTES} bytes of SQL, got {bytes}"));
+    }
+    Ok(())
+}
+
+/// What a batch's statements may not do on top of the usual refusals: end,
+/// begin or split the transaction the host holds around them, which would
+/// let half a batch commit.
+fn deny_escapes_in_batch(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => Authorization::Deny,
+        _ => deny_escapes(context),
+    }
+}
+
+/// Runs each statement on `conn`, inside the transaction the caller opened,
+/// and answers the rows each changed. Rows a statement returns are
+/// discarded; stepping it once runs all of its writes.
+fn run_batch(conn: &Connection, statements: &[Statement]) -> Result<Vec<u64>, String> {
+    statements
+        .iter()
+        .enumerate()
+        .map(|(n, statement)| {
+            execute(conn, &statement.sql, &statement.params, false, 0)
+                .map(|outcome| outcome.rows_affected as u64)
+                .map_err(|why| format!("statement {}: {why}", n + 1))
+        })
+        .collect()
+}
+
+/// Opens the transaction, runs the batch under `authorizer`, and commits
+/// only if every statement succeeded. The authorizer is off while the host
+/// itself begins and ends, and on for every statement the caller wrote.
+fn in_transaction(
+    conn: &Connection,
+    statements: &[Statement],
+    install: impl Fn(&Connection) -> Result<(), String>,
+) -> Result<Vec<u64>, String> {
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>).map_err(|e| e.to_string())?;
+    conn.execute_batch("begin immediate").map_err(describe)?;
+    let outcome = install(conn).and_then(|()| run_batch(conn, statements));
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>).map_err(|e| e.to_string())?;
+    match outcome {
+        Ok(counts) => match conn.execute_batch("commit") {
+            Ok(()) => Ok(counts),
+            Err(why) => {
+                let _ = conn.execute_batch("rollback");
+                Err(describe(why))
+            }
+        },
+        Err(why) => {
+            // Interrupted or failed, SQLite may have rolled back already;
+            // either way nothing of this batch stays.
+            let _ = conn.execute_batch("rollback");
+            Err(why)
+        }
+    }
+}
+
+/// Runs a handler's `db.batch`: every statement in one transaction, all or
+/// nothing, with the refusals and the deadline `query` has.
+pub fn batch_until(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    statements: &[Statement],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u64>, String> {
+    check_batch(statements)?;
+    let conn = open_as(config, app, identity)?;
+    if let Some(deadline) = deadline {
+        interrupt_at(&conn, deadline)?;
+    }
+    in_transaction(&conn, statements, |conn| {
+        conn.authorizer(Some(deny_escapes_in_batch)).map_err(|e| e.to_string())
+    })
+}
+
+/// `batch_until` as a scoped caller: each statement under `scope`'s
+/// authorizer, which already refuses any transaction statement.
+pub fn batch_scoped_until(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    scope: &Scope,
+    statements: &[Statement],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u64>, String> {
+    check_batch(statements)?;
+    let conn = open_scoped(config, app, identity, scope, deadline)?;
+    in_transaction(&conn, statements, |conn| install_scope(conn, scope))
 }
 
 /// The columns of each named view that exists, for a caller deciding what to
@@ -444,7 +584,7 @@ fn describe(error: rusqlite::Error) -> String {
     }
 }
 
-fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool) -> Result<SqlOutcome, String> {
+fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool, max_rows: usize) -> Result<SqlOutcome, String> {
     let mut statement = match conn.prepare(sql) {
         Ok(statement) => statement,
         Err(rusqlite::Error::MultipleStatement) if !params.is_empty() || !scripts => {
@@ -497,7 +637,7 @@ fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool) -> Res
     let mut rows = Vec::new();
     let mut truncated = false;
     while let Some(row) = cursor.next().map_err(describe)? {
-        if rows.len() >= MAX_ROWS {
+        if rows.len() >= max_rows {
             truncated = true;
             break;
         }

@@ -1515,3 +1515,38 @@ async fn the_devices_sidecar_never_leaves_through_a_url_a_pull_or_an_export() {
     let (_, text) = tool(&w.config, "/mcp", TOKEN, "fetch", serde_json::json!({"id":"yard.devices"})).await;
     assert!(!leaks(&text), "fetch: {text}");
 }
+
+// --- running jobs ---------------------------------------------------------------
+
+/// Running a job spends the app's budget on demand, so it takes Manage. An
+/// editor may still schedule one; it may not set one off, by MCP or by the
+/// admin page.
+#[tokio::test]
+async fn a_person_without_manage_cannot_run_a_job_by_mcp_or_the_admin_page() {
+    let w = world().await;
+    std::fs::create_dir_all(w.config.data_dir.join("yard")).unwrap();
+    std::fs::write(w.config.data_dir.join("yard/handler.wasm"), include_bytes!("fixtures/handler.wasm")).unwrap();
+    toolsite::platform::schedule::set_job(&w.config, "yard", "mark", "0 0 0 1 1 *", "/api/job-mark").unwrap();
+    let marks = |config: &Config| {
+        toolsite::runtime::db::run(config, "yard", "select count(*) from marks", &[])
+            .map(|out| out.rows[0][0].as_i64().unwrap())
+            .unwrap_or(0)
+    };
+
+    let ed = token_for(&w.config, "ed@x.test");
+    let (err, text) = tool(&w.config, "/mcp", &ed, "app_jobs", serde_json::json!({"app":"yard","name":"mark","run_now":true})).await;
+    assert!(err, "an editor ran a job over MCP: {text}");
+    let form = format!("token={}&app=yard&name=mark", form_token(&w.config, "ed@x.test"));
+    let (status, body, _) = send(&w.config, post_as("/admin/job-run", &session(&w.config, "ed@x.test"), form)).await;
+    assert!(!status.is_redirection(), "an editor ran a job from the admin page: {status} {body}");
+    assert_eq!(marks(&w.config), 0, "the job ran for an editor");
+    // The tab shows no button to an editor either.
+    let (_, page, _) = send(&w.config, get_as("/admin/apps/yard/jobs", &session(&w.config, "ed@x.test"))).await;
+    assert!(!page.contains("Run now"), "an editor is offered Run now");
+
+    // Someone who manages the app can.
+    let sub = token_for(&w.config, "sub@x.test");
+    let (err, text) = tool(&w.config, "/mcp", &sub, "app_jobs", serde_json::json!({"app":"yard","name":"mark","run_now":true})).await;
+    assert!(!err && text.contains("ran: 200"), "{text}");
+    assert_eq!(marks(&w.config), 1);
+}

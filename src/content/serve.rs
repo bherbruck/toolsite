@@ -6,7 +6,7 @@ use crate::{
             icon_path, is_hidden, read_meta, Icon,
         },
     },
-    runtime::wasm::{Guards, Request as WasmRequest},
+    runtime::wasm::Request as WasmRequest,
     AppState,
 };
 use maud::{html, Markup};
@@ -496,6 +496,7 @@ async fn run_handler(
         body,
     };
 
+    let guards = crate::runtime::limits::of(&state.config, app).await.request;
     let runtime = state.runtime.clone();
     let config = state.config.clone();
     let owned_app = app.to_string();
@@ -516,7 +517,7 @@ async fn run_handler(
             &wasm,
             user,
             guest_request,
-            Guards::default(),
+            guards,
         )
     })
     .await;
