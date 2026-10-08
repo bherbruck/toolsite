@@ -172,7 +172,7 @@ pub fn authorize(config: &Config, app: &str, presented: &str) -> bool {
 /// A consistent copy of the app's database as a file the caller owns and
 /// must delete. Nothing if the app has no database yet.
 pub fn snapshot(config: &Config, app: &str) -> Result<Option<PathBuf>, String> {
-    let source = db::db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    let source = db::app_db(config, app)?;
     if !source.is_file() {
         return Ok(None);
     }

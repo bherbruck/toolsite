@@ -29,14 +29,16 @@ fn key_path(config: &Config) -> PathBuf {
 /// Without it one is generated beside them, which still protects a backup
 /// that loses only the database file, and is stated plainly rather than
 /// pretended to be more.
+///
+/// On Postgres there is no file to fall back on: every runner must open
+/// every value, so the key is the environment's or nothing (the boot guard
+/// makes it the environment's).
 fn key(config: &Config) -> Result<[u8; 32], String> {
     if let Ok(configured) = std::env::var("TOOLSITE_SECRET_KEY") {
-        let decoded = BASE64
-            .decode(configured.trim())
-            .map_err(|_| "TOOLSITE_SECRET_KEY must be base64".to_string())?;
-        return decoded
-            .try_into()
-            .map_err(|_| "TOOLSITE_SECRET_KEY must decode to 32 bytes".to_string());
+        return parse_key(&configured);
+    }
+    if config.stores.is_postgres() {
+        return Err("TOOLSITE_SECRET_KEY is required on Postgres".to_string());
     }
 
     let path = key_path(config);
@@ -59,6 +61,36 @@ fn key(config: &Config) -> Result<[u8; 32], String> {
     }
     tracing::info!("generated a key for sealed values at .site/secret.key");
     Ok(fresh)
+}
+
+/// `TOOLSITE_SECRET_KEY` as bytes. The errors never repeat the value.
+pub fn parse_key(configured: &str) -> Result<[u8; 32], String> {
+    let decoded = BASE64
+        .decode(configured.trim())
+        .map_err(|_| "TOOLSITE_SECRET_KEY must be base64".to_string())?;
+    decoded
+        .try_into()
+        .map_err(|_| "TOOLSITE_SECRET_KEY must decode to 32 bytes".to_string())
+}
+
+/// What form tokens are derived with on Postgres, as an HKDF label.
+pub const FORM_KEY_LABEL: &str = "toolsite form key v1";
+
+/// A key for one purpose, derived from the site key with HKDF-SHA256, so
+/// one variable serves every runner and a key for one use never opens
+/// another's.
+pub fn derive(key: &[u8; 32], label: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(None, key)
+        .expand(label.as_bytes(), &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 length");
+    out
+}
+
+/// The form-token key on Postgres: derived from the site key rather than
+/// kept in `.site/form.key`, which only one runner would have.
+pub fn form_key(config: &Config) -> Result<[u8; 32], String> {
+    Ok(derive(&key(config)?, FORM_KEY_LABEL))
 }
 
 /// Encrypts a value. The same value sealed twice looks different, since
@@ -116,6 +148,24 @@ mod tests {
         if std::env::var("TOOLSITE_SECRET_KEY").is_err() {
             assert!(open(&elsewhere, &sealed).is_none(), "another site's key opened it");
         }
+    }
+
+    #[test]
+    fn the_derived_form_key_is_stable_for_one_secret_and_different_for_two() {
+        let one = [7u8; 32];
+        let two = [8u8; 32];
+        assert_eq!(derive(&one, FORM_KEY_LABEL), derive(&one, FORM_KEY_LABEL));
+        assert_ne!(derive(&one, FORM_KEY_LABEL), derive(&two, FORM_KEY_LABEL));
+        // Not the secret itself, and not another purpose's key.
+        assert_ne!(derive(&one, FORM_KEY_LABEL), one);
+        assert_ne!(derive(&one, FORM_KEY_LABEL), derive(&one, "toolsite bus key v1"));
+    }
+
+    #[test]
+    fn a_secret_key_is_32_bytes_of_base64() {
+        assert_eq!(parse_key(" AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8= ").unwrap()[31], 31);
+        assert!(parse_key("c2hvcnQ=").is_err());
+        assert!(parse_key("not base64!").is_err());
     }
 
     #[test]

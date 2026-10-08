@@ -57,7 +57,7 @@ pub fn apply(config: &Config, app: &str) -> Result<(usize, usize, Vec<String>), 
     if files.is_empty() {
         return Ok((0, 0, Vec::new()));
     }
-    let path = db::db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    let path = db::app_db(config, app)?;
 
     // Migrations read `pragma user_version`, which the authorizer refuses, so
     // the schema moves before the door closes — exactly as for the account

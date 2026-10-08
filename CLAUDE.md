@@ -38,6 +38,11 @@ config.rs          Config shared by every layer
 seal.rs            values sealed at rest with the site key: app settings, two-step secrets
 ui.rs              the theme for pages toolsite serves itself
 
+state/             where platform state lives, below every other layer
+  mod.rs           Backend (files, or Postgres with DATABASE_URL), Stores, boot guards, wait()
+  pg.rs            the pool and its TLS, redaction, the per-schema ladder runner under an advisory lock
+  runners.rs       the runner registry: a row and a heartbeat per process, so a runner knows it is alone
+
 platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
   permissions.rs   the permissions rules: an add row, View/Edit/Manage per person, Locked/Customizable
@@ -102,12 +107,16 @@ that only an admin may connect a publishing client is platform's, and the
 tokens it issues live in platform's own database.
 
 Dependency direction is one-way: `platform` and `content` depend on
-`runtime` and `accounts`; everything depends on `config` and `content::slug`.
-Nothing in `runtime` reaches back up into HTTP types.
+`runtime` and `accounts`; everything depends on `config`, `content::slug`
+and `state`. Nothing in `runtime` reaches back up into HTTP types, and
+nothing in `state` reaches `Config` or anything above it.
 
 ## Conventions
 
-- Storage is plain files under `DATA_DIR`; there is no database. A page is
+- Storage is plain files under `DATA_DIR` by default; with `DATABASE_URL`
+  platform state is moving to Postgres store by store
+  (`docs/design/postgres-scaleout.md`), and file mode must keep behaving
+  exactly as before. A page is
   `<slug>.html`, its icon `<slug>.icon`, its state `<slug>.meta`. An app is a
   directory whose `index.html` serves at the app root; its files live under
   `<app>/.blobs/`, which no slug, bundle path or blob key can name.
@@ -160,6 +169,9 @@ property it rests on, not just the happy path.
 
 A test that reaches the network is `#[ignore]`d with a reason, so the suite
 stays hermetic and `cargo test -- --ignored` still proves the real path.
+Tests that need Postgres are ignored the same way and carry `postgres` in
+their names; `scripts/test-postgres.sh` starts Postgres and MinIO in Docker
+and runs them, each in a database of its own.
 
 **Anything touching the outside world must be tried in the container**, not
 only against `cargo run`. The host has CA certificates, a full toolchain and

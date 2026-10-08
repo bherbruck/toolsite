@@ -2199,7 +2199,19 @@ pub fn derive_form_token(config: &Config, user_id: &str) -> String {
 /// and anyone who knew an account's id could work out its form token. An
 /// app's own code learns ids through `identity`, and every app shares this
 /// origin, so the key has to be one only the server holds.
+///
+/// On Postgres every runner must derive the same tokens, so the key comes
+/// from the site key instead of a file one runner made.
 fn form_secret(config: &Config) -> [u8; 32] {
+    if config.stores.is_postgres() {
+        return crate::seal::form_key(config).unwrap_or_else(|why| {
+            // A random key fails every form rather than accepting a guessable one.
+            tracing::error!(%why, "no form key: admin forms fail until TOOLSITE_SECRET_KEY is set");
+            let mut key = [0u8; 32];
+            rand::rng().fill_bytes(&mut key);
+            key
+        });
+    }
     let path = config.data_dir.join(".site").join("form.key");
     if let Ok(bytes) = std::fs::read(&path)
         && let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice())

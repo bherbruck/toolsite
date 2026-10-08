@@ -557,7 +557,7 @@ pub struct Regenerated {
 /// change, and named in the notes.
 pub fn regenerate(config: &Config, app: &str, meta: &PageMeta) -> Result<Regenerated, String> {
     let salt = meta.access_salt.clone().unwrap_or_else(new_salt);
-    let path = db::db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    let path = db::app_db(config, app)?;
     if !path.is_file() && meta.policies.is_empty() && meta.queryable.is_empty() && meta.generated.is_empty() {
         return Ok(Regenerated { generated: Vec::new(), notes: Vec::new(), salt });
     }

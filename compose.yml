@@ -34,6 +34,32 @@ services:
       # is set, since discovery metadata needs absolute URLs.
       - TOOLSITE_BASE_URL=${TOOLSITE_BASE_URL:-${PUBLIC_BASE_URL:-http://localhost:${PORT:-8080}}}
       - RUST_LOG=${RUST_LOG:-info}
+      # Platform state in Postgres instead of files. Empty means files.
+      # With `--profile postgres`, point these at the services below:
+      #   DATABASE_URL=postgres://toolsite:<password>@postgres:5432/toolsite?sslmode=disable
+      #   TOOLSITE_SECRET_KEY=<openssl rand -base64 32>
+      #   TOOLSITE_BLOB_S3_ENDPOINT=http://minio:9000
+      #   TOOLSITE_BLOB_S3_BUCKET=toolsite
+      #   TOOLSITE_BLOB_S3_ACCESS_KEY_ID=toolsite
+      #   TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY=<password>
+      #   TOOLSITE_BLOB_S3_PATH_STYLE=1
+      # and set POSTGRES_PASSWORD to the same <password>.
+      - DATABASE_URL=${DATABASE_URL:-}
+      - TOOLSITE_SECRET_KEY=${TOOLSITE_SECRET_KEY:-}
+      - TOOLSITE_BLOB_S3_ENDPOINT=${TOOLSITE_BLOB_S3_ENDPOINT:-}
+      - TOOLSITE_BLOB_S3_BUCKET=${TOOLSITE_BLOB_S3_BUCKET:-}
+      - TOOLSITE_BLOB_S3_ACCESS_KEY_ID=${TOOLSITE_BLOB_S3_ACCESS_KEY_ID:-}
+      - TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY=${TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY:-}
+      - TOOLSITE_BLOB_S3_PATH_STYLE=${TOOLSITE_BLOB_S3_PATH_STYLE:-}
+
+    # Started first when the postgres profile is on; ignored when it is off.
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+      bucket:
+        condition: service_completed_successfully
+        required: false
 
     volumes:
       # Pages, bundles, handlers, per-app databases and the account database
@@ -50,5 +76,49 @@ services:
       start_period: 5s
       retries: 3
 
+  # `docker compose --profile postgres up -d`: a database and a bucket for
+  # platform state, on this machine. Production points DATABASE_URL and the
+  # bucket variables at managed services instead.
+  postgres:
+    image: postgres:16
+    profiles: [postgres]
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=toolsite
+      - POSTGRES_DB=toolsite
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-}
+    volumes:
+      - toolsite-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "toolsite", "-d", "toolsite"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # MinIO no longer publishes minio/minio on Docker Hub; Chainguard's build
+  # is public.
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    profiles: [postgres]
+    restart: unless-stopped
+    command: ["server", "/data"]
+    environment:
+      - MINIO_ROOT_USER=toolsite
+      - MINIO_ROOT_PASSWORD=${POSTGRES_PASSWORD:-}
+    volumes:
+      - toolsite-minio:/data
+
+  # Creates the bucket once MinIO answers, then exits.
+  bucket:
+    image: cgr.dev/chainguard/minio-client:latest
+    profiles: [postgres]
+    depends_on: [minio]
+    restart: on-failure
+    environment:
+      - MC_HOST_local=http://toolsite:${POSTGRES_PASSWORD:-}@minio:9000
+    command: ["mb", "--ignore-existing", "local/toolsite"]
+
 volumes:
   toolsite-data:
+  toolsite-postgres:
+  toolsite-minio:

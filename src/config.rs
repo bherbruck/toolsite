@@ -77,6 +77,9 @@ pub struct Config {
     /// Jobs in progress and queued, shared like `connections` so the
     /// scheduler, a person and an app all see one run per job.
     pub jobs: std::sync::Arc<crate::platform::schedule::Jobs>,
+    /// Where platform state lives: files, or Postgres when `DATABASE_URL`
+    /// is set. Chosen once in `main`; every copy shares the same handles.
+    pub stores: crate::state::Stores,
 }
 
 impl Config {
@@ -116,6 +119,7 @@ impl Config {
             mfa: self.mfa.clone(),
             limits: self.limits.clone(),
             jobs: self.jobs.clone(),
+            stores: self.stores.clone(),
         }
     }
 
@@ -148,6 +152,7 @@ impl Config {
             mfa: crate::accounts::mfa::Settings::off(),
             limits: Default::default(),
             jobs: Default::default(),
+            stores: Default::default(),
         }
     }
 }

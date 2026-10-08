@@ -57,6 +57,18 @@ pub fn db_path(config: &Config, app: &str) -> Option<PathBuf> {
     valid_slug(app).then(|| config.data_dir.join(app).join("data.db"))
 }
 
+/// The app's database file, for opening: `db_path`, unless another runner
+/// is live on the platform database, when two processes could write one
+/// SQLite file at once and the refusal is the safe answer.
+pub(crate) fn app_db(config: &Config, app: &str) -> Result<PathBuf, String> {
+    let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    if let Some(why) = config.stores.sqlite_refusal() {
+        tracing::warn!(%app, %why, "app database refused");
+        return Err(why);
+    }
+    Ok(path)
+}
+
 /// Blocks any statement that could reach outside this one file. Done with
 /// SQLite's authorizer rather than by inspecting the SQL, because the
 /// authorizer sees the parsed action and can't be talked out of it by
@@ -75,7 +87,7 @@ fn deny_escapes(context: AuthContext<'_>) -> Authorization {
 
 /// The app's database with the identity bound and the usual guard in place.
 pub(crate) fn open_as(config: &Config, app: &str, identity: Option<&Identity>) -> Result<Connection, String> {
-    let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    let path = app_db(config, app)?;
     let conn = open_unguarded(&path, config.max_db_bytes)?;
     relax_sync(&conn)?;
     bind_identity(&conn, identity)?;
@@ -435,7 +447,7 @@ pub(crate) fn open_scoped(
     if scope.readable.is_empty() && scope.writable.is_empty() {
         return Err(format!("{app} declares nothing a person may query"));
     }
-    let path = db_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    let path = app_db(config, app)?;
     if !path.is_file() {
         return Err(format!("{app} has no database yet"));
     }
@@ -642,7 +654,7 @@ pub fn batch_scoped_until(
 /// The columns of each named view that exists, for a caller deciding what to
 /// ask. Host-run: a person never gets to pragma.
 pub fn describe_views(config: &Config, app: &str, views: &[String]) -> Vec<(String, Vec<String>)> {
-    let Some(path) = db_path(config, app) else {
+    let Ok(path) = app_db(config, app) else {
         return Vec::new();
     };
     let Ok(conn) = open_unguarded(&path, config.max_db_bytes) else {

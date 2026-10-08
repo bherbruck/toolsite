@@ -96,10 +96,38 @@ async fn main() -> anyhow::Result<()> {
         read(&["TOOLSITE_DATA_DIR", "DATA_DIR"]).unwrap_or_else(|| "/data".into()),
     );
     fs::create_dir_all(&data_dir).await?;
+    toolsite::state::keep_runtime(tokio::runtime::Handle::current());
+
+    // Where platform state lives: files, or Postgres when DATABASE_URL is
+    // set. Decided before anything touches .site/, so a refusal leaves the
+    // directory as it found it, and shared with the user commands so they
+    // work against the same backend the server does.
+    let bucket = read(&["TOOLSITE_BLOB_S3_ENDPOINT", "ENDPOINT"]).is_some()
+        && read(&["TOOLSITE_BLOB_S3_BUCKET", "BUCKET"]).is_some();
+    let backend = match toolsite::state::Settings::from_env(|name| read(&[name]), bucket) {
+        Ok(settings) => toolsite::state::open(&settings, &data_dir).await,
+        Err(why) => Err(why),
+    }
+    .unwrap_or_else(|why| refuse(&why));
 
     if let Some(Command::User { command }) = cli.command {
-        return run_user_command(command, data_dir, read(&["TOOLSITE_BASE_URL", "PUBLIC_BASE_URL"]));
+        let stores = toolsite::state::Stores { backend, runner: None };
+        return run_user_command(command, data_dir, read(&["TOOLSITE_BASE_URL", "PUBLIC_BASE_URL"]), stores);
     }
+
+    // On Postgres this process joins the runner registry and keeps its row
+    // fresh, so it knows when it is not the only one.
+    let runner = match &backend {
+        toolsite::state::Backend::Postgres(postgres) => {
+            let runner = Arc::new(toolsite::state::runners::Runner::new("all", read(&["TOOLSITE_RUNNER_ADDRESS"])));
+            runner.register(&postgres.pool).await.unwrap_or_else(|why| refuse(&why));
+            tracing::info!(runner = %runner.id, address = runner.address.as_deref().unwrap_or("<unset>"), "registered as a runner");
+            runner.clone().spawn(postgres.pool.clone());
+            runner.clone().leave_on_shutdown(postgres.pool.clone());
+            Some(runner)
+        }
+        toolsite::state::Backend::Files => None,
+    };
 
     // Authenticates MCP *clients* — who may publish — and nothing else. An
     // OAuth client signs in with an admin account instead, which needs no
@@ -461,6 +489,7 @@ async fn main() -> anyhow::Result<()> {
         mfa,
         limits,
         jobs: Arc::new(toolsite::platform::schedule::Jobs::new(job_starts).with_running_per_app(jobs_running)),
+        stores: toolsite::state::Stores { backend, runner },
     });
 
     // Per-app grants became View rows on their apps; done once.
@@ -510,12 +539,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A boot refusal: logged at error, as the guard worded it (never with a
+/// secret), and the process exits rather than serving a split site.
+fn refuse(why: &str) -> ! {
+    tracing::error!("refusing to start: {why}");
+    std::process::exit(1);
+}
+
 /// Account management from a shell on the machine. No token, no HTTP — it
 /// opens the account database the same way the server does.
 fn run_user_command(
     command: UserCommand,
     data_dir: PathBuf,
     base_url: Option<String>,
+    stores: toolsite::state::Stores,
 ) -> anyhow::Result<()> {
     use toolsite::accounts::users;
 
@@ -551,6 +588,7 @@ fn run_user_command(
         mfa: toolsite::accounts::mfa::Settings::off(),
         limits: Default::default(),
         jobs: Default::default(),
+        stores,
     };
 
     let report = |result: Result<(), String>, done: &str| -> anyhow::Result<()> {

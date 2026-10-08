@@ -53,6 +53,12 @@ hmac = "0.13"
 sha1 = "0.11"
 data-encoding = "2"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+tokio-postgres = "0.7.18"
+deadpool-postgres = "0.14.2"
+hkdf = "0.13.0"
+webpki-roots = "1"
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # build.rs packs examples/ into tarballs the server embeds.
 [build-dependencies]
