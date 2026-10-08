@@ -455,6 +455,13 @@ async fn run_handler(
 ) -> Response {
     let method = request.method().to_string();
     let uri = request.uri().clone();
+    // Kept for the host: a file the handler points at may be asked for in
+    // part, which the host answers, not the handler.
+    let wants_part = matches!(request.method(), &axum::http::Method::GET | &axum::http::Method::HEAD)
+        .then(|| PartAsked {
+            range: header_text(request.headers(), header::RANGE),
+            if_range: header_text(request.headers(), header::IF_RANGE),
+        });
     let headers: Vec<(String, String)> = request
         .headers()
         .iter()
@@ -537,7 +544,7 @@ async fn run_handler(
                 .find(|(name, _)| name.eq_ignore_ascii_case(BLOB_HEADER))
                 .map(|(_, key)| key.clone());
             if let Some(key) = blob_key {
-                return serve_blob(&state.config, app, &key, status, &response.headers).await;
+                return serve_blob(&state.config, app, &key, status, &response.headers, wants_part).await;
             }
             // A handler that renders HTML gets the same favicon links a
             // static page does; its own length header would then be wrong,
@@ -597,14 +604,66 @@ fn refused_response_header(app: &str, name: &str, value: &str) -> bool {
     false
 }
 
+/// What a GET or HEAD said about wanting part of a file.
+struct PartAsked {
+    range: Option<String>,
+    if_range: Option<String>,
+}
+
+fn header_text(headers: &axum::http::HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_string)
+}
+
+/// One range from a `Range: bytes=...` header. Anything else, several
+/// ranges included, is none: the whole file is served, which is always an
+/// allowed answer to a range request.
+fn single_range(value: &str) -> Option<crate::runtime::blobs::ByteRange> {
+    use crate::runtime::blobs::ByteRange;
+    let (unit, spec) = value.trim().split_once('=')?;
+    if !unit.trim().eq_ignore_ascii_case("bytes") || spec.contains(',') {
+        return None;
+    }
+    let (first, last) = spec.trim().split_once('-')?;
+    let number = |text: &str| -> Option<u64> {
+        (!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())).then(|| text.parse().ok()).flatten()
+    };
+    match (first, last) {
+        ("", length) => number(length).map(ByteRange::Suffix),
+        (first, "") => number(first).map(ByteRange::From),
+        (first, last) => {
+            let (first, last) = (number(first)?, number(last)?);
+            (first <= last).then_some(ByteRange::Span(first, last))
+        }
+    }
+}
+
 async fn serve_blob(
     config: &Config,
     app: &str,
     key: &str,
     status: StatusCode,
     handler_headers: &[(String, String)],
+    asked: Option<PartAsked>,
 ) -> Response {
-    let (entry, stream) = match crate::runtime::blobs::open(config, app, key).await {
+    let said = |name: &str| {
+        handler_headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    };
+    // Part of the file only when the handler answered 200 and did not say
+    // otherwise, and, with If-Range, only while the handler's own ETag still
+    // matches strongly. Without that, a client could stitch the start of an
+    // old file to the end of a new one.
+    let ranges_allowed = status == StatusCode::OK && !said("accept-ranges").is_some_and(|v| v.eq_ignore_ascii_case("none"));
+    let range = asked
+        .filter(|_| ranges_allowed)
+        .filter(|asked| match &asked.if_range {
+            None => true,
+            Some(validator) => said("etag").is_some_and(|etag| !etag.starts_with("W/") && etag == validator.trim()),
+        })
+        .and_then(|asked| asked.range.as_deref().and_then(single_range));
+    let (entry, slice, stream) = match crate::runtime::blobs::open_range(config, app, key, range).await {
         Ok(opened) => opened,
         Err(crate::runtime::blobs::Error::NotFound) => {
             tracing::warn!(app, key, "handler pointed at a blob that does not exist");
@@ -615,12 +674,25 @@ async fn serve_blob(
             return (StatusCode::INTERNAL_SERVER_ERROR, "could not read the file").into_response();
         }
     };
+    use crate::runtime::blobs::Slice;
+    let (status, length, content_range) = match slice {
+        Slice::Whole => (status, entry.size, None),
+        Slice::Part { first, last } => (
+            StatusCode::PARTIAL_CONTENT,
+            last - first + 1,
+            Some(format!("bytes {first}-{last}/{}", entry.size)),
+        ),
+        Slice::Unsatisfiable => (StatusCode::RANGE_NOT_SATISFIABLE, 0, Some(format!("bytes */{}", entry.size))),
+    };
     let mut builder = axum::response::Response::builder().status(status);
     let mut typed = false;
     for (name, value) in handler_headers {
-        // The length is the file's, and the pointer itself is not for the
-        // visitor. Everything else the handler said stands.
-        if name.eq_ignore_ascii_case(BLOB_HEADER) || name.eq_ignore_ascii_case("content-length") {
+        // The length and range are the host's, and the pointer itself is
+        // not for the visitor. Everything else the handler said stands.
+        if name.eq_ignore_ascii_case(BLOB_HEADER)
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("content-range")
+        {
             continue;
         }
         if refused_response_header(app, name, value) {
@@ -634,8 +706,14 @@ async fn serve_blob(
     if !typed {
         builder = builder.header(header::CONTENT_TYPE, &entry.content_type);
     }
+    if ranges_allowed && said("accept-ranges").is_none() {
+        builder = builder.header(header::ACCEPT_RANGES, "bytes");
+    }
+    if let Some(content_range) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, content_range);
+    }
     builder
-        .header(header::CONTENT_LENGTH, entry.size)
+        .header(header::CONTENT_LENGTH, length)
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -691,6 +769,17 @@ pub(crate) async fn site_favicon_ico() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_byte_range_is_read_and_anything_else_is_the_whole_file() {
+        use crate::runtime::blobs::ByteRange;
+        assert_eq!(single_range("bytes=0-99"), Some(ByteRange::Span(0, 99)));
+        assert_eq!(single_range("Bytes = 100-"), Some(ByteRange::From(100)));
+        assert_eq!(single_range("bytes=-500"), Some(ByteRange::Suffix(500)));
+        for whole in ["bytes=0-1,4-5", "items=0-1", "bytes=5-2", "bytes=-", "bytes=a-b", "bytes=+1-2", "0-99", "bytes=1-2-3"] {
+            assert_eq!(single_range(whole), None, "{whole}");
+        }
+    }
 
     #[test]
     fn a_handler_cannot_send_headers_that_reach_beyond_its_app() {

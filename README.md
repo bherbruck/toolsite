@@ -552,7 +552,13 @@ Bytes never pass through the guest, whose request body is capped at 8 MB:
 - **Out.** The handler answers with `x-toolsite-blob: <key>` and an empty
   body; the platform streams the file in its place, with the stored content
   type unless the handler set one, and keeps the handler's other headers. By
-  answering, the handler has decided the visitor may have it.
+  answering, the handler has decided the visitor may have it. A `Range`
+  request gets just those bytes (206, or 416 past the end), so DuckDB-WASM
+  can read a Parquet file's footer and the columns it needs without the
+  rest, and a video can seek. Only when the handler answered 200; one
+  range per request (several get the whole file); `If-Range` is honoured
+  against an `ETag` the handler set; `accept-ranges: none` from the handler
+  turns it off.
 - **Small things.** `put`, `get`, `stat`, `list`, `delete` from inside the
   handler; `get` refuses anything over 16 MB.
 - **Made by the handler or a job.** For a file too big to build in memory, a
