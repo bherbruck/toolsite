@@ -408,9 +408,13 @@ fn spawn(
     // Its own thread rather than a task: every call blocks, on wasm or on a
     // host import such as SQLite, and it may hold the thread for as long as
     // the wall clock allows.
+    // The runtime it was started from, entered on its thread, so a host
+    // call that waits on a store (`state::wait`) has one to wait with.
+    let handle = tokio::runtime::Handle::try_current().ok();
     std::thread::Builder::new()
         .name(format!("resident-{app}"))
         .spawn(move || {
+            let _entered = handle.as_ref().map(|handle| handle.enter());
             let _slot = slot;
             thread.run(queue)
         })

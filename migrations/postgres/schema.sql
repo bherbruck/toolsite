@@ -76,6 +76,10 @@ column state.runners.internal_port integer not null default 8081
 column state.runners.pool text not null default 'default'::text
 column state.runners.roles ARRAY not null default '{control,worker}'::text[]
 column state.runners.started_at bigint not null
+column state.tickets.expires_at bigint not null
+column state.tickets.id_hash text not null
+column state.tickets.kind text not null
+column state.tickets.payload bytea not null
 constraint accounts.grants grants_pkey: PRIMARY KEY (user_id, app)
 constraint accounts.grants grants_user_id_fkey: FOREIGN KEY (user_id) REFERENCES accounts.users(id)
 constraint accounts.identities identities_pkey: PRIMARY KEY (provider, provider_id)
@@ -107,6 +111,7 @@ constraint oauth.tokens tokens_kind_check: CHECK ((kind = ANY (ARRAY['access'::t
 constraint oauth.tokens tokens_pkey: PRIMARY KEY (token_hash)
 constraint state.migrations migrations_pkey: PRIMARY KEY (store, version)
 constraint state.runners runners_pkey: PRIMARY KEY (id)
+constraint state.tickets tickets_pkey: PRIMARY KEY (id_hash)
 index accounts CREATE INDEX grants_by_app ON accounts.grants USING btree (app)
 index accounts CREATE INDEX invites_by_user ON accounts.invites USING btree (user_id)
 index accounts CREATE INDEX mfa_failures_by_user ON accounts.mfa_failures USING btree (user_id, at)
@@ -135,5 +140,7 @@ index oauth CREATE INDEX tokens_expiry ON oauth.tokens USING btree (expires_at)
 index oauth CREATE UNIQUE INDEX clients_pkey ON oauth.clients USING btree (id)
 index oauth CREATE UNIQUE INDEX codes_pkey ON oauth.codes USING btree (code_hash)
 index oauth CREATE UNIQUE INDEX tokens_pkey ON oauth.tokens USING btree (token_hash)
+index state CREATE INDEX tickets_expires_at ON state.tickets USING btree (expires_at)
 index state CREATE UNIQUE INDEX migrations_pkey ON state.migrations USING btree (store, version)
 index state CREATE UNIQUE INDEX runners_pkey ON state.runners USING btree (id)
+index state CREATE UNIQUE INDEX tickets_pkey ON state.tickets USING btree (id_hash)

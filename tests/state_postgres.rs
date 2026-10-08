@@ -72,14 +72,16 @@ async fn the_ladder_applies_once_when_three_runners_boot_together_on_postgres() 
         applied.extend(boot.await.unwrap().expect("a runner failed to migrate"));
     }
     applied.sort();
-    assert_eq!(applied, ["probe/001", "probe/002", "state/001", "state/002"], "steps applied across the three runners");
+    let mut expected = vec!["probe/001".to_string(), "probe/002".to_string()];
+    expected.extend((1..=pg::LADDERS[0].steps.len()).map(|n| format!("state/{n:03}")));
+    assert_eq!(applied, expected, "steps applied across the three runners");
 
     let postgres = pg::connect(&url, 1).await.unwrap();
     let client = postgres.pool.get().await.unwrap();
     let probes: i64 = client.query_one("select count(*) from probe.once", &[]).await.unwrap().get(0);
     assert_eq!(probes, 2);
     let recorded: i64 = client.query_one("select count(*) from state.migrations", &[]).await.unwrap().get(0);
-    assert_eq!(recorded, 4);
+    assert_eq!(recorded as usize, expected.len());
     drop(client);
 
     // A fourth boot later finds nothing to do.
@@ -122,7 +124,7 @@ async fn two_live_runners_refuse_sqlite_apps_until_one_leaves_on_postgres() {
 
     let first = Arc::new(Runner::new(&["control", "worker"], "default", Some("worker-1.railway.internal".into()), 8081));
     assert!(first.register(&postgres.pool).await.unwrap().is_empty());
-    let stores = Stores { backend: Backend::Files, runner: Some(first.clone()) };
+    let stores = Stores { backend: Backend::Files, runner: Some(first.clone()), ..Default::default() };
     assert!(stores.sqlite_refusal().is_none(), "alone, but refused");
 
     let second = Runner::new(&["worker"], "gpu", None, 9000);
@@ -178,10 +180,12 @@ async fn a_database_from_the_first_release_climbs_to_the_runner_columns_on_postg
     let postgres = pg::connect(&url, 1).await.unwrap();
     const FIRST: &[Ladder] = &[Ladder { store: "state", steps: &[pg::LADDERS[0].steps[0]] }];
     assert_eq!(pg::migrate(&postgres.pool, FIRST).await.unwrap(), ["state/001"]);
-    // Other stores' ladders may climb alongside; `state` takes only its second step.
+    // Other stores' ladders may climb alongside; `state` takes every step
+    // after its first, and the runner columns arrive with the second.
     let climbed = pg::migrate(&postgres.pool, pg::LADDERS).await.unwrap();
-    let state: Vec<&String> = climbed.iter().filter(|step| step.starts_with("state/")).collect();
-    assert_eq!(state, ["state/002"], "{climbed:?}");
+    let state: Vec<String> = climbed.iter().filter(|step| step.starts_with("state/")).cloned().collect();
+    let expected: Vec<String> = (2..=pg::LADDERS[0].steps.len()).map(|n| format!("state/{n:03}")).collect();
+    assert_eq!(state, expected, "{climbed:?}");
     let runner = Runner::new(&["control", "worker"], "default", None, 8081);
     assert!(runner.register(&postgres.pool).await.unwrap().is_empty());
     drop(postgres);

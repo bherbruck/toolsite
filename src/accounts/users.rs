@@ -1454,6 +1454,12 @@ pub struct HandoffParams {
 /// is minted on the main host, where the site session is; the app host gets
 /// it by presenting the code, once, within a minute, from the browser that
 /// holds the matching handoff cookie.
+///
+/// It carries the app session's token, so it is a credential: kept in
+/// `state::Tickets` by the digest of its code, sealed with the site key,
+/// spent by the first landing, so neither a dump of the store nor a code
+/// presented twice yields the session.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct HandoffTicket {
     pub app: String,
     token: String,
@@ -1461,7 +1467,6 @@ pub struct HandoffTicket {
     /// Within the app's path, starting `/p/<app>`.
     next: String,
     state: String,
-    expires_at: std::time::Instant,
 }
 
 /// How long a code waits for the app host to collect it.
@@ -1666,16 +1671,14 @@ async fn handoff_to_app_host(config: Arc<Config>, params: HandoffParams, headers
         Ok(Err(_)) => return Redirect::to(&format!("/auth/login?next={}", urlencoding::encode(&next))).into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "handoff failed").into_response(),
     };
-    let code = crate::content::slug::random_token(40);
-    {
-        let now = std::time::Instant::now();
-        let mut handoffs = config.handoffs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        handoffs.retain(|_, ticket| ticket.expires_at > now);
-        handoffs.insert(
-            code.clone(),
-            HandoffTicket { app: app.clone(), token, max_age, next, state, expires_at: now + HANDOFF_TTL },
-        );
-    }
+    let ticket = HandoffTicket { app: app.clone(), token, max_age, next, state };
+    let code = match config.stores.tickets.put(crate::state::tickets::Kind::Handoff, HANDOFF_TTL, &ticket).await {
+        Ok(code) => code,
+        Err(why) => {
+            tracing::error!(app = %app, %why, "handoff failed: the code could not be stored");
+            return (StatusCode::SERVICE_UNAVAILABLE, "handoff failed").into_response();
+        }
+    };
     let lookup = (config.clone(), app.clone());
     let Ok(origin) = tokio::task::spawn_blocking(move || crate::content::origins::app_base(&lookup.0, &lookup.1)).await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "handoff failed").into_response();
@@ -1701,12 +1704,15 @@ pub async fn landing(
         tracing::warn!("landing refused: not on an app host");
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    let ticket = {
-        let now = std::time::Instant::now();
-        let mut handoffs = config.handoffs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        handoffs.retain(|_, ticket| ticket.expires_at > now);
-        handoffs.remove(&params.code)
-    };
+    let ticket = config
+        .stores
+        .tickets
+        .take::<HandoffTicket>(crate::state::tickets::Kind::Handoff, &params.code)
+        .await
+        .unwrap_or_else(|why| {
+            tracing::error!(app = %host_app, %why, "handoff code could not be spent");
+            None
+        });
     let Some(ticket) = ticket else {
         tracing::warn!(app = %host_app, "landing refused: code unknown, expired or already used");
         return (

@@ -39,6 +39,7 @@ pub const LADDERS: &[Ladder] = &[
         steps: &[
             include_str!("../../migrations/postgres/state/001_initial.sql"),
             include_str!("../../migrations/postgres/state/002_runner_placement.sql"),
+            include_str!("../../migrations/postgres/state/003_tickets.sql"),
         ],
     },
     Ladder {

@@ -8,21 +8,25 @@
 //! store the upload URL uses. The kinds, the limits, the slug rules and the
 //! editor check at arrival are the same code, so nothing is looser here.
 //!
-//! Chunks are spooled to disk under `.tmp/inline/<id>/`, one file per index,
-//! so a 64 MB bundle never sits in memory twice, and a client that stops
-//! halfway leaves a directory the next `upload_begin` sweeps.
+//! The upload itself (what, for whom, which chunks have arrived) is a
+//! ticket in `state::Tickets`, updated per chunk with the ticket held, so
+//! two chunks at once both count. The bytes are spooled to this runner's
+//! disk under `.tmp/inline/<digest>/`, one file per index, so a 64 MB bundle
+//! never sits in memory twice, and a client that stops halfway leaves a
+//! directory the next `upload_begin` sweeps. The spool is named by the
+//! ticket's digest, never its id, and stays per runner until content moves
+//! to the bucket.
+//!
+//! Every function here blocks (on the spool, and on the store through
+//! `state::wait`), so callers run them on a blocking thread.
 
 use crate::{
     config::Config,
-    content::slug::random_token,
     platform::upload::{SourceMeta, UploadKind, MAX_UPLOAD_BYTES},
+    state::tickets::{self, Kind},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 /// The most one chunk may hold once decoded. Base64 adds a third, so a
 /// chunk is about 1 MB on the wire, which every MCP client carries.
@@ -33,7 +37,8 @@ pub const INLINE_TTL: Duration = Duration::from_secs(900);
 
 /// One upload in flight: what it is, who began it, and which chunks have
 /// arrived. Only the index-to-size map lives here; the bytes are on disk.
-#[derive(Debug)]
+/// Its expiry is the ticket's.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct InlineUpload {
     pub slug: String,
     pub kind: UploadKind,
@@ -43,7 +48,6 @@ pub struct InlineUpload {
     pub user: Option<String>,
     /// The folder a new app lands in.
     pub project: Option<String>,
-    pub expires_at: Instant,
     pub chunks: BTreeMap<u32, u64>,
 }
 
@@ -51,49 +55,38 @@ fn spool_root(config: &Config) -> PathBuf {
     config.data_dir.join(".tmp").join("inline")
 }
 
+/// An upload's spool, by the digest of its id: a hex name whatever the id
+/// says, so no id reaches the path, and the id is not left on disk.
 fn spool_dir(config: &Config, id: &str) -> PathBuf {
-    spool_root(config).join(id)
+    spool_root(config).join(tickets::digest(Kind::InlineUpload, id))
 }
 
-/// Drops expired uploads and their spools. Also removes any spool directory
-/// older than an hour that no live upload names, which is what a restart
-/// leaves behind.
+/// Removes every spool older than an upload lives. A spool is made when
+/// its upload begins, which is when its ticket's clock starts, so one this
+/// old belongs to an upload that has expired, here or after a restart.
 pub fn sweep(config: &Config) {
-    let now = Instant::now();
-    let mut live: Vec<String> = Vec::new();
-    let expired: Vec<String> = {
-        let mut uploads = config.inline_uploads.lock().unwrap();
-        let expired: Vec<String> = uploads
-            .iter()
-            .filter(|(_, u)| u.expires_at <= now)
-            .map(|(id, _)| id.to_string())
-            .collect();
-        for id in expired.iter() {
-            uploads.remove(id.as_str());
-        }
-        live.extend(uploads.keys().cloned());
-        expired
-    };
-    for id in expired.iter() {
-        let _ = std::fs::remove_dir_all(spool_dir(config, id));
-    }
     if let Ok(entries) = std::fs::read_dir(spool_root(config)) {
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if live.contains(&name) {
-                continue;
-            }
             let stale = entry
                 .metadata()
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age > Duration::from_secs(3600));
+                .is_some_and(|age| age > INLINE_TTL + Duration::from_secs(60));
             if stale {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
+}
+
+const UNKNOWN: &str = "upload id unknown or expired; call upload_begin again";
+
+/// The answer for an id with no live upload. Its spool, if this runner has
+/// one, goes now rather than at the next sweep.
+fn unknown(config: &Config, id: &str) -> String {
+    let _ = std::fs::remove_dir_all(spool_dir(config, id));
+    UNKNOWN.to_string()
 }
 
 /// Opens an upload and returns its id. The spool directory is created now,
@@ -107,20 +100,9 @@ pub fn begin(
     project: Option<String>,
 ) -> Result<String, String> {
     sweep(config);
-    let id = random_token(32);
+    let upload = InlineUpload { slug, kind, meta, user, project, chunks: BTreeMap::new() };
+    let id = crate::state::wait(config.stores.tickets.put(Kind::InlineUpload, INLINE_TTL, &upload))?;
     std::fs::create_dir_all(spool_dir(config, &id)).map_err(|e| format!("could not open a spool: {e}"))?;
-    config.inline_uploads.lock().unwrap().insert(
-        id.clone(),
-        InlineUpload {
-            slug,
-            kind,
-            meta,
-            user,
-            project,
-            expires_at: Instant::now() + INLINE_TTL,
-            chunks: BTreeMap::new(),
-        },
-    );
     Ok(id)
 }
 
@@ -151,52 +133,54 @@ pub(crate) fn chunk_within(config: &Config, id: &str, index: u32, data: &str, ce
     if bytes.is_empty() {
         return Err("a chunk holds at least one byte".to_string());
     }
-    let dir = {
-        let mut uploads = config.inline_uploads.lock().unwrap();
-        let upload = uploads
-            .get_mut(id)
-            .filter(|u| u.expires_at > Instant::now())
-            .ok_or_else(|| "upload id unknown or expired; call upload_begin again".to_string())?;
+    let size = bytes.len() as u64;
+    let mut over = false;
+    let counted = crate::state::wait(config.stores.tickets.update(Kind::InlineUpload, id, |upload: &mut InlineUpload| {
         let others: u64 = upload
             .chunks
             .iter()
             .filter(|(i, _)| **i != index)
             .map(|(_, size)| *size)
             .sum();
-        if others + bytes.len() as u64 > ceiling {
-            // Over the ceiling the upload is lost either way; say so and
-            // clear the spool rather than hold it until expiry.
-            uploads.remove(id);
-            let _ = std::fs::remove_dir_all(spool_dir(config, id));
+        if others + size > ceiling {
+            over = true;
             return Err(format!(
                 "the upload would pass {} bytes, the ceiling for one upload; it is cancelled",
                 ceiling
             ));
         }
-        upload.chunks.insert(index, bytes.len() as u64);
-        spool_dir(config, id)
+        upload.chunks.insert(index, size);
+        Ok(Progress {
+            received: upload.chunks.values().sum(),
+            present: upload.chunks.keys().copied().collect(),
+        })
+    }));
+    let progress = match counted {
+        Ok(Some(progress)) => progress,
+        Ok(None) => return Err(unknown(config, id)),
+        Err(why) => {
+            if over {
+                // Over the ceiling the upload is lost either way; say so and
+                // clear the spool rather than hold it until expiry.
+                let _ = crate::state::wait(config.stores.tickets.take::<InlineUpload>(Kind::InlineUpload, id));
+                let _ = std::fs::remove_dir_all(spool_dir(config, id));
+            }
+            return Err(why);
+        }
     };
+    let dir = spool_dir(config, id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not spool the chunk: {e}"))?;
     std::fs::write(dir.join(format!("{index}.part")), &bytes).map_err(|e| format!("could not spool the chunk: {e}"))?;
-    let uploads = config.inline_uploads.lock().unwrap();
-    let upload = uploads.get(id).ok_or_else(|| "upload id unknown".to_string())?;
-    Ok(Progress {
-        received: upload.chunks.values().sum(),
-        present: upload.chunks.keys().copied().collect(),
-    })
+    Ok(progress)
 }
 
 /// Closes the upload and returns it with its bytes in order, or the indexes
 /// that never arrived. Either way the id is spent and the spool is gone.
 pub fn finish(config: &Config, id: &str, count: u32) -> Result<(InlineUpload, Vec<u8>), String> {
-    let upload = {
-        let mut uploads = config.inline_uploads.lock().unwrap();
-        uploads.remove(id)
-    };
+    let upload = crate::state::wait(config.stores.tickets.take::<InlineUpload>(Kind::InlineUpload, id));
     let dir = spool_dir(config, id);
     let outcome = (|| {
-        let upload = upload
-            .filter(|u| u.expires_at > Instant::now())
-            .ok_or_else(|| "upload id unknown or expired; call upload_begin again".to_string())?;
+        let upload = upload?.ok_or_else(|| UNKNOWN.to_string())?;
         if count == 0 {
             return Err("chunks must be at least 1".to_string());
         }
@@ -234,10 +218,13 @@ pub fn finish(config: &Config, id: &str, count: u32) -> Result<(InlineUpload, Ve
 mod tests {
     use super::*;
 
-    fn config() -> (tempfile::TempDir, Config) {
+    /// A site, and a runtime entered for the store calls these blocking
+    /// functions wait on, as their blocking thread would have.
+    fn config() -> (tempfile::TempDir, Config, tokio::runtime::Runtime) {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::local(dir.path().to_path_buf(), "t");
-        (dir, config)
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        (dir, config, runtime)
     }
 
     fn meta() -> SourceMeta {
@@ -254,7 +241,8 @@ mod tests {
 
     #[test]
     fn chunks_join_in_index_order_whatever_order_they_came() {
-        let (_dir, config) = config();
+        let (_dir, config, runtime) = config();
+        let _entered = runtime.enter();
         let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
         chunk(&config, &id, 2, &b64(b"cc")).unwrap();
         chunk(&config, &id, 0, &b64(b"aa")).unwrap();
@@ -269,19 +257,21 @@ mod tests {
 
     #[test]
     fn a_missing_chunk_is_named_and_the_upload_is_cancelled() {
-        let (_dir, config) = config();
+        let (_dir, config, runtime) = config();
+        let _entered = runtime.enter();
         let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
         chunk(&config, &id, 0, &b64(b"aa")).unwrap();
         chunk(&config, &id, 2, &b64(b"cc")).unwrap();
         let error = finish(&config, &id, 3).unwrap_err();
         assert!(error.contains("chunks 1 never arrived"), "{error}");
         assert!(!spool_dir(&config, &id).exists());
-        assert!(config.inline_uploads.lock().unwrap().is_empty());
+        assert_eq!(crate::state::wait(config.stores.tickets.live(Kind::InlineUpload)).unwrap(), 0);
     }
 
     #[test]
     fn a_repeated_index_replaces_rather_than_adds() {
-        let (_dir, config) = config();
+        let (_dir, config, runtime) = config();
+        let _entered = runtime.enter();
         let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
         chunk(&config, &id, 0, &b64(b"wrong")).unwrap();
         let progress = chunk(&config, &id, 0, &b64(b"right")).unwrap();
@@ -292,7 +282,8 @@ mod tests {
 
     #[test]
     fn a_chunk_past_the_ceiling_cancels_the_upload_and_clears_the_spool() {
-        let (_dir, config) = config();
+        let (_dir, config, runtime) = config();
+        let _entered = runtime.enter();
         let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
         chunk_within(&config, &id, 0, &b64(&[1u8; 10]), 15).unwrap();
         let error = chunk_within(&config, &id, 1, &b64(&[2u8; 10]), 15).unwrap_err();
@@ -303,7 +294,8 @@ mod tests {
 
     #[test]
     fn a_chunk_larger_than_the_chunk_size_or_not_base64_is_refused() {
-        let (_dir, config) = config();
+        let (_dir, config, runtime) = config();
+        let _entered = runtime.enter();
         let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
         let big = vec![0u8; CHUNK_BYTES + 1];
         assert!(chunk(&config, &id, 0, &b64(&big)).unwrap_err().contains("at most"));
@@ -313,14 +305,36 @@ mod tests {
 
     #[test]
     fn an_expired_upload_is_gone_with_its_spool() {
-        let (_dir, config) = config();
+        let (_dir, config, runtime) = config();
+        let _entered = runtime.enter();
         let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
         chunk(&config, &id, 0, &b64(b"aa")).unwrap();
-        config.inline_uploads.lock().unwrap().get_mut(&id).unwrap().expires_at = Instant::now() - Duration::from_secs(1);
+        assert!(crate::state::wait(config.stores.tickets.expire(Kind::InlineUpload, &id)).unwrap());
         assert!(chunk(&config, &id, 1, &b64(b"bb")).unwrap_err().contains("expired"));
-        // The next begin sweeps it.
-        let _ = begin(&config, "other".into(), UploadKind::Page, meta(), None, None).unwrap();
         assert!(!spool_dir(&config, &id).exists(), "the expired spool stayed");
-        assert!(!config.inline_uploads.lock().unwrap().contains_key(&id));
+        assert!(finish(&config, &id, 1).unwrap_err().contains("expired"));
+    }
+
+    #[test]
+    fn a_spool_is_named_by_digest_so_no_id_reaches_the_path_or_the_disk() {
+        let (dir, config, runtime) = config();
+        let _entered = runtime.enter();
+        let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
+        chunk(&config, &id, 0, &b64(b"aa")).unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path().join(".tmp/inline"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![tickets::digest(Kind::InlineUpload, &id)]);
+        assert!(!names.iter().any(|name| name.contains(&id)));
+
+        // An id that would climb out of the spool is only ever a digest.
+        std::fs::write(dir.path().join("keep.html"), b"kept").unwrap();
+        for hostile in ["..", "../..", "../../keep.html", "/"] {
+            assert!(chunk(&config, hostile, 0, &b64(b"x")).is_err());
+            assert!(finish(&config, hostile, 1).is_err());
+        }
+        assert!(dir.path().join("keep.html").exists(), "a hostile id removed a file outside the spool");
     }
 }

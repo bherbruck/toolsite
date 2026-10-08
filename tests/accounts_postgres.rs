@@ -79,7 +79,7 @@ fn site(policy: Policy) -> Site {
     });
     let config = Config {
         mfa: Settings { policy, for_providers: false, clock: Clock::fixed(T0) },
-        stores: Stores { backend, runner: None },
+        stores: Stores::new(backend, None, Some(KEY)).unwrap(),
         ..Config::local(dir.path().to_path_buf(), "test-token")
     };
     Site { config: Arc::new(config), url, name, _dir: dir }

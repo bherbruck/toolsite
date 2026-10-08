@@ -387,7 +387,7 @@ pub async fn render(
     let Some(renderer) = config.renderer.clone() else {
         return Err(no_browser_message());
     };
-    let token = preview::issue(config, app, path, user_id)?;
+    let token = preview::issue(config, app, path, user_id).await?;
     let url = preview_url(config, app, &token);
     let png = renderer.render(&url, &options).await?;
     tokio::task::spawn_blocking(move || fit(&png))

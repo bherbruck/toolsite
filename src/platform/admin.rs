@@ -2448,7 +2448,7 @@ pub async fn settings_link(
     if let Err(response) = checked_app(&config, &headers, &form.token, &form.app, Scope::Editor).await {
         return response;
     }
-    match crate::platform::secrets::create_entry(&config, &form.app) {
+    match crate::platform::secrets::create_entry(&config, &form.app).await {
         Ok(url) => app_tab(config, headers, form.app, "settings".into(), Some(Fresh::SettingsLink(url))).await,
         Err(message) => redirect_flash(&back_or(form.back.as_deref(), "/admin/apps"), false, message),
     }

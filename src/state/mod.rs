@@ -8,6 +8,7 @@
 
 pub mod pg;
 pub mod runners;
+pub mod tickets;
 
 use std::{
     future::Future,
@@ -29,17 +30,34 @@ pub enum Backend {
     Postgres(Arc<pg::Postgres>),
 }
 
-/// The store handles every layer reaches platform state through. Empty
-/// apart from the backend for now: each store joins as it moves behind its
-/// trait, an `Arc<dyn Trait>` chosen here from the backend.
+/// The store handles every layer reaches platform state through. Each
+/// store joins as it moves behind its trait, a handle chosen here from the
+/// backend.
 #[derive(Clone, Default)]
 pub struct Stores {
     pub backend: Backend,
     /// This process in the runner registry, when it serves on Postgres.
     pub runner: Option<Arc<runners::Runner>>,
+    /// Upload URLs, settings links, inline uploads, browser uploads,
+    /// provider sign-ins, previews and handoff codes.
+    pub tickets: tickets::Tickets,
 }
 
 impl Stores {
+    /// The stores for a backend. On Postgres the ticket key comes from
+    /// `TOOLSITE_SECRET_KEY`, as the boot guard already insists, so every
+    /// runner opens what any runner sealed.
+    pub fn new(backend: Backend, runner: Option<Arc<runners::Runner>>, secret_key: Option<&str>) -> Result<Stores, String> {
+        let tickets = match &backend {
+            Backend::Files => tickets::Tickets::memory(),
+            Backend::Postgres(postgres) => {
+                let key = secret_key.ok_or("TOOLSITE_SECRET_KEY is required on Postgres")?;
+                tickets::Tickets::postgres(postgres.pool.clone(), &crate::seal::parse_key(key)?)
+            }
+        };
+        Ok(Stores { backend, runner, tickets })
+    }
+
     pub fn is_postgres(&self) -> bool {
         matches!(self.backend, Backend::Postgres(_))
     }

@@ -103,16 +103,13 @@ fn app_cookie(config: &Config, email: &str, app: &str) -> (String, String) {
 }
 
 async fn upload(site: &Site, app: &str, kind: &str, body: Vec<u8>) -> (u16, String) {
-    let ticket = toolsite::content::slug::random_token(24);
-    site.config.uploads.lock().unwrap().insert(
-        ticket.clone(),
-        UploadTicket {
-            slug: app.to_string(),
-            expires_at: Instant::now() + Duration::from_secs(60),
-            user: None,
-            project: None,
-        },
-    );
+    let ticket = toolsite::platform::upload::issue_ticket(
+        &site.config,
+        &UploadTicket { slug: app.to_string(), user: None, project: None },
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
     let response = reqwest::Client::new()
         .put(format!("http://{}/upload/{ticket}?{kind}", site.addr))
         .body(body)

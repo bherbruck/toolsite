@@ -30,6 +30,7 @@ use crate::{
     accounts::users::{self, AtEmail},
     config::Config,
     content::slug::random_token,
+    state::tickets::Kind as TicketKind,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -40,10 +41,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use maud::html;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 /// A sign-in has this long between leaving for the provider and coming back.
 const LOGIN_TTL: Duration = Duration::from_secs(600);
@@ -127,13 +125,15 @@ impl Provider {
     }
 }
 
-/// A sign-in that has left for the provider and not come back yet.
+/// A sign-in that has left for the provider and not come back yet. Kept in
+/// `state::Tickets` by its `state`, sealed (the verifier is a credential),
+/// with its expiry.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PendingLogin {
     pub provider: String,
     pub nonce: String,
     pub verifier: String,
     pub next: String,
-    pub expires_at: Instant,
 }
 
 // --- configuration ---------------------------------------------------------
@@ -384,7 +384,6 @@ pub async fn begin(
         }
     };
 
-    let state = random_token(32);
     let nonce = random_token(32);
     let verifier = random_token(64);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -393,6 +392,16 @@ pub async fn begin(
     let Ok(mut url) = url::Url::parse(&endpoints.authorization) else {
         tracing::warn!(provider = %slug, "sign-in refused: provider's authorization endpoint is not a URL");
         return refusal(StatusCode::BAD_GATEWAY, "Sign-in is not available", "The provider configuration is not valid.");
+    };
+    // The state is the ticket's id: whoever comes back with it is the
+    // sign-in that left.
+    let pending = PendingLogin { provider: slug.clone(), nonce: nonce.clone(), verifier, next };
+    let state = match config.stores.tickets.put(TicketKind::Login, LOGIN_TTL, &pending).await {
+        Ok(state) => state,
+        Err(why) => {
+            tracing::error!(provider = %slug, %why, "sign-in refused: could not remember it");
+            return refusal(StatusCode::SERVICE_UNAVAILABLE, "Sign-in is not available", "Try again in a moment.");
+        }
     };
     {
         let mut query = url.query_pairs_mut();
@@ -409,21 +418,6 @@ pub async fn begin(
         }
     }
 
-    {
-        let now = Instant::now();
-        let mut logins = config.logins.lock().unwrap();
-        logins.retain(|_, pending| pending.expires_at > now);
-        logins.insert(
-            state,
-            PendingLogin {
-                provider: slug.clone(),
-                nonce,
-                verifier,
-                next,
-                expires_at: now + LOGIN_TTL,
-            },
-        );
-    }
     (
         [(header::CACHE_CONTROL, "no-store")],
         Redirect::to(url.as_str()),
@@ -479,12 +473,13 @@ pub async fn callback(
 
     // The state is spent whatever happens next, so a replayed callback has
     // nothing to replay against.
-    let pending = params.state.as_deref().and_then(|state| {
-        let now = Instant::now();
-        let mut logins = config.logins.lock().unwrap();
-        logins.retain(|_, pending| pending.expires_at > now);
-        logins.remove(state)
-    });
+    let pending = match params.state.as_deref() {
+        Some(state) => config.stores.tickets.take::<PendingLogin>(TicketKind::Login, state).await.unwrap_or_else(|why| {
+            tracing::error!(provider = %slug, %why, "sign-in state could not be read");
+            None
+        }),
+        None => None,
+    };
     let Some(pending) = pending.filter(|pending| pending.provider == slug) else {
         tracing::warn!(provider = %slug, state_presented = params.state.is_some(), "sign-in refused: unknown, expired or spent state");
         return refusal(

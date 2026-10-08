@@ -23,7 +23,7 @@ pub(crate) async fn receive(
     request: Request<Body>,
 ) -> Response {
     let config = &state.config;
-    let Some(ticket) = blobs::take_upload(config, &ticket) else {
+    let Some(ticket) = blobs::take_upload(config, &ticket).await else {
         tracing::warn!("blob upload refused: ticket unknown, expired or already used");
         return (
             StatusCode::UNAUTHORIZED,
