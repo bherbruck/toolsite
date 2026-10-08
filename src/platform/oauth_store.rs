@@ -316,6 +316,16 @@ mod tests {
         (dir, config)
     }
 
+    #[test]
+    fn the_token_database_keeps_full_sync_unlike_an_apps() {
+        let (_dir, config) = config();
+        let conn = open(&config).unwrap();
+        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>).unwrap();
+        let sync: i64 = conn.query_row("pragma synchronous", [], |row| row.get(0)).unwrap();
+        // 2 is FULL: a token issued is a token on disk, power cut or not.
+        assert_eq!(sync, 2);
+    }
+
     /// Backdates a row so the tests do not have to wait a day.
     fn age(config: &Config, table: &str, by: Duration) {
         let conn = open(config).unwrap();

@@ -363,7 +363,9 @@ impl StoreState {
             let identity = self.identity();
             self.db = Some(db::open_until(&self.site, &self.app, identity.as_ref(), Some(self.deadline))?);
         }
-        Ok(self.db.as_ref().expect("opened above"))
+        let conn = self.db.as_ref().expect("opened above");
+        db::busy_until(conn, self.deadline)?;
+        Ok(conn)
     }
 
     /// The call's connection for `query-scoped` and `batch-scoped`, and the
@@ -379,6 +381,7 @@ impl StoreState {
             self.scoped = Some((conn, scope));
         }
         let (conn, scope) = self.scoped.as_ref().expect("opened above");
+        db::busy_until(conn, self.deadline)?;
         Ok((conn, scope))
     }
 }
@@ -879,7 +882,10 @@ impl Runtime {
 /// open writer.
 fn arm(store: &mut Store<StoreState>, guards: Guards) {
     end_call(store);
-    store.data_mut().deadline = Instant::now() + guards.wall_clock;
+    // A wall clock no Instant can hold, from a ceiling set absurdly high,
+    // is as good as none rather than a panic on every call.
+    let now = Instant::now();
+    store.data_mut().deadline = now.checked_add(guards.wall_clock).unwrap_or(now + Duration::from_secs(365 * 24 * 3600));
     store.data_mut().query_rows = guards.query_rows;
     store.set_fuel(guards.fuel.unwrap_or(u64::MAX)).expect("fuel is enabled");
     store.set_epoch_deadline(1);
@@ -1440,6 +1446,149 @@ mod tests {
         assert!(resident.data().writers.is_empty());
         assert!(resident.data().db.is_none());
         assert!(resident.data_mut().get("report.bin".into()).is_err());
+    }
+
+    #[test]
+    fn temp_tables_triggers_and_savepoints_of_one_call_are_gone_by_the_next_on_the_same_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut resident = runtime.store(site_in(&dir), "app", Some(person("u-alice")), Guards::default());
+        sql(&mut resident, "create table t (x, who)").unwrap();
+        // Alice's call leaves a temp table and a temp trigger that would
+        // stamp every later insert as hers, and a savepoint open.
+        sql(&mut resident, "create temp table scratch (x)").unwrap();
+        sql(&mut resident, "insert into scratch values ('alice was here')").unwrap();
+        sql(
+            &mut resident,
+            "create temp trigger stamp after insert on main.t begin update t set who = 'u-alice' where rowid = new.rowid; end",
+        )
+        .unwrap();
+        sql(&mut resident, "savepoint held").unwrap();
+        sql(&mut resident, "insert into t values (1, current_user())").unwrap();
+
+        // Bob's event on the same instance.
+        resident.data_mut().user = Some(person("u-bob"));
+        arm(&mut resident, Guards::default());
+        assert!(sql(&mut resident, "select * from scratch").is_err(), "a temp table outlived its call");
+        assert_eq!(text(&sql(&mut resident, "select count(*) from temp.sqlite_master").unwrap()), "0");
+        sql(&mut resident, "insert into t values (2, current_user())").unwrap();
+        assert_eq!(text(&sql(&mut resident, "select group_concat(who) from t").unwrap()), "u-bob", "the savepoint's row stayed or the trigger fired");
+
+        // A tick, as nobody: none of either person.
+        resident.data_mut().user = None;
+        arm(&mut resident, Guards::default());
+        assert_eq!(text(&sql(&mut resident, "select current_user()").unwrap()), "null");
+    }
+
+    #[test]
+    fn a_scoped_caller_cannot_create_temp_objects_or_triggers_even_in_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = site_in(&dir);
+        shop(&site);
+        let runtime = runtime();
+        // An index for `reindex` to have something to rebuild: with none it
+        // asks nothing and does nothing.
+        db::run(&site, "shop", "create index orders_owner on orders (owner_id)", &[]).unwrap();
+        let mut store = runtime.store(site.clone(), "shop", Some(person("u-alice")), Guards::default());
+        for statement in [
+            "create temp table scratch (x)",
+            "create temp view v as select 1",
+            "create temp trigger t after insert on orders begin delete from orders; end",
+            "create trigger t after insert on orders begin delete from orders; end",
+            "create trigger t instead of insert on my_orders begin delete from orders; end",
+            "drop trigger if exists ts_abc_my_orders_insert",
+            "vacuum",
+            "reindex",
+            "analyze",
+        ] {
+            assert!(scoped_sql(&mut store, statement).is_err(), "{statement} was allowed");
+            assert!(
+                batch_scoped(&mut store, &["insert into my_orders (total) values (1)", statement]).is_err(),
+                "{statement} was allowed in a batch"
+            );
+        }
+        let rows = db::run(&site, "shop", "select count(*) from orders", &[]).unwrap();
+        assert_eq!(rows.rows[0][0], serde_json::json!(0), "a refused batch left its insert");
+        let triggers = db::run(&site, "shop", "select count(*) from sqlite_master where type = 'trigger'", &[]).unwrap();
+        assert_eq!(triggers.rows[0][0], serde_json::json!(crate::runtime::access::trigger_names("abc", "my_orders").len()));
+    }
+
+    #[test]
+    fn a_statement_cached_on_the_plain_connection_is_never_run_on_the_scoped_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = site_in(&dir);
+        shop(&site);
+        let runtime = runtime();
+        let mut store = runtime.store(site, "shop", Some(person("u-alice")), Guards::default());
+        // Prepared and cached under the plain authorizer, which allows it.
+        for _ in 0..3 {
+            sql(&mut store, "select * from orders").unwrap();
+        }
+        assert!(matches!(scoped_sql(&mut store, "select * from orders"), Err(WitDbError::Denied(_))));
+        assert!(matches!(batch_scoped(&mut store, &["select * from orders"]), Err(WitDbError::Denied(_))));
+        // And the reverse: the scoped connection's view does not make the
+        // plain one's base table any less reachable for the author.
+        scoped_sql(&mut store, "select * from my_orders").unwrap();
+        sql(&mut store, "select * from orders").unwrap();
+    }
+
+    #[test]
+    fn uncommitted_plain_writes_never_show_through_the_scoped_connection_and_roll_back_with_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = site_in(&dir);
+        shop(&site);
+        let runtime = runtime();
+        let mut store = runtime.store(site.clone(), "shop", Some(person("u-alice")), Guards::default());
+        sql(&mut store, "begin").unwrap();
+        sql(&mut store, "insert into orders (owner_id, total) values ('u-alice', 1)").unwrap();
+        assert_eq!(text(&scoped_sql(&mut store, "select count(*) from my_orders").unwrap()), "0");
+        arm(&mut store, Guards::default());
+        assert_eq!(text(&scoped_sql(&mut store, "select count(*) from my_orders").unwrap()), "0");
+        assert_eq!(text(&sql(&mut store, "select count(*) from orders").unwrap()), "0");
+    }
+
+    #[test]
+    fn waiting_on_a_lock_the_call_itself_holds_stops_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = site_in(&dir);
+        shop(&site);
+        let runtime = runtime();
+        let guards = Guards { wall_clock: Duration::from_millis(600), ..Guards::default() };
+        let mut store = runtime.store(site, "shop", Some(person("u-alice")), guards);
+        // The plain connection takes the write lock; the scoped one then
+        // asks for it. SQLite's busy handler would sleep its full five
+        // seconds there, where no progress handler runs.
+        sql(&mut store, "begin immediate").unwrap();
+        let started = Instant::now();
+        assert!(scoped_sql(&mut store, "insert into my_orders (total) values (1)").is_err());
+        assert!(batch_scoped(&mut store, &["insert into my_orders (total) values (1)"]).is_err());
+        assert!(started.elapsed() < Duration::from_millis(2500), "waited {:?} past a 600 ms call", started.elapsed());
+    }
+
+    #[test]
+    fn vacuum_into_cannot_copy_the_database_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime();
+        let mut store = runtime.store(site_in(&dir), "app", None, Guards::default());
+        sql(&mut store, "create table t (x); insert into t values ('secret')").unwrap();
+        let out = dir.path().join("copied.db");
+        let other = dir.path().join("victim");
+        std::fs::create_dir_all(&other).unwrap();
+        for statement in [
+            format!("vacuum into '{}'", out.display()),
+            "vacuum into '../victim/data.db'".to_string(),
+            "vacuum main into '../copied.db'".to_string(),
+        ] {
+            assert!(sql(&mut store, &statement).is_err(), "{statement} ran");
+            assert!(batch(&mut store, &[&statement]).is_err(), "{statement} ran in a batch");
+        }
+        assert!(!out.exists());
+        assert!(!other.join("data.db").exists());
+        assert!(!dir.path().join("copied.db").exists());
+        for refused in ["select load_extension('/lib/x86_64-linux-gnu/libc.so.6')", "select writefile('/tmp/x', 'y')"] {
+            assert!(sql(&mut store, refused).is_err(), "{refused} ran");
+            assert!(batch(&mut store, &[refused]).is_err(), "{refused} ran in a batch");
+        }
     }
 
     #[test]

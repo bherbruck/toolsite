@@ -141,3 +141,76 @@ async fn a_writer_key_cannot_escape_the_apps_files() {
     assert!(!dir.path().join("victim/pwned").exists());
     assert_eq!(temps(&dir, "app"), 0);
 }
+
+/// Where writes in progress live: under `.blobs/tmp/`, which no key, no
+/// listing and no route can name. A guest that knows the layout still
+/// cannot serve, read or list a half-written file, its own or another's.
+#[tokio::test]
+async fn a_write_in_progress_is_out_of_reach_of_every_route_and_key() {
+    let (dir, config) = server();
+    publish_handler(&config, "app");
+    let tmp = dir.path().join("app/.blobs/tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("inflight.part"), "HALF WRITTEN").unwrap();
+    std::fs::create_dir_all(dir.path().join("app/.blobs/data")).unwrap();
+    std::fs::write(dir.path().join("app/.blobs/data/kept.txt"), "kept").unwrap();
+
+    for uri in [
+        "/p/app/.blobs/tmp/inflight.part",
+        "/p/app/.blobs/data/kept.txt",
+        "/p/app/%2eblobs/tmp/inflight.part",
+        "/p/app/%2Eblobs%2Ftmp%2Finflight.part",
+        "/p/app/x/../.blobs/tmp/inflight.part",
+    ] {
+        let (status, body) = get(&config, uri).await;
+        assert!(!body.contains("HALF WRITTEN") && body != "kept", "{uri} served it: {status}");
+    }
+    for key in ["../tmp/inflight.part", "tmp/../../tmp/inflight.part", ".blobs/tmp/inflight.part", "../../.blobs/tmp/inflight.part"] {
+        for route in ["blob-serve", "blob-get", "blob-stat"] {
+            let (status, body) = get(&config, &format!("/p/app/api/{route}?key={key}")).await;
+            assert!(!body.contains("HALF WRITTEN"), "{route} {key}: {status} {body}");
+        }
+        let (status, body) = get(&config, &format!("/p/app/api/writer-write?key={key}&parts=over")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key} was written: {body}");
+    }
+    let (_, listed) = get(&config, "/p/app/api/blob-list?prefix=").await;
+    assert!(!listed.contains("inflight"), "{listed}");
+    assert_eq!(std::fs::read_to_string(tmp.join("inflight.part")).unwrap(), "HALF WRITTEN");
+}
+
+/// A process that died mid-write leaves its temp file. The next writer of
+/// that app sweeps one a day old, and leaves a fresh one, which may be a
+/// write still going on.
+#[tokio::test]
+async fn temp_files_a_crash_left_are_swept_and_a_live_one_is_not() {
+    let (dir, config) = server();
+    publish_handler(&config, "app");
+    let tmp = dir.path().join("app/.blobs/tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("crashed.part"), "x".repeat(1000)).unwrap();
+    std::fs::write(tmp.join("live.part"), "y").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
+    std::fs::File::options().write(true).open(tmp.join("crashed.part")).unwrap().set_modified(old).unwrap();
+
+    let (status, body) = get(&config, "/p/app/api/writer-write?key=new.txt&parts=a").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!tmp.join("crashed.part").exists(), "a day-old temp was kept");
+    assert!(tmp.join("live.part").exists(), "a fresh temp was swept");
+}
+
+/// Many small appends count toward the ceiling as one large one would.
+#[tokio::test]
+async fn the_write_ceiling_counts_every_small_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        blobs: toolsite::runtime::blobs::Blobs { max_write_bytes: 10, ..toolsite::runtime::blobs::Blobs::local(0) },
+        ..Config::local(dir.path().to_path_buf(), "test-token")
+    });
+    publish_handler(&config, "app");
+    let parts = ["x"; 11].join(",");
+    let (status, body) = get(&config, &format!("/p/app/api/writer-write?key=small.txt&parts={parts}")).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    let (status, _) = get(&config, "/p/app/api/blob-get?key=small.txt").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(temps(&dir, "app"), 0);
+}

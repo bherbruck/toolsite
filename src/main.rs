@@ -420,6 +420,10 @@ async fn main() -> anyhow::Result<()> {
         "TOOLSITE_JOB_STARTS_PER_MINUTE",
         toolsite::platform::schedule::DEFAULT_STARTS_PER_MINUTE as u64,
     ) as usize;
+    let jobs_running = count(
+        "TOOLSITE_JOBS_RUNNING_PER_APP",
+        toolsite::platform::schedule::DEFAULT_RUNNING_PER_APP as u64,
+    ) as usize;
     tracing::info!(
         request_fuel = ?limits.request_fuel,
         request_seconds = limits.request_seconds,
@@ -428,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
         query_rows = limits.query_rows,
         memory_mb = limits.memory_mb,
         job_starts_per_minute = job_starts,
+        jobs_running_per_app = jobs_running,
         "app limit ceilings"
     );
 
@@ -455,7 +460,7 @@ async fn main() -> anyhow::Result<()> {
         handoffs: Mutex::new(HashMap::new()),
         mfa,
         limits,
-        jobs: Arc::new(toolsite::platform::schedule::Jobs::new(job_starts)),
+        jobs: Arc::new(toolsite::platform::schedule::Jobs::new(job_starts).with_running_per_app(jobs_running)),
     });
 
     // Per-app grants became View rows on their apps; done once.

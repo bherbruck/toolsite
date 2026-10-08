@@ -865,6 +865,7 @@ fn sql_archive(dir: &Path) -> Result<Vec<u8>> {
 /// missing from it.
 fn project_archive(dir: &Path) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
+    builder.follow_symlinks(false);
     append_source(&mut builder, dir, Path::new(""))?;
     let tar = builder.into_inner()?;
 
@@ -886,11 +887,14 @@ fn append_source(builder: &mut tar::Builder<Vec<u8>>, dir: &Path, within: &Path)
         }
         let path = entry.path();
         let inside = within.join(&name);
-        // Not followed through a link: a link to a parent would never end.
-        if entry.file_type()?.is_dir() {
+        // A link is left out, not followed: one to a parent would never end,
+        // and one to ~/.ssh would put a key on the server and in the app's
+        // repository. Sockets and pipes are not source either.
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
             builder.append_dir(&inside, &path)?;
             append_source(builder, &path, &inside)?;
-        } else {
+        } else if kind.is_file() {
             builder.append_path_with_name(&path, &inside)?;
         }
     }
@@ -956,6 +960,9 @@ fn find_upload_url(text: &str) -> Option<String> {
 
 fn tar_gz(root: &Path) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
+    // A link goes in as a link, which the server leaves out, rather than as
+    // whatever it points at outside the build.
+    builder.follow_symlinks(false);
     builder.append_dir_all(".", root)?;
     let tar = builder.into_inner()?;
 
@@ -1097,6 +1104,49 @@ mod tests {
                 "web/package.json",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_source_archive_never_follows_a_link_out_of_the_project_or_round_a_loop() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("id_ed25519"), "PRIVATE KEY").unwrap();
+        std::fs::create_dir_all(outside.path().join("secrets")).unwrap();
+        std::fs::write(outside.path().join("secrets/token"), "TOKEN").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.ts"), "ok").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("id_ed25519"), root.join("key")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secrets"), root.join("src/secrets")).unwrap();
+        // A link to the project's own parent: followed, it would never end.
+        std::os::unix::fs::symlink("..", root.join("src/up")).unwrap();
+        std::os::unix::fs::symlink(root, root.join("loop")).unwrap();
+
+        let bytes = project_archive(root).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        let mut names = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut body).unwrap();
+            assert!(!body.contains("PRIVATE KEY") && !body.contains("TOKEN"), "{body}");
+            names.push(entry.path().unwrap().to_string_lossy().to_string());
+        }
+        names.sort();
+        assert_eq!(names, ["src", "src/main.ts"]);
+
+        // The bundle a build makes: a link goes in as a link, never as the
+        // file it points at.
+        let bytes = tar_gz(root).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut body = String::new();
+            let _ = std::io::Read::read_to_string(&mut entry, &mut body);
+            assert!(!body.contains("PRIVATE KEY") && !body.contains("TOKEN"), "{body}");
+        }
     }
 
     #[test]

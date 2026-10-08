@@ -1550,3 +1550,40 @@ async fn a_person_without_manage_cannot_run_a_job_by_mcp_or_the_admin_page() {
     assert!(!err && text.contains("ran: 200"), "{text}");
     assert_eq!(marks(&w.config), 1);
 }
+
+/// A job's status line is the handler's own words when it fails, which can
+/// name what it was doing. Who may see it is who may edit the app: not a
+/// viewer, by MCP or by the admin page, and not someone with no grant.
+#[tokio::test]
+async fn a_jobs_status_is_shown_to_its_editors_and_never_to_a_viewer() {
+    let w = world().await;
+    toolsite::platform::schedule::set_job(&w.config, "ledger", "close", "0 0 0 1 1 *", "/api/close").unwrap();
+    toolsite::platform::schedule::record_run(&w.config, "ledger", "close", "failed: wrote 4411-2222 to the books");
+    let leaks = |text: &str| text.contains("4411-2222");
+
+    // The admin page, for a viewer of ledger, for nobody, and for an editor
+    // of another folder.
+    for who in ["fin", "nobody", "ed"] {
+        let (status, page, _) = send(&w.config, get_as("/admin/apps/ledger/jobs", &session(&w.config, &format!("{who}@x.test")))).await;
+        assert!(!status.is_success() && !leaks(&page), "{who} opened ledger's jobs tab: {status}");
+        let form = format!("token={}&app=ledger&name=close", form_token(&w.config, &format!("{who}@x.test")));
+        let (status, _, _) = send(&w.config, post_as("/admin/job-run", &session(&w.config, &format!("{who}@x.test")), form)).await;
+        assert!(!status.is_redirection(), "{who} ran ledger's job from the admin page: {status}");
+    }
+    // MCP, for the one of them who may connect a client at all.
+    let ed = token_for(&w.config, "ed@x.test");
+    for arguments in [
+        serde_json::json!({"app":"ledger"}),
+        serde_json::json!({"app":"ledger","name":"close","run_now":true}),
+        serde_json::json!({"app":"ledger","name":"mine","schedule":"* * * * * *","path":"/api/close"}),
+    ] {
+        let (err, text) = tool(&w.config, "/mcp", &ed, "app_jobs", arguments.clone()).await;
+        assert!(err && !leaks(&text), "an editor of another folder got {arguments}: {text}");
+    }
+    assert_eq!(toolsite::platform::schedule::read_jobs(&w.config, "ledger").len(), 1);
+
+    // Someone who manages ledger's folder sees it.
+    let boss = token_for(&w.config, "boss@x.test");
+    let (err, text) = tool(&w.config, "/mcp", &boss, "app_jobs", serde_json::json!({"app":"ledger"})).await;
+    assert!(!err && leaks(&text), "{text}");
+}

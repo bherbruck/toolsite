@@ -500,3 +500,215 @@ async fn batch_scoped_holds_every_statement_to_the_row_level_policy() {
     assert_eq!((status, body.as_str()), (200, "ok:0"));
     assert_eq!(scalar(&site.config, "app", "select count(*) from orders"), serde_json::json!(2));
 }
+
+// --- adversarial: an app that tries to take more than its share ---------------
+
+/// An app that declares many jobs and starts them all together gets a few
+/// at once, by `jobs.run`, by a person and by the schedule alike; the rest
+/// are refused or skipped, and another app is not held up.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_runs_only_a_few_jobs_at_once_however_they_are_started() {
+    let site = site_with(|config| Config { jobs: Arc::new(schedule::Jobs::new(600).with_running_per_app(2)), ..config });
+    install(&site, "greedy");
+    install(&site, "other");
+    for n in 0..6 {
+        schedule::set_job(&site.config, "greedy", &format!("nap{n}"), NEVER, "/api/job-nap").unwrap();
+    }
+    schedule::set_job(&site.config, "other", "nap", NEVER, "/api/job-nap").unwrap();
+
+    assert_eq!(run_now(&site, "greedy", "nap0").await, (200, "started".into()));
+    assert_eq!(run_now(&site, "greedy", "nap1").await, (200, "started".into()));
+    let (status, body) = run_now(&site, "greedy", "nap2").await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("at once"), "{body}");
+    // Asking again for one that runs still queues it: no new slot needed.
+    assert_eq!(run_now(&site, "greedy", "nap0").await, (200, "queued".into()));
+    // A person asking is refused the same way.
+    let refused = schedule::run_job(&site.state(), "greedy", "nap3").await.unwrap_err();
+    assert!(refused.contains("at once"), "{refused}");
+    // The schedule too: every job due, two already running, none started.
+    let scheduler = schedule::Scheduler::new(site.state());
+    for n in 0..6 {
+        schedule::set_job(&site.config, "greedy", &format!("nap{n}"), "* * * * * *", "/api/job-nap").unwrap();
+    }
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 1;
+    let started = scheduler.tick(at).await;
+    assert!(started.is_empty(), "{} more runs started beside the two", started.len());
+    assert_eq!(schedule::read_jobs(&site.config, "greedy")["nap4"].last_skipped_at, Some(at));
+    // Another app starts at once.
+    assert_eq!(run_now(&site, "other", "nap").await, (200, "started".into()));
+
+    assert!(until(Duration::from_secs(60), || !(0..6).any(|n| site.config.jobs.is_running("greedy", &format!("nap{n}")))).await);
+    // Two runs, and nap0's one queued rerun: never more than two at a time.
+    let jobs = schedule::read_jobs(&site.config, "greedy");
+    assert_eq!(marks(&site.config, "greedy", "nap"), 3, "{:?}", (jobs.get("nap0"), jobs.get("nap1")));
+    // With the slots free again, the next asks start.
+    assert_eq!(run_now(&site, "greedy", "nap2").await, (200, "started".into()));
+}
+
+/// A visitor hammering a public route that starts a job: the job runs once
+/// at a time with one rerun queued, and the app's rate holds however fast
+/// the visitor asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_visitor_looping_on_a_route_that_starts_a_job_cannot_queue_more_than_one_rerun() {
+    let site = site_with(|config| Config { jobs: Arc::new(schedule::Jobs::new(5)), ..config });
+    install(&site, "app");
+    schedule::set_job(&site.config, "app", "nap", NEVER, "/api/job-nap").unwrap();
+    schedule::set_job(&site.config, "app", "mark", NEVER, "/api/job-mark").unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..50 {
+        answers.push(run_now(&site, "app", "nap").await.1);
+    }
+    assert_eq!(answers.iter().filter(|a| *a == "started").count(), 1, "{answers:?}");
+    assert!(until(Duration::from_secs(30), || !site.config.jobs.is_running("app", "nap")).await);
+    assert_eq!(marks(&site.config, "app", "nap"), 2, "fifty asks were more than one run and one rerun");
+    // Starts and reruns counted: two of the five a minute are spent, and
+    // three more starts of anything use up the rest.
+    for _ in 0..3 {
+        assert_eq!(run_now(&site, "app", "mark").await.0, 200);
+        assert!(until(Duration::from_secs(20), || !site.config.jobs.is_running("app", "mark")).await);
+    }
+    let (status, body) = run_now(&site, "app", "mark").await;
+    assert_eq!(status, 409, "{body}");
+}
+
+#[tokio::test]
+async fn an_app_declaring_more_jobs_than_it_may_is_refused_whole() {
+    let site = site();
+    install(&site, "app");
+    let toml: String = (0..=schedule::MAX_JOBS_PER_APP)
+        .map(|n| format!("[[job]]\nname = \"j{n}\"\nschedule = \"0 0 3 * * *\"\npath = \"/api/x\"\n"))
+        .collect();
+    let error = toolsite::platform::manifest::apply(&site.config, "app", &toml).await.unwrap_err();
+    assert!(error.contains("at most"), "{error}");
+    assert!(schedule::read_jobs(&site.config, "app").is_empty());
+}
+
+#[tokio::test]
+async fn limits_that_are_not_whole_positive_numbers_are_refused_and_huge_ones_clamped() {
+    let site = site();
+    install(&site, "app");
+    for bad in [
+        "request_seconds = -1",
+        "request_seconds = 1.5",
+        "job_fuel = \"none\"",
+        "memory_mb = 99999999999999999999999",
+        "query_rows = 0",
+        "query_rows = true",
+    ] {
+        let outcome = toolsite::platform::manifest::apply(&site.config, "app", &format!("[limits]\n{bad}\n")).await;
+        assert!(outcome.is_err(), "{bad} was taken: {outcome:?}");
+    }
+    assert_eq!(limits::of(&site.config, "app").await.request, toolsite::runtime::wasm::Guards::default());
+
+    // The largest number TOML has: clamped to each ceiling, said so.
+    let notes = declare(
+        &site,
+        "app",
+        "[limits]\nrequest_seconds = 9223372036854775807\nmemory_mb = 9223372036854775807\nquery_rows = 9223372036854775807\njob_fuel = 9223372036854775807\n",
+    )
+    .await;
+    assert!(notes.join("\n").contains("memory_mb: asked for"), "{notes:?}");
+    let effective = limits::of(&site.config, "app").await;
+    let ceilings = limits::Ceilings::default();
+    assert_eq!(effective.request.wall_clock, Duration::from_secs(ceilings.request_seconds));
+    assert_eq!(effective.job.memory_bytes as u64, ceilings.memory_mb * 1024 * 1024);
+    assert_eq!(effective.request.query_rows as u64, ceilings.query_rows);
+    assert_eq!(effective.job.fuel, ceilings.job_fuel);
+    // And a call runs under them.
+    assert_eq!(call(&site, "app", request("GET", "/api/echo", "", "")).await.0, 200);
+}
+
+/// A request and a job of one app run under their own limits: a long
+/// job's time is not a request's, and a short request's is not a job's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_never_gets_a_jobs_time_nor_a_job_a_requests() {
+    let site = site();
+    install(&site, "app");
+    declare(&site, "app", "[limits]\nrequest_seconds = 1\njob_seconds = 10\n").await;
+    schedule::set_job(&site.config, "app", "nap", NEVER, "/api/job-nap").unwrap();
+
+    // A request that naps past its one second is stopped there. Compiled
+    // first, so the clock below is the call's alone.
+    assert_eq!(call(&site, "app", request("GET", "/api/echo", "", "")).await.0, 200);
+    let guards = limits::of(&site.config, "app").await.request;
+    let (runtime, config) = (site.runtime.clone(), site.config.clone());
+    let started = Instant::now();
+    let outcome = tokio::task::spawn_blocking(move || {
+        runtime.handle(config, "app", HANDLER, None, request("GET", "/api/job-nap", "ms=3000", ""), guards)
+    })
+    .await
+    .unwrap();
+    assert!(outcome.is_err() || outcome.as_ref().unwrap().status != 200, "a request napped three seconds on a one-second limit");
+    assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+    assert_eq!(marks(&site.config, "app", "nap"), 0);
+
+    // The same nap as a job, started from that request's app, has ten.
+    assert_eq!(run_now(&site, "app", "nap").await, (200, "started".into()));
+    assert!(until(Duration::from_secs(30), || !site.config.jobs.is_running("app", "nap")).await);
+    assert_eq!(schedule::read_jobs(&site.config, "app")["nap"].last_status.as_deref(), Some("200"));
+
+    // And a job of a site whose job clock is short is stopped on it, even
+    // though requests there may run longer.
+    let short = site_with(|config| Config {
+        limits: limits::Ceilings { job_seconds: 1, request_seconds: 60, ..Default::default() },
+        ..config
+    });
+    install(&short, "app");
+    declare(&short, "app", "[limits]\nrequest_seconds = 30\n").await;
+    schedule::set_job(&short.config, "app", "nap", NEVER, "/api/job-nap").unwrap();
+    match schedule::run_job(&short.state(), "app", "nap").await.unwrap() {
+        schedule::Ran::Finished(status) => assert!(status.starts_with("failed"), "{status}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A scoped batch has the deadline a scoped query has: a recursive CTE that
+/// reads nothing but itself still stops.
+#[tokio::test]
+async fn a_scoped_batch_cannot_outrun_the_call_with_a_recursive_cte() {
+    let site = site();
+    install(&site, "app");
+    orders(&site, "app", "[limits]\nrequest_seconds = 1").await;
+    let user = toolsite::accounts::users::sign_up(&site.config, "alice@example.com", "correct horse battery").unwrap();
+    let alice = Some(toolsite::runtime::wasm::User { id: user.id.clone(), email: user.email.clone() });
+    let body = "insert into my_orders (total) values (1)\n\
+                with recursive n(i) as (select 1 union all select i+1 from n) select count(*) from n";
+    let guards = limits::of(&site.config, "app").await.request;
+    let (runtime, config) = (site.runtime.clone(), site.config.clone());
+    let started = Instant::now();
+    let outcome = tokio::task::spawn_blocking(move || {
+        runtime.handle(config, "app", HANDLER, alice, request("POST", "/api/batch-scoped", "", body), guards)
+    })
+    .await
+    .unwrap();
+    if let Ok(response) = outcome {
+        assert_ne!(response.status, 200, "{}", String::from_utf8_lossy(&response.body));
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "ran for {:?}", started.elapsed());
+    assert_eq!(scalar(&site.config, "app", "select count(*) from orders"), serde_json::json!(0));
+}
+
+/// What a scoped batch reports when it fails is about the statement, not
+/// about rows the person cannot see.
+#[tokio::test]
+async fn a_failed_scoped_batch_says_nothing_of_rows_the_person_cannot_see() {
+    let site = site();
+    install(&site, "app");
+    orders(&site, "app", "").await;
+    let alice = toolsite::accounts::users::sign_up(&site.config, "alice@example.com", "correct horse battery").unwrap();
+    let bob = toolsite::accounts::users::sign_up(&site.config, "bob@example.com", "correct horse battery").unwrap();
+    db::run(&site.config, "app", &format!("insert into orders (id, owner_id, total) values (77, '{}', 4411.22)", bob.id), &[]).unwrap();
+    let as_alice = Some(toolsite::runtime::wasm::User { id: alice.id.clone(), email: alice.email.clone() });
+    for statements in [
+        vec!["insert into my_orders (id, total) values (77, 1)"],
+        vec!["insert into my_orders (id, total) values (5, 1)", "update my_orders set id = 77 where id = 5"],
+        vec!["select total from orders"],
+        vec!["select * from my_orders where total / 0 = 1 or (select total from orders where id = 77) > 0"],
+    ] {
+        let (status, body) = call_as(&site, "app", as_alice.clone(), request("POST", "/api/batch-scoped", "", &statements.join("\n"))).await;
+        assert_ne!(status, 200, "{statements:?}: {body}");
+        assert!(!body.contains("4411") && !body.contains(&bob.id) && !body.contains("bob@"), "{statements:?} told: {body}");
+    }
+    assert_eq!(scalar(&site.config, "app", "select total from orders where id = 77"), serde_json::json!(4411.22));
+}

@@ -486,7 +486,10 @@ the only time limit. What the app asked is stored, and clamped per call, so a
 raised ceiling applies without a redeploy. `memory_mb` covers requests and
 jobs; a resident instance has its own under `[resident]`. `query_rows`
 applies to `query` and `query-scoped` alike. The app's admin page and its
-`fetch` metadata (`limits`) show what it runs under now.
+`fetch` metadata (`limits`) show what it runs under now. Asking takes Edit
+on the app, the same as deploying its handler: the ceilings are the owner's
+boundary, and an editor's code can already spend a call's whole budget, so
+`[limits]` moves nothing past what the site allows.
 
 ### Writing many rows: db.batch
 
@@ -712,7 +715,9 @@ more run for the moment the current one finishes and answers `queued`; more
 asks before then are the same one run. So a job that works in stages asks
 for itself at the end of each, and the next stage starts with no gap. An app
 may start 600 a minute (`TOOLSITE_JOB_STARTS_PER_MINUTE`), queued runs
-included; it can never name another app's job.
+included; it can never name another app's job. At most four of an app's
+jobs run at once (`TOOLSITE_JOBS_RUNNING_PER_APP`), however they were
+started, and an app declares at most 100.
 
 ## Settings
 
@@ -1853,6 +1858,7 @@ is required to serve HTTP.
 | `TOOLSITE_MAX_QUERY_ROWS` | no (default `50000`) | The most rows one `query` may return when an app asks. |
 | `TOOLSITE_MAX_MEMORY_MB` | no (default `1024`) | The most memory a request or job may ask for. |
 | `TOOLSITE_JOB_STARTS_PER_MINUTE` | no (default `600`) | Jobs one app may start through `jobs.run` in a minute, queued reruns included. |
+| `TOOLSITE_JOBS_RUNNING_PER_APP` | no (default `4`) | Jobs of one app that may run at once, however they were started. A scheduled turn past it is skipped and recorded; `jobs.run` and Run now are refused. |
 | `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings and two-step sign-in secrets. Generated beside the data when unset, which is weaker; see Settings. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |

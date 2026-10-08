@@ -43,6 +43,18 @@ const FALLBACK_WINDOW: u64 = 30;
 /// back; low enough that a loop cannot keep the server busy for nothing.
 pub const DEFAULT_STARTS_PER_MINUTE: usize = 600;
 
+/// Jobs of one app that may run at once, however they were started. Each
+/// holds a blocking thread for up to the job's wall clock, so without this
+/// an app declaring a hundred jobs and starting them together would take
+/// the threads every other app's requests and jobs run on.
+pub const DEFAULT_RUNNING_PER_APP: usize = 4;
+
+/// Jobs one app may declare. The scheduler reads and plans every one on
+/// each wake, and records each skipped turn in the app's job file, so a
+/// thousand every-second jobs would have it rewriting that file a thousand
+/// times a second.
+pub const MAX_JOBS_PER_APP: usize = 100;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Job {
     /// Standard cron with seconds leading, as the `cron` crate reads it.
@@ -72,9 +84,10 @@ pub struct Job {
 /// per process, shared by every copy of the config like `connections`, so
 /// the scheduler, a person and an app's handler all see the same runs.
 pub struct Jobs {
-    /// `app/job` for each job in progress, and whether another run is
-    /// queued behind it.
-    running: Mutex<HashMap<String, bool>>,
+    /// Each job in progress, by app and name, and whether another run is
+    /// queued behind it. A pair rather than `app/job`, since an app's slug
+    /// may itself hold a `/`.
+    running: Mutex<HashMap<(String, String), bool>>,
     /// When each app's recent `jobs.run` starts happened, the last minute's.
     starts: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// What a job started from inside a handler runs on: the runtime and
@@ -86,12 +99,28 @@ pub struct Jobs {
     /// `jobs.run` starts per app per minute, from
     /// `TOOLSITE_JOB_STARTS_PER_MINUTE`.
     pub starts_per_minute: usize,
+    /// Jobs of one app running at once, from
+    /// `TOOLSITE_JOBS_RUNNING_PER_APP`.
+    pub running_per_app: usize,
 }
 
 impl Default for Jobs {
     fn default() -> Self {
         Self::new(DEFAULT_STARTS_PER_MINUTE)
     }
+}
+
+/// Why a job's slot could not be taken.
+#[derive(Debug, Clone, PartialEq)]
+enum Busy {
+    /// The job itself is running.
+    Running,
+    /// The app already runs as many jobs as it may at once.
+    App(usize),
+}
+
+fn too_many(app: &str, running: usize) -> String {
+    format!("{app} already runs {running} jobs at once, which is this site's limit; try again when one finishes")
 }
 
 /// Whether a run began, or was queued behind one in progress.
@@ -103,8 +132,13 @@ pub enum Ran {
     Queued,
 }
 
-fn key(app: &str, name: &str) -> String {
-    format!("{app}/{name}")
+fn key(app: &str, name: &str) -> (String, String) {
+    (app.to_string(), name.to_string())
+}
+
+/// Jobs of `app` in progress, from the running map.
+fn running_of(running: &HashMap<(String, String), bool>, app: &str) -> usize {
+    running.keys().filter(|(of, _)| of == app).count()
 }
 
 impl Jobs {
@@ -115,7 +149,13 @@ impl Jobs {
             attached: Mutex::default(),
             changed: tokio::sync::Notify::new(),
             starts_per_minute,
+            running_per_app: DEFAULT_RUNNING_PER_APP,
         }
+    }
+
+    /// The same, letting `running` jobs of one app run at once.
+    pub fn with_running_per_app(self, running: usize) -> Self {
+        Self { running_per_app: running.max(1), ..self }
     }
 
     /// Gives jobs started from inside a handler somewhere to run. Called
@@ -136,15 +176,38 @@ impl Jobs {
         self.changed.notify_one();
     }
 
-    /// Takes the job's one slot, or says it is taken.
-    fn claim(&self, app: &str, name: &str) -> bool {
+    /// Takes the job's one slot, or says why not: it is running, or its
+    /// app runs as many jobs as it may.
+    fn claim(&self, app: &str, name: &str) -> Result<(), Busy> {
         let mut running = self.running.lock().unwrap();
+        self.claim_in(&mut running, app, name)
+    }
+
+    /// Takes the job's slot or, when it is running, queues one more run of
+    /// it, under the one lock: checked and queued apart, a run that ended in
+    /// between would leave the caller told "queued" with nothing to run.
+    fn claim_or_queue(&self, app: &str, name: &str) -> Result<(), Busy> {
+        let mut running = self.running.lock().unwrap();
+        let claimed = self.claim_in(&mut running, app, name);
+        if let Err(Busy::Running) = claimed {
+            if let Some(again) = running.get_mut(&key(app, name)) {
+                *again = true;
+            }
+        }
+        claimed
+    }
+
+    fn claim_in(&self, running: &mut HashMap<(String, String), bool>, app: &str, name: &str) -> Result<(), Busy> {
         let key = key(app, name);
         if running.contains_key(&key) {
-            return false;
+            return Err(Busy::Running);
+        }
+        let of_app = running_of(running, app);
+        if of_app >= self.running_per_app {
+            return Err(Busy::App(of_app));
         }
         running.insert(key, false);
-        true
+        Ok(())
     }
 
     /// After a run: true, with the slot still held, when another run was
@@ -247,6 +310,9 @@ pub fn set_job(
     {
         let _held = FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut jobs = read_jobs(config, app);
+        if !jobs.contains_key(name) && jobs.len() >= MAX_JOBS_PER_APP {
+            return Err(format!("{app} already has {} jobs, the most one app may declare", jobs.len()));
+        }
         jobs.insert(
             name.to_string(),
             Job {
@@ -384,9 +450,10 @@ pub async fn run_job(state: &AppState, app: &str, name: &str) -> Result<Ran, Str
     if !read_jobs(&state.config, app).contains_key(name) {
         return Err(format!("{app} has no job called {name}"));
     }
-    if !state.config.jobs.claim(app, name) {
-        queue_again(&state.config, app, name);
-        return Ok(Ran::Queued);
+    match state.config.jobs.claim_or_queue(app, name) {
+        Ok(()) => {}
+        Err(Busy::Running) => return Ok(Ran::Queued),
+        Err(Busy::App(running)) => return Err(too_many(app, running)),
     }
     let outcome = run_once(state, app, name).await;
     // The slot is settled before answering, so a caller who asks again
@@ -406,16 +473,6 @@ pub async fn run_job(state: &AppState, app: &str, name: &str) -> Result<Ran, Str
     outcome.map(Ran::Finished)
 }
 
-/// Marks a running job to run once more. False when it was not running.
-fn queue_again(config: &Config, app: &str, name: &str) -> bool {
-    match config.jobs.running.lock().unwrap().get_mut(&key(app, name)) {
-        Some(again) => {
-            *again = true;
-            true
-        }
-        None => false,
-    }
-}
 
 /// `jobs.run` from inside an app's handler: starts one of the app's own
 /// jobs in the background, or queues one more run of it if it is running.
@@ -441,8 +498,12 @@ pub fn start_from_app(config: &Arc<Config>, app: &str, name: &str) -> Result<Str
     let Some(runtime) = runtime.upgrade() else {
         return Err("jobs cannot be started on this server yet".to_string());
     };
+    let of_app = running_of(&running, app);
+    if of_app >= jobs.running_per_app {
+        return Err(too_many(app, of_app));
+    }
     jobs.count_start(app)?;
-    running.insert(key(app, name), false);
+    jobs.claim_in(&mut running, app, name).map_err(|_| too_many(app, of_app))?;
     drop(running);
     let state = AppState { config: config.clone(), runtime };
     let (app, name) = (app.to_string(), name.to_string());
@@ -541,8 +602,13 @@ impl Scheduler {
                 if !is_due(&job, at) {
                     continue;
                 }
-                if !self.state.config.jobs.claim(&app, &name) {
-                    tracing::warn!(app, job = name, "still running; skipping this turn");
+                if let Err(busy) = self.state.config.jobs.claim(&app, &name) {
+                    match busy {
+                        Busy::Running => tracing::warn!(app, job = name, "still running; skipping this turn"),
+                        Busy::App(running) => {
+                            tracing::warn!(app, job = name, running, "the app runs as many jobs as it may; skipping this turn")
+                        }
+                    }
                     update(&self.state.config, &app, &name, |job| job.last_skipped_at = Some(at));
                     continue;
                 }
@@ -687,12 +753,58 @@ mod tests {
     #[test]
     fn a_job_runs_once_at_a_time_and_one_more_run_queues_behind_it() {
         let jobs = Jobs::new(10);
-        assert!(jobs.claim("app", "work"));
-        assert!(!jobs.claim("app", "work"), "a second run got the slot");
-        assert!(jobs.claim("app", "other"), "another job of the app was held up");
+        assert!(jobs.claim("app", "work").is_ok());
+        assert_eq!(jobs.claim("app", "work"), Err(Busy::Running), "a second run got the slot");
+        // Asking while it runs queues exactly one more, in the same step.
+        assert_eq!(jobs.claim_or_queue("app", "work"), Err(Busy::Running));
+        assert!(jobs.again_or_release("app", "work"), "the queued run was lost");
+        assert!(!jobs.again_or_release("app", "work"));
+        assert!(jobs.claim("app", "work").is_ok(), "the slot was not given back");
+        assert!(jobs.claim("app", "other").is_ok(), "another job of the app was held up");
         // Nothing queued: finishing lets the slot go.
         assert!(!jobs.again_or_release("app", "work"));
         assert!(!jobs.is_running("app", "work"));
+    }
+
+    #[test]
+    fn an_app_runs_at_most_its_share_of_jobs_at_once_and_another_app_is_not_held_up() {
+        let jobs = Jobs::new(100).with_running_per_app(2);
+        assert!(jobs.claim("busy", "one").is_ok());
+        assert!(jobs.claim("busy", "two").is_ok());
+        assert_eq!(jobs.claim("busy", "three"), Err(Busy::App(2)));
+        // Another app, even one whose slug starts with this one's, runs.
+        assert!(jobs.claim("busy/sub", "one").is_ok());
+        assert!(jobs.claim("quiet", "one").is_ok());
+        // One finishing frees a place.
+        assert!(!jobs.again_or_release("busy", "one"));
+        assert!(jobs.claim("busy", "three").is_ok());
+    }
+
+    #[test]
+    fn an_app_declares_at_most_a_hundred_jobs() {
+        let (_dir, config) = config();
+        for n in 0..MAX_JOBS_PER_APP {
+            set_job(&config, "app", &format!("job{n}"), "0 0 3 * * *", "/api/x").unwrap();
+        }
+        let error = set_job(&config, "app", "one-more", "0 0 3 * * *", "/api/x").unwrap_err();
+        assert!(error.contains("most"), "{error}");
+        // Changing one it has is still fine.
+        set_job(&config, "app", "job0", "0 0 4 * * *", "/api/y").unwrap();
+        assert_eq!(read_jobs(&config, "app").len(), MAX_JOBS_PER_APP);
+    }
+
+    #[test]
+    fn a_schedule_that_never_fires_is_refused_at_once_and_never_spins_the_scheduler() {
+        let (_dir, config) = config();
+        let started = Instant::now();
+        for never in ["0 0 0 30 2 *", "0 0 0 31 4 *", "0 0 0 1 1 * 2001"] {
+            let error = set_job(&config, "app", "never", never, "/api/x").unwrap_err();
+            assert!(error.contains("never fires"), "{never}: {error}");
+            // A job file written by hand, or by an older server, with one.
+            let job = Job { schedule: never.to_string(), path: "/api/x".into(), ..Job::default() };
+            assert_eq!(next_due(&job, now()), None, "{never}");
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     }
 
     #[test]

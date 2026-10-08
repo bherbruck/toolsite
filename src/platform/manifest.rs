@@ -307,6 +307,13 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
     if let Some(asked) = &limits {
         asked.check()?;
     }
+    if manifest.jobs.len() > schedule::MAX_JOBS_PER_APP {
+        return Err(format!(
+            "[[job]]: {} declared, but an app may have at most {}",
+            manifest.jobs.len(),
+            schedule::MAX_JOBS_PER_APP
+        ));
+    }
 
     let resident = match &manifest.resident {
         Some(declared) if declared.enabled => Some(check_resident(config, runtime, app, declared).await?),

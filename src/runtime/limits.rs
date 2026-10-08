@@ -137,7 +137,7 @@ impl Ceilings {
         let none = Asked::default();
         let asked = asked.unwrap_or(&none);
         let rows = asked.query_rows.unwrap_or(DEFAULT_QUERY_ROWS).min(self.query_rows) as usize;
-        let memory = |default: u64| (asked.memory_mb.unwrap_or(default).min(self.memory_mb) * MIB) as usize;
+        let memory = |default: u64| asked.memory_mb.unwrap_or(default).min(self.memory_mb).saturating_mul(MIB).min(usize::MAX as u64) as usize;
         let seconds = |asked: Option<u64>, default: u64, ceiling: u64| Duration::from_secs(asked.unwrap_or(default).min(ceiling));
         Effective {
             request: Guards {
@@ -274,6 +274,35 @@ mod tests {
     fn a_ceiling_below_a_default_lowers_the_default_too() {
         let ceilings = Ceilings { request_seconds: 2, ..Ceilings::default() };
         assert_eq!(ceilings.effective(None).request.wall_clock, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn absurd_asks_and_ceilings_clamp_rather_than_overflow() {
+        let huge = Asked {
+            request_fuel: Some(u64::MAX),
+            request_seconds: Some(u64::MAX),
+            job_seconds: Some(u64::MAX),
+            query_rows: Some(u64::MAX),
+            memory_mb: Some(u64::MAX),
+            ..Asked::default()
+        };
+        // Under the default ceilings: each one, exactly.
+        let effective = Ceilings::default().effective(Some(&huge));
+        assert_eq!(effective.request.memory_bytes, 1024 * 1024 * 1024);
+        assert_eq!(effective.request.wall_clock, Duration::from_secs(60));
+        assert_eq!(effective.request.query_rows, 50_000);
+        // An owner who set every ceiling to the largest number there is
+        // gets very large limits, not a panic on every call.
+        let open = Ceilings::from_env(|name| {
+            (!name.contains("FUEL")).then(|| u64::MAX.to_string())
+        })
+        .unwrap();
+        let effective = open.effective(Some(&huge));
+        assert!(effective.job.memory_bytes > 0);
+        let runtime = crate::runtime::wasm::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let site = std::sync::Arc::new(Config::local(dir.path().to_path_buf(), "t"));
+        drop(runtime.store(site, "app", None, effective.job));
     }
 
     #[test]

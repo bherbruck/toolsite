@@ -1905,6 +1905,26 @@ async fn duckdb_report_job_writes_parquet_that_parses_and_only_a_granted_person_
     // Only keys the job recorded are served, whatever else the app keeps.
     let (status, _) = call(&config, &ann_app, "GET", "/p/duckdb-report/api/files/reports/other.parquet", serde_json::Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // However the path is spelled: encoded slashes and dots, a traversal
+    // back out of reports/, or a recorded key with something on the end.
+    toolsite::runtime::blobs::put(&config, "duckdb-report", "private/payroll.csv", "text/csv", b"PAYROLL").unwrap();
+    for path in [
+        "private/payroll.csv".to_string(),
+        "private%2Fpayroll.csv".to_string(),
+        "reports/..%2F..%2Fprivate/payroll.csv".to_string(),
+        "reports/%2e%2e/private/payroll.csv".to_string(),
+        "%70rivate/payroll.csv".to_string(),
+        format!("{key}%00private/payroll.csv"),
+        format!("{key}/../../private/payroll.csv"),
+    ] {
+        let (status, body, headers) = send(&config, Request::builder()
+            .uri(format!("/p/duckdb-report/api/files/{path}"))
+            .header("cookie", &ann_app)
+            .body(Body::empty())
+            .unwrap()).await;
+        assert!(!String::from_utf8_lossy(&body).contains("PAYROLL"), "{path} served the unrecorded file: {status}");
+        assert!(headers.iter().all(|(k, _)| k != "x-toolsite-blob"), "{path}");
+    }
 
     // A visitor cannot run the job, even forging the header.
     let forged = Request::builder()

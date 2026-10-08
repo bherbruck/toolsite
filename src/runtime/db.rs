@@ -235,6 +235,18 @@ pub(crate) fn execute_on(conn: &Connection, sql: &str, params: &[Value], max_row
     execute(conn, sql, params, true, max_rows)
 }
 
+/// Waits for another connection's write lock no later than `deadline`. A
+/// statement waiting on a lock sleeps in SQLite's busy handler, where the
+/// progress handler never runs: without this a call whose other connection
+/// holds `begin immediate` would sleep the full busy timeout past its own
+/// wall clock. Set before each statement of a kept connection, since the
+/// time left shrinks as the call goes on.
+pub(crate) fn busy_until(conn: &Connection, deadline: std::time::Instant) -> Result<(), String> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    conn.busy_timeout(left.min(std::time::Duration::from_millis(BUSY_TIMEOUT_MS as u64)))
+        .map_err(|e| e.to_string())
+}
+
 /// Makes SQLite stop the running statement once `deadline` passes, and any
 /// later one on this connection at once.
 fn interrupt_at(conn: &Connection, deadline: std::time::Instant) -> Result<(), String> {
@@ -913,6 +925,23 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(version, 0, "platform tables appeared in an app database");
+    }
+
+    #[test]
+    fn only_an_apps_own_database_commits_without_waiting_for_the_disk() {
+        let (_dir, config) = config();
+        let sync = |conn: &Connection| -> i64 {
+            authorizer_off(conn).unwrap();
+            conn.query_row("pragma synchronous", [], |row| row.get(0)).unwrap()
+        };
+        run(&config, "app", "create table t (a)", &[]).unwrap();
+        // 1 is NORMAL, 2 is FULL.
+        assert_eq!(sync(&open_as(&config, "app", None).unwrap()), 1);
+        assert_eq!(sync(&crate::accounts::users::open(&config).unwrap()), 2);
+        // No app name reaches the account database's file to relax it.
+        for name in [".site", "../.site", ".site/auth"] {
+            assert!(open_as(&config, name, None).is_err(), "{name}");
+        }
     }
 
     #[test]
