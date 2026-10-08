@@ -1,6 +1,6 @@
 # Postgres scale-out: design note
 
-Status: proposal for step 1, with the seams for steps 2 to 4. Written against
+Status: proposal for step 1, with the seams for steps 2 to 5. Written against
 `main` at `e8bce6d`. Nothing here is built yet.
 
 The approved plan has four steps:
@@ -12,8 +12,12 @@ The approved plan has four steps:
 3. Per-app `[database] engine = "postgres" | "sqlite"`: a schema and a role
    per app, native row-level security from `[[access.table]]`.
 4. One binary, `TOOLSITE_ROLE=all|control|worker`.
+5. An **edge** role (added by the owner after the first draft): toolsite's
+   own reverse proxy in the same binary, the only public entry point.
+   `TOOLSITE_ROLE` takes a comma list: `all` (default), `control,edge`,
+   `edge`, `control`, `worker`.
 
-This note covers step 1 in detail and says where steps 2 to 4 attach, so that
+This note covers step 1 in detail and says where steps 2 to 5 attach, so that
 step 1 leaves the right hooks and does not need to be redone.
 
 Terms used here:
@@ -156,6 +160,19 @@ Several modules list apps by scanning `DATA_DIR`: `store::collect_slugs`,
 | Scheduler | `schedule::Scheduler::spawn`, one per process from `main` | Process task. Two runners fire every job twice |
 | MCP sessions | none: `with_legacy_session_mode(false)` | Stateless; any runner can answer |
 | Per-call wasm state | `StoreState` (db connection, writers, deadline) | Per call; safe |
+
+### 1.9 Network entry points and client facts
+
+This matters for the edge role (section 6.4): whatever a runner learns from
+the socket today, a worker behind an edge must learn from the edge instead.
+
+| Entry point | Where | What it reads from the connection |
+|---|---|---|
+| HTTP on `PORT` | `main` (`axum::serve` without `ConnectInfo`) | No client address. `Host` (`app_hosts::route_by_host`, `origins::classify`), `Sec-Fetch-*` (`shield.rs`), cookies, `Authorization` |
+| WebSocket upgrade | `websocket::upgrade` | Same as HTTP; `ConnectInfo` for the guest has no remote address |
+| TCP ports from `TOOLSITE_PORTS` | `ports::listen`, `tcp.rs` | Peer address: `connections.remote` (the guest's `remote()`), `per_ip` and `raw_per_app` limits in `Hub` |
+| UDP ports | `udp.rs` (`Peers` map per address) | Peer address: flow identity, `udp_per_second`, `udp_queued_bytes` |
+| Screenshot renderer | `screenshot.rs`, `preview_base` (this runner's own port by default) | Opens `/preview/{token}` on whatever address `preview_base` names |
 
 ---
 
@@ -617,7 +634,7 @@ difference. The verification is the same code as the import's mapping
 
 ---
 
-## 6. Seams for steps 2 to 4
+## 6. Seams for steps 2 to 5
 
 Step 1 leaves these hooks, each with a trivial in-process implementation.
 
@@ -723,14 +740,155 @@ on the wrong role answers `421 Misdirected Request` with the right host.
 Control also runs handlers when an MCP tool needs one (`call_app_tool`,
 `run_sql`); that is the same code, not a route.
 
-The split needs routing by host, which Railway does per service and not per
-path. It is therefore supported with subdomain mode (`TOOLSITE_APPS_DOMAIN`):
-`tools.*` to control, `*.apps.*` to workers. In path mode the only role is
-`all`.
+Without an edge, the split needs routing by host, which Railway does per
+service and not per path: subdomain mode only (`tools.*` to control,
+`*.apps.*` to workers). With an edge (section 6.4) the edge routes by host
+and path, so path mode can split roles too.
+
+`TOOLSITE_ROLE` is a comma list of `control`, `worker` and `edge`. `all` is
+`control,worker` in one process with no proxy at all: today's behaviour,
+and the default. Any set that holds `edge` makes the edge the public
+listener on `PORT`; any set without `edge` (for example `worker`) listens
+only on the internal port and accepts only requests that an edge signed.
 
 Step 1 hook: `build_router` already assembles every route in one place. Step
 1 groups them into `control_routes()` and `worker_routes()` functions with no
 change in behaviour, so step 4 only selects.
+
+### 6.4 Step 5: the edge role
+
+**Why.** Railway's load balancer picks a replica at random, with no
+affinity. A resident app's connections must reach the one worker that holds
+its lease, and a device's TCP stream cannot be redirected. An edge that
+knows the placement solves that, and also gives worker pools, health checks,
+draining, and workers that are not on the internet at all.
+
+**What it is.** A module `platform::edge` (one concern: deciding where a
+connection goes and carrying its bytes there). It runs no handler, opens no
+app database and keeps no state that another edge would need. Several edges
+run side by side behind Railway's balancer.
+
+#### Placement: the routing table and its source
+
+For each incoming request or stream the edge decides one target:
+
+| Traffic | How it is recognised | Target |
+|---|---|---|
+| Platform route | Main host (`origins::classify`), path in the control set of 6.3 | A live control runner (the local one in `control,edge`) |
+| App traffic, ordinary app | App host, or `/p/<app>/...` in path mode | A live worker in the app's pool, chosen by rendezvous hashing on the app name, so one app's compiled handler and bundle cache stay warm on few workers. Next choice on failure |
+| App traffic, resident app or SQLite home app (question 1) | `meta.resident` or the app's engine | The holder of lease `resident:<app>` (or `home:<app>`). With no holder, the hashed choice, which then takes the lease |
+| TCP or UDP port | `TOOLSITE_PORTS` mapping, now bound by the edge | As for the mapped app (a port's app is usually resident) |
+| Anything else | Unknown host | Refused at the edge, as `route_by_host` refuses it today |
+
+Sources, all in Postgres, all cached in the edge:
+
+| Data | Table | Cache refresh |
+|---|---|---|
+| Runners: id, roles, pool, internal address, internal port, `draining`, `heartbeat_at` | `state.runners` (extended from step 1) | Every 2 s, and on bus `RunnersChanged` |
+| Leases: `resident:<app>`, `home:<app>` | `state.leases` | On bus `LeaseChanged`; entries older than 10 s are read again |
+| App facts: pool, resident, sockets, label | `platform.pages.meta` | On bus `AppChanged` |
+| Port map | `TOOLSITE_PORTS` (environment of the edge) | At boot |
+
+A stale cache is never a correctness problem, because **the worker is the
+authority**. A worker that receives traffic for a resident app whose lease it
+does not hold answers `421` with `x-toolsite-holder: <runner id>` (HTTP and
+WebSocket) or a refusal code in the stream preamble reply (TCP, UDP). The
+edge drops that cache entry, reads the lease and retries once. Two instances
+of one resident app therefore never run, whatever the edges believe.
+
+A new app field `pool` (from `[runtime] pool = "..."` in toolsite.toml,
+default `default`) names the worker pool. Workers set their pool with
+`TOOLSITE_POOL`. That is the hook for worker pools; it opens nothing new.
+
+#### Finding workers
+
+- Each runner writes its `state.runners` row at boot and every 5 s:
+  `roles`, `pool`, `address` (its private address, from
+  `TOOLSITE_RUNNER_ADDRESS`; on Railway the replica's address on
+  `*.railway.internal`, IPv6), `internal_port` (`TOOLSITE_INTERNAL_PORT`,
+  default 8081), `draining`.
+- The edge counts a runner live when its heartbeat is younger than 15 s
+  **and** its own probe of `GET /healthz` on the internal port passed in the
+  last 5 s. A failed connect marks a runner down at once, with backoff,
+  before the next probe.
+- Workers get no public domain on Railway. The internal port is reachable
+  only on the private network.
+
+#### Carrying the bytes
+
+| Kind | How | Backpressure and timeouts |
+|---|---|---|
+| HTTP | `hyper-util` client, HTTP/1.1 keep-alive pool per worker. Bodies stream both ways, never buffered, so `/upload` and `/blob` keep their own ceilings | Connect timeout 2 s. Retry on another runner only when the connect failed (no byte sent), for any method; never after a byte was sent. Response-header timeout = the request wall-clock ceiling (`limits.request_seconds`) plus 5 s. Header read timeout on the client side 10 s (slow headers). A cap on in-flight requests per worker and per edge; past it, `503` with `Retry-After` |
+| WebSocket | The edge forwards the upgrade request. Only when the worker answers `101` does the edge answer the client `101` and splice the two upgraded connections (`copy_bidirectional`). Frames are not parsed | Bounded copy buffers: a slow client stalls the worker's writes, which the worker's existing per-connection queue cut-off handles. Idle timeout follows `Limits.check_every`. A non-`101` answer is passed through as an ordinary response and the connection is never spliced (upgrade smuggling) |
+| TCP | The edge accepts on the mapped port, opens a TCP connection to the worker's internal stream port, sends a signed preamble (below), waits for the worker's accept byte, then splices | `tcp_idle` and `tcp_send_timeout` apply at the edge too. Per-IP and per-app connection counts move to the edge, which is the only place that sees every client |
+| UDP | One authenticated framed stream per (edge, worker, port). Each frame: flow id, client address, length, datagram. Replies come back on the same stream and leave from the edge's socket | Per-flow queue bounded by `udp_queued_bytes`; on overflow the datagram is dropped, as UDP allows. `udp_per_second` is enforced at the edge before the datagram crosses the network |
+
+#### What passes from edge to worker, and how it is protected
+
+**Identity does not pass.** A worker reads the session cookie or bearer and
+looks it up in Postgres itself, exactly as today. The edge never says who a
+person is, so a compromised or confused edge cannot sign anyone in.
+
+**Transport facts pass**, because only the edge knows them: client address
+and port, the `Host` the client sent, scheme, and the edge's id. They travel
+in one header, `x-toolsite-edge`, signed with HMAC-SHA256 under a key derived
+from `TOOLSITE_SECRET_KEY` (label `toolsite edge v1`). The MAC covers the
+facts, a timestamp, and the request's method, host and path. TCP and UDP
+streams carry the same fields in a signed preamble.
+
+- The edge removes every incoming `x-toolsite-*`, `forwarded`,
+  `x-forwarded-*` and `x-real-ip` header before it adds its own.
+- A worker, and a control runner behind an edge, accept a request only with a
+  valid header no older than 30 s; anything else is `403`, logged at `warn`
+  with the arriving headers (never cookies or tokens, as CLAUDE.md asks). The
+  check is one middleware on the internal listener, outermost, before
+  `shield` and `route_by_host`.
+- Workers then trust the facts: `ConnectInfo.remote` and the per-IP limits
+  use the signed address.
+
+Why a signed header rather than relying on the private network: every
+service in the Railway project can reach a worker's internal port, and that
+includes the screenshot browser sidecar, which runs untrusted page script.
+Without a check, a published page could have the sidecar call a worker with
+any client address it likes. mTLS on the private network would also work,
+but needs a certificate authority and rotation for no gain over a MAC: the
+private network is already WireGuard-encrypted, so the header is not visible
+to an eavesdropper. mTLS stays an option for a deployment off Railway.
+
+#### Draining
+
+On SIGTERM a worker sets `draining = true`. Edges stop sending it new
+requests and streams within one cache refresh (bus `RunnersChanged` makes it
+immediate). Requests in flight finish, up to the platform's drain window. Its
+WebSockets get close code `1012` (service restart) so browsers reconnect,
+which lands them on another worker. A resident holder releases its lease
+first, so the next connection starts the instance elsewhere. An edge that
+drains stops accepting and lets its spliced streams end, up to the same
+window.
+
+#### `control,edge` in one process
+
+One public listener on `PORT`. The edge layer classifies each request:
+platform routes go to the in-process control `Router` by `oneshot`, with the
+transport facts in a request extension rather than a header (the same way
+`lib.rs` already hands `/p/{app}/mcp` to its own router); app traffic is
+proxied to workers. The edge also binds `TOOLSITE_PORTS`. Control's loops
+run (scheduler leader, `resume_pending`, migrations); no worker loops run,
+and this process never instantiates a guest for app traffic.
+
+In `all` the edge layer is a pass-through that only builds the transport
+facts from the socket, so file mode and single-runner sites behave as today.
+
+#### Step 1 hooks for the edge
+
+- `state.runners` carries `roles`, `pool`, `address`, `internal_port` and
+  `draining` from the start.
+- Transport facts become one type, `TransportFacts { client, host, scheme
+  }`, built by a layer at the listener and read from request extensions by
+  `route_by_host`, `shield`, `websocket.rs`, `tcp.rs` and `udp.rs`. In step 1
+  it is filled from the socket; in step 5 from the verified header.
+- `ports::listen` takes its port map and target as arguments, so the same
+  code can run in an edge.
 
 ---
 
@@ -751,6 +909,15 @@ change in behaviour, so step 4 only selects.
 | `DATABASE_URL` leaks | Password in logs or error pages | Never logged; errors redacted | A test fails a connect on purpose and checks the logged text for the password |
 | Bucket prefix | An app names `.toolsite/...` through a blob key | `blobs::valid_key` refuses a leading `.` | A forged key `.toolsite/content/x/files/index.html` is refused by `put`, `get`, `list` and `upload-url` |
 | Migration command | Symlinks or odd names in `DATA_DIR` pull in other files | No symlink following; slug and asset-path rules | A symlink to `/etc/passwd` placed in an app directory is skipped and reported |
+| Edge: bypass | A request reaches a worker or control without passing an edge | Internal listener only; signed `x-toolsite-edge` required | Worker router driven by `oneshot` with no header, a bad MAC, a header older than 30 s, and a valid header for another path: each `403`, logged |
+| Edge: forged client facts | A client sends `x-forwarded-for`, `forwarded`, `x-real-ip` or its own `x-toolsite-edge` | The edge strips them all before signing | A request through a real edge with each forged header: the guest's `remote()` and the per-IP count use the socket's address |
+| Edge: private-network callers | The screenshot sidecar or another project service calls a worker | Same MAC check; the key is never in the database | A test plays the sidecar: a plain request to the internal port, with and without copied headers, is refused |
+| Edge: stream preambles | A forged or replayed TCP or UDP preamble on the worker's stream port | MAC over facts, timestamp and port; 30 s window | Forged, stale and other-port preambles are refused before any byte reaches the app |
+| Edge: misrouting | A stale cache sends a resident app's traffic to a runner without the lease | The worker answers `421` with the holder; the edge retries once | Two workers, lease moved between them: the edge follows; at no point do two instances run |
+| Edge: request and upgrade smuggling | Conflicting `Content-Length` and `Transfer-Encoding`; a non-`101` answer to an upgrade followed by raw bytes | hyper on both sides refuses ambiguous framing; the edge splices only after a real `101` | A forged ambiguous request is refused at the edge; a worker that answers `200` to an upgrade gets no raw tunnel |
+| Edge: host confusion | An app host with a platform path, or a main host with an app path | The edge classifies with `origins::classify`; the worker runs `route_by_host` again | The `subdomains.rs` cases run through an edge with the same results |
+| Edge: exhaustion | Slow headers, many idle sockets, a UDP flood | Header read timeout, in-flight caps, per-IP limits and UDP rate at the edge | A slow-header client is cut off; one IP past its limit does not starve another |
+| Edge: draining | New traffic to a draining worker | `draining` flag and bus event | A draining worker gets no new requests; its WebSockets close with `1012` and reconnect elsewhere |
 
 Every step gets an adversarial pass before it is pushed, as agreed.
 
@@ -785,6 +952,27 @@ After step 1 a site can run on Postgres with **one** runner (the volume still
 holds SQLite app data). That is the intended first production use: move the
 Herbrucks site's platform state, watch it, then go on to steps 2 and 3.
 
+Step 1 also leaves the edge hooks of 6.4 (runner columns, `TransportFacts`,
+`ports::listen` arguments). They belong in PR 1 and in PR 6's touch of
+`websocket.rs`; they add about half a day.
+
+### 8.1 Step 5: the edge, as its own later step
+
+Depends on step 2 (bus, leases) and step 4 (role sets, route groups). Each
+row is one PR, in order.
+
+| # | PR | Scope | Tests | Estimate |
+|---|---|---|---|---|
+| E1 | Role sets and edge auth | `TOOLSITE_ROLE` comma list; internal listener; `x-toolsite-edge` signing and the verifying middleware; header stripping | The bypass, forged-facts and sidecar tests of section 7 | 1.5 days |
+| E2 | Registry and health | Runner rows with roles, pool, address, draining; probes; edge caches with bus invalidation; `pool` in toolsite.toml | A runner that stops heartbeating leaves the edge's table in 15 s; a failed connect removes it at once | 1.5 days |
+| E3 | HTTP proxy | `platform::edge` placement and proxy; retries only before the first byte; timeouts and in-flight caps; `control,edge` in-process dispatch | The full suite through an edge in front of two workers; smuggling and host-confusion tests; 503 when no worker is live | 2.5 days |
+| E4 | WebSocket and resident routing | Upgrade proxy; `421` with holder and one retry | Misrouting and upgrade-smuggling tests; `tests/resident.rs` and `connections.rs` through an edge | 1.5 days |
+| E5 | TCP | Ports bound by the edge; signed preamble; splice; per-IP limits at the edge | Preamble tests; `tcp-chat` and `mqtt-broker` examples through an edge | 1.5 days |
+| E6 | UDP | Framed authenticated stream per edge, worker and port | `syslog` example through an edge; flood test | 2 days |
+| E7 | Draining and container trial | SIGTERM handling on edge and worker; compose file with two edges, two workers, one control; Railway notes | Draining tests; the whole set tried in the container | 1.5 days |
+
+About 12 agent-days.
+
 ---
 
 ## Questions for the owner
@@ -806,3 +994,9 @@ Herbrucks site's platform state, watch it, then go on to steps 2 and 3.
    or be counted site-wide (a write per connect and disconnect)?
 5. **Bucket required.** Is it acceptable that Postgres mode requires the
    bucket, and that the local blob backend is refused there?
+6. **Edge trust.** Is a signed internal header enough between edge and
+   workers on Railway's private network, or should mTLS be planned now?
+7. **Ports at the edge.** With an edge, Railway's TCP proxy would point at
+   the edge service and the edge binds `TOOLSITE_PORTS`. Is that the wanted
+   shape for the MQTT and syslog ports? Per-IP limits then live at the edge,
+   which also answers part of question 4.
