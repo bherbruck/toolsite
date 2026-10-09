@@ -72,7 +72,7 @@ platform/          the site as its owner uses it
 content/           what gets published, and how it is served
   slug.rs          naming rules (what may become a path), tokens, escaping
   store.rs         PageMeta, page/icon paths, titles, gates, the project tree
-  catalog/         Catalog: each slug's meta, notes and generation, on files or Postgres; update_meta is the only way to change a meta
+  catalog/         Catalog: each slug's meta, notes and generation, the project tree, a move's journal and hold, host labels, markers; on files or Postgres; update_meta and update_folders are the only ways to change a meta or the tree
   bundle.rs        tar unpacking, entry classification, traversal defence
   serve.rs         the public site: pages, assets, handler dispatch
   origins.rs       which origin serves an app: labels, app URLs, which host a request is on

@@ -32,6 +32,9 @@ use toolsite::{
 };
 use tower::ServiceExt;
 
+mod common;
+use common::blocking;
+
 const TOKEN: &str = "test-token";
 const PW: &str = "correct horse battery";
 
@@ -90,18 +93,21 @@ async fn place_app(config: &Config, app: &str, project: &str, gate: &str) {
 }
 
 fn session(config: &Arc<Config>, email: &str) -> String {
-    users::log_in(config, email, PW).unwrap().1
+    blocking(|| users::log_in(config, email, PW).unwrap().1)
 }
 
 fn user(config: &Config, email: &str) -> users::User {
-    users::user_by_email(config, email).unwrap()
+    blocking(|| users::user_by_email(config, email).unwrap())
 }
 
 fn token_for(config: &Config, email: &str) -> String {
-    let client = toolsite::platform::oauth_store::register_client(config, Some("t"), &["https://c.test/cb".into()]).unwrap();
-    toolsite::platform::oauth_store::issue_tokens(config, &client.id, &user(config, email).id, None)
-        .unwrap()
-        .access_token
+    let user = user(config, email);
+    blocking(|| {
+        let client = toolsite::platform::oauth_store::register_client(config, Some("t"), &["https://c.test/cb".into()]).unwrap();
+        toolsite::platform::oauth_store::issue_tokens(config, &client.id, &user.id, None)
+            .unwrap()
+            .access_token
+    })
 }
 
 fn form_token(config: &Config, email: &str) -> String {
@@ -111,36 +117,69 @@ fn form_token(config: &Config, email: &str) -> String {
 struct World {
     _dir: TempDir,
     config: Arc<Config>,
+    database: Option<common::Database>,
+}
+
+impl World {
+    /// Drops the scenario's database, on Postgres.
+    async fn finish(self) {
+        if let Some(database) = self.database {
+            // The tree and the move's record lived in the database.
+            for file in ["projects.json", "relocating.json", "labels.json"] {
+                assert!(!self.config.data_dir.join(".site").join(file).exists(), "{file} was written on a Postgres site");
+            }
+            drop(self.config);
+            database.drop().await;
+        }
+    }
 }
 
 async fn world() -> World {
+    world_on(false).await
+}
+
+/// The world on files, or on Postgres: accounts, OAuth, tickets and the
+/// catalog in a database of its own.
+async fn world_on(postgres: bool) -> World {
     let dir = tempfile::tempdir().unwrap();
+    let database = match postgres {
+        true => Some(common::Database::new().await),
+        false => None,
+    };
     // OAuth tokens are only honoured where the site knows its own address.
-    let config = Arc::new(Config {
-        base_url: Some("https://site.test".to_string()),
-        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    let base = Config { base_url: Some("https://site.test".to_string()), ..Config::local(dir.path().to_path_buf(), TOKEN) };
+    let config = Arc::new(match &database {
+        Some(database) => Config { stores: database.stores(), ..base },
+        None => base,
     });
-    users::sign_up_as(&config, "boss@x.test", PW, true).unwrap();
-    for who in ["mgr", "sub", "ed", "fin", "nobody"] {
-        users::sign_up(&config, &format!("{who}@x.test"), PW).unwrap();
-    }
+    blocking(|| {
+        users::sign_up_as(&config, "boss@x.test", PW, true).unwrap();
+        for who in ["mgr", "sub", "ed", "fin", "nobody"] {
+            users::sign_up(&config, &format!("{who}@x.test"), PW).unwrap();
+        }
+    });
     store::create_folder(&config, "", "ops").await.unwrap();
     store::create_folder(&config, "ops", "warehouse").await.unwrap();
     store::create_folder(&config, "", "finance").await.unwrap();
-    users::grant_scope(&config, "mgr@x.test", "ops", Scope::Admin, None).unwrap();
-    users::grant_scope(&config, "sub@x.test", "ops/warehouse", Scope::Admin, None).unwrap();
-    users::grant_scope(&config, "ed@x.test", "ops/warehouse", Scope::Editor, None).unwrap();
-    users::grant_scope(&config, "fin@x.test", "finance", Scope::Viewer, None).unwrap();
+    blocking(|| {
+        users::grant_scope(&config, "mgr@x.test", "ops", Scope::Admin, None).unwrap();
+        users::grant_scope(&config, "sub@x.test", "ops/warehouse", Scope::Admin, None).unwrap();
+        users::grant_scope(&config, "ed@x.test", "ops/warehouse", Scope::Editor, None).unwrap();
+        users::grant_scope(&config, "fin@x.test", "finance", Scope::Viewer, None).unwrap();
+    });
     place_app(&config, "yard", "ops/warehouse", "restricted").await;
     place_app(&config, "dock", "ops", "restricted").await;
     place_app(&config, "ledger", "finance", "restricted").await;
     place_app(&config, "rootapp", "", "restricted").await;
-    World { _dir: dir, config }
+    World { _dir: dir, config, database }
 }
 
 fn held(config: &Config, email: &str, path: &str) -> Option<Scope> {
-    let locks = store::locked_prefixes_blocking(config);
-    users::effective_scope(config, &user(config, email), path, &locks)
+    let user = user(config, email);
+    blocking(|| {
+        let locks = store::locked_prefixes_blocking(config);
+        users::effective_scope(config, &user, path, &locks)
+    })
 }
 
 async fn mcp_post(config: &Arc<Config>, path: &str, token: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
@@ -688,9 +727,7 @@ fn location(headers: &[(String, String)]) -> Option<String> {
     headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.clone())
 }
 
-#[tokio::test]
-async fn an_old_project_link_never_says_where_a_hidden_project_went() {
-    let w = world().await;
+async fn old_project_links(w: World) {
     let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"rename","path":"finance","name":"money"})).await;
     assert!(!err, "{out}");
     // A stranger and an account with nothing there get what a missing project
@@ -709,11 +746,21 @@ async fn an_old_project_link_never_says_where_a_hidden_project_went() {
     let (status, _, headers) = send(&w.config, get_as("/browse/finance", &session(&w.config, "fin@x.test"))).await;
     assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
     assert_eq!(location(&headers).as_deref(), Some("/browse/money"));
+    w.finish().await;
 }
 
-#[tokio::test]
-async fn an_app_whose_project_is_missing_is_closed_whatever_it_says_itself() {
-    let w = world().await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_old_project_link_never_says_where_a_hidden_project_went() {
+    old_project_links(world_on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn an_old_project_link_never_says_where_a_hidden_project_went_on_postgres() {
+    old_project_links(world_on(true).await).await;
+}
+
+async fn missing_project_closes(w: World) {
     // ops is locked and restricted; dock's own "public" is ignored under it.
     store::set_folder_gate(&w.config, "ops", Some("restricted")).await.unwrap();
     store::set_locked(&w.config, "ops", true).await.unwrap();
@@ -731,18 +778,28 @@ async fn an_app_whose_project_is_missing_is_closed_whatever_it_says_itself() {
     assert_ne!(status, StatusCode::OK, "a half-finished move opened an app its lock kept closed");
     let (_, index, _) = send(&w.config, get("/")).await;
     assert!(!index.contains("dock title"), "a half-finished move listed the app to a stranger");
+    w.finish().await;
 }
 
-#[tokio::test]
-async fn a_move_that_stopped_halfway_never_counts_rows_its_lock_ignored_and_finishes_when_run_again() {
-    let w = world().await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_whose_project_is_missing_is_closed_whatever_it_says_itself() {
+    missing_project_closes(world_on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn an_app_whose_project_is_missing_is_closed_whatever_it_says_itself_on_postgres() {
+    missing_project_closes(world_on(true).await).await;
+}
+
+async fn halfway_move(w: World) {
     // ops locked and restricted: ed's Edit on ops/warehouse does not count.
     store::set_folder_gate(&w.config, "ops", Some("restricted")).await.unwrap();
     store::set_locked(&w.config, "ops", true).await.unwrap();
     assert_eq!(held(&w.config, "ed@x.test", "ops/warehouse/yard"), None);
 
     // Every intermediate state of ops -> ops2, in the order a move takes.
-    toolsite::platform::projects::begin_relocation(&w.config, "ops", "ops2").unwrap();
+    toolsite::platform::projects::begin_relocation(&w.config, "ops", "ops2").await.unwrap();
     // 1. apps rewritten.
     for (app, at) in store::apps_with_folders(&w.config).await {
         if at == "ops" || at.starts_with("ops/") {
@@ -771,6 +828,18 @@ async fn a_move_that_stopped_halfway_never_counts_rows_its_lock_ignored_and_fini
     // And a second resume does nothing.
     toolsite::platform::projects::resume_pending(&w.config).await.unwrap();
     assert!(store::folder_exists(&w.config, "ops2").await && !store::folder_exists(&w.config, "ops").await);
+    w.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_that_stopped_halfway_never_counts_rows_its_lock_ignored_and_finishes_when_run_again() {
+    halfway_move(world_on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_move_that_stopped_halfway_never_counts_rows_its_lock_ignored_and_finishes_when_run_again_on_postgres() {
+    halfway_move(world_on(true).await).await;
 }
 
 #[tokio::test]
@@ -870,9 +939,7 @@ async fn a_project_holding_only_a_hidden_app_is_not_removed() {
     assert!(store::folder_exists(&w.config, "quiet").await);
 }
 
-#[tokio::test]
-async fn renaming_onto_an_old_name_sends_old_links_to_the_new_owner_only_for_those_who_may_see_it() {
-    let w = world().await;
+async fn rename_onto_old_name(w: World) {
     tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"rename","path":"finance","name":"money"})).await;
     let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"rename","path":"ops","name":"finance"})).await;
     assert!(!err, "{out}");
@@ -883,11 +950,21 @@ async fn renaming_onto_an_old_name_sends_old_links_to_the_new_owner_only_for_tho
     assert_eq!(held(&w.config, "fin@x.test", "finance"), None, "fin's old rows followed the name, not the project");
     assert_eq!(held(&w.config, "fin@x.test", "money"), Some(Scope::Viewer));
     assert_eq!(held(&w.config, "mgr@x.test", "finance"), Some(Scope::Admin));
+    w.finish().await;
 }
 
-#[tokio::test]
-async fn a_manager_cannot_rename_or_move_a_project_into_or_over_a_sibling_it_does_not_manage() {
-    let w = world().await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renaming_onto_an_old_name_sends_old_links_to_the_new_owner_only_for_those_who_may_see_it() {
+    rename_onto_old_name(world_on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn renaming_onto_an_old_name_sends_old_links_to_the_new_owner_only_for_those_who_may_see_it_on_postgres() {
+    rename_onto_old_name(world_on(true).await).await;
+}
+
+async fn sibling_moves_refused(w: World) {
     let t = token_for(&w.config, "sub@x.test");
     // sub manages ops/warehouse only.
     for args in [
@@ -911,6 +988,18 @@ async fn a_manager_cannot_rename_or_move_a_project_into_or_over_a_sibling_it_doe
         assert!(err, "{args} went through: {out}");
     }
     assert!(store::folder_exists(&w.config, "ops/warehouse").await && store::folder_exists(&w.config, "finance").await);
+    w.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manager_cannot_rename_or_move_a_project_into_or_over_a_sibling_it_does_not_manage() {
+    sibling_moves_refused(world_on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_manager_cannot_rename_or_move_a_project_into_or_over_a_sibling_it_does_not_manage_on_postgres() {
+    sibling_moves_refused(world_on(true).await).await;
 }
 
 /// Access set on a path before any app lives there must not open the app

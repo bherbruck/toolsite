@@ -247,42 +247,35 @@ fn parent_of(path: &str) -> String {
     path.rsplit_once('/').map(|(above, _)| above.to_string()).unwrap_or_default()
 }
 
-/// A move in progress, written before the first step and removed after the
-/// last, so a move that stopped halfway is finished on the next start or
-/// the next move rather than left half done.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Relocation {
-    from: String,
-    to: String,
-}
-
-fn journal_path(config: &Config) -> std::path::PathBuf {
-    store::relocation_journal(config)
-}
-
-/// Records that `from` is about to become `to`. Public for the tests that
-/// walk a move one step at a time.
-pub fn begin_relocation(config: &Config, from: &str, to: &str) -> Result<(), String> {
-    let path = journal_path(config);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string(&Relocation { from: from.to_string(), to: to.to_string() }).map_err(|e| e.to_string())?;
-    let temp = path.with_extension("json.part");
-    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&temp, &path).map_err(|e| e.to_string())
+/// Records that `from` is about to become `to`: the journal of a move,
+/// written before the first step and cleared after the last, so a move that
+/// stopped halfway is finished on the next start or the next move rather
+/// than left half done. Public for the tests that walk a move one step at
+/// a time.
+pub async fn begin_relocation(config: &Config, from: &str, to: &str) -> Result<(), String> {
+    crate::content::catalog::of(config).begin_relocation(from, to).await
 }
 
 /// Finishes a move that stopped halfway, if there is one. Every step finds
 /// nothing to do when it has already run, so running this twice is safe.
-/// Called at start and before every move.
+/// Called at start and before every move, and holds moves while it runs, so
+/// two runners starting together never finish one move at once.
 pub async fn resume_pending(config: &Config) -> Result<(), String> {
-    let Ok(text) = std::fs::read_to_string(journal_path(config)) else {
-        return Ok(());
-    };
-    let Ok(job) = serde_json::from_str::<Relocation>(&text) else {
-        tracing::error!("an unreadable project move record was found and left in place");
-        return Err("a project move record could not be read".into());
+    let hold = crate::content::catalog::of(config).hold_relocations().await?;
+    let resumed = resume_held(config).await;
+    hold.release().await;
+    resumed
+}
+
+/// `resume_pending` for a caller that already holds moves.
+async fn resume_held(config: &Config) -> Result<(), String> {
+    let job = match crate::content::catalog::of(config).relocation().await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Ok(()),
+        Err(why) => {
+            tracing::error!(%why, "an unreadable project move record was found and left in place");
+            return Err("a project move record could not be read".into());
+        }
     };
     tracing::warn!(from = %job.from, to = %job.to, "finishing a project move that stopped halfway");
     finish(config, &job.from, &job.to).await
@@ -316,15 +309,31 @@ async fn finish(config: &Config, from: &str, to: &str) -> Result<(), String> {
     tokio::task::spawn_blocking(move || users::move_scope_tree(&config2, &old, &new))
         .await
         .map_err(|_| "The project's access rows were not moved.".to_string())??;
-    let _ = std::fs::remove_file(journal_path(config));
-    Ok(())
+    crate::content::catalog::of(config).end_relocation().await
 }
 
 /// Moves a project and everything keyed by its path to `to`: the tree, the
 /// apps inside it and below, the access rows set there and below, and the
-/// lock (it lives on the project).
+/// lock (it lives on the project). Holds moves throughout, here and on every
+/// runner: two moves at once would share one journal, and the second could
+/// move what the first just renamed.
 async fn relocate(config: &Arc<Config>, actor: Option<&User>, from: &str, to: &str) -> Result<(), Problem> {
-    resume_pending(config).await.map_err(Problem::Invalid)?;
+    let hold = crate::content::catalog::of(config).hold_relocations().await.map_err(Problem::Invalid)?;
+    let moved = relocate_held(config, actor, from, to).await;
+    hold.release().await;
+    moved
+}
+
+async fn relocate_held(config: &Arc<Config>, actor: Option<&User>, from: &str, to: &str) -> Result<(), Problem> {
+    resume_held(config).await.map_err(Problem::Invalid)?;
+    // Asked again now that moves are held: the caller checked before
+    // another move, which may have renamed either end, had finished.
+    if !store::folder_exists(config, from).await {
+        return Err(Problem::Invalid(format!("There is no project '{from}'.")));
+    }
+    if !store::folder_exists(config, &parent_of(to)).await {
+        return Err(Problem::Invalid(format!("There is no project '{}'.", parent_of(to))));
+    }
     if store::folder_exists(config, to).await {
         return Err(Problem::Invalid(format!("There is already a project '{to}'.")));
     }
@@ -360,7 +369,7 @@ async fn relocate(config: &Arc<Config>, actor: Option<&User>, from: &str, to: &s
         .await
         .map_err(|_| Problem::Invalid("The project was not moved.".into()))?
         .map_err(Problem::Invalid)?;
-    begin_relocation(config, from, to).map_err(Problem::Invalid)?;
+    begin_relocation(config, from, to).await.map_err(Problem::Invalid)?;
     finish(config, from, to).await.map_err(Problem::Invalid)?;
     tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), from, to, "project moved");
     Ok(())

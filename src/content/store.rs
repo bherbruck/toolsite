@@ -410,7 +410,8 @@ pub(crate) async fn is_hidden(config: &Config, slug: &str) -> bool {
 // A project is a folder in a tree the platform keeps, and an app belongs to
 // one. The tree is logical: an app's URL is its slug whatever folder it is
 // in, so moving an app changes who may manage it, not where it lives. The
-// tree is kept under `.site/`, which no slug can name.
+// catalog keeps the tree (`.site/projects.json`, which no slug can name, or
+// `platform.projects`); every change here is one `update_folders`.
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq)]
 pub struct Folder {
@@ -437,43 +438,14 @@ pub struct Folder {
 /// Aliases kept per project. Enough for a few renames in a row.
 const MAX_ALIASES: usize = 5;
 
-fn projects_path(config: &Config) -> PathBuf {
-    config.data_dir.join(".site").join("projects.json")
-}
-
 pub async fn list_folders(config: &Config) -> Vec<Folder> {
-    match fs::read_to_string(projects_path(config)).await {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// One writer at a time for the project tree. Every change reads the whole
-/// file, edits it and writes it back; two at once would lose one of them,
-/// and a lost lock or general access setting opens what it closed.
-static FOLDERS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Writes the tree whole, through a temporary file and a rename, so a crash
-/// leaves the old file or the new one and never half of one. A torn file
-/// would read as "no projects": every lock and project setting gone.
-async fn write_folders(config: &Config, folders: &[Folder]) -> std::io::Result<()> {
-    let path = projects_path(config);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let json = serde_json::to_string_pretty(folders).map_err(std::io::Error::other)?;
-    let temp = path.with_extension("json.part");
-    fs::write(&temp, json).await?;
-    fs::rename(&temp, &path).await
+    crate::content::catalog::folders(config).await
 }
 
 /// The projects that are locked, for the permission rule. Read in a blocking
 /// context because every scope check runs in one.
 pub fn locked_prefixes_blocking(config: &Config) -> Vec<String> {
-    let mut locked: Vec<String> = std::fs::read_to_string(projects_path(config))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Vec<Folder>>(&text).ok())
-        .unwrap_or_default()
+    let mut locked: Vec<String> = crate::content::catalog::folders_blocking(config)
         .into_iter()
         .filter(|folder| folder.locked)
         .map(|folder| folder.path)
@@ -482,7 +454,7 @@ pub fn locked_prefixes_blocking(config: &Config) -> Vec<String> {
     // the old path after the tree has moved on. A lock that moved with the
     // tree is held at the old path too until the move is done, so rows it
     // ignored stay ignored in between.
-    if let Some((from, to)) = relocation_in_progress(config) {
+    if let Some(crate::content::catalog::Relocation { from, to }) = crate::content::catalog::relocation_blocking(config) {
         let extra: Vec<String> = locked
             .iter()
             .filter_map(|path| {
@@ -498,18 +470,6 @@ pub fn locked_prefixes_blocking(config: &Config) -> Vec<String> {
     locked
 }
 
-/// Where the record of an unfinished project move lives.
-pub fn relocation_journal(config: &Config) -> PathBuf {
-    config.data_dir.join(".site").join("relocating.json")
-}
-
-/// The `(from, to)` of an unfinished project move, if one is recorded.
-pub fn relocation_in_progress(config: &Config) -> Option<(String, String)> {
-    let text = std::fs::read_to_string(relocation_journal(config)).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some((value.get("from")?.as_str()?.to_string(), value.get("to")?.as_str()?.to_string()))
-}
-
 /// Whether one project is locked.
 pub async fn folder_locked(config: &Config, path: &str) -> bool {
     list_folders(config).await.iter().any(|folder| folder.path == path && folder.locked)
@@ -517,13 +477,15 @@ pub async fn folder_locked(config: &Config, path: &str) -> bool {
 
 /// Locks or unlocks a project. The top level has no row and cannot be locked.
 pub async fn set_locked(config: &Config, path: &str, locked: bool) -> Result<(), String> {
-    let _one_writer = FOLDERS_WRITE.lock().await;
-    let mut folders = list_folders(config).await;
-    let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
-        return Err(format!("there is no project '{path}'"));
-    };
-    folder.locked = locked;
-    write_folders(config, &folders).await.map_err(|e| e.to_string())
+    crate::content::catalog::update_folders(config, |folders| {
+        let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
+            return Err(format!("there is no project '{path}'"));
+        };
+        folder.locked = locked;
+        Ok(())
+    })
+    .await
+    .map(drop)
 }
 
 /// Sets or clears a project's general access. The top level has no row; its
@@ -533,13 +495,15 @@ pub async fn set_folder_gate(config: &Config, path: &str, gate: Option<&str>) ->
         Some(word) => Some(normalise_gate(word).ok_or_else(|| format!("'{word}' is not public, authenticated or restricted"))?.to_string()),
         None => None,
     };
-    let _one_writer = FOLDERS_WRITE.lock().await;
-    let mut folders = list_folders(config).await;
-    let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
-        return Err(format!("there is no project '{path}'"));
-    };
-    folder.gate = gate;
-    write_folders(config, &folders).await.map_err(|e| e.to_string())
+    crate::content::catalog::update_folders(config, |folders| {
+        let Some(folder) = folders.iter_mut().find(|folder| folder.path == path) else {
+            return Err(format!("there is no project '{path}'"));
+        };
+        folder.gate = gate;
+        Ok(())
+    })
+    .await
+    .map(drop)
 }
 
 /// Where an app's general access comes from.
@@ -683,22 +647,15 @@ pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<
     if !(parent.is_empty() || crate::content::slug::valid_slug(parent)) {
         return Err("invalid parent folder".into());
     }
-    let _one_writer = FOLDERS_WRITE.lock().await;
-    let mut folders = list_folders(config).await;
-    if !parent.is_empty() && !folders.iter().any(|folder| folder.path == parent) {
-        return Err(format!("there is no folder '{parent}'"));
-    }
     let path = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
-    if folders.iter().any(|folder| folder.path == path) {
-        return Err(format!("there is already a folder '{path}'"));
-    }
+    // Apps are not part of the tree, so this is asked before it is held.
     if let Some(app) = app_at_path(config, &path).await {
         return Err(format!(
             "the app {app} is at {path}; a project cannot share an app's path, because access on one would open the other"
         ));
     }
     let folder = Folder {
-        path,
+        path: path.clone(),
         name: name.to_string(),
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -708,11 +665,21 @@ pub async fn create_folder(config: &Config, parent: &str, name: &str) -> Result<
         renamed_from: Vec::new(),
         gate: None,
     };
-    drop_alias(&mut folders, &folder.path);
-    folders.push(folder.clone());
-    folders.sort_by(|a, b| a.path.cmp(&b.path));
-    write_folders(config, &folders).await.map_err(|e| e.to_string())?;
-    Ok(folder)
+    let created = folder.clone();
+    crate::content::catalog::update_folders(config, move |folders| {
+        if !parent.is_empty() && !folders.iter().any(|folder| folder.path == parent) {
+            return Err(format!("there is no folder '{parent}'"));
+        }
+        if folders.iter().any(|folder| folder.path == path) {
+            return Err(format!("there is already a folder '{path}'"));
+        }
+        drop_alias(folders, &folder.path);
+        folders.push(folder);
+        folders.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(())
+    })
+    .await?;
+    Ok(created)
 }
 
 /// A path is now a real project, so no other project may still answer to it
@@ -726,53 +693,57 @@ fn drop_alias(folders: &mut [Folder], path: &str) {
 /// Moves the project at `from`, and every project below it, to `to`. Only
 /// the tree changes here; the caller moves what points into it first.
 pub async fn relocate_folder(config: &Config, from: &str, to: &str) -> Result<(), String> {
-    let _one_writer = FOLDERS_WRITE.lock().await;
-    let mut folders = list_folders(config).await;
-    if !folders.iter().any(|folder| folder.path == from) {
-        return Err(format!("there is no project '{from}'"));
-    }
-    let under = format!("{from}/");
-    for folder in folders.iter_mut() {
-        if folder.path == from {
-            folder.path = to.to_string();
-            folder.name = to.rsplit('/').next().unwrap_or(to).to_string();
-            folder.renamed_from.retain(|old| old != to);
-            folder.renamed_from.push(from.to_string());
-            if folder.renamed_from.len() > MAX_ALIASES {
-                let excess = folder.renamed_from.len() - MAX_ALIASES;
-                folder.renamed_from.drain(..excess);
-            }
-        } else if let Some(rest) = folder.path.strip_prefix(&under) {
-            folder.path = format!("{to}/{rest}");
+    crate::content::catalog::update_folders(config, |folders| {
+        if !folders.iter().any(|folder| folder.path == from) {
+            return Err(format!("there is no project '{from}'"));
         }
-    }
-    // Every new path is real now; no alias elsewhere may claim it.
-    let new_paths: Vec<String> = folders
-        .iter()
-        .filter(|folder| folder.path == to || folder.path.starts_with(&format!("{to}/")))
-        .map(|folder| folder.path.clone())
-        .collect();
-    for path in new_paths {
+        let under = format!("{from}/");
         for folder in folders.iter_mut() {
-            if folder.path != to {
-                folder.renamed_from.retain(|old| *old != path);
+            if folder.path == from {
+                folder.path = to.to_string();
+                folder.name = to.rsplit('/').next().unwrap_or(to).to_string();
+                folder.renamed_from.retain(|old| old != to);
+                folder.renamed_from.push(from.to_string());
+                if folder.renamed_from.len() > MAX_ALIASES {
+                    let excess = folder.renamed_from.len() - MAX_ALIASES;
+                    folder.renamed_from.drain(..excess);
+                }
+            } else if let Some(rest) = folder.path.strip_prefix(&under) {
+                folder.path = format!("{to}/{rest}");
             }
         }
-    }
-    folders.sort_by(|a, b| a.path.cmp(&b.path));
-    write_folders(config, &folders).await.map_err(|e| e.to_string())
+        // Every new path is real now; no alias elsewhere may claim it.
+        let new_paths: Vec<String> = folders
+            .iter()
+            .filter(|folder| folder.path == to || folder.path.starts_with(&format!("{to}/")))
+            .map(|folder| folder.path.clone())
+            .collect();
+        for path in new_paths {
+            for folder in folders.iter_mut() {
+                if folder.path != to {
+                    folder.renamed_from.retain(|old| *old != path);
+                }
+            }
+        }
+        folders.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(())
+    })
+    .await
+    .map(drop)
 }
 
 /// Removes the project row at `path`. The caller has checked it is empty.
 pub async fn remove_folder(config: &Config, path: &str) -> Result<(), String> {
-    let _one_writer = FOLDERS_WRITE.lock().await;
-    let mut folders = list_folders(config).await;
-    let before = folders.len();
-    folders.retain(|folder| folder.path != path);
-    if folders.len() == before {
-        return Err(format!("there is no project '{path}'"));
-    }
-    write_folders(config, &folders).await.map_err(|e| e.to_string())
+    crate::content::catalog::update_folders(config, |folders| {
+        let before = folders.len();
+        folders.retain(|folder| folder.path != path);
+        if folders.len() == before {
+            return Err(format!("there is no project '{path}'"));
+        }
+        Ok(())
+    })
+    .await
+    .map(drop)
 }
 
 /// Where an old project path now lives, if a project was renamed or moved

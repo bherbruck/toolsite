@@ -13,6 +13,9 @@ use tempfile::TempDir;
 use toolsite::{build_router, platform::upload::UploadTicket, runtime::wasm::Runtime, Config};
 use tower::ServiceExt;
 
+mod common;
+use common::blocking;
+
 const TOKEN: &str = "test-token";
 
 fn server() -> (TempDir, Arc<Config>) {
@@ -450,11 +453,11 @@ async fn a_handler_is_validated_when_it_is_uploaded() {
 // --- accounts and gates -------------------------------------------------
 
 fn account(config: &Config, email: &str, password: &str) {
-    toolsite::accounts::users::sign_up(config, email, password).unwrap();
+    blocking(|| toolsite::accounts::users::sign_up(config, email, password)).unwrap();
 }
 
 fn sign_in(config: &Arc<Config>, email: &str, password: &str) -> String {
-    let (_, token) = toolsite::accounts::users::log_in(config, email, password).unwrap();
+    let (_, token) = blocking(|| toolsite::accounts::users::log_in(config, email, password)).unwrap();
     token
 }
 
@@ -1027,7 +1030,7 @@ async fn the_login_form_cannot_be_used_to_inject_markup() {
 // --- admin --------------------------------------------------------------
 
 fn admin_account(config: &Config, email: &str, password: &str) {
-    toolsite::accounts::users::sign_up_as(config, email, password, true).unwrap();
+    blocking(|| toolsite::accounts::users::sign_up_as(config, email, password, true)).unwrap();
 }
 
 /// The token an admin's own forms carry. Pulled from a rendered page rather
@@ -3946,14 +3949,49 @@ impl Mcp {
 /// token (so a test can act as the platform itself).
 fn scoped_site() -> (TempDir, Arc<Config>) {
     let dir = tempfile::tempdir().unwrap();
-    let config = Arc::new(Config {
-        data_dir: dir.path().to_path_buf(),
+    let config = Arc::new(scoped_config(dir.path()));
+    (dir, config)
+}
+
+fn scoped_config(dir: &std::path::Path) -> Config {
+    Config {
+        data_dir: dir.to_path_buf(),
         base_url: Some(BASE.to_string()),
         local_base: "http://localhost:8080".to_string(),
         valid_tokens: vec![TOKEN.to_string()],
-        ..Config::local(dir.path().to_path_buf(), "unused")
-    });
-    (dir, config)
+        ..Config::local(dir.to_path_buf(), "unused")
+    }
+}
+
+/// `scoped_site` on files, or on Postgres with accounts, OAuth, tickets and
+/// the catalog in a database of its own.
+struct Site {
+    _dir: TempDir,
+    config: Arc<Config>,
+    database: Option<common::Database>,
+}
+
+impl Site {
+    async fn on(postgres: bool) -> Site {
+        let (dir, config) = scoped_site();
+        if !postgres {
+            return Site { _dir: dir, config, database: None };
+        }
+        let database = common::Database::new().await;
+        let config = Arc::new(Config { stores: database.stores(), ..scoped_config(&config.data_dir) });
+        Site { _dir: dir, config, database: Some(database) }
+    }
+
+    async fn finish(self) {
+        if let Some(database) = self.database {
+            // The tree and the move's record lived in the database.
+            for file in ["projects.json", "relocating.json", "labels.json"] {
+                assert!(!self.config.data_dir.join(".site").join(file).exists(), "{file} was written on a Postgres site");
+            }
+            drop(self.config);
+            database.drop().await;
+        }
+    }
 }
 
 async fn folder(config: &Config, parent: &str, name: &str) {
@@ -3973,7 +4011,7 @@ async fn app_in(config: &Config, app: &str, in_folder: &str) {
 
 fn scope(config: &Config, email: &str, prefix: &str, scope: &str) {
     let scope = toolsite::accounts::users::Scope::parse(scope).unwrap();
-    toolsite::accounts::users::grant_scope(config, email, prefix, scope, None).unwrap();
+    blocking(|| toolsite::accounts::users::grant_scope(config, email, prefix, scope, None)).unwrap();
 }
 
 /// Signs the account's Claude in: register, consent, exchange.
@@ -4200,11 +4238,12 @@ async fn a_viewer_only_account_is_turned_away_from_the_publishing_endpoint_and_t
     assert_eq!(status, StatusCode::OK);
 }
 
-#[tokio::test]
-async fn the_project_tree_is_never_served_and_a_moved_app_keeps_its_url() {
-    let (dir, config) = scoped_site();
+async fn tree_never_served(site: Site) {
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
-    assert!(dir.path().join(".site/projects.json").exists());
+    if site.database.is_none() {
+        assert!(config.data_dir.join(".site/projects.json").exists());
+    }
     let (status, ..) = send(&config, get("/p/.site/projects.json")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, ..) = send(&config, get("/p/.site/")).await;
@@ -4224,6 +4263,18 @@ async fn the_project_tree_is_never_served_and_a_moved_app_keeps_its_url() {
     let (status, ..) = send(&config, post_form("/admin/move", &boss, format!("token={token}&app=tool&folder=nowhere"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "a bad folder should come back with a message, not a bare error");
     assert_eq!(toolsite::content::catalog::meta(&config, "tool").await.project.as_deref(), Some("ops"));
+    site.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_project_tree_is_never_served_and_a_moved_app_keeps_its_url() {
+    tree_never_served(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn the_project_tree_is_never_served_and_a_moved_app_keeps_its_url_on_postgres() {
+    tree_never_served(Site::on(true).await).await;
 }
 
 #[tokio::test]
@@ -5680,9 +5731,8 @@ async fn creating_a_project_needs_admin_at_the_parent_and_refuses_a_duplicate() 
     assert!(is_error, "{text}");
 }
 
-#[tokio::test]
-async fn moving_an_app_needs_admin_at_both_ends_and_a_real_target() {
-    let (_dir, config) = scoped_site();
+async fn app_move_needs_admin(site: Site) {
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
     folder(&config, "ops", "yard").await;
     folder(&config, "", "finance").await;
@@ -5709,6 +5759,18 @@ async fn moving_an_app_needs_admin_at_both_ends_and_a_real_target() {
     let (status, page, _) = send(&config, get_as("/browse/ops/yard", &session)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("tracker"), "the moved app is not under its new project");
+    site.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moving_an_app_needs_admin_at_both_ends_and_a_real_target() {
+    app_move_needs_admin(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn moving_an_app_needs_admin_at_both_ends_and_a_real_target_on_postgres() {
+    app_move_needs_admin(Site::on(true).await).await;
 }
 
 #[tokio::test]
@@ -6345,9 +6407,8 @@ async fn the_add_control_sits_above_the_table_so_the_headers_label_rules() {
 
 // --- renaming, moving and removing projects -------------------------------------------
 
-#[tokio::test]
-async fn renaming_a_project_carries_its_apps_access_and_lock_and_keeps_the_old_link() {
-    let (_dir, config) = scoped_site();
+async fn rename_carries_everything(site: Site) {
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
     folder(&config, "ops", "yard").await;
     app_in(&config, "forklifts", "ops/yard").await;
@@ -6376,7 +6437,7 @@ async fn renaming_a_project_carries_its_apps_access_and_lock_and_keeps_the_old_l
     assert_eq!(toolsite::content::store::app_folder(&config, "forklifts").await, "ops/dock");
     assert!(toolsite::content::store::folder_locked(&config, "ops/dock").await, "the lock did not move");
     // The editor holds Edit on the new path, and nothing is left on the old one.
-    let rows = toolsite::accounts::users::list_scopes(&config).unwrap();
+    let rows = blocking(|| toolsite::accounts::users::list_scopes(&config)).unwrap();
     assert!(rows.iter().any(|r| r.email == "ed@example.com" && r.prefix == "ops/dock"), "{rows:?}");
     assert!(!rows.iter().any(|r| r.prefix.starts_with("ops/yard")), "{rows:?}");
     let ed = sign_in(&config, "ed@example.com", "correct horse");
@@ -6392,11 +6453,22 @@ async fn renaming_a_project_carries_its_apps_access_and_lock_and_keeps_the_old_l
     folder(&config, "ops", "yard").await;
     let (status, ..) = send(&config, get_as("/browse/ops/yard", &fa)).await;
     assert_eq!(status, StatusCode::OK);
+    site.finish().await;
 }
 
-#[tokio::test]
-async fn a_project_cannot_be_renamed_onto_another_or_by_someone_without_admin_at_its_parent() {
-    let (_dir, config) = scoped_site();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn renaming_a_project_carries_its_apps_access_and_lock_and_keeps_the_old_link() {
+    rename_carries_everything(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn renaming_a_project_carries_its_apps_access_and_lock_and_keeps_the_old_link_on_postgres() {
+    rename_carries_everything(Site::on(true).await).await;
+}
+
+async fn rename_onto_another_refused(site: Site) {
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
     folder(&config, "ops", "yard").await;
     folder(&config, "ops", "dock").await;
@@ -6415,11 +6487,22 @@ async fn a_project_cannot_be_renamed_onto_another_or_by_someone_without_admin_at
     assert!(is_error, "an admin of the project alone renamed it: {text}");
     assert!(text.contains("admin") && text.contains("ops"), "{text}");
     assert!(toolsite::content::store::folder_exists(&config, "ops/yard").await);
+    site.finish().await;
 }
 
-#[tokio::test]
-async fn moving_a_project_refuses_its_own_inside_and_needs_admin_at_three_places() {
-    let (_dir, config) = scoped_site();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_cannot_be_renamed_onto_another_or_by_someone_without_admin_at_its_parent() {
+    rename_onto_another_refused(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_project_cannot_be_renamed_onto_another_or_by_someone_without_admin_at_its_parent_on_postgres() {
+    rename_onto_another_refused(Site::on(true).await).await;
+}
+
+async fn project_move_needs_admin(site: Site) {
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
     folder(&config, "ops", "yard").await;
     folder(&config, "ops/yard", "north").await;
@@ -6447,11 +6530,22 @@ async fn moving_a_project_refuses_its_own_inside_and_needs_admin_at_three_places
     let (is_error, text) = full.call("projects", serde_json::json!({ "action": "move_project", "path": "finance/yard", "parent": "" })).await;
     assert!(!is_error, "{text}");
     assert!(toolsite::content::store::folder_exists(&config, "yard/north").await);
+    site.finish().await;
 }
 
-#[tokio::test]
-async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it() {
-    let (_dir, config) = scoped_site();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moving_a_project_refuses_its_own_inside_and_needs_admin_at_three_places() {
+    project_move_needs_admin(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn moving_a_project_refuses_its_own_inside_and_needs_admin_at_three_places_on_postgres() {
+    project_move_needs_admin(Site::on(true).await).await;
+}
+
+async fn only_empty_removed(site: Site) {
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
     folder(&config, "ops", "yard").await;
     folder(&config, "ops", "empty").await;
@@ -6480,7 +6574,7 @@ async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it() {
     .await;
     assert_eq!(headers.iter().find(|(k, _)| k == "location").unwrap().1, "/browse/ops");
     assert!(!toolsite::content::store::folder_exists(&config, "ops/empty").await);
-    let rows = toolsite::accounts::users::list_scopes(&config).unwrap();
+    let rows = blocking(|| toolsite::accounts::users::list_scopes(&config)).unwrap();
     assert!(!rows.iter().any(|r| r.prefix == "ops/empty"), "{rows:?}");
 
     // The tool refuses the same way.
@@ -6488,6 +6582,18 @@ async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it() {
     let mut mcp = Mcp::open(&config, &token).await;
     let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "remove", "path": "ops/yard" })).await;
     assert!(is_error && text.contains("not empty"), "{text}");
+    site.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it() {
+    only_empty_removed(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it_on_postgres() {
+    only_empty_removed(Site::on(true).await).await;
 }
 
 // --- general access on projects ------------------------------------------------
@@ -6576,10 +6682,9 @@ async fn a_stranger_is_kept_out_of_an_app_restricted_by_its_project_until_the_pr
     }
 }
 
-#[tokio::test]
-async fn a_project_keeps_its_access_when_renamed_and_the_tab_and_tool_set_it() {
+async fn access_survives_rename(site: Site) {
     use toolsite::content::store::{effective_gate, GateSource};
-    let (_dir, config) = scoped_site();
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
     unset_app_in(&config, "forklifts", "ops").await;
     account(&config, "fa@example.com", "correct horse");
@@ -6613,6 +6718,18 @@ async fn a_project_keeps_its_access_when_renamed_and_the_tab_and_tool_set_it() {
     let (is_error, text) = mcp.call("projects", serde_json::json!({ "action": "access", "path": "site" })).await;
     assert!(!is_error && text.contains("follows"), "{text}");
     assert_eq!(effective_gate(&config, "forklifts", "/").await.source, GateSource::Site);
+    site.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_keeps_its_access_when_renamed_and_the_tab_and_tool_set_it() {
+    access_survives_rename(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_project_keeps_its_access_when_renamed_and_the_tab_and_tool_set_it_on_postgres() {
+    access_survives_rename(Site::on(true).await).await;
 }
 
 #[tokio::test]
@@ -6633,9 +6750,8 @@ async fn every_search_field_has_the_magnifier_clear_button_and_shortcut() {
     assert!(page.contains("placeholder=\"Search apps and projects\""));
 }
 
-#[tokio::test]
-async fn a_project_cannot_be_renamed_or_moved_onto_an_apps_path() {
-    let (_dir, config) = scoped_site();
+async fn no_rename_onto_app(site: Site) {
+    let config = site.config.clone();
     folder(&config, "", "ops").await;
     folder(&config, "ops", "yard").await;
     folder(&config, "ops/yard", "north").await;
@@ -6658,6 +6774,18 @@ async fn a_project_cannot_be_renamed_or_moved_onto_an_apps_path() {
     let (is_error, text) = full.call("projects", serde_json::json!({ "action": "move_project", "path": "labs/north", "parent": "finance" })).await;
     assert!(is_error && text.contains("finance/north"), "{text}");
     assert!(toolsite::content::store::folder_exists(&config, "labs/north").await);
+    site.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_cannot_be_renamed_or_moved_onto_an_apps_path() {
+    no_rename_onto_app(Site::on(common::wants_postgres()).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_project_cannot_be_renamed_or_moved_onto_an_apps_path_on_postgres() {
+    no_rename_onto_app(Site::on(true).await).await;
 }
 
 // --- app tools ---------------------------------------------------------------

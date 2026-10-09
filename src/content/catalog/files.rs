@@ -7,12 +7,17 @@
 //! or the new one and a crash never leaves half of one. The temporary file's
 //! name starts with a dot: no slug or bundle path can name it, so it is
 //! never served even if a crash leaves it behind.
+//!
+//! The site-wide records live under `.site/`, which no slug can name:
+//! `projects.json` (the tree), `relocating.json` (a move under way),
+//! `labels.json` (every host label issued) and one file per marker. Each is
+//! changed under a lock of its own in this process and written the same way.
 
-use super::{Catalog, MetaEdit, Retired};
-use crate::content::store::{current_words, PageMeta};
+use super::{Catalog, FoldersEdit, Held, LabelChoice, MetaEdit, Relocation, Retired};
+use crate::content::store::{current_words, Folder, PageMeta};
 use async_trait::async_trait;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
 };
@@ -25,6 +30,10 @@ pub struct Files {
 /// lock per slug rather than a few shared ones, so an edit that reads
 /// another app's meta can never wait on itself.
 static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
+
+/// One hold on project moves per `DATA_DIR`. Async, since a move awaits
+/// between its steps while holding it.
+static MOVES: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
 
 /// Generations, by `DATA_DIR` and app. In memory: on files there is one
 /// process, and its caches start empty, so counting from zero at boot is
@@ -42,6 +51,58 @@ impl Files {
 
     fn lock_for(&self, slug: &str) -> Arc<Mutex<()>> {
         held(&LOCKS).entry(self.data_dir.join(slug)).or_default().clone()
+    }
+
+    /// A file under `.site/`. Its lock shares the map with the slugs': a
+    /// slug never starts with a dot, so the two never meet.
+    fn site_file(&self, name: &str) -> PathBuf {
+        self.data_dir.join(".site").join(name)
+    }
+
+    fn read_folders(&self) -> Vec<Folder> {
+        std::fs::read_to_string(self.site_file("projects.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn change_folders(&self, edit: FoldersEdit<'_>) -> Result<Vec<Folder>, String> {
+        let path = self.site_file("projects.json");
+        let lock = held(&LOCKS).entry(path.clone()).or_default().clone();
+        let _one_writer = held(&lock);
+        let mut folders = self.read_folders();
+        edit(&mut folders)?;
+        let json = serde_json::to_string_pretty(&folders).map_err(|e| e.to_string())?;
+        write_aside(&path, json.as_bytes())?;
+        Ok(folders)
+    }
+
+    fn read_relocation(&self) -> Result<Option<Relocation>, String> {
+        match std::fs::read_to_string(self.site_file("relocating.json")) {
+            Ok(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|_| "a project move record could not be read".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("a project move record could not be read: {e}")),
+        }
+    }
+
+    /// Every label issued, by label. Unreadable reads as none, as it
+    /// always has; the labels in metas still hold their apps' names.
+    fn read_labels(&self) -> BTreeMap<String, String> {
+        std::fs::read_to_string(self.site_file("labels.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// A marker's file: its name is a constant of the caller's, checked
+    /// here anyway, since it is joined to a path.
+    fn flag_file(&self, name: &str) -> Result<PathBuf, String> {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+            return Err(format!("{name:?} is not a marker name"));
+        }
+        Ok(self.site_file(name))
     }
 
     /// Where a slug's sidecar of this kind is, or would be written: beside
@@ -188,6 +249,91 @@ impl Catalog for Files {
     fn retire_blocking(&self, _slug: &str, _at: u64) -> Result<Retired, String> {
         Ok(Retired { pages: Vec::new() })
     }
+
+    async fn folders(&self) -> Result<Vec<Folder>, String> {
+        Ok(self.read_folders())
+    }
+
+    fn folders_blocking(&self) -> Result<Vec<Folder>, String> {
+        Ok(self.read_folders())
+    }
+
+    async fn update_folders(&self, edit: FoldersEdit<'_>) -> Result<Vec<Folder>, String> {
+        self.change_folders(edit)
+    }
+
+    async fn relocation(&self) -> Result<Option<Relocation>, String> {
+        self.read_relocation()
+    }
+
+    fn relocation_blocking(&self) -> Result<Option<Relocation>, String> {
+        self.read_relocation()
+    }
+
+    async fn begin_relocation(&self, from: &str, to: &str) -> Result<(), String> {
+        let json = serde_json::to_string(&Relocation { from: from.to_string(), to: to.to_string() })
+            .map_err(|e| e.to_string())?;
+        write_aside(&self.site_file("relocating.json"), json.as_bytes())
+    }
+
+    async fn end_relocation(&self) -> Result<(), String> {
+        match std::fs::remove_file(self.site_file("relocating.json")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    async fn hold_relocations(&self) -> Result<Box<dyn Held>, String> {
+        let lock = held(&MOVES).entry(self.data_dir.clone()).or_default().clone();
+        Ok(Box::new(MoveHold(lock.lock_owned().await)))
+    }
+
+    fn label_owner_blocking(&self, label: &str) -> Result<Option<String>, String> {
+        Ok(self.read_labels().remove(label))
+    }
+
+    /// A label issued to another app is refused, as Postgres's key refuses
+    /// it. A list that cannot be written is logged and the label still
+    /// given, as it always was: the app's meta keeps it, and the meta is
+    /// what later assignments read besides the list.
+    fn assign_label_blocking(&self, app: &str, record: bool, choose: LabelChoice<'_>) -> Result<String, String> {
+        let path = self.site_file("labels.json");
+        let lock = held(&LOCKS).entry(path.clone()).or_default().clone();
+        let _one_writer = held(&lock);
+        let mut labels = self.read_labels();
+        let label = choose(&labels);
+        if let Some(owner) = labels.get(&label).filter(|owner| *owner != app)
+            && record
+        {
+            return Err(format!("the host label {label} was issued to {owner} already"));
+        }
+        if record && !labels.contains_key(&label) {
+            labels.insert(label.clone(), app.to_string());
+            let written = serde_json::to_string_pretty(&labels)
+                .map_err(|e| e.to_string())
+                .and_then(|json| write_aside(&path, json.as_bytes()));
+            if let Err(why) = written {
+                tracing::warn!(app, %why, "the list of issued host labels could not be written");
+            }
+        }
+        Ok(label)
+    }
+
+    async fn flag(&self, name: &str) -> Result<Option<String>, String> {
+        Ok(tokio::fs::read_to_string(self.flag_file(name)?).await.ok())
+    }
+
+    async fn set_flag(&self, name: &str, value: &str) -> Result<(), String> {
+        write_aside(&self.flag_file(name)?, value.as_bytes())
+    }
+}
+
+/// A hold on project moves in this process.
+struct MoveHold(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
+
+#[async_trait]
+impl Held for MoveHold {
+    async fn release(self: Box<Self>) {}
 }
 
 /// Every published slug under `dir`, the way the index lists them.

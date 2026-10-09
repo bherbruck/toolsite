@@ -26,6 +26,16 @@ pub const LOCK_MIGRATE: i32 = 1;
 /// a rotation or issue for the same account take turns, so a pair written
 /// but not yet committed cannot slip past the revocation's delete.
 pub const LOCK_OAUTH_USER: i32 = 2;
+/// The project tree: a change reads every row and writes the difference,
+/// so changes take turns.
+pub const LOCK_PROJECTS: i32 = 3;
+/// Project moves: one at a time across runners, held for a whole move, so
+/// two runners never resume one move at once and two moves never share the
+/// one journal row.
+pub const LOCK_RELOCATION: i32 = 4;
+/// Host labels: held while a free label is chosen and issued, so two apps
+/// never choose the same one. The primary key refuses it besides.
+pub const LOCK_LABELS: i32 = 5;
 
 /// One store's schema, as the steps that build it. Version `n` is
 /// `steps[n - 1]`; a step never changes once released, the ladder only grows.
@@ -56,7 +66,10 @@ pub const LADDERS: &[Ladder] = &[
     },
     Ladder {
         store: "platform",
-        steps: &[include_str!("../../migrations/postgres/platform/001_pages.sql")],
+        steps: &[
+            include_str!("../../migrations/postgres/platform/001_pages.sql"),
+            include_str!("../../migrations/postgres/platform/002_projects_labels.sql"),
+        ],
     },
 ];
 

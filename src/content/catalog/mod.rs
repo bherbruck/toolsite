@@ -1,5 +1,7 @@
 //! The catalog: what is published, where, and how. Each page's and app's
-//! `PageMeta`, its notes, its generation, and which slugs exist.
+//! `PageMeta`, its notes, its generation, and which slugs exist; the project
+//! tree and the record of a move under way; every host label issued; and
+//! the site's one-time markers.
 //!
 //! Two implementations: `files`, today's sidecars under `DATA_DIR` (the
 //! default), and `postgres`, schema `platform`, when the site runs on
@@ -14,6 +16,14 @@
 //! whichever of two concurrent changes wrote first, and a lost `hidden` or
 //! `gate` opens what was closed.
 //!
+//! The project tree changes the same way, as one `update_folders` call
+//! (one writer at a time: a lock and a rename on files, an advisory lock
+//! and the difference written in one transaction on Postgres). A project
+//! move holds `hold_relocations` from its first check to its journal being
+//! cleared, so two moves, or two runners resuming one, take turns. A host
+//! label is chosen and issued under a lock too, and on Postgres the label's
+//! primary key refuses a second app besides.
+//!
 //! The catalog never reaches the sockets or instances a change affects:
 //! `update_meta` here tells `config.app_events()`, which closes them.
 
@@ -25,18 +35,43 @@ mod conformance;
 
 use crate::{
     config::Config,
-    content::store::PageMeta,
+    content::store::{Folder, PageMeta},
     state::{
         events::{AppChange, AppEvents},
         Backend,
     },
 };
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// A change to one meta, run while the catalog holds it. An error leaves
 /// the stored meta as it was and is returned.
 pub type MetaEdit<'a> = Box<dyn FnOnce(&mut PageMeta) -> Result<(), String> + Send + 'a>;
+
+/// A change to the whole project tree, run while the catalog holds it. An
+/// error leaves the tree as it was and is returned.
+pub type FoldersEdit<'a> = Box<dyn FnOnce(&mut Vec<Folder>) -> Result<(), String> + Send + 'a>;
+
+/// Chooses an app's host label from every label issued so far (label to
+/// app), while the catalog holds the list. Pure: it runs under a lock, so
+/// it reads nothing else.
+pub type LabelChoice<'a> = Box<dyn FnOnce(&BTreeMap<String, String>) -> String + Send + 'a>;
+
+/// A project move that has begun and not finished.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Relocation {
+    pub from: String,
+    pub to: String,
+}
+
+/// Project moves held: no other move, here or on another runner, starts or
+/// resumes until this is released or dropped.
+#[async_trait]
+pub trait Held: Send {
+    /// Lets the next move in. A hold that cannot be released cleanly is
+    /// let go some other way (its connection closed), never kept.
+    async fn release(self: Box<Self>);
+}
 
 /// What a removal took out of the catalog, for the trash to keep beside the
 /// files it moved.
@@ -80,6 +115,39 @@ pub trait Catalog: Send + Sync {
     /// is destroyed: the files backend leaves its sidecars for the trash to
     /// move, Postgres keeps the rows in `platform.removed_pages`.
     fn retire_blocking(&self, slug: &str, at: u64) -> Result<Retired, String>;
+
+    /// The project tree, sorted by path.
+    async fn folders(&self) -> Result<Vec<Folder>, String>;
+    /// `folders` for a synchronous caller: every scope check reads the
+    /// locked projects from one.
+    fn folders_blocking(&self) -> Result<Vec<Folder>, String>;
+    /// Runs `edit` on the whole tree with it held and stores the result.
+    /// Of any number of calls at once, every edit lands.
+    async fn update_folders(&self, edit: FoldersEdit<'_>) -> Result<Vec<Folder>, String>;
+
+    /// The project move under way, if one is recorded. An unreadable record
+    /// is an error, not "none": a move left half done must be noticed.
+    async fn relocation(&self) -> Result<Option<Relocation>, String>;
+    fn relocation_blocking(&self) -> Result<Option<Relocation>, String>;
+    /// Records that `from` is about to become `to`, replacing any record.
+    async fn begin_relocation(&self, from: &str, to: &str) -> Result<(), String>;
+    /// Clears the record: the move is done.
+    async fn end_relocation(&self) -> Result<(), String>;
+    /// Waits until no other move is running, here or on any runner, and
+    /// holds moves until the answer is released.
+    async fn hold_relocations(&self) -> Result<Box<dyn Held>, String>;
+
+    /// The app a host label was issued to, if it was.
+    fn label_owner_blocking(&self, label: &str) -> Result<Option<String>, String>;
+    /// With every label issued held, asks `choose` for `app`'s label and,
+    /// when `record`, issues it to the app. A label already issued to
+    /// another app is never issued again: on Postgres its primary key
+    /// refuses the second app even if `choose` asked for it.
+    fn assign_label_blocking(&self, app: &str, record: bool, choose: LabelChoice<'_>) -> Result<String, String>;
+
+    /// A one-time marker's value, if it was set.
+    async fn flag(&self, name: &str) -> Result<Option<String>, String>;
+    async fn set_flag(&self, name: &str, value: &str) -> Result<(), String>;
 }
 
 /// The catalog this site's backend keeps. Cheap: it holds a path or a pool
@@ -187,4 +255,39 @@ pub(crate) fn apps_among(slugs: Vec<String>) -> Vec<String> {
     apps.sort();
     apps.dedup();
     apps
+}
+
+/// The project tree; empty, logged, when it cannot be read. Empty closes
+/// rather than opens: an app whose project is not in the tree is restricted,
+/// and a move or a new project inside one finds no parent.
+pub async fn folders(config: &Config) -> Vec<Folder> {
+    of(config).folders().await.unwrap_or_else(|why| {
+        tracing::warn!(%why, "the project tree could not be read");
+        Vec::new()
+    })
+}
+
+/// `folders` for a synchronous caller.
+pub fn folders_blocking(config: &Config) -> Vec<Folder> {
+    of(config).folders_blocking().unwrap_or_else(|why| {
+        tracing::warn!(%why, "the project tree could not be read");
+        Vec::new()
+    })
+}
+
+/// Changes the project tree in one held step.
+pub async fn update_folders(
+    config: &Config,
+    edit: impl FnOnce(&mut Vec<Folder>) -> Result<(), String> + Send,
+) -> Result<Vec<Folder>, String> {
+    of(config).update_folders(Box::new(edit)).await
+}
+
+/// The project move under way, for a synchronous caller; none, logged,
+/// when the record cannot be read.
+pub fn relocation_blocking(config: &Config) -> Option<Relocation> {
+    of(config).relocation_blocking().unwrap_or_else(|why| {
+        tracing::warn!(%why, "the record of a project move could not be read");
+        None
+    })
 }

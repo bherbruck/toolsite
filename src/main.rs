@@ -505,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
     // A project move that stopped halfway, say with the process, is finished
     // before anything is served, so no request sees the state in between.
     if let Err(why) = toolsite::platform::projects::resume_pending(&config).await {
-        tracing::error!(%why, "a project move could not be finished; check .site/relocating.json");
+        tracing::error!(%why, "a project move could not be finished; it is tried again before the next move");
     }
 
     let runtime = Runtime::new()?;

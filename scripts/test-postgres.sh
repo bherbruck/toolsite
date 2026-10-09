@@ -52,6 +52,10 @@ export TOOLSITE_TEST_DATABASE_URL="postgres://postgres:$password@127.0.0.1:$pg_p
 export TOOLSITE_TEST_S3_ENDPOINT="http://127.0.0.1:$minio_port"
 export TOOLSITE_TEST_S3_ACCESS_KEY_ID=toolsite
 export TOOLSITE_TEST_S3_SECRET_ACCESS_KEY="$password"
+# A Postgres site seals with the key from the environment. Exported for the
+# whole run, so a file-mode test in the same binary as a Postgres one never
+# sees the key appear halfway through.
+export TOOLSITE_SECRET_KEY="$(head -c 32 /dev/urandom | base64)"
 echo "$postgres_image on 127.0.0.1:$pg_port, minio on 127.0.0.1:$minio_port"
 
 cargo test -- --ignored postgres

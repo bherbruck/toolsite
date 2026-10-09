@@ -3,15 +3,18 @@
 //! (`scripts/test-postgres.sh` starts one). It pins what the rules above
 //! rely on: a meta comes back exactly as it went in, field by field; one
 //! slug's meta never answers for another's; an edit that fails changes
-//! nothing; and of many changes at once, every one lands.
+//! nothing; and of many changes at once, every one lands. The same for the
+//! project tree; a project move's record and its hold, which lets one move
+//! run at a time; host labels, which two apps never share however many are
+//! assigned at once; and markers.
 
-use super::{files::Files, postgres::Postgres, Catalog};
+use super::{files::Files, postgres::Postgres, Catalog, Relocation};
 use crate::{
     accounts::store::conformance::{drop_postgres_database, postgres_database},
-    content::store::{PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
+    content::store::{Folder, PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
     runtime::limits::Asked,
 };
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 /// Values that have broken stores before: quotes and SQL, a NUL, Unicode
 /// lookalikes, and a long string.
@@ -229,6 +232,222 @@ async fn published_files_are_listed(catalog: &dyn Catalog, data_dir: &Path) {
     assert_eq!(catalog.apps().await.unwrap(), vec!["board", "note"]);
 }
 
+fn folder(path: &str) -> Folder {
+    Folder {
+        path: path.to_string(),
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        created_at: 1_700_000_000,
+        locked: false,
+        renamed_from: Vec::new(),
+        gate: None,
+    }
+}
+
+async fn add_folder(catalog: &dyn Catalog, made: Folder) {
+    catalog
+        .update_folders(Box::new(move |folders| {
+            folders.push(made);
+            folders.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(())
+        }))
+        .await
+        .unwrap();
+}
+
+/// Every field of a project comes back as it went in, the tree reads in
+/// path order, a rename is a new path and the old one gone, and an edit
+/// that fails changes nothing.
+async fn the_tree_round_trips(catalog: &dyn Catalog) {
+    assert_eq!(catalog.folders().await.unwrap(), Vec::<Folder>::new());
+    let full = Folder {
+        locked: true,
+        renamed_from: vec!["old".into(), hostile()[0].clone(), hostile()[2].clone()],
+        gate: Some("restricted".into()),
+        name: hostile()[1].replace('\0', ""),
+        ..folder("ops")
+    };
+    add_folder(catalog, full.clone()).await;
+    add_folder(catalog, folder("ops/yard")).await;
+    add_folder(catalog, folder("Zeta")).await;
+    add_folder(catalog, folder("ops_x")).await;
+    let tree = catalog.folders().await.unwrap();
+    let paths: Vec<&str> = tree.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["Zeta", "ops", "ops/yard", "ops_x"], "not in the order the file keeps");
+    assert_eq!(tree[1], full);
+    assert_eq!(catalog.folders_blocking().unwrap(), tree);
+
+    let refused = catalog
+        .update_folders(Box::new(|folders| {
+            folders.clear();
+            Err("refused".into())
+        }))
+        .await;
+    assert_eq!(refused.unwrap_err(), "refused");
+    assert_eq!(catalog.folders().await.unwrap(), tree);
+
+    // A move: one path goes, another comes, everything else is as it was.
+    let moved = catalog
+        .update_folders(Box::new(|folders| {
+            for f in folders.iter_mut() {
+                if f.path == "ops/yard" {
+                    f.path = "ops/dock".into();
+                    f.renamed_from.push("ops/yard".into());
+                }
+            }
+            folders.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(())
+        }))
+        .await
+        .unwrap();
+    assert_eq!(catalog.folders().await.unwrap(), moved);
+    assert!(moved.iter().any(|f| f.path == "ops/dock" && f.renamed_from == vec!["ops/yard".to_string()]));
+    assert!(!moved.iter().any(|f| f.path == "ops/yard"));
+    catalog.update_folders(Box::new(|folders| {
+        folders.retain(|f| f.path == "ops");
+        Ok(())
+    }))
+    .await
+    .unwrap();
+    assert_eq!(catalog.folders().await.unwrap(), vec![full]);
+    catalog.update_folders(Box::new(|folders| {
+        folders.clear();
+        Ok(())
+    }))
+    .await
+    .unwrap();
+}
+
+/// Many projects created at once, each its own: all of them are there
+/// after. Read the tree, add one and write it back as three steps would
+/// keep only some.
+async fn concurrent_tree_changes_all_land(catalog: Arc<dyn Catalog>) {
+    const WRITERS: usize = 24;
+    let start = Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut tasks = Vec::new();
+    for writer in 0..WRITERS {
+        let (catalog, start) = (catalog.clone(), start.clone());
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            add_folder(&*catalog, folder(&format!("p{writer:02}"))).await;
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let paths: Vec<String> = catalog.folders().await.unwrap().into_iter().map(|f| f.path).collect();
+    let wanted: Vec<String> = (0..WRITERS).map(|w| format!("p{w:02}")).collect();
+    assert_eq!(paths, wanted, "{} of {WRITERS} concurrent projects were lost", WRITERS - paths.len());
+}
+
+async fn a_move_is_recorded_until_it_ends(catalog: Arc<dyn Catalog>) {
+    assert_eq!(catalog.relocation().await.unwrap(), None);
+    catalog.begin_relocation("ops", "ops2").await.unwrap();
+    let wanted = Relocation { from: "ops".into(), to: "ops2".into() };
+    assert_eq!(catalog.relocation().await.unwrap(), Some(wanted.clone()));
+    let reading = catalog.clone();
+    let blocking = tokio::task::spawn_blocking(move || reading.relocation_blocking()).await.unwrap().unwrap();
+    assert_eq!(blocking, Some(wanted));
+    // One record at a time: a new one replaces it.
+    catalog.begin_relocation(&hostile()[0], "b/c").await.unwrap();
+    assert_eq!(catalog.relocation().await.unwrap(), Some(Relocation { from: hostile()[0].clone(), to: "b/c".into() }));
+    catalog.end_relocation().await.unwrap();
+    assert_eq!(catalog.relocation().await.unwrap(), None);
+    catalog.end_relocation().await.unwrap();
+}
+
+/// While one move holds, the next waits; released, or dropped as a task
+/// that fails would drop it, the next goes in.
+async fn one_move_at_a_time(catalog: Arc<dyn Catalog>) {
+    let first = catalog.hold_relocations().await.unwrap();
+    let waiting = catalog.clone();
+    let mut second = tokio::spawn(async move { waiting.hold_relocations().await.unwrap() });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut second).await.is_err(),
+        "a second move started while the first held"
+    );
+    first.release().await;
+    let second = tokio::time::timeout(Duration::from_secs(10), second).await.expect("the second move never started").unwrap();
+    let waiting = catalog.clone();
+    let mut third = tokio::spawn(async move { waiting.hold_relocations().await.unwrap() });
+    assert!(tokio::time::timeout(Duration::from_millis(300), &mut third).await.is_err());
+    drop(second);
+    let third = tokio::time::timeout(Duration::from_secs(10), third).await.expect("a dropped hold kept the next move out").unwrap();
+    third.release().await;
+}
+
+/// The first label of `wanted` that nobody holds yet.
+fn first_free(wanted: Vec<String>) -> super::LabelChoice<'static> {
+    Box::new(move |issued| wanted.iter().find(|label| !issued.contains_key(*label)).cloned().expect("a free label"))
+}
+
+/// Many apps asking for a label at once, each wanting the first free one
+/// of the same list: every app gets one, and no two the same. Without the
+/// hold, each would read the same list and choose the same label.
+async fn concurrent_labels_are_never_shared(catalog: Arc<dyn Catalog>) {
+    const APPS: usize = 16;
+    let wanted: Vec<String> = (0..APPS).map(|n| format!("shared-{n:02}")).collect();
+    let start = Arc::new(std::sync::Barrier::new(APPS));
+    let mut tasks = Vec::new();
+    for n in 0..APPS {
+        let (catalog, start, wanted) = (catalog.clone(), start.clone(), wanted.clone());
+        tasks.push(tokio::task::spawn_blocking(move || {
+            start.wait();
+            let app = format!("app{n:02}");
+            let label = catalog.assign_label_blocking(&app, true, first_free(wanted));
+            (app, label)
+        }));
+    }
+    let mut given = std::collections::BTreeMap::new();
+    for task in tasks {
+        let (app, label) = task.await.unwrap();
+        let label = label.unwrap_or_else(|why| panic!("{app} got no label: {why}"));
+        if let Some(other) = given.insert(label.clone(), app.clone()) {
+            panic!("{label} was given to both {other} and {app}");
+        }
+    }
+    assert_eq!(given.len(), APPS);
+    for (label, app) in &given {
+        assert_eq!(catalog.label_owner_blocking(label).unwrap().as_deref(), Some(app.as_str()));
+    }
+}
+
+async fn labels_are_issued_once(catalog: Arc<dyn Catalog>) {
+    let catalog = catalog.clone();
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(catalog.label_owner_blocking("shop").unwrap(), None);
+        // Not recorded: the app does not exist yet.
+        let label = catalog.assign_label_blocking("shop", false, Box::new(|_| "shop".to_string())).unwrap();
+        assert_eq!(label, "shop");
+        assert_eq!(catalog.label_owner_blocking("shop").unwrap(), None);
+        // Recorded, and asking again keeps it.
+        catalog.assign_label_blocking("shop", true, Box::new(|_| "shop".to_string())).unwrap();
+        assert_eq!(catalog.label_owner_blocking("shop").unwrap().as_deref(), Some("shop"));
+        catalog
+            .assign_label_blocking("shop", true, Box::new(|issued| {
+                assert_eq!(issued.get("shop").map(String::as_str), Some("shop"));
+                "shop".to_string()
+            }))
+            .unwrap();
+        // Never to another app, even if a choice asks for it.
+        let refused = catalog.assign_label_blocking("Shop", true, Box::new(|_| "shop".to_string()));
+        assert!(refused.is_err(), "a label issued to one app was issued to another");
+        assert_eq!(catalog.label_owner_blocking("shop").unwrap().as_deref(), Some("shop"));
+        // Labels and apps are compared exactly.
+        assert_eq!(catalog.label_owner_blocking("SHOP").unwrap(), None);
+    })
+    .await
+    .unwrap();
+}
+
+async fn markers_round_trip(catalog: &dyn Catalog) {
+    assert_eq!(catalog.flag("grants-adopted").await.unwrap(), None);
+    catalog.set_flag("grants-adopted", "3\n").await.unwrap();
+    assert_eq!(catalog.flag("grants-adopted").await.unwrap().as_deref(), Some("3\n"));
+    catalog.set_flag("grants-adopted", "0\n").await.unwrap();
+    assert_eq!(catalog.flag("grants-adopted").await.unwrap().as_deref(), Some("0\n"));
+    assert_eq!(catalog.flag("other-marker").await.unwrap(), None);
+}
+
 async fn run(catalog: Arc<dyn Catalog>, data_dir: &Path) {
     every_field_round_trips(&*catalog).await;
     slugs_are_apart(&*catalog).await;
@@ -238,6 +457,13 @@ async fn run(catalog: Arc<dyn Catalog>, data_dir: &Path) {
     notes_round_trip(&*catalog).await;
     generations_count_per_app(&*catalog).await;
     published_files_are_listed(&*catalog, data_dir).await;
+    the_tree_round_trips(&*catalog).await;
+    concurrent_tree_changes_all_land(catalog.clone()).await;
+    a_move_is_recorded_until_it_ends(catalog.clone()).await;
+    one_move_at_a_time(catalog.clone()).await;
+    concurrent_labels_are_never_shared(catalog.clone()).await;
+    labels_are_issued_once(catalog.clone()).await;
+    markers_round_trip(&*catalog).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -274,6 +500,51 @@ async fn the_files_catalog_writes_the_same_sidecar_as_before() {
     assert!(old.hidden);
 }
 
+/// The tree, a move's record, the issued labels and a marker are the same
+/// files in the same shape as before this store, and every write is a
+/// rename: nothing but the files themselves is left in `.site/`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_files_catalog_writes_the_same_site_files_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = dir.path().join(".site");
+    let catalog = Arc::new(Files::new(dir.path().to_path_buf()));
+    let locked = Folder { locked: true, gate: Some("restricted".into()), renamed_from: vec!["old".into()], ..folder("ops") };
+    add_folder(&*catalog, locked.clone()).await;
+    add_folder(&*catalog, folder("ops/yard")).await;
+    let tree = vec![locked, folder("ops/yard")];
+    assert_eq!(std::fs::read_to_string(site.join("projects.json")).unwrap(), serde_json::to_string_pretty(&tree).unwrap());
+    // A tree written before, with a field this build does not know, reads.
+    std::fs::write(site.join("projects.json"), r#"[{"path":"a","name":"a","created_at":1,"someday":true}]"#).unwrap();
+    assert_eq!(catalog.folders().await.unwrap(), vec![Folder { created_at: 1, ..folder("a") }]);
+
+    catalog.begin_relocation("a", "b").await.unwrap();
+    assert_eq!(std::fs::read_to_string(site.join("relocating.json")).unwrap(), r#"{"from":"a","to":"b"}"#);
+    catalog.end_relocation().await.unwrap();
+    assert!(!site.join("relocating.json").exists());
+    std::fs::write(site.join("relocating.json"), "{torn").unwrap();
+    assert!(catalog.relocation().await.is_err(), "a torn record read as no move at all");
+    std::fs::remove_file(site.join("relocating.json")).unwrap();
+
+    let labels = catalog.clone();
+    tokio::task::spawn_blocking(move || {
+        labels.assign_label_blocking("Shop", true, Box::new(|_| "shop-1a2b3c4d".to_string())).unwrap();
+    })
+    .await
+    .unwrap();
+    let mut issued = std::collections::BTreeMap::new();
+    issued.insert("shop-1a2b3c4d".to_string(), "Shop".to_string());
+    assert_eq!(std::fs::read_to_string(site.join("labels.json")).unwrap(), serde_json::to_string_pretty(&issued).unwrap());
+
+    catalog.set_flag("grants-adopted", "2\n").await.unwrap();
+    assert_eq!(std::fs::read_to_string(site.join("grants-adopted")).unwrap(), "2\n");
+    assert!(catalog.set_flag("../escape", "x").await.is_err());
+
+    let mut left: Vec<String> =
+        std::fs::read_dir(&site).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, vec!["grants-adopted", "labels.json", "projects.json"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
 async fn the_postgres_catalog_conforms() {
@@ -299,6 +570,35 @@ async fn the_postgres_catalog_conforms() {
         .unwrap();
     assert!(catalog.meta("torn").await.is_err());
     assert!(catalog.update_meta("torn", Box::new(|_| Ok(()))).await.is_err());
+
+    // Another runner's move: the lock taken on a session of its own. A move
+    // here waits for it, whatever this process's own queue says.
+    let other = pool.get().await.unwrap();
+    other.execute("select pg_advisory_lock($1::int4, 0)", &[&crate::state::pg::LOCK_RELOCATION]).await.unwrap();
+    let waiting = catalog.clone();
+    let mut here = tokio::spawn(async move { waiting.hold_relocations().await.unwrap() });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut here).await.is_err(),
+        "a move started while another runner's held"
+    );
+    other.execute("select pg_advisory_unlock($1::int4, 0)", &[&crate::state::pg::LOCK_RELOCATION]).await.unwrap();
+    let here = tokio::time::timeout(Duration::from_secs(10), here).await.expect("the move never started").unwrap();
+    // And the other way round: while this hold is on, the other runner's
+    // try fails.
+    let taken: bool = other
+        .query_one("select pg_try_advisory_lock($1::int4, 0)", &[&crate::state::pg::LOCK_RELOCATION])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!taken, "another runner took the move lock while a move here held it");
+    here.release().await;
+    let taken: bool = other
+        .query_one("select pg_try_advisory_lock($1::int4, 0)", &[&crate::state::pg::LOCK_RELOCATION])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(taken, "a released hold kept the lock");
+    drop(other);
     drop(client);
     drop(catalog);
     std::thread::spawn(move || drop_postgres_database(pool, &name)).join().unwrap();

@@ -947,12 +947,23 @@ pub async fn change_lock(
 
 // --- the old per-app grants -------------------------------------------------------
 
+/// The marker that says old grants were adopted: `.site/grants-adopted`, or
+/// its row in `platform.site_flags`.
+const GRANTS_ADOPTED: &str = "grants-adopted";
+
 /// Turns every per-app grant into a View row on that app, once. The grant
 /// itself stays, because it carries the role the app reads.
 pub async fn adopt_grants(config: &Arc<Config>) {
-    let marker = config.data_dir.join(".site").join("grants-adopted");
-    if tokio::fs::metadata(&marker).await.is_ok() {
-        return;
+    let catalog = crate::content::catalog::of(config);
+    match catalog.flag(GRANTS_ADOPTED).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return,
+        Err(why) => {
+            // Adopting adds only rows nobody is missing, so it waits for a
+            // start that can read whether it ran.
+            tracing::warn!(%why, "whether old grants were adopted could not be read; not adopting now");
+            return;
+        }
     }
     let grants = {
         let config = config.clone();
@@ -967,10 +978,9 @@ pub async fn adopt_grants(config: &Arc<Config>) {
             adopted += 1;
         }
     }
-    if let Some(parent) = marker.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+    if let Err(why) = catalog.set_flag(GRANTS_ADOPTED, &format!("{adopted}\n")).await {
+        tracing::warn!(%why, "that old grants were adopted could not be recorded; they are looked at again next start");
     }
-    let _ = tokio::fs::write(&marker, format!("{adopted}\n")).await;
     if adopted > 0 {
         tracing::info!(adopted, "per-app grants became View rows");
     }

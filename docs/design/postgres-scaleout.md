@@ -194,7 +194,7 @@ Rules behind the choices:
 | `auth.db` tables | Postgres schema `accounts`, same tables and columns | Read on every request; needs one truth |
 | `oauth.db` tables | Postgres schema `oauth` | Same |
 | `projects.json` | `platform.projects` (one row per project; `renamed_from text[]`) | Row updates under a transaction replace the whole-file rewrite |
-| `relocating.json` | `platform.relocations` (at most one row) | Resumed under an advisory lock, so two runners cannot resume one move |
+| `relocating.json` | `platform.relocations` (at most one row) | Resumed under an advisory lock, so two runners cannot resume one move. PR 7: the lock is held for a whole move, not only a resume, since two moves at once share the one row; moves in one process also queue in memory before taking a connection, or waiters would hold the whole pool while the mover needs one |
 | `labels.json` | `platform.host_labels (label primary key, app, issued_at)` | Uniqueness by constraint, not by a process mutex |
 | `github.json` | `platform.github_installations` | Small, shared |
 | `grants-adopted` | `platform.site_flags (name primary key, value, at)` | One-time markers |
@@ -551,7 +551,7 @@ migrations/postgres/schema.sql                     declared shape, all four
 | Today | Postgres |
 |---|---|
 | `FOLDERS_WRITE` around read, edit, write of `projects.json` | `update_folders` runs in one transaction after `pg_advisory_xact_lock(LOCK_PROJECTS)`, reads all rows, applies the closure, writes the difference |
-| `relocating.json` journal, resumed at boot and before each move | `platform.relocations` row. `resume_pending` takes `pg_advisory_xact_lock(LOCK_RELOCATION)`. The three steps of `projects::finish` stay as they are, in the same order; each is idempotent. They stay separate steps because the access rows belong to `AccountStore` and the tree to `Catalog`, and one transaction across both would couple them |
+| `relocating.json` journal, resumed at boot and before each move | `platform.relocations` row. `resume_pending`, and every move from its first check to its last step (PR 7), holds `pg_advisory_xact_lock(LOCK_RELOCATION)` in a transaction on a connection kept for the move; a hold dropped without release closes that connection. The three steps of `projects::finish` stay as they are, in the same order; each is idempotent. They stay separate steps because the access rows belong to `AccountStore` and the tree to `Catalog`, and one transaction across both would couple them |
 | `schedule::FILES` around job record updates | Single-row `update platform.jobs set ... where app = $1 and name = $2`. `set_job` checks `MAX_JOBS_PER_APP` under `pg_advisory_xact_lock(LOCK_JOBS, hash(app))` |
 | `Jobs.running` map | A lease `job:<app>/<name>` per run. The per-app running ceiling is a count of live `job:<app>/*` leases, checked under `pg_advisory_xact_lock(LOCK_JOBS, hash(app))` |
 | `Jobs.starts` minute windows | `RateWindows::spend("job-starts:<app>", per_minute, 60s)`: one upsert on `(key, window_start)` |

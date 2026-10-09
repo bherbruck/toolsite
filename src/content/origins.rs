@@ -20,7 +20,6 @@ use crate::{
     content::{catalog, slug::valid_segment},
 };
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
 
 /// The longest DNS label.
 pub const MAX_LABEL: usize = 63;
@@ -156,34 +155,13 @@ fn derived(app: &str, attempt: u32) -> String {
     }
 }
 
-/// Every label ever issued, and the app it was issued to. A label is never
-/// issued to another app afterwards, even once its app is removed: a host's
-/// bookmarks, its storage in the browser and any cookie still held for it
-/// would otherwise pass to whoever published next under that name. An app
-/// published again under the same name, or put back from `.trash/`, gets
-/// its own label back.
-fn registry_path(config: &Config) -> std::path::PathBuf {
-    config.data_dir.join(".site").join("labels.json")
-}
-
-fn read_registry(config: &Config) -> std::collections::BTreeMap<String, String> {
-    std::fs::read_to_string(registry_path(config))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-fn write_registry(config: &Config, registry: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
-    let path = registry_path(config);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
-    // Written aside and renamed, so a crash leaves the old list, never half.
-    let partial = path.with_extension("json.partial");
-    std::fs::write(&partial, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&partial, &path).map_err(|e| e.to_string())
-}
+// Every label ever issued, and the app it was issued to, is kept by the
+// catalog (`.site/labels.json`, or `platform.host_labels`). A label is never
+// issued to another app afterwards, even once its app is removed: a host's
+// bookmarks, its storage in the browser and any cookie still held for it
+// would otherwise pass to whoever published next under that name. An app
+// published again under the same name, or put back from `.trash/`, gets
+// its own label back.
 
 /// Every top-level name that can be an app: a directory or a loose page.
 fn app_names(config: &Config) -> Vec<String> {
@@ -207,28 +185,23 @@ fn app_exists(config: &Config, app: &str) -> bool {
     config.data_dir.join(app).is_dir() || config.data_dir.join(format!("{app}.html")).is_file()
 }
 
-/// One assignment at a time, so two apps cannot both take a free label.
-static ASSIGNING: Mutex<()> = Mutex::new(());
-
 /// The app's label, assigned and stored the first time it is asked for. An
 /// app that does not exist yet (an upload URL handed out before the upload)
 /// gets the label it would be assigned, unstored.
 ///
-/// Labels other apps hold or ever held are skipped (see `registry_path`),
-/// and so is a name that is a label itself and has not been assigned yet,
-/// so an app called `orders-1a2b3c4d` is not later moved off its own name.
+/// Labels other apps hold or ever held are skipped (see the issued labels
+/// above), and so is a name that is a label itself and has not been
+/// assigned yet, so an app called `orders-1a2b3c4d` is not later moved off
+/// its own name. The choice is made while the catalog holds the issued
+/// labels, so two apps cannot both take a free one.
 pub fn label_for(config: &Config, app: &str) -> String {
     if let Some(label) = catalog::meta_blocking(config, app).label.filter(|l| valid_label(l)) {
         return label;
     }
-    let _one = ASSIGNING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let meta = catalog::meta_blocking(config, app);
-    if let Some(label) = meta.label.filter(|l| valid_label(l)) {
-        return label;
-    }
-    let mut registry = read_registry(config);
-    let mut held: std::collections::HashSet<String> =
-        registry.iter().filter(|(_, owner)| owner.as_str() != app).map(|(label, _)| label.clone()).collect();
+    // Labels other apps hold by their meta, or by their name. Read before
+    // the hold: every label issued since is in the list the choice reads
+    // inside it, since every assignment writes that list first.
+    let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
     for other in app_names(config).into_iter().filter(|other| other != app) {
         match catalog::meta_blocking(config, &other).label {
             Some(label) => {
@@ -240,23 +213,31 @@ pub fn label_for(config: &Config, app: &str) -> String {
             None => {}
         }
     }
-    let label = registry
-        .iter()
-        .find(|(label, owner)| owner.as_str() == app && valid_label(label) && !held.contains(label.as_str()))
-        .map(|(label, _)| label.clone())
-        .unwrap_or_else(|| {
-            (0..)
-                .map(|attempt| derived(app, attempt))
-                .find(|label| !held.contains(label))
-                .expect("an unbounded search finds a free label")
-        });
-    if app_exists(config, app) {
-        if registry.get(&label).map(String::as_str) != Some(app) {
-            registry.insert(label.clone(), app.to_string());
-            if let Err(why) = write_registry(config, &registry) {
-                tracing::warn!(app, %why, "the list of issued host labels could not be written");
-            }
+    let exists = app_exists(config, app);
+    let owner = app.to_string();
+    let choose = Box::new(move |issued: &std::collections::BTreeMap<String, String>| {
+        held.extend(issued.iter().filter(|(_, by)| **by != owner).map(|(label, _)| label.clone()));
+        issued
+            .iter()
+            .find(|(label, by)| **by == owner && valid_label(label) && !held.contains(label.as_str()))
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| {
+                (0..)
+                    .map(|attempt| derived(&owner, attempt))
+                    .find(|label| !held.contains(label))
+                    .expect("an unbounded search finds a free label")
+            })
+    });
+    let label = match catalog::of(config).assign_label_blocking(app, exists, choose) {
+        Ok(label) => label,
+        Err(why) => {
+            // Nothing was issued, so nothing is stored: the label is derived
+            // again, and issued, next time.
+            tracing::warn!(app, %why, "a host label could not be issued");
+            return derived(app, 0);
         }
+    };
+    if exists {
         let stored = label.clone();
         if let Err(why) = catalog::update_meta_blocking(config, app, move |meta| {
             meta.label = Some(stored);
@@ -268,18 +249,27 @@ pub fn label_for(config: &Config, app: &str) -> String {
     label
 }
 
+/// The app a label was issued to, as the catalog has it. A list that
+/// cannot be read names nobody, so the host is answered as unknown.
+fn label_owner(config: &Config, label: &str) -> Option<String> {
+    catalog::of(config).label_owner_blocking(label).unwrap_or_else(|why| {
+        tracing::warn!(label, %why, "the issued host labels could not be read");
+        None
+    })
+}
+
 /// The app a label belongs to, if any.
 pub fn app_for_label(config: &Config, label: &str) -> Option<String> {
     if !valid_label(label) {
         return None;
     }
     // Most labels are their app's own name, and every label issued is in
-    // the registry with its app.
+    // the list with its app.
     if app_exists(config, label) && label_for(config, label) == label {
         return Some(label.to_string());
     }
-    if let Some(owner) = read_registry(config).get(label) {
-        return (app_exists(config, owner) && label_for(config, owner) == label).then(|| owner.clone());
+    if let Some(owner) = label_owner(config, label) {
+        return (app_exists(config, &owner) && label_for(config, &owner) == label).then_some(owner);
     }
     app_names(config)
         .into_iter()
