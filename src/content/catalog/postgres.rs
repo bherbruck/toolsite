@@ -71,13 +71,6 @@ fn sorted(mut folders: Vec<Folder>) -> Vec<Folder> {
     folders
 }
 
-/// Moves in this process queue here before they take a connection. Without
-/// it, every move waiting on `LOCK_RELOCATION` would hold a pooled
-/// connection while it waited, and enough of them would leave none for the
-/// move that holds the lock to do its steps with: a deadlock across the
-/// pool. One process-wide queue for every database, since moves are rare.
-static MOVES: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<()>>> = std::sync::LazyLock::new(Default::default);
-
 /// Project moves held: this process's turn, and a pooled connection inside
 /// a transaction that took `LOCK_RELOCATION` for every other runner.
 /// Committing lets the next move in; a hold dropped without that closes
@@ -380,7 +373,12 @@ impl Catalog for Postgres {
     }
 
     async fn hold_relocations(&self) -> Result<Box<dyn Held>, String> {
-        let turn = MOVES.clone().lock_owned().await;
+        // Moves in this process queue for their turn before they take a
+        // connection. Without it, every move waiting on `LOCK_RELOCATION`
+        // would hold a pooled connection while it waited, and enough of them
+        // would leave none for the move that holds the lock to do its steps
+        // with: a deadlock across the pool.
+        let turn = super::take_turn(self.files.data_dir()).await?;
         let client = self.client().await?;
         // Held in the struct from here, so an error below closes the
         // connection rather than pooling one inside a transaction.

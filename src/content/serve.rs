@@ -213,12 +213,8 @@ pub(crate) async fn serve_page(
     // Sidecars sit beside the files they describe, so an exact-path lookup
     // would hand them out: .meta says whether a page is hidden and which gate
     // it is behind, and .notes is written for the next agent, not the public.
-    if slug.rsplit('.').next().is_some_and(|extension| {
-        matches!(
-            extension,
-            "meta" | "notes" | "icon" | "source" | "secrets" | "jobs" | "migrations" | "exports" | "deploys" | "devices" | "repo" | "tools"
-        )
-    }) {
+    // The same goes for the app's handler and database at its root.
+    if crate::content::store::platform_file(slug) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 

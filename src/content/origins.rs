@@ -195,8 +195,21 @@ fn app_exists(config: &Config, app: &str) -> bool {
 /// its own name. The choice is made while the catalog holds the issued
 /// labels, so two apps cannot both take a free one.
 pub fn label_for(config: &Config, app: &str) -> String {
-    if let Some(label) = catalog::meta_blocking(config, app).label.filter(|l| valid_label(l)) {
-        return label;
+    issued_label(config, app).unwrap_or_else(|why| {
+        // Nothing was issued, so nothing is stored: the label is derived
+        // again, and issued, next time. Good enough for a URL; a host is
+        // never matched to an app this way (see `app_for_label`).
+        tracing::warn!(app, %why, "a host label could not be issued");
+        derived(app, 0)
+    })
+}
+
+/// `label_for`, or why the catalog could not say. Only a label read or
+/// issued here is an answer: the name derived in its place may be a label
+/// some other app holds, which the catalog could not be asked about.
+fn issued_label(config: &Config, app: &str) -> Result<String, String> {
+    if let Some(label) = catalog::of(config).meta_blocking(app)?.label.filter(|l| valid_label(l)) {
+        return Ok(label);
     }
     // Labels other apps hold by their meta, or by their name. Read before
     // the hold: every label issued since is in the list the choice reads
@@ -228,15 +241,7 @@ pub fn label_for(config: &Config, app: &str) -> String {
                     .expect("an unbounded search finds a free label")
             })
     });
-    let label = match catalog::of(config).assign_label_blocking(app, exists, choose) {
-        Ok(label) => label,
-        Err(why) => {
-            // Nothing was issued, so nothing is stored: the label is derived
-            // again, and issued, next time.
-            tracing::warn!(app, %why, "a host label could not be issued");
-            return derived(app, 0);
-        }
-    };
+    let label = catalog::of(config).assign_label_blocking(app, exists, choose)?;
     if exists {
         let stored = label.clone();
         if let Err(why) = catalog::update_meta_blocking(config, app, move |meta| {
@@ -246,7 +251,7 @@ pub fn label_for(config: &Config, app: &str) -> String {
             tracing::warn!(app, %why, "an app's host label could not be stored; it is derived again next time");
         }
     }
-    label
+    Ok(label)
 }
 
 /// The app a label was issued to, as the catalog has it. A list that
@@ -258,22 +263,22 @@ fn label_owner(config: &Config, label: &str) -> Option<String> {
     })
 }
 
-/// The app a label belongs to, if any.
+/// The app a label belongs to, if any. Only labels the catalog read or
+/// issued count: while it cannot be asked, no host is anybody's.
 pub fn app_for_label(config: &Config, label: &str) -> Option<String> {
     if !valid_label(label) {
         return None;
     }
+    let holds = |app: &str| app_exists(config, app) && issued_label(config, app).is_ok_and(|issued| issued == label);
     // Most labels are their app's own name, and every label issued is in
     // the list with its app.
-    if app_exists(config, label) && label_for(config, label) == label {
+    if holds(label) {
         return Some(label.to_string());
     }
     if let Some(owner) = label_owner(config, label) {
-        return (app_exists(config, &owner) && label_for(config, &owner) == label).then_some(owner);
+        return holds(&owner).then_some(owner);
     }
-    app_names(config)
-        .into_iter()
-        .find(|app| app_exists(config, app) && label_for(config, app) == label)
+    app_names(config).into_iter().find(|app| holds(app))
 }
 
 /// The base an app's URLs are built on: its own origin in subdomain mode,

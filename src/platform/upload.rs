@@ -211,14 +211,53 @@ pub(crate) async fn store_for_publisher(
     }
 
     let is_new = !crate::content::store::app_exists(config, &app).await;
+    if is_new {
+        forget_stale_meta(config, &app).await;
+    }
     let response = store_for_slug(config, runtime, slug, kind, body, meta).await;
     if response.status().is_success() {
         if is_new {
             forget_stale_access(config, &app, project.as_deref()).await;
+            hold_the_name(config, &app).await;
         }
         stamp_new_app(config, &app, user.as_deref(), project.as_deref()).await;
     }
     response
+}
+
+/// A new app starts from the default meta. One left at its name with no
+/// files (a removal whose catalog step failed, on Postgres) would otherwise
+/// hand the newcomer its gate, its project and its creator, and with them
+/// whoever holds access there. Logged, like stale access, and not kept: an
+/// app that never existed has no trash entry to keep it in.
+async fn forget_stale_meta(config: &Config, app: &str) {
+    let stored = crate::content::catalog::meta(config, app).await;
+    let as_json = |meta: &crate::content::store::PageMeta| serde_json::to_value(meta).unwrap_or_default();
+    if as_json(&stored) == as_json(&crate::content::store::PageMeta::default()) {
+        return;
+    }
+    tracing::warn!(app, stale = %as_json(&stored), "a new app had a meta waiting at its name; it starts from the default");
+    if let Err(why) = crate::content::catalog::update_meta(config, app, |meta| {
+        *meta = crate::content::store::PageMeta::default();
+        Ok(())
+    })
+    .await
+    {
+        tracing::warn!(app, %why, "a stale meta could not be cleared");
+    }
+}
+
+/// Makes the app's directory, if its first publish wrote none, so the name
+/// is taken by whatever was published first on either backend. On files a
+/// manifest or a source alone made one, by writing a sidecar inside it; on
+/// Postgres the meta is a row, and without this the next publisher at the
+/// name, in another project, would count as new and inherit that row.
+async fn hold_the_name(config: &Config, app: &str) {
+    if !crate::content::store::app_exists(config, app).await
+        && let Err(e) = fs::create_dir_all(config.data_dir.join(app)).await
+    {
+        tracing::warn!(app, error = %e, "a new app's directory could not be made");
+    }
 }
 
 /// A new app starts with no one holding anything on it. Rows or grants left
@@ -475,9 +514,9 @@ pub(crate) async fn store_for_slug(
             return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
         }
         // Decompression is CPU-bound and blocking; keep it off the runtime.
-        let unpack_dest = dest.clone();
+        let (unpack_dest, unpack_slug) = (dest.clone(), slug.clone());
         let result =
-            tokio::task::spawn_blocking(move || unpack_bundle(&body, &unpack_dest)).await;
+            tokio::task::spawn_blocking(move || unpack_bundle(&body, &unpack_dest, &unpack_slug)).await;
         let unpacked = match result {
             Ok(Ok(unpacked)) => unpacked,
             Ok(Err(message)) => {

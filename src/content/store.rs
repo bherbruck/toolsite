@@ -34,6 +34,24 @@ pub(crate) async fn icon_path(config: &Config, slug: &str) -> Option<PathBuf> {
     fs::metadata(&index).await.ok().map(|_| index)
 }
 
+/// The extensions of the sidecars kept beside a page, or inside an app's
+/// directory as `index.<extension>`: its meta, notes, icon and the rest.
+pub(crate) const SIDECAR_EXTENSIONS: [&str; 12] =
+    ["meta", "notes", "icon", "source", "secrets", "jobs", "migrations", "exports", "deploys", "devices", "repo", "tools"];
+
+/// Whether `path`, a slug or bundle path (`app/...`), names a file the
+/// platform keeps rather than one the app published: a sidecar anywhere, or
+/// the app's handler and database (with SQLite's companions) at its root.
+/// Never served, and never written by a bundle: a bundle that could write
+/// `index.meta` would set its own gate and project, and one served
+/// `data.db` would hand out every row.
+pub(crate) fn platform_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let sidecar = name.rsplit_once('.').is_some_and(|(_, extension)| SIDECAR_EXTENSIONS.contains(&extension));
+    let at_app_root = path.split('/').count() == 2;
+    sidecar || (at_app_root && (name == "handler.wasm" || name == "data.db" || name.starts_with("data.db-")))
+}
+
 /// Per-page state kept in a `<slug>.meta` sidecar. Absent means "a normal,
 /// visible page", so nothing has to be written on the common path.
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -444,8 +462,21 @@ pub async fn list_folders(config: &Config) -> Vec<Folder> {
 
 /// The projects that are locked, for the permission rule. Read in a blocking
 /// context because every scope check runs in one.
+///
+/// A tree or a move record that cannot be read answers the empty path, the
+/// whole site, as locked: only rows set for the whole site count until it
+/// can be read again. Answering no locks would open every row a lock was
+/// ignoring for as long as the outage lasted.
 pub fn locked_prefixes_blocking(config: &Config) -> Vec<String> {
-    let mut locked: Vec<String> = crate::content::catalog::folders_blocking(config)
+    let catalog = crate::content::catalog::of(config);
+    let (folders, relocation) = match (catalog.folders_blocking(), catalog.relocation_blocking()) {
+        (Ok(folders), Ok(relocation)) => (folders, relocation),
+        (Err(why), _) | (_, Err(why)) => {
+            tracing::warn!(%why, "the project tree could not be read; every project counts as locked");
+            return vec![String::new()];
+        }
+    };
+    let mut locked: Vec<String> = folders
         .into_iter()
         .filter(|folder| folder.locked)
         .map(|folder| folder.path)
@@ -454,7 +485,7 @@ pub fn locked_prefixes_blocking(config: &Config) -> Vec<String> {
     // the old path after the tree has moved on. A lock that moved with the
     // tree is held at the old path too until the move is done, so rows it
     // ignored stay ignored in between.
-    if let Some(crate::content::catalog::Relocation { from, to }) = crate::content::catalog::relocation_blocking(config) {
+    if let Some(crate::content::catalog::Relocation { from, to }) = relocation {
         let extra: Vec<String> = locked
             .iter()
             .filter_map(|path| {

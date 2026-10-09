@@ -161,7 +161,8 @@ pub(crate) struct Unpacked {
     pub(crate) skipped: Vec<&'static str>,
 }
 
-pub(crate) fn unpack_bundle(body: &[u8], dest: &std::path::Path) -> Result<Unpacked, String> {
+/// `slug` is what `dest` serves as: the app, or a page inside one.
+pub(crate) fn unpack_bundle(body: &[u8], dest: &std::path::Path, slug: &str) -> Result<Unpacked, String> {
     let paths = bundle_entry_paths(body)?;
     let strip = bundle_strip_prefix(&paths);
 
@@ -192,6 +193,13 @@ pub(crate) fn unpack_bundle(body: &[u8], dest: &std::path::Path) -> Result<Unpac
             None => rel,
         };
         if rel.is_empty() {
+            continue;
+        }
+        if crate::content::store::platform_file(&format!("{slug}/{rel}")) {
+            let reason = "files the platform keeps (sidecars such as index.meta, handler.wasm, data.db)";
+            if !skipped.contains(&reason) {
+                skipped.push(reason);
+            }
             continue;
         }
 
@@ -285,7 +293,7 @@ mod tests {
             ("assets/main-4f2a.js", "console.log(1)"),
             ("assets/main-4f2a.css", "body{}"),
         ]);
-        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        let unpacked = unpack_bundle(&body, dir.path(), "app").unwrap();
         assert_eq!(
             unpacked.files,
             ["assets/main-4f2a.css", "assets/main-4f2a.js", "index.html"]
@@ -298,7 +306,7 @@ mod tests {
     fn a_single_wrapping_directory_is_stripped() {
         let dir = tempfile::tempdir().unwrap();
         let body = tarball(&[("dist/index.html", "<h1>hi</h1>"), ("dist/app.js", "x")]);
-        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        let unpacked = unpack_bundle(&body, dir.path(), "app").unwrap();
         assert_eq!(unpacked.files, ["app.js", "index.html"]);
         assert!(dir.path().join("index.html").exists());
     }
@@ -308,7 +316,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for path in ["../escape.html", "a/../../escape.html", "/etc/escape.html"] {
             let body = tarball(&[("index.html", "ok"), (path, "pwned")]);
-            let error = unpack_bundle(&body, dir.path()).unwrap_err();
+            let error = unpack_bundle(&body, dir.path(), "app").unwrap_err();
             assert!(error.contains("unsafe path"), "{path:?} gave {error:?}");
         }
         // Nothing from a rejected archive may be left behind outside the dest.
@@ -319,7 +327,7 @@ mod tests {
     fn symlinks_are_skipped_and_reported_rather_than_followed() {
         let dir = tempfile::tempdir().unwrap();
         let body = tarball(&[("index.html", "ok"), ("passwd.html@", "")]);
-        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        let unpacked = unpack_bundle(&body, dir.path(), "app").unwrap();
         assert_eq!(unpacked.files, ["index.html"]);
         assert!(unpacked.skipped.contains(&"symlinks and special files"));
         assert!(!dir.path().join("passwd.html").exists());
@@ -329,7 +337,7 @@ mod tests {
     fn dotfiles_are_skipped_and_reported() {
         let dir = tempfile::tempdir().unwrap();
         let body = tarball(&[("index.html", "ok"), (".env", "SECRET=1")]);
-        let unpacked = unpack_bundle(&body, dir.path()).unwrap();
+        let unpacked = unpack_bundle(&body, dir.path(), "app").unwrap();
         assert_eq!(unpacked.files, ["index.html"]);
         assert!(unpacked.skipped.contains(&"dotfiles"));
         assert!(!dir.path().join(".env").exists());
@@ -338,13 +346,13 @@ mod tests {
     #[test]
     fn an_empty_archive_is_an_error_not_a_silent_success() {
         let dir = tempfile::tempdir().unwrap();
-        let error = unpack_bundle(&tarball(&[]), dir.path()).unwrap_err();
+        let error = unpack_bundle(&tarball(&[]), dir.path(), "app").unwrap_err();
         assert!(error.contains("no files"), "got {error:?}");
     }
 
     #[test]
     fn garbage_is_rejected_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(unpack_bundle(b"not a gzip stream at all", dir.path()).is_err());
+        assert!(unpack_bundle(b"not a gzip stream at all", dir.path(), "app").is_err());
     }
 }

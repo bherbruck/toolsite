@@ -615,11 +615,13 @@ pub fn scopes_for(config: &Config, user_id: &str) -> Vec<(String, Scope)> {
 }
 
 /// The outermost locked project over `path`, if any. A locked project
-/// discards every row set inside it, so the outermost lock decides.
+/// discards every row set inside it, so the outermost lock decides. The
+/// empty path is what an unreadable tree answers (see
+/// `store::locked_prefixes_blocking`): then only rows for the whole site count.
 fn lock_over<'a>(path: &str, locks: &'a [String]) -> Option<&'a str> {
     locks
         .iter()
-        .filter(|lock| !lock.is_empty() && prefix_covers(lock, path))
+        .filter(|lock| prefix_covers(lock, path))
         .min_by_key(|lock| lock.len())
         .map(String::as_str)
 }

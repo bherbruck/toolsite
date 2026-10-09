@@ -31,10 +31,6 @@ pub struct Files {
 /// another app's meta can never wait on itself.
 static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
 
-/// One hold on project moves per `DATA_DIR`. Async, since a move awaits
-/// between its steps while holding it.
-static MOVES: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
-
 /// Generations, by `DATA_DIR` and app. In memory: on files there is one
 /// process, and its caches start empty, so counting from zero at boot is
 /// enough to tell its own publishes apart.
@@ -49,6 +45,10 @@ impl Files {
         Files { data_dir }
     }
 
+    pub(super) fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     fn lock_for(&self, slug: &str) -> Arc<Mutex<()>> {
         held(&LOCKS).entry(self.data_dir.join(slug)).or_default().clone()
     }
@@ -59,18 +59,19 @@ impl Files {
         self.data_dir.join(".site").join(name)
     }
 
-    fn read_folders(&self) -> Vec<Folder> {
-        std::fs::read_to_string(self.site_file("projects.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    /// The tree, empty when there is no file yet. A file that cannot be read
+    /// or parsed is an error, not an empty tree: an empty tree forgets every
+    /// lock, which opens the rows a lock was ignoring, and writing an edit
+    /// over it would lose every project.
+    fn read_folders(&self) -> Result<Vec<Folder>, String> {
+        read_site_json(&self.site_file("projects.json"), "the project tree")
     }
 
     fn change_folders(&self, edit: FoldersEdit<'_>) -> Result<Vec<Folder>, String> {
         let path = self.site_file("projects.json");
         let lock = held(&LOCKS).entry(path.clone()).or_default().clone();
         let _one_writer = held(&lock);
-        let mut folders = self.read_folders();
+        let mut folders = self.read_folders()?;
         edit(&mut folders)?;
         let json = serde_json::to_string_pretty(&folders).map_err(|e| e.to_string())?;
         write_aside(&path, json.as_bytes())?;
@@ -87,13 +88,12 @@ impl Files {
         }
     }
 
-    /// Every label issued, by label. Unreadable reads as none, as it
-    /// always has; the labels in metas still hold their apps' names.
-    fn read_labels(&self) -> BTreeMap<String, String> {
-        std::fs::read_to_string(self.site_file("labels.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    /// Every label issued, by label; none when there is no file yet. A file
+    /// that cannot be read is an error: a removed app's label is kept only
+    /// here, so reading it as empty would issue that label again, and
+    /// writing the next label over it would forget every one.
+    fn read_labels(&self) -> Result<BTreeMap<String, String>, String> {
+        read_site_json(&self.site_file("labels.json"), "the issued host labels")
     }
 
     /// A marker's file: its name is a constant of the caller's, checked
@@ -169,6 +169,16 @@ impl Files {
         let json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
         write_aside(&self.sidecar(slug, "meta"), json.as_bytes())?;
         Ok(meta)
+    }
+}
+
+/// A JSON record under `.site/`: its default when the file is not there,
+/// an error when it is there and cannot be read or parsed.
+fn read_site_json<T: serde::de::DeserializeOwned + Default>(path: &Path, what: &str) -> Result<T, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{what} could not be read: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(format!("{what} could not be read: {e}")),
     }
 }
 
@@ -251,11 +261,11 @@ impl Catalog for Files {
     }
 
     async fn folders(&self) -> Result<Vec<Folder>, String> {
-        Ok(self.read_folders())
+        self.read_folders()
     }
 
     fn folders_blocking(&self) -> Result<Vec<Folder>, String> {
-        Ok(self.read_folders())
+        self.read_folders()
     }
 
     async fn update_folders(&self, edit: FoldersEdit<'_>) -> Result<Vec<Folder>, String> {
@@ -284,12 +294,11 @@ impl Catalog for Files {
     }
 
     async fn hold_relocations(&self) -> Result<Box<dyn Held>, String> {
-        let lock = held(&MOVES).entry(self.data_dir.clone()).or_default().clone();
-        Ok(Box::new(MoveHold(lock.lock_owned().await)))
+        Ok(Box::new(MoveHold(super::take_turn(&self.data_dir).await?)))
     }
 
     fn label_owner_blocking(&self, label: &str) -> Result<Option<String>, String> {
-        Ok(self.read_labels().remove(label))
+        Ok(self.read_labels()?.remove(label))
     }
 
     /// A label issued to another app is refused, as Postgres's key refuses
@@ -300,7 +309,7 @@ impl Catalog for Files {
         let path = self.site_file("labels.json");
         let lock = held(&LOCKS).entry(path.clone()).or_default().clone();
         let _one_writer = held(&lock);
-        let mut labels = self.read_labels();
+        let mut labels = self.read_labels()?;
         let label = choose(&labels);
         if let Some(owner) = labels.get(&label).filter(|owner| *owner != app)
             && record

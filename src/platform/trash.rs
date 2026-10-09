@@ -58,6 +58,14 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
         }
     }
 
+    // The files are gone, so whatever the app holds open goes now, before
+    // the catalog step: a removal that fails there must not leave its
+    // sockets and instance running.
+    if !slug.contains('/') && !moved.is_empty() {
+        use crate::state::events::{AppChange, AppEvents};
+        config.app_events().app_changed(AppChange { app: slug, hidden: false, removed: true });
+    }
+
     // What the catalog held for the slug and everything under it. On files
     // that is the sidecars just moved; on Postgres the rows, which are
     // written beside the files here so the trash reads the same either way.
@@ -82,8 +90,6 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
     // path starts with nobody on it. A copy stays with the files, so putting
     // the app back can put its people back too.
     if !slug.contains('/') {
-        use crate::state::events::{AppChange, AppEvents};
-        config.app_events().app_changed(AppChange { app: slug, hidden: false, removed: true });
         let project = std::fs::read_to_string(destination.join("slug.meta"))
             .or_else(|_| std::fs::read_to_string(destination.join("app/index.meta")))
             .ok()

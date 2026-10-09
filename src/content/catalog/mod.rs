@@ -73,6 +73,53 @@ pub trait Held: Send {
     async fn release(self: Box<Self>);
 }
 
+/// Project moves, app moves and project creations and removals that may
+/// wait for their turn in one process at once. Each is an admin's request;
+/// past this many, the next is refused rather than queued, so a burst of
+/// them cannot pile up requests (or, on Postgres, connections) without end.
+pub const MAX_WAITING_MOVES: usize = 32;
+
+/// One site's queue of moves in this process: its turn, and how many wait.
+#[derive(Default)]
+struct Turns {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+/// The queues, by `DATA_DIR`: one per site, which in a server is one.
+static TURNS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<Turns>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// This process's turn at moving `data_dir`'s projects, waiting behind at
+/// most `MAX_WAITING_MOVES` others.
+async fn take_turn(data_dir: &std::path::Path) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    use std::sync::atomic::Ordering;
+    let turns = TURNS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(data_dir.to_path_buf())
+        .or_default()
+        .clone();
+    if let Ok(turn) = turns.lock.clone().try_lock_owned() {
+        return Ok(turn);
+    }
+    /// Counts one waiter for as long as it waits, however the wait ends.
+    struct Waiting(Arc<Turns>);
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    if turns.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING_MOVES {
+        turns.waiting.fetch_sub(1, Ordering::SeqCst);
+        return Err("too many project changes are waiting for one another; try again in a moment".into());
+    }
+    let waiting = Waiting(turns.clone());
+    let turn = turns.lock.clone().lock_owned().await;
+    drop(waiting);
+    Ok(turn)
+}
+
 /// What a removal took out of the catalog, for the trash to keep beside the
 /// files it moved.
 #[derive(Debug, Clone, PartialEq)]
@@ -281,13 +328,4 @@ pub async fn update_folders(
     edit: impl FnOnce(&mut Vec<Folder>) -> Result<(), String> + Send,
 ) -> Result<Vec<Folder>, String> {
     of(config).update_folders(Box::new(edit)).await
-}
-
-/// The project move under way, for a synchronous caller; none, logged,
-/// when the record cannot be read.
-pub fn relocation_blocking(config: &Config) -> Option<Relocation> {
-    of(config).relocation_blocking().unwrap_or_else(|why| {
-        tracing::warn!(%why, "the record of a project move could not be read");
-        None
-    })
 }

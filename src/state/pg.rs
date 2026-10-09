@@ -586,6 +586,60 @@ mod tests {
         assert!(statements > 80, "the scan found only {statements} statements");
     }
 
+    /// Advisory locks share one key space per database. Every class is a
+    /// constant here, no two the same, and every lock any store takes names
+    /// its class by one of them as `$1::int4`: a literal number or a single
+    /// 64-bit key could meet another purpose's lock and wait on it, or let
+    /// two purposes that must not share a turn share one.
+    #[test]
+    fn every_advisory_lock_takes_a_class_of_its_own() {
+        let pg = include_str!("pg.rs");
+        let mut classes: Vec<(String, i32)> = pg
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub const LOCK_"))
+            .map(|rest| {
+                let (name, value) = rest.split_once(": i32 = ").expect("a lock class is an i32");
+                (format!("LOCK_{name}"), value.trim_end_matches(';').parse().unwrap())
+            })
+            .collect();
+        assert!(classes.len() >= 5, "{classes:?}");
+        classes.sort_by_key(|(_, value)| *value);
+        assert!(classes.windows(2).all(|pair| pair[0].1 != pair[1].1), "two lock classes share a value: {classes:?}");
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root.clone()];
+        let mut seen = 0;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+                if path.extension().is_none_or(|e| e != "rs") || name.ends_with("conformance.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let source = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+                for (at, _) in source.match_indices("pg_advisory") {
+                    let call = &source[at..(at + 200).min(source.len())];
+                    if call.starts_with("pg_advisory\"") || !call.contains('(') {
+                        continue;
+                    }
+                    seen += 1;
+                    assert!(call.contains("($1::int4,"), "{name}: an advisory lock with no class: {call}");
+                    let args = &call[call.find("&[").unwrap_or_else(|| panic!("{name}: no parameters: {call}"))..];
+                    assert!(
+                        classes.iter().any(|(class, _)| args.starts_with(&format!("&[&{class}")) || args.starts_with(&format!("&[&crate::state::pg::{class}"))),
+                        "{name}: an advisory lock whose class is not a constant: {call}"
+                    );
+                }
+            }
+        }
+        assert!(seen >= 6, "the scan found only {seen} advisory locks");
+    }
+
     #[test]
     fn every_ladder_is_named_once_and_every_step_has_sql() {
         let mut stores: Vec<&str> = LADDERS.iter().map(|l| l.store).collect();

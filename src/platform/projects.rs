@@ -119,7 +119,12 @@ pub(crate) async fn tree(config: &Arc<Config>, actor: Option<&User>) -> Vec<Node
 pub(crate) async fn create(config: &Arc<Config>, actor: Option<&User>, parent: &str, name: &str) -> Result<Folder, Problem> {
     let parent = clean(parent)?;
     need(config, actor, &parent, Scope::Admin).await?;
-    let folder = store::create_folder(config, &parent, name.trim()).await.map_err(Problem::Invalid)?;
+    // Held, so a move that has checked its new path is free finds it free
+    // when it gets there.
+    let hold = crate::content::catalog::of(config).hold_relocations().await.map_err(Problem::Invalid)?;
+    let created = store::create_folder(config, &parent, name.trim()).await;
+    hold.release().await;
+    let folder = created.map_err(Problem::Invalid)?;
     tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), folder = %folder.path, "project created");
     Ok(folder)
 }
@@ -128,6 +133,19 @@ pub(crate) async fn create(config: &Arc<Config>, actor: Option<&User>, parent: &
 /// where it is now and at the target, since access from the old projects
 /// stops and access from the new ones starts. Returns the app's new path.
 pub(crate) async fn move_app(config: &Arc<Config>, actor: Option<&User>, app: &str, target: &str) -> Result<String, Problem> {
+    // Held from the first check to the last step, like a project move: a
+    // project renamed or removed between the check that it exists and the
+    // app naming it would leave the app in a project the tree does not hold.
+    let hold = crate::content::catalog::of(config).hold_relocations().await.map_err(Problem::Invalid)?;
+    let moved = match resume_held(config).await {
+        Ok(()) => move_app_held(config, actor, app, target).await,
+        Err(why) => Err(Problem::Invalid(why)),
+    };
+    hold.release().await;
+    moved
+}
+
+async fn move_app_held(config: &Arc<Config>, actor: Option<&User>, app: &str, target: &str) -> Result<String, Problem> {
     if !export::valid_app(app) {
         return Err(Problem::Invalid(format!("'{app}' is not an app name")));
     }
@@ -277,6 +295,15 @@ async fn resume_held(config: &Config) -> Result<(), String> {
             return Err("a project move record could not be read".into());
         }
     };
+    // Only a record a move could have written is finished. Anything else
+    // (the top level at either end, a path that is no project path, a
+    // project into itself) would move every app and every access row it
+    // names, so it is left in place for a person to look at.
+    let project_path = |path: &str| !path.is_empty() && users::valid_prefix(path);
+    if !project_path(&job.from) || !project_path(&job.to) || users::prefix_covers(&job.from, &job.to) || users::prefix_covers(&job.to, &job.from) {
+        tracing::error!(from = %job.from, to = %job.to, "a project move record names no move toolsite makes; it was left in place");
+        return Err("a project move record names no move toolsite makes".into());
+    }
     tracing::warn!(from = %job.from, to = %job.to, "finishing a project move that stopped halfway");
     finish(config, &job.from, &job.to).await
 }
@@ -432,6 +459,18 @@ pub(crate) async fn move_project(config: &Arc<Config>, actor: Option<&User>, pat
 /// Removes an empty project. Admin at its parent. A project with anything
 /// inside is refused with what is inside: nothing is destroyed here.
 pub(crate) async fn remove(config: &Arc<Config>, actor: Option<&User>, path: &str) -> Result<(), Problem> {
+    // Held, so no app moves in between the check that the project is
+    // empty and its row going.
+    let hold = crate::content::catalog::of(config).hold_relocations().await.map_err(Problem::Invalid)?;
+    let removed = match resume_held(config).await {
+        Ok(()) => remove_held(config, actor, path).await,
+        Err(why) => Err(Problem::Invalid(why)),
+    };
+    hold.release().await;
+    removed
+}
+
+async fn remove_held(config: &Arc<Config>, actor: Option<&User>, path: &str) -> Result<(), Problem> {
     let path = clean(path)?;
     if path.is_empty() {
         return Err(Problem::Invalid("The top level cannot be removed.".into()));
