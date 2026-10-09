@@ -219,7 +219,7 @@ impl Ceilings {
 /// The limits one app's calls run under now, read from its meta per call
 /// so a redeployed `[limits]` applies to the next request.
 pub async fn of(config: &Config, app: &str) -> Effective {
-    let meta = crate::content::store::read_meta(config, app).await;
+    let meta = crate::content::catalog::meta(config, app).await;
     config.limits.effective(meta.limits.as_ref())
 }
 

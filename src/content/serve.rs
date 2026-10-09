@@ -3,7 +3,7 @@ use crate::{
     content::{
         slug::{valid_asset_path, valid_slug},
         store::{
-            icon_path, is_hidden, read_meta, Icon,
+            icon_path, is_hidden, Icon,
         },
     },
     runtime::wasm::Request as WasmRequest,
@@ -110,7 +110,7 @@ pub(crate) async fn serve_icon(
     // open, has no icon as far as they can tell. The index asks for icons
     // with the site cookie, so that is who is asking here too.
     let app = slug.split('/').next().unwrap_or(slug);
-    let meta = read_meta(&config, app).await;
+    let meta = crate::content::catalog::meta(&config, app).await;
     let gate = crate::content::store::effective_gate(&config, app, "/").await.gate;
     if meta.hidden {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -407,7 +407,7 @@ fn app_scoped_next(app: &str, path: &str) -> String {
 /// in person, as the index and `/me/mcp` both need it. A hidden app is
 /// closed to everyone.
 pub(crate) async fn may_open(config: &Arc<Config>, app: &str, user: &crate::accounts::users::User) -> bool {
-    let meta = read_meta(config, app).await;
+    let meta = crate::content::catalog::meta(config, app).await;
     if meta.hidden {
         return false;
     }
@@ -645,7 +645,7 @@ pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> 
     // Nearest enclosing app wins, so nested bundles behave sensibly.
     for depth in (1..segments.len()).rev() {
         let app = segments[..depth].join("/");
-        if !read_meta(config, &app).await.spa {
+        if !crate::content::catalog::meta(config, &app).await.spa {
             continue;
         }
         let index = config.data_dir.join(format!("{app}/index.html"));

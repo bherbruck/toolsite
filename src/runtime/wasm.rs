@@ -375,7 +375,7 @@ impl StoreState {
             let identity = self.identity();
             // Read per call rather than cached, like allow_http: a policy
             // added by a manifest upload applies to the next request.
-            let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
+            let meta = crate::content::catalog::meta_blocking(&self.site, &self.app);
             let scope = db::Scope::of(&meta);
             let conn = db::open_scoped(&self.site, &self.app, identity.as_ref(), &scope)?;
             self.scoped = Some((conn, scope));
@@ -496,7 +496,7 @@ impl self::toolsite::app::fetch::Host for StoreState {
     ) -> Result<self::toolsite::app::fetch::Response, String> {
         // Read per call rather than cached: changing an app's allowlist takes
         // effect on the next request, not the next restart.
-        let allow = crate::content::store::read_meta_blocking(&self.site, &self.app).allow_http;
+        let allow = crate::content::catalog::meta_blocking(&self.site, &self.app).allow_http;
         // A slow host must not hold the call past its wall clock.
         let left = self.time_left();
         if left.is_zero() {
@@ -1387,7 +1387,11 @@ mod tests {
             access_salt: Some("abc".into()),
             ..Default::default()
         };
-        crate::content::store::write_meta_blocking(site, "shop", &meta).unwrap();
+        crate::content::catalog::update_meta_blocking(site, "shop", move |stored| {
+            *stored = meta;
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

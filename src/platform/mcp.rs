@@ -3,7 +3,7 @@ use crate::{
     config::Config,
     content::{
         slug::{random_slug, valid_segment, valid_slug},
-        store::{collect_slugs, page_path, page_title, page_url, read_meta, relative_time, write_meta},
+        store::{page_path, page_title, page_url, relative_time},
     },
     platform::{
         bearer::Caller,
@@ -620,9 +620,9 @@ impl PageHost {
         // the app's own meta decides hidden and access, and its rule for
         // the page's path inside it applies. A page's missing meta must
         // never read as "open".
-        let meta = read_meta(&self.config, slug).await;
+        let meta = crate::content::catalog::meta(&self.config, slug).await;
         let app = slug.split('/').next().unwrap_or(slug).to_string();
-        let app_meta = read_meta(&self.config, &app).await;
+        let app_meta = crate::content::catalog::meta(&self.config, &app).await;
         if meta.hidden || app_meta.hidden {
             return false;
         }
@@ -642,8 +642,7 @@ impl PageHost {
 
     /// Every slug the caller may open, for search.
     async fn visible_slugs(&self, caller: &Caller) -> Vec<String> {
-        let mut slugs = Vec::new();
-        collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
+        let slugs = crate::content::catalog::slugs(&self.config).await;
         let mut out = Vec::new();
         for slug in slugs {
             if self.may_see(caller, &slug).await {
@@ -1619,7 +1618,7 @@ impl PageHost {
                     user_id: user.id,
                     email: user.email.clone(),
                 };
-                let meta = crate::content::store::read_meta_blocking(&config, &app);
+                let meta = crate::content::catalog::meta_blocking(&config, &app);
                 let scope = db::Scope::of(&meta);
                 tracing::info!(app = %app, as_user = %user.email, "admin ran scoped SQL as an account");
                 db::run_scoped(&config, &app, Some(&identity), &scope, &sql, &params)
@@ -1932,15 +1931,15 @@ impl PageHost {
 
         match notes {
             Some(notes) => {
-                crate::content::store::write_notes(&self.config, &slug, &notes)
+                crate::content::catalog::set_notes(&self.config, &slug, &notes)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    .map_err(|e| McpError::internal_error(e, None))?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "saved {} characters of notes for {slug}",
                     notes.len()
                 ))]))
             }
-            None => match crate::content::store::read_notes(&self.config, &slug).await {
+            None => match crate::content::catalog::notes(&self.config, &slug).await {
                 Some(notes) => Ok(CallToolResult::success(vec![ContentBlock::text(notes)])),
                 None => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "no notes for {slug} yet"
@@ -2050,12 +2049,11 @@ impl PageHost {
     ) -> Result<CallToolResult, McpError> {
         let include_all = include_all.unwrap_or(false);
         let caller = Self::caller(&ctx);
-        let mut slugs = Vec::new();
-        collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
+        let slugs = crate::content::catalog::slugs(&self.config).await;
 
         let mut rows = Vec::new();
         for slug in slugs {
-            let meta = read_meta(&self.config, &slug).await;
+            let meta = crate::content::catalog::meta(&self.config, &slug).await;
             if !include_all && (meta.hidden || !meta.listed) {
                 continue;
             }
@@ -2130,7 +2128,7 @@ impl PageHost {
             let app = slug.split('/').next().unwrap_or(&slug).to_string();
             let path = crate::content::store::logical_path(&self.config, &app).await;
             let is_admin_here = self.held_on(user, &app).await == Some(Scope::Admin);
-            let created_it = read_meta(&self.config, &app).await.created_by.as_deref() == Some(user.id.as_str());
+            let created_it = crate::content::catalog::meta(&self.config, &app).await.created_by.as_deref() == Some(user.id.as_str());
             if !is_admin_here && !created_it {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "{} may remove only apps it created under {path}; removing {app} needs admin there.",
@@ -2216,34 +2214,42 @@ impl PageHost {
             ))]));
         }
 
-        let mut meta = read_meta(&self.config, &slug).await;
-        if let Some(hidden) = hidden {
-            meta.hidden = hidden;
-        }
-        if let Some(listed) = listed {
-            meta.listed = listed;
-        }
-        match (path, gate) {
-            // A rule for one corner of the app.
-            (Some(prefix), Some(gate)) => {
-                meta.rules.retain(|rule| rule.prefix != prefix);
-                meta.rules.push(crate::content::store::PathRule { prefix, gate });
+        let mut no_rule = None;
+        let missing = &mut no_rule;
+        let saved = crate::content::catalog::update_meta(&self.config, &slug, move |meta| {
+            if let Some(hidden) = hidden {
+                meta.hidden = hidden;
             }
-            (Some(prefix), None) => {
-                let before = meta.rules.len();
-                meta.rules.retain(|rule| rule.prefix != prefix);
-                if meta.rules.len() == before {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                        "{slug} has no rule for {prefix}"
-                    ))]));
+            if let Some(listed) = listed {
+                meta.listed = listed;
+            }
+            match (path, gate) {
+                // A rule for one corner of the app.
+                (Some(prefix), Some(gate)) => {
+                    meta.rules.retain(|rule| rule.prefix != prefix);
+                    meta.rules.push(crate::content::store::PathRule { prefix, gate });
                 }
+                (Some(prefix), None) => {
+                    let before = meta.rules.len();
+                    meta.rules.retain(|rule| rule.prefix != prefix);
+                    if meta.rules.len() == before {
+                        // Nothing to remove: nothing is written.
+                        *missing = Some(prefix);
+                        return Err("no such rule".into());
+                    }
+                }
+                (None, Some(gate)) => meta.gate = (gate != "default").then_some(gate),
+                (None, None) => {}
             }
-            (None, Some(gate)) => meta.gate = (gate != "default").then_some(gate),
-            (None, None) => {}
+            Ok(())
+        })
+        .await;
+        if let Some(prefix) = no_rule {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "{slug} has no rule for {prefix}"
+            ))]));
         }
-        write_meta(&self.config, &slug, &meta)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let meta = saved.map_err(|e| McpError::internal_error(e, None))?;
 
         let rules = if meta.rules.is_empty() {
             String::new()

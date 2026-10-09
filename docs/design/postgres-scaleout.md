@@ -198,7 +198,7 @@ Rules behind the choices:
 | `labels.json` | `platform.host_labels (label primary key, app, issued_at)` | Uniqueness by constraint, not by a process mutex |
 | `github.json` | `platform.github_installations` | Small, shared |
 | `grants-adopted` | `platform.site_flags (name primary key, value, at)` | One-time markers |
-| `.meta` | `platform.pages (slug primary key, meta jsonb, generation bigint, created_at, removed_at)` | One row per page or app. `meta` keeps the `PageMeta` serde shape so the struct does not change |
+| `.meta` | `platform.pages (slug primary key, meta json, generation bigint, notes, created_at, updated_at)` | One row per page or app. `meta` keeps the `PageMeta` serde shape so the struct does not change. `json`, not `jsonb` (PR 6): `jsonb` refuses `\u0000`, which a meta string may hold, and `json` returns the text exactly as stored |
 | `.notes` | `platform.pages.notes text` | Small text |
 | `.secrets` | `platform.app_settings (app, name, sealed, primary key (app, name))` | Values stay sealed with the site key |
 | `.jobs` | `platform.jobs (app, name, schedule, path, last_* columns)` | Single-row updates; no file lock |
@@ -210,7 +210,7 @@ Rules behind the choices:
 | `<app>/data.db` | Stays on the volume in step 1. Moves to a Postgres schema in step 3 for apps on the `postgres` engine | SQLite needs a local file. See question 1 |
 | Blobs, local backend | Refused: Postgres mode requires the bucket | A volume-local blob store cannot be shared |
 | Blobs, S3 backend | Unchanged: bucket `<app>/<key>` | Already shared |
-| `.trash/` | `platform.pages.removed_at` plus `platform.trash (id, slug, at, permissions jsonb)`; objects move to `.toolsite/trash/<id>/` | Nothing destroys data; the rows and objects stay restorable |
+| `.trash/` | A removal moves the slug's `platform.pages` rows into `platform.removed_pages` (PR 6, so the primary key stays the slug and a republished app starts empty), plus `platform.trash (id, slug, at, permissions jsonb)`; objects move to `.toolsite/trash/<id>/` | Nothing destroys data; the rows and objects stay restorable |
 | `.tmp/` scratch | Stays per process (`TOOLSITE_SCRATCH_DIR`, default `DATA_DIR/.tmp`) | Never shared, never read after the call |
 | Upload, settings-link, blob-upload, provider-login, preview, handoff tickets | `state.tickets (kind, id_hash primary key, payload, sealed bool, expires_at)` | Any runner can mint or redeem |
 | Inline upload chunks | Bucket `.toolsite/tmp/inline/<id>/<n>`; the ticket row holds the chunk map | Chunks can arrive at any runner |

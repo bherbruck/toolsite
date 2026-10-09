@@ -101,7 +101,7 @@ pub async fn admits(config: &Config, app: &str, socket: PortSocket) -> bool {
     config.ports.maps(app, socket)
         && store::app_exists(config, app).await
         && !store::is_hidden(config, app).await
-        && store::read_meta(config, app).await.ports.contains(&socket)
+        && crate::content::catalog::meta(config, app).await.ports.contains(&socket)
 }
 
 /// Binds every mapped port and starts taking connections on it. Returns the

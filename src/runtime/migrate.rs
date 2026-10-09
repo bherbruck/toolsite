@@ -83,16 +83,21 @@ pub fn apply(config: &Config, app: &str) -> Result<(usize, usize, Vec<String>), 
 
     // The schema moved, so the generated views are rebuilt on it: a column
     // added here reaches `select *` only through a fresh `create view`.
-    let mut meta = crate::content::store::read_meta_blocking(config, app);
+    let meta = crate::content::catalog::meta_blocking(config, app);
     let mut notes = Vec::new();
     if !meta.policies.is_empty() || !meta.queryable.is_empty() || !meta.generated.is_empty() {
         let regenerated = crate::runtime::access::regenerate(config, app, &meta)?;
         notes = regenerated.notes;
         let salt = Some(regenerated.salt);
         if meta.generated != regenerated.generated || meta.access_salt != salt {
-            meta.generated = regenerated.generated;
-            meta.access_salt = salt;
-            crate::content::store::write_meta_blocking(config, app, &meta)?;
+            // Only what the views made is written back, so a change to the
+            // rest of the meta meanwhile is kept.
+            let generated = regenerated.generated;
+            crate::content::catalog::update_meta_blocking(config, app, move |meta| {
+                meta.generated = generated;
+                meta.access_salt = salt;
+                Ok(())
+            })?;
         }
     }
     Ok((after, after.saturating_sub(before), notes))

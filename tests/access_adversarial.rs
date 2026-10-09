@@ -83,10 +83,10 @@ fn write_page(config: &Config, slug: &str, html: &str) {
 
 async fn place_app(config: &Config, app: &str, project: &str, gate: &str) {
     write_page(config, &format!("{app}/index"), &format!("<title>{app} title</title><p>{app} body</p>"));
-    let mut meta = store::read_meta(config, app).await;
+    let mut meta = toolsite::content::catalog::meta(config, app).await;
     meta.project = (!project.is_empty()).then(|| project.to_string());
     meta.gate = Some(gate.to_string());
-    store::write_meta(config, app, &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(config, app, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
 }
 
 fn session(config: &Arc<Config>, email: &str) -> String {
@@ -399,9 +399,9 @@ async fn a_page_inside_a_restricted_app_is_not_listed_or_fetched_through_its_own
     });
     std::fs::create_dir_all(config.data_dir.join("vault")).unwrap();
     write_page(&config, "vault/plans", "<title>vault plans title</title><p>secret plans</p>");
-    let mut meta = store::read_meta(&config, "vault").await;
+    let mut meta = toolsite::content::catalog::meta(&config, "vault").await;
     meta.gate = Some("restricted".to_string());
-    store::write_meta(&config, "vault", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&config, "vault", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
 
     assert_ne!(send(&config, get("/p/vault/plans")).await.0, StatusCode::OK, "the page itself is closed");
     let page = send(&config, get("/")).await.1;
@@ -470,7 +470,7 @@ async fn an_editor_over_mcp_is_refused_every_tool_on_an_app_outside_its_project(
     assert!(users::user_by_email(&w.config, "fin@x.test").is_some());
     assert_eq!(store::app_folder(&w.config, "ledger").await, "finance");
     assert_eq!(store::app_folder(&w.config, "yard").await, "ops/warehouse");
-    assert!(!store::read_meta(&w.config, "ledger").await.hidden);
+    assert!(!toolsite::content::catalog::meta(&w.config, "ledger").await.hidden);
 }
 
 #[tokio::test]
@@ -717,16 +717,16 @@ async fn an_app_whose_project_is_missing_is_closed_whatever_it_says_itself() {
     // ops is locked and restricted; dock's own "public" is ignored under it.
     store::set_folder_gate(&w.config, "ops", Some("restricted")).await.unwrap();
     store::set_locked(&w.config, "ops", true).await.unwrap();
-    let mut meta = store::read_meta(&w.config, "dock").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "dock").await;
     meta.gate = Some("public".into());
-    store::write_meta(&w.config, "dock", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "dock", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let (status, ..) = send(&w.config, get("/p/dock/")).await;
     assert_ne!(status, StatusCode::OK, "the lock did not hold to begin with");
 
     // A move that stopped after the apps were rewritten but before the tree:
     // dock names a project that does not exist yet. It must stay closed.
     meta.project = Some("ops2".into());
-    store::write_meta(&w.config, "dock", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "dock", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let (status, ..) = send(&w.config, get("/p/dock/")).await;
     assert_ne!(status, StatusCode::OK, "a half-finished move opened an app its lock kept closed");
     let (_, index, _) = send(&w.config, get("/")).await;
@@ -746,9 +746,9 @@ async fn a_move_that_stopped_halfway_never_counts_rows_its_lock_ignored_and_fini
     // 1. apps rewritten.
     for (app, at) in store::apps_with_folders(&w.config).await {
         if at == "ops" || at.starts_with("ops/") {
-            let mut meta = store::read_meta(&w.config, &app).await;
+            let mut meta = toolsite::content::catalog::meta(&w.config, &app).await;
             meta.project = Some(format!("ops2{}", &at[3..]));
-            store::write_meta(&w.config, &app, &meta).await.unwrap();
+            toolsite::content::catalog::update_meta(&w.config, &app, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
         }
     }
     for path in ["ops/warehouse/yard", "ops2/warehouse/yard", "ops/warehouse", "ops2/warehouse"] {
@@ -841,10 +841,10 @@ async fn project_access_follows_the_lock_and_only_a_manager_there_may_set_it() {
     let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"access","path":"ops/warehouse","gate":"public"})).await;
     assert!(err, "a project inside a lock was made public: {out}");
     // An app's own setting and a route rule inside the lock do not open it.
-    let mut meta = store::read_meta(&w.config, "yard").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "yard").await;
     meta.gate = Some("public".into());
     meta.rules.push(store::PathRule { prefix: "/".into(), gate: "public".into() });
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     for uri in ["/p/yard/", "/p/yard/index", "/icon/yard", "/p/yard/favicon.svg", "/p/yard/api/x"] {
         let (status, ..) = send(&w.config, get(uri)).await;
         assert_ne!(status, StatusCode::OK, "{uri} opened under a locked restricted project");
@@ -862,9 +862,9 @@ async fn a_project_holding_only_a_hidden_app_is_not_removed() {
     let w = world().await;
     store::create_folder(&w.config, "", "quiet").await.unwrap();
     place_app(&w.config, "ghost", "quiet", "restricted").await;
-    let mut meta = store::read_meta(&w.config, "ghost").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "ghost").await;
     meta.hidden = true;
-    store::write_meta(&w.config, "ghost", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "ghost", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let (err, out) = tool(&w.config, "/mcp", TOKEN, "projects", serde_json::json!({"action":"remove","path":"quiet"})).await;
     assert!(err, "a project with a hidden app inside was removed: {out}");
     assert!(store::folder_exists(&w.config, "quiet").await);
@@ -1189,9 +1189,9 @@ async fn an_apps_connector_shows_and_runs_only_what_its_access_and_route_rules_a
     let w = world().await;
     let manifest = format!("[[route]]\npath = \"/api/staff\"\ngate = \"restricted\"\n{YARD_TOOLS}");
     offer_tools(&w.config, "yard", &manifest).await;
-    let mut meta = store::read_meta(&w.config, "yard").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "yard").await;
     meta.gate = Some("authenticated".to_string());
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let (ed, nobody) = (token_for(&w.config, "ed@x.test"), token_for(&w.config, "nobody@x.test"));
 
     assert_eq!(listed(&w.config, "/p/yard/mcp", &ed).await, ["log", "staff"]);
@@ -1207,7 +1207,7 @@ async fn an_apps_connector_shows_and_runs_only_what_its_access_and_route_rules_a
     // Closed again, and then locked against rows above: what the page
     // refuses, the connector refuses.
     meta.gate = Some("restricted".to_string());
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     assert!(listed(&w.config, "/p/yard/mcp", &nobody).await.is_empty());
     let mgr = token_for(&w.config, "mgr@x.test");
     assert_eq!(listed(&w.config, "/p/yard/mcp", &mgr).await.len(), 2);
@@ -1229,9 +1229,9 @@ async fn a_hidden_or_removed_app_offers_its_tools_to_nobody_and_reads_like_a_mis
     let pin = tool(&w.config, "/me/mcp", &ed, "pin_app", serde_json::json!({"app":"yard","pinned":true})).await;
     assert!(!pin.0, "{}", pin.1);
 
-    let mut meta = store::read_meta(&w.config, "yard").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "yard").await;
     meta.hidden = true;
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     for who in [&ed, &boss] {
         assert!(listed(&w.config, "/p/yard/mcp", who).await.is_empty());
         assert!(!listed(&w.config, "/me/mcp", who).await.iter().any(|n| n.starts_with("yard__")));
@@ -1243,7 +1243,7 @@ async fn a_hidden_or_removed_app_offers_its_tools_to_nobody_and_reads_like_a_mis
 
     // Removed: the sidecar goes to the trash with the app.
     meta.hidden = false;
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let (is_error, text) = tool(&w.config, "/mcp", TOKEN, "remove_page", serde_json::json!({"slug":"yard","confirm":"yard"})).await;
     assert!(!is_error, "{text}");
     assert!(!w.config.data_dir.join("yard.tools").exists());
@@ -1293,9 +1293,9 @@ async fn a_pin_left_on_an_app_the_person_lost_lists_and_runs_nothing() {
     tool(&w.config, "/me/mcp", &ed, "pin_app", serde_json::json!({"app":"yard","pinned":true})).await;
     assert!(listed(&w.config, "/mcp", &ed).await.iter().any(|n| n == "yard__log"));
     // The app moves out of ed's project.
-    let mut meta = store::read_meta(&w.config, "yard").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "yard").await;
     meta.project = Some("finance".to_string());
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let fin = token_for(&w.config, "fin@x.test");
     assert!(!listed(&w.config, "/me/mcp", &ed).await.iter().any(|n| n.starts_with("yard__")));
     let (is_error, text) = tool(&w.config, "/me/mcp", &ed, "yard__log", serde_json::json!({})).await;
@@ -1399,9 +1399,9 @@ async fn the_tools_tab_and_connector_link_are_shown_only_to_those_who_may_open_t
 async fn the_tools_sidecar_never_leaves_through_a_download_pull_or_export() {
     let w = world().await;
     offer_tools(&w.config, "yard", YARD_TOOLS).await;
-    let mut meta = store::read_meta(&w.config, "yard").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "yard").await;
     meta.gate = Some("public".to_string());
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     for path in ["/p/yard.tools", "/p/yard/.tools", "/p/yard/../yard.tools", "/p/yard%2Etools", "/p/yard/%2e%2e/yard.tools", "/icon/yard.tools"] {
         let (_, body, _) = send(&w.config, get(path)).await;
         assert!(!body.contains("/api/staff/tool"), "{path}");
@@ -1483,9 +1483,9 @@ async fn only_a_manager_of_the_app_mints_lists_or_revokes_its_device_tokens_over
 async fn the_devices_sidecar_never_leaves_through_a_url_a_pull_or_an_export() {
     let w = world().await;
     let (_, token) = toolsite::platform::devices::create(&w.config, "yard", "boiler").unwrap();
-    let mut meta = store::read_meta(&w.config, "yard").await;
+    let mut meta = toolsite::content::catalog::meta(&w.config, "yard").await;
     meta.gate = Some("public".to_string());
-    store::write_meta(&w.config, "yard", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let stored = std::fs::read_to_string(w.config.data_dir.join("yard.devices")).unwrap();
     let hash = stored.split("\"hash\": \"").nth(1).and_then(|rest| rest.split('"').next()).unwrap().to_string();
     let leaks = |body: &str| body.contains(&hash) || body.contains(&token) || body.contains("boiler");

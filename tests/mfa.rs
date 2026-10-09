@@ -337,9 +337,9 @@ async fn password_alone_with_mfa_on_yields_no_session_and_no_access() {
     let dir = config.data_dir.join("notes");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("index.html"), "<h1>notes home</h1>").unwrap();
-    let mut meta = toolsite::content::store::read_meta_blocking(&config, "notes");
+    let mut meta = toolsite::content::catalog::meta_blocking(&config, "notes");
     meta.gate = Some("authenticated".into());
-    toolsite::content::store::write_meta_blocking(&config, "notes", &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(&config, "notes", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 
     let (reply, pending) = password(&config, "root@example.com", "/admin").await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
@@ -454,9 +454,9 @@ async fn the_subdomain_handoff_refuses_to_mint_for_a_pending_sign_in() {
     let app = config.data_dir.join("orders");
     std::fs::create_dir_all(&app).unwrap();
     std::fs::write(app.join("index.html"), "<h1>orders home</h1>").unwrap();
-    let mut meta = toolsite::content::store::read_meta_blocking(&config, "orders");
+    let mut meta = toolsite::content::catalog::meta_blocking(&config, "orders");
     meta.gate = Some("authenticated".into());
-    toolsite::content::store::write_meta_blocking(&config, "orders", &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(&config, "orders", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 
     let fy = person(&config, "fy@example.com", false);
     let site_session = session(&config, "fy@example.com");

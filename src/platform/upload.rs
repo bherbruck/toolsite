@@ -4,7 +4,7 @@ use crate::{
     content::{
         bundle::unpack_bundle,
         slug::valid_slug,
-        store::{page_url, read_meta, write_meta},
+        store::page_url,
     },
     runtime::wasm::Runtime,
     AppState,
@@ -250,23 +250,23 @@ pub(crate) async fn forget_stale_access(config: &Config, app: &str, project: Opt
 /// An editor may later remove what it created and nothing else; the folder
 /// decides who may manage it from here on.
 pub(crate) async fn stamp_new_app(config: &Config, app: &str, user_id: Option<&str>, project: Option<&str>) {
-    let mut meta = read_meta(config, app).await;
-    let mut changed = false;
-    if meta.created_by.is_none()
-        && let Some(user_id) = user_id
-    {
-        meta.created_by = Some(user_id.to_string());
-        changed = true;
+    let meta = crate::content::catalog::meta(config, app).await;
+    let user_id = user_id.filter(|_| meta.created_by.is_none()).map(str::to_string);
+    let project = project.filter(|p| !p.is_empty() && meta.project.is_none()).map(str::to_string);
+    if user_id.is_none() && project.is_none() {
+        return;
     }
-    if meta.project.is_none()
-        && let Some(project) = project.filter(|p| !p.is_empty())
-    {
-        meta.project = Some(project.to_string());
-        changed = true;
-    }
-    if changed {
-        let _ = write_meta(config, app, &meta).await;
-    }
+    // Checked again while held: only the first publish stamps.
+    let _ = crate::content::catalog::update_meta(config, app, move |meta| {
+        if meta.created_by.is_none() {
+            meta.created_by = user_id;
+        }
+        if meta.project.is_none() {
+            meta.project = project;
+        }
+        Ok(())
+    })
+    .await;
 }
 
 /// Writes `body` as `kind` at `slug`, for a caller that has already decided
@@ -442,7 +442,7 @@ pub(crate) async fn store_for_slug(
         // Held until the handler is written, so a manifest declaring
         // [resident] cannot be checked against the handler this replaces.
         let _declaring = config.residents.declaring().await;
-        if !takes_connections && crate::content::store::read_meta(config, &app).await.resident.is_some() {
+        if !takes_connections && crate::content::catalog::meta(config, &app).await.resident.is_some() {
             tracing::warn!(app = %app, "handler rejected: the app runs resident and the handler takes no connections");
             return (
                 StatusCode::BAD_REQUEST,
@@ -491,9 +491,11 @@ pub(crate) async fn store_for_slug(
         };
 
         if spa {
-            let mut meta = read_meta(config, &slug).await;
-            meta.spa = true;
-            let _ = write_meta(config, &slug, &meta).await;
+            let _ = crate::content::catalog::update_meta(config, &slug, |meta| {
+                meta.spa = true;
+                Ok(())
+            })
+            .await;
         }
 
         // A single page at the same slug would shadow this app for good:

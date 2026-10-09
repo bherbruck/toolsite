@@ -65,6 +65,19 @@ column oauth.tokens.kind text not null
 column oauth.tokens.resource text
 column oauth.tokens.token_hash text not null
 column oauth.tokens.user_id text not null
+column platform.pages.created_at bigint not null
+column platform.pages.generation bigint not null default 0
+column platform.pages.meta json not null default '{}'::json
+column platform.pages.notes text
+column platform.pages.slug text not null
+column platform.pages.updated_at bigint not null
+column platform.removed_pages.created_at bigint not null
+column platform.removed_pages.generation bigint not null
+column platform.removed_pages.id bigint not null default nextval('platform.removed_pages_id_seq'::regclass)
+column platform.removed_pages.meta json not null
+column platform.removed_pages.notes text
+column platform.removed_pages.removed_at bigint not null
+column platform.removed_pages.slug text not null
 column state.migrations.applied_at bigint not null
 column state.migrations.store text not null
 column state.migrations.version integer not null
@@ -109,6 +122,8 @@ constraint oauth.codes codes_pkey: PRIMARY KEY (code_hash)
 constraint oauth.tokens tokens_client_id_fkey: FOREIGN KEY (client_id) REFERENCES oauth.clients(id)
 constraint oauth.tokens tokens_kind_check: CHECK ((kind = ANY (ARRAY['access'::text, 'refresh'::text])))
 constraint oauth.tokens tokens_pkey: PRIMARY KEY (token_hash)
+constraint platform.pages pages_pkey: PRIMARY KEY (slug)
+constraint platform.removed_pages removed_pages_pkey: PRIMARY KEY (id)
 constraint state.migrations migrations_pkey: PRIMARY KEY (store, version)
 constraint state.runners runners_pkey: PRIMARY KEY (id)
 constraint state.tickets tickets_pkey: PRIMARY KEY (id_hash)
@@ -140,6 +155,9 @@ index oauth CREATE INDEX tokens_expiry ON oauth.tokens USING btree (expires_at)
 index oauth CREATE UNIQUE INDEX clients_pkey ON oauth.clients USING btree (id)
 index oauth CREATE UNIQUE INDEX codes_pkey ON oauth.codes USING btree (code_hash)
 index oauth CREATE UNIQUE INDEX tokens_pkey ON oauth.tokens USING btree (token_hash)
+index platform CREATE INDEX removed_pages_slug ON platform.removed_pages USING btree (slug)
+index platform CREATE UNIQUE INDEX pages_pkey ON platform.pages USING btree (slug)
+index platform CREATE UNIQUE INDEX removed_pages_pkey ON platform.removed_pages USING btree (id)
 index state CREATE INDEX tickets_expires_at ON state.tickets USING btree (expires_at)
 index state CREATE UNIQUE INDEX migrations_pkey ON state.migrations USING btree (store, version)
 index state CREATE UNIQUE INDEX runners_pkey ON state.runners USING btree (id)

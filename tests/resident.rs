@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, Message};
 use toolsite::{
     build_router,
-    content::store::{self, PageMeta, ResidentMeta},
+    content::store::{PageMeta, ResidentMeta},
     platform::upload::UploadTicket,
     runtime::{resident::Status, wasm::Runtime},
     Config,
@@ -41,9 +41,9 @@ async fn site() -> Site {
 }
 
 fn edit_meta(config: &Config, name: &str, change: impl FnOnce(&mut PageMeta)) {
-    let mut meta = store::read_meta_blocking(config, name);
+    let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     change(&mut meta);
-    store::write_meta_blocking(config, name, &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 }
 
 /// An app with a socket at `/ws`, resident when `resident` is given.

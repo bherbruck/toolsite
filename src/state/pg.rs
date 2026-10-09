@@ -54,6 +54,10 @@ pub const LADDERS: &[Ladder] = &[
         store: "oauth",
         steps: &[include_str!("../../migrations/postgres/oauth/001_initial.sql")],
     },
+    Ladder {
+        store: "platform",
+        steps: &[include_str!("../../migrations/postgres/platform/001_pages.sql")],
+    },
 ];
 
 pub struct Postgres {
@@ -563,7 +567,7 @@ mod tests {
             scanned.push(name);
         }
         scanned.sort();
-        for expected in ["accounts/store/postgres.rs", "platform/oauth_store/postgres.rs", "state/pg.rs", "state/runners.rs", "state/tickets.rs"] {
+        for expected in ["accounts/store/postgres.rs", "content/catalog/postgres.rs", "platform/oauth_store/postgres.rs", "state/pg.rs", "state/runners.rs", "state/tickets.rs"] {
             assert!(scanned.iter().any(|f| f == expected), "{expected} was not scanned: {scanned:?}");
         }
         assert!(statements > 80, "the scan found only {statements} statements");

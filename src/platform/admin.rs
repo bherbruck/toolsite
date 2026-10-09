@@ -23,7 +23,7 @@ use crate::{
     config::Config,
     content::{
         slug::valid_slug,
-        store::{self, collect_slugs, read_meta, write_meta, PathRule},
+        store::{self, PathRule},
     },
     platform::export,
     ui::{self, Flash},
@@ -486,7 +486,7 @@ pub async fn search_apps(
         return ([no_store()], Json(Vec::<Match>::new())).into_response();
     }
     let mut found = Vec::new();
-    for app in app_names(&config).await {
+    for app in crate::content::catalog::apps(&config).await {
         if !viewer.is_admin && !held_on(&config, &viewer, &app).await.is_some_and(|have| have >= Scope::Editor) {
             continue;
         }
@@ -542,19 +542,6 @@ pub async fn search_projects(
 
 // --- apps ----------------------------------------------------------------------
 
-/// The apps that exist, by their top-level directory.
-async fn app_names(config: &Config) -> Vec<String> {
-    let mut slugs = Vec::new();
-    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
-    let mut apps: Vec<String> = slugs
-        .into_iter()
-        .map(|slug| slug.split('/').next().unwrap_or(&slug).to_string())
-        .collect();
-    apps.sort();
-    apps.dedup();
-    apps
-}
-
 struct AppRow {
     app: String,
     /// Where the app opens: on its own host in subdomain mode.
@@ -570,7 +557,7 @@ struct AppRow {
 }
 
 async fn app_row(config: &Config, app: &str) -> AppRow {
-    let meta = read_meta(config, app).await;
+    let meta = crate::content::catalog::meta(config, app).await;
     let path = crate::content::store::page_path(config, app).await;
     let title = match &path {
         Some(path) => crate::content::store::page_title(path).await,
@@ -840,7 +827,7 @@ async fn app_tab_with(
     if !export::valid_app(&app) || !TABS.iter().any(|(key, _)| *key == tab) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let exists = app_names(&config).await.iter().any(|name| name == &app);
+    let exists = crate::content::catalog::apps(&config).await.iter().any(|name| name == &app);
     if !exists {
         return (StatusCode::NOT_FOUND, "no such app").into_response();
     }
@@ -856,7 +843,7 @@ async fn app_tab_with(
     }
 
     let token = form_token(&config, &admin);
-    let meta = read_meta(&config, &app).await;
+    let meta = crate::content::catalog::meta(&config, &app).await;
     let hrefs: Vec<(String, String)> = TABS
         .iter()
         .map(|(key, _)| (key.to_string(), tab_href(&app, key)))
@@ -928,7 +915,7 @@ async fn app_tab_with(
             render_jobs_tab(&config, &app, &jobs, &token, &back, is_admin_here)
         }
         _ => {
-            let notes = crate::content::store::read_notes(&config, &app).await;
+            let notes = crate::content::catalog::notes(&config, &app).await;
             render_notes_tab(&app, notes.as_deref(), &token, &back)
         }
     };
@@ -2303,11 +2290,15 @@ pub async fn change_gate(
     if let Some(lock) = crate::content::store::effective_gate(&config, &form.app, "/").await.locked_by {
         return redirect_flash(&back, false, format!("{lock} is locked: its general access applies to everything inside it."));
     }
-    let mut meta = read_meta(&config, &form.app).await;
-    meta.gate = level;
-    if write_meta(&config, &form.app, &meta).await.is_err() {
-        return redirect_flash(&back, false, "Access was not saved.");
-    }
+    let meta = match crate::content::catalog::update_meta(&config, &form.app, move |meta| {
+        meta.gate = level;
+        Ok(())
+    })
+    .await
+    {
+        Ok(meta) => meta,
+        Err(_) => return redirect_flash(&back, false, "Access was not saved."),
+    };
     let now = crate::content::store::effective_gate(&config, &form.app, "/").await;
     let said = match meta.gate.as_deref() {
         Some(gate) => format!("Access for {} is {}.", form.app, gate_label(gate)),
@@ -2345,24 +2336,25 @@ pub async fn change_rule(
     if !prefix.starts_with('/') || prefix.contains("..") {
         return redirect_flash(&back, false, "Enter the prefix as a path in the app, for example /admin.");
     }
-    let mut meta = read_meta(&config, &form.app).await;
-    meta.rules.retain(|rule| rule.prefix != prefix);
-    let text = match form.action.as_str() {
+    let (added, text) = match form.action.as_str() {
         "add" => {
             let Some(gate) = crate::content::store::normalise_gate(&form.gate.unwrap_or_default()).map(str::to_string) else {
                 return (StatusCode::BAD_REQUEST, "unknown access level").into_response();
             };
-            meta.rules.push(PathRule {
-                prefix: prefix.clone(),
-                gate: gate.clone(),
-            });
-            format!("Access for {prefix} is {}.", gate_label(&gate))
+            let text = format!("Access for {prefix} is {}.", gate_label(&gate));
+            (Some(PathRule { prefix: prefix.clone(), gate }), text)
         }
-        "remove" => format!("The rule for {prefix} is removed."),
+        "remove" => (None, format!("The rule for {prefix} is removed.")),
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     };
-    match write_meta(&config, &form.app, &meta).await {
-        Ok(()) => redirect_flash(&back, true, text),
+    let saved = crate::content::catalog::update_meta(&config, &form.app, move |meta| {
+        meta.rules.retain(|rule| rule.prefix != prefix);
+        meta.rules.extend(added);
+        Ok(())
+    })
+    .await;
+    match saved {
+        Ok(_) => redirect_flash(&back, true, text),
         Err(_) => redirect_flash(&back, false, "The rule was not saved."),
     }
 }
@@ -2391,11 +2383,15 @@ pub async fn change_visibility(
     if !valid_slug(&form.app) {
         return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
     }
-    let mut meta = read_meta(&config, &form.app).await;
-    meta.listed = form.listed.is_some();
-    meta.hidden = form.hidden.is_some();
-    match write_meta(&config, &form.app, &meta).await {
-        Ok(()) => redirect_flash(&back, true, "Visibility is saved."),
+    let (listed, hidden) = (form.listed.is_some(), form.hidden.is_some());
+    let saved = crate::content::catalog::update_meta(&config, &form.app, move |meta| {
+        meta.listed = listed;
+        meta.hidden = hidden;
+        Ok(())
+    })
+    .await;
+    match saved {
+        Ok(_) => redirect_flash(&back, true, "Visibility is saved."),
         Err(_) => redirect_flash(&back, false, "Visibility was not saved."),
     }
 }
@@ -2423,7 +2419,7 @@ pub async fn change_notes(
     if !valid_slug(&form.app) {
         return (StatusCode::BAD_REQUEST, "invalid app name").into_response();
     }
-    match crate::content::store::write_notes(&config, &form.app, &form.notes).await {
+    match crate::content::catalog::set_notes(&config, &form.app, &form.notes).await {
         Ok(()) => redirect_flash(&back, true, "Notes are saved."),
         Err(_) => redirect_flash(&back, false, "Notes were not saved."),
     }

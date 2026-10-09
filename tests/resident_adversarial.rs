@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, Message};
 use toolsite::{
     accounts::users::{self, Scope},
     build_router,
-    content::store::{self, PageMeta, ResidentMeta},
+    content::store::{PageMeta, ResidentMeta},
     platform::upload::UploadTicket,
     runtime::{
         resident::{Residents, Status},
@@ -64,9 +64,9 @@ async fn site_at(base_url: Option<&str>, change: impl FnOnce(&mut Residents)) ->
 }
 
 fn edit_meta(config: &Config, name: &str, change: impl FnOnce(&mut PageMeta)) {
-    let mut meta = store::read_meta_blocking(config, name);
+    let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     change(&mut meta);
-    store::write_meta_blocking(config, name, &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 }
 
 fn app_with(config: &Config, name: &str, wasm: &[u8], resident: Option<ResidentMeta>) {
@@ -718,7 +718,7 @@ async fn a_manifest_and_a_handler_uploaded_at_once_never_leave_a_resident_app_wi
             upload(&site, "racy", "manifest", manifest.clone()),
             upload(&site, "racy", "handler", LEGACY.to_vec()),
         );
-        let resident = store::read_meta(&site.config, "racy").await.resident.is_some();
+        let resident = toolsite::content::catalog::meta(&site.config, "racy").await.resident.is_some();
         let handler = std::fs::read(site.config.data_dir.join("racy/handler.wasm")).unwrap();
         assert!(
             !(resident && handler == LEGACY),

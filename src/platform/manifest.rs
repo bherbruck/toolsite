@@ -12,7 +12,7 @@
 
 use crate::{
     config::Config,
-    content::store::{read_meta, write_meta, PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
+    content::store::{PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
     platform::schedule,
     runtime::{resident, wasm::Runtime},
 };
@@ -321,7 +321,17 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
     };
 
     let mut changed = Vec::new();
-    let mut meta = read_meta(config, app).await;
+    // Worked out on a copy, then stored in one held step that writes only
+    // what this file declares: a change made meanwhile to anything else,
+    // hiding the app or moving it, is kept.
+    let mut meta = crate::content::catalog::meta(config, app).await;
+    let (declares_spa, declares_gate, declares_roles, declares_allow, declares_access) = (
+        manifest.spa.is_some(),
+        manifest.gate.is_some(),
+        manifest.roles.is_some(),
+        manifest.allow_http.is_some(),
+        manifest.access.is_some(),
+    );
 
     if let Some(spa) = manifest.spa {
         if meta.spa != spa {
@@ -527,9 +537,35 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
         changed.extend(regenerated.notes);
     }
 
-    write_meta(config, app, &meta)
-        .await
-        .map_err(|e| e.to_string())?;
+    let declared = meta;
+    crate::content::catalog::update_meta(config, app, move |meta| {
+        if declares_spa {
+            meta.spa = declared.spa;
+        }
+        if declares_gate {
+            meta.gate = declared.gate;
+        }
+        if declares_roles {
+            meta.roles = declared.roles;
+        }
+        if declares_allow {
+            meta.allow_http = declared.allow_http;
+        }
+        meta.sockets = declared.sockets;
+        meta.socket_protocols = declared.socket_protocols;
+        meta.ports = declared.ports;
+        meta.resident = declared.resident;
+        meta.limits = declared.limits;
+        meta.rules = declared.rules;
+        if declares_access {
+            meta.queryable = declared.queryable;
+            meta.policies = declared.policies;
+            meta.generated = declared.generated;
+            meta.access_salt = declared.access_salt;
+        }
+        Ok(())
+    })
+    .await?;
     if resident_changed {
         // The instance running now was started with the old settings, or
         // should not run at all.
@@ -766,7 +802,7 @@ mod tests {
         .unwrap();
         assert!(!changed.is_empty());
 
-        let meta = read_meta(&config, "board").await;
+        let meta = crate::content::catalog::meta(&config, "board").await;
         assert!(meta.spa);
         assert_eq!(meta.gate_for("/", "granted"), "public");
         assert_eq!(meta.gate_for("/triage", "granted"), "authenticated");
@@ -787,7 +823,7 @@ mod tests {
 
         // The manifest owns what it declares, so an empty one clears them.
         apply(&config, "board", "gate = \"public\"\n").await.unwrap();
-        assert!(read_meta(&config, "board").await.rules.is_empty());
+        assert!(crate::content::catalog::meta(&config, "board").await.rules.is_empty());
         assert!(schedule::read_jobs(&config, "board").is_empty());
     }
 
@@ -824,25 +860,25 @@ mod tests {
         assert!(error.contains("must start with '/'"), "got {error}");
 
         // The valid half must not have been applied.
-        assert_eq!(read_meta(&config, "board").await.gate.as_deref(), Some("public"));
+        assert_eq!(crate::content::catalog::meta(&config, "board").await.gate.as_deref(), Some("public"));
     }
 
     #[tokio::test]
     async fn outbound_hosts_come_from_the_manifest_and_default_to_none() {
         let (_t, config) = config();
-        assert!(read_meta(&config, "app").await.allow_http.is_empty());
+        assert!(crate::content::catalog::meta(&config, "app").await.allow_http.is_empty());
 
         apply(&config, "app", "allow_http = [\"api.github.com\"]\n")
             .await
             .unwrap();
         assert_eq!(
-            read_meta(&config, "app").await.allow_http,
+            crate::content::catalog::meta(&config, "app").await.allow_http,
             ["api.github.com"]
         );
 
         // An empty list is a decision, not an omission: it takes it away.
         apply(&config, "app", "allow_http = []\n").await.unwrap();
-        assert!(read_meta(&config, "app").await.allow_http.is_empty());
+        assert!(crate::content::catalog::meta(&config, "app").await.allow_http.is_empty());
     }
 
     #[tokio::test]
@@ -875,7 +911,7 @@ mod tests {
         let runtime = Runtime::new().unwrap();
         let error = apply_checked(&config, &runtime, "old", "[resident]\nenabled = true\n").await.unwrap_err();
         assert!(error.contains("on-connection"), "the reason should name the export: {error}");
-        assert!(read_meta(&config, "old").await.resident.is_none());
+        assert!(crate::content::catalog::meta(&config, "old").await.resident.is_none());
 
         // Off is always allowed.
         apply_checked(&config, &runtime, "old", "[resident]\nenabled = false\n").await.unwrap();
@@ -885,7 +921,7 @@ mod tests {
         let fresh = Runtime::new().unwrap();
         apply_checked(&config, &fresh, "old", "[resident]\nenabled = true\ntick_ms = 500\n").await.unwrap();
         assert_eq!(
-            read_meta(&config, "old").await.resident,
+            crate::content::catalog::meta(&config, "old").await.resident,
             Some(ResidentMeta { memory_mb: None, tick_ms: Some(500) })
         );
     }

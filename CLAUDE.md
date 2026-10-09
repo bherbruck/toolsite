@@ -42,6 +42,7 @@ state/             where platform state lives, below every other layer
   mod.rs           Backend (files, or Postgres with DATABASE_URL), Stores, boot guards, wait()
   pg.rs            the pool and its TLS, redaction, the per-schema ladder runner under an advisory lock
   runners.rs       the runner registry: a row and a heartbeat per process (roles, pool, address), so a runner knows it is alone
+  events.rs        AppEvents: an app hidden or removed, for whoever holds its sockets and instances
 
 platform/          the site as its owner uses it
   admin.rs         /admin: accounts, gates and grants for whoever runs it
@@ -70,7 +71,8 @@ platform/          the site as its owner uses it
 
 content/           what gets published, and how it is served
   slug.rs          naming rules (what may become a path), tokens, escaping
-  store.rs         page/icon/meta paths, titles, visibility, listing
+  store.rs         PageMeta, page/icon paths, titles, gates, the project tree
+  catalog/         Catalog: each slug's meta, notes and generation, on files or Postgres; update_meta is the only way to change a meta
   bundle.rs        tar unpacking, entry classification, traversal defence
   serve.rs         the public site: pages, assets, handler dispatch
   origins.rs       which origin serves an app: labels, app URLs, which host a request is on
@@ -83,6 +85,7 @@ runtime/           executing an app's own code and data
   access.rs        row-level policies from toolsite.toml, realised as views and triggers
   blobs.rs         per-app files, on the volume or in a bucket, keyed like paths
   connections.rs   every open connection by app: topics, state, limits; no HTTP, no transport
+  events.rs        the in-process AppEvents: closes a hidden or removed app's sockets and resident
 
 accounts/          people who USE published apps
   users.rs         accounts, sessions, grants, sign-in routes

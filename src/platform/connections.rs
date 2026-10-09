@@ -117,7 +117,7 @@ async fn deliver(
     conn: &str,
     event: ConnectionEvent,
 ) -> Result<Option<Result<(), String>>, String> {
-    let meta = crate::content::store::read_meta(&state.config, app).await;
+    let meta = crate::content::catalog::meta(&state.config, app).await;
     // Each event is a call like a request, with the request's limits.
     let guards = state.config.limits.effective(meta.limits.as_ref()).request;
     if let Some(resident) = meta.resident {
@@ -223,7 +223,7 @@ async fn may_stay(state: &AppState, app: &str, door: &Door, user: Option<&User>)
     if crate::content::store::is_hidden(config, app).await || !crate::content::store::app_exists(config, app).await {
         return false;
     }
-    if !crate::content::store::read_meta(config, app).await.sockets.iter().any(|s| s == socket) {
+    if !crate::content::catalog::meta(config, app).await.sockets.iter().any(|s| s == socket) {
         return false;
     }
     let gate = crate::content::store::effective_gate(config, app, socket).await.gate;

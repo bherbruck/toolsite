@@ -86,9 +86,9 @@ fn app(config: &Config, name: &str, gate: &str) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("index.html"), format!("<title>{name}</title><h1>{name} home</h1>")).unwrap();
     std::fs::write(dir.join("handler.wasm"), HANDLER).unwrap();
-    let mut meta = toolsite::content::store::read_meta_blocking(config, name);
+    let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     meta.gate = Some(gate.to_string());
-    toolsite::content::store::write_meta_blocking(config, name, &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 }
 
 fn host_of(config: &Config, app: &str) -> String {
@@ -258,7 +258,7 @@ async fn a_label_stays_with_its_app_through_project_moves_and_renames() {
     projects(serde_json::json!({"action": "move", "app": "Orders", "path": "ops"})).await;
     assert_eq!(toolsite::content::origins::label_for(&config, "Orders"), label);
     projects(serde_json::json!({"action": "rename", "path": "ops", "name": "yard"})).await;
-    assert_eq!(toolsite::content::store::read_meta(&config, "Orders").await.project.as_deref(), Some("yard"));
+    assert_eq!(toolsite::content::catalog::meta(&config, "Orders").await.project.as_deref(), Some("yard"));
     assert_eq!(toolsite::content::origins::label_for(&config, "Orders"), label);
 
     // An app published later under exactly that name does not take it.
@@ -653,9 +653,9 @@ async fn a_socket_opens_only_from_its_own_app_hosts_pages() {
     use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
     let (_dir, config) = site();
     app(&config, "team", "public");
-    let mut meta = toolsite::content::store::read_meta_blocking(&config, "team");
+    let mut meta = toolsite::content::catalog::meta_blocking(&config, "team");
     meta.sockets = vec!["/ws".into()];
-    toolsite::content::store::write_meta_blocking(&config, "team", &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(&config, "team", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = build_router(config.clone(), Runtime::new().unwrap());
@@ -849,7 +849,11 @@ async fn a_removed_apps_host_is_never_issued_to_another_app_and_comes_back_with_
     // Put back from the bin, Shop has its own host again.
     let kept = config.data_dir.join(".trash/1000-Shop");
     std::fs::rename(kept.join("app"), config.data_dir.join("Shop")).unwrap();
-    std::fs::rename(kept.join("slug.meta"), config.data_dir.join("Shop.meta")).unwrap();
+    // The meta came back inside the app's directory; a sidecar beside it
+    // comes back too, when that is where it was.
+    if kept.join("slug.meta").exists() {
+        std::fs::rename(kept.join("slug.meta"), config.data_dir.join("Shop.meta")).unwrap();
+    }
     assert_eq!(toolsite::content::origins::label_for(&config, "Shop"), label);
     assert!(get(&config, &old_host, "/p/Shop/", Some(&format!("__Host-ts_app={shop_cookie}"))).await.body.contains("Shop home"));
     assert!(get(&config, &squatter_host, &format!("/p/{label}/"), None).await.body.contains(&format!("{label} home")));
@@ -866,9 +870,9 @@ async fn an_app_published_again_under_its_name_gets_its_host_back_even_without_i
 
     // A meta rewritten by a writer that read it before the label was stored
     // loses the label; the registry still knows it.
-    let mut meta = toolsite::content::store::read_meta_blocking(&config, "Shop");
+    let mut meta = toolsite::content::catalog::meta_blocking(&config, "Shop");
     meta.label = None;
-    toolsite::content::store::write_meta_blocking(&config, "Shop", &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(&config, "Shop", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
     app(&config, "shop-squat", "public");
     assert_eq!(toolsite::content::origins::label_for(&config, "Shop"), label);
 }
@@ -1054,9 +1058,9 @@ async fn a_socket_without_origin_that_says_it_crossed_sites_is_refused() {
     use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
     let (_dir, config) = site();
     app(&config, "team", "public");
-    let mut meta = toolsite::content::store::read_meta_blocking(&config, "team");
+    let mut meta = toolsite::content::catalog::meta_blocking(&config, "team");
     meta.sockets = vec!["/ws".into()];
-    toolsite::content::store::write_meta_blocking(&config, "team", &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(&config, "team", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let router = build_router(config.clone(), Runtime::new().unwrap());

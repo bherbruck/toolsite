@@ -12,7 +12,7 @@ use tokio::{
 };
 use toolsite::{
     build_router,
-    content::store::{self, PortProtocol, PortSocket},
+    content::store::{PortProtocol, PortSocket},
     runtime::{connections, wasm::Runtime},
     Config,
 };
@@ -41,9 +41,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
 }
 
 fn hide(config: &Config, app: &str, hidden: bool) {
-    let mut meta = store::read_meta_blocking(config, app);
+    let mut meta = toolsite::content::catalog::meta_blocking(config, app);
     meta.hidden = hidden;
-    store::write_meta_blocking(config, app, &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(config, app, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 }
 
 /// Reads one line, waiting long: the first event compiles the handler.
@@ -94,12 +94,12 @@ async fn refusals_are_logged_at_warn_without_tokens_or_payload_bytes() {
     std::fs::create_dir_all(&app).unwrap();
     std::fs::write(app.join("handler.wasm"), HANDLER).unwrap();
     std::fs::write(app.join("index.html"), "<title>app</title>").unwrap();
-    let mut meta = store::read_meta_blocking(&config, "broker");
+    let mut meta = toolsite::content::catalog::meta_blocking(&config, "broker");
     meta.ports = vec![
         PortSocket { protocol: PortProtocol::Tcp, port },
         PortSocket { protocol: PortProtocol::Udp, port: dgram },
     ];
-    store::write_meta_blocking(&config, "broker", &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(&config, "broker", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
     let (_, token) = toolsite::platform::devices::create(&config, "broker", "boiler").unwrap();
 
     // A token accepted, a wrong one refused, a payload echoed.

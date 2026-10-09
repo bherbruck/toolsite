@@ -17,7 +17,7 @@
 
 use crate::{
     config::Config,
-    content::{slug::valid_segment, store},
+    content::{catalog, slug::valid_segment},
 };
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
@@ -218,19 +218,19 @@ static ASSIGNING: Mutex<()> = Mutex::new(());
 /// and so is a name that is a label itself and has not been assigned yet,
 /// so an app called `orders-1a2b3c4d` is not later moved off its own name.
 pub fn label_for(config: &Config, app: &str) -> String {
-    if let Some(label) = store::read_meta_blocking(config, app).label.filter(|l| valid_label(l)) {
+    if let Some(label) = catalog::meta_blocking(config, app).label.filter(|l| valid_label(l)) {
         return label;
     }
     let _one = ASSIGNING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut meta = store::read_meta_blocking(config, app);
-    if let Some(label) = meta.label.clone().filter(|l| valid_label(l)) {
+    let meta = catalog::meta_blocking(config, app);
+    if let Some(label) = meta.label.filter(|l| valid_label(l)) {
         return label;
     }
     let mut registry = read_registry(config);
     let mut held: std::collections::HashSet<String> =
         registry.iter().filter(|(_, owner)| owner.as_str() != app).map(|(label, _)| label.clone()).collect();
     for other in app_names(config).into_iter().filter(|other| other != app) {
-        match store::read_meta_blocking(config, &other).label {
+        match catalog::meta_blocking(config, &other).label {
             Some(label) => {
                 held.insert(label);
             }
@@ -257,8 +257,11 @@ pub fn label_for(config: &Config, app: &str) -> String {
                 tracing::warn!(app, %why, "the list of issued host labels could not be written");
             }
         }
-        meta.label = Some(label.clone());
-        if let Err(why) = store::write_meta_blocking(config, app, &meta) {
+        let stored = label.clone();
+        if let Err(why) = catalog::update_meta_blocking(config, app, move |meta| {
+            meta.label = Some(stored);
+            Ok(())
+        }) {
             tracing::warn!(app, %why, "an app's host label could not be stored; it is derived again next time");
         }
     }

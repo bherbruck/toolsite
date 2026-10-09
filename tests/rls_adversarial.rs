@@ -135,7 +135,7 @@ async fn vault(config: &Config) -> People {
 }
 
 fn scope(config: &Config) -> Scope {
-    Scope::of(&toolsite::content::store::read_meta_blocking(config, "vault"))
+    Scope::of(&toolsite::content::catalog::meta_blocking(config, "vault"))
 }
 
 fn scoped(config: &Config, who: Option<&Identity>, sql: &str) -> Result<db::SqlOutcome, String> {
@@ -595,7 +595,7 @@ async fn an_app_with_no_declared_access_refuses_everything_rather_than_falling_o
     write_page(&config, "plain/index", "<h1>plain</h1>");
     db::run(&config, "plain", "create table t (x); insert into t values (1)", &[]).unwrap();
     let who = Identity { user_id: "u".into(), email: "u@example.com".into(), role: None };
-    let scope = Scope::of(&toolsite::content::store::read_meta_blocking(&config, "plain"));
+    let scope = Scope::of(&toolsite::content::catalog::meta_blocking(&config, "plain"));
     let out = db::run_scoped(&config, "plain", Some(&who), &scope, "select 1", &[]);
     refused_or_declares_nothing(&out);
     let out = db::run_scoped(&config, "plain", Some(&who), &scope, "select * from t", &[]);
@@ -604,7 +604,7 @@ async fn an_app_with_no_declared_access_refuses_everything_rather_than_falling_o
     // are the same as none.
     write_page(&config, "early/index", "<h1>early</h1>");
     toolsite::platform::manifest::apply(&config, "early", "[[access.table]]\ntable = \"t\"\nwhere = \"1\"\nwrite = true\n").await.unwrap();
-    let scope = Scope::of(&toolsite::content::store::read_meta_blocking(&config, "early"));
+    let scope = Scope::of(&toolsite::content::catalog::meta_blocking(&config, "early"));
     assert!(scope.readable.is_empty() && scope.writable.is_empty());
 }
 
@@ -660,7 +660,7 @@ async fn a_policy_naming_a_table_that_does_not_exist_is_refused_not_generated_br
     .unwrap_err();
     assert!(error.contains("does not parse") || error.contains("no such table"), "{error}");
     // The earlier policies are untouched by the failed apply.
-    let meta = toolsite::content::store::read_meta_blocking(&config, "vault");
+    let meta = toolsite::content::catalog::meta_blocking(&config, "vault");
     assert_eq!(meta.policies.len(), 4, "{:?}", meta.policies);
     // A where with a bound parameter cannot become a view either.
     let error = toolsite::platform::manifest::apply(&config, "vault", "[[access.table]]\ntable = \"orders\"\nwhere = \"owner_id = ?\"\n").await.unwrap_err();

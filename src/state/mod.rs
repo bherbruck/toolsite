@@ -6,6 +6,7 @@
 //! `platform` or `Config`. It decides the backend once, at boot, and refuses
 //! to start when the choice would split a site's state in two.
 
+pub mod events;
 pub mod pg;
 pub mod runners;
 pub mod tickets;
@@ -248,6 +249,24 @@ pub fn wait<F: Future>(future: F) -> F::Output {
     handle.block_on(future)
 }
 
+/// `wait` for the few synchronous callers that may also run on an async
+/// worker: on one of a multi-threaded runtime's workers the thread is
+/// handed over to blocking first (`block_in_place`), so the tasks queued
+/// behind it move to another worker instead of stalling. On a blocking
+/// thread it is `wait`. A single-threaded runtime's own thread has no other
+/// worker to hand its tasks to, so there it panics, as `wait` does. The
+/// catalog's blocking reads use this, since host labels are read
+/// synchronously while a request is routed.
+pub fn wait_in_place<F: Future>(future: F) -> F::Output {
+    let handle = tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| RUNTIME.get().cloned())
+        .expect("state::wait_in_place needs a tokio runtime: none is entered here and none was kept");
+    // No probe here, unlike `wait`: this is the expected path, and a caught
+    // panic still reaches the panic hook and the log.
+    tokio::task::block_in_place(|| handle.block_on(future))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +393,33 @@ mod tests {
         runtime.block_on(async {
             tokio::spawn(async { wait(async { 1 }) }).await.map_err(|e| std::panic::resume_unwind(e.into_panic())).unwrap()
         });
+    }
+
+    async fn slow_answer() -> u32 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        42
+    }
+
+    /// Every place a blocking catalog read happens: an async worker of the
+    /// server's runtime, a blocking thread of either kind of runtime.
+    #[test]
+    fn wait_in_place_answers_on_a_worker_and_on_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let on_worker = runtime.block_on(async { tokio::spawn(async { wait_in_place(slow_answer()) }).await.unwrap() });
+        assert_eq!(on_worker, 42);
+        let on_blocking = runtime.block_on(async { tokio::task::spawn_blocking(|| wait_in_place(slow_answer())).await.unwrap() });
+        assert_eq!(on_blocking, 42);
+
+        let single = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let on_blocking = single.block_on(async { tokio::task::spawn_blocking(|| wait_in_place(slow_answer())).await.unwrap() });
+        assert_eq!(on_blocking, 42);
+    }
+
+    #[test]
+    #[should_panic]
+    fn wait_in_place_panics_on_a_single_threaded_runtimes_own_thread() {
+        let single = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        single.block_on(async { wait_in_place(slow_answer()) });
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@
 use crate::{
     accounts::users::{self, Scope, ScopeGrant, User},
     config::Config,
-    content::store::{self, read_meta, write_meta, Folder},
+    content::store::{self, Folder},
     platform::{admin, export},
 };
 use std::sync::Arc;
@@ -157,11 +157,13 @@ pub(crate) async fn move_app(config: &Arc<Config>, actor: Option<&User>, app: &s
             "{to} is a project. An app cannot sit at a project's path; rename the app or choose another project."
         )));
     }
-    let mut meta = read_meta(config, app).await;
-    meta.project = (!target.is_empty()).then(|| target.clone());
-    write_meta(config, app, &meta)
-        .await
-        .map_err(|_| Problem::Invalid("The app was not moved.".into()))?;
+    let project = (!target.is_empty()).then(|| target.clone());
+    crate::content::catalog::update_meta(config, app, move |meta| {
+        meta.project = project;
+        Ok(())
+    })
+    .await
+    .map_err(|_| Problem::Invalid("The app was not moved.".into()))?;
     let (config2, old, new) = (config.clone(), from.clone(), to.clone());
     let _ = tokio::task::spawn_blocking(move || users::move_scopes(&config2, &old, &new)).await;
     tracing::info!(by = %actor.map(|u| u.email.as_str()).unwrap_or("token"), app, from = %from, to = %to, "app moved");
@@ -298,11 +300,13 @@ async fn finish(config: &Config, from: &str, to: &str) -> Result<(), String> {
     for (app, at) in store::apps_with_folders(config).await {
         if !at.is_empty() && users::prefix_covers(from, &at) {
             let rest = &at[from.len()..];
-            let mut meta = read_meta(config, &app).await;
-            meta.project = Some(format!("{to}{rest}"));
-            write_meta(config, &app, &meta)
-                .await
-                .map_err(|_| format!("{app} was not moved. Run the same change again to finish it."))?;
+            let project = format!("{to}{rest}");
+            crate::content::catalog::update_meta(config, &app, move |meta| {
+                meta.project = Some(project);
+                Ok(())
+            })
+            .await
+            .map_err(|_| format!("{app} was not moved. Run the same change again to finish it."))?;
         }
     }
     if store::folder_exists(config, from).await && !store::folder_exists(config, to).await {

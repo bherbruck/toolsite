@@ -204,9 +204,9 @@ fn app(config: &Config, name: &str) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("index.html"), format!("<title>{name}</title><h1>{name} home</h1>")).unwrap();
     std::fs::write(dir.join("handler.wasm"), HANDLER).unwrap();
-    let mut meta = toolsite::content::store::read_meta_blocking(config, name);
+    let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     meta.gate = Some("authenticated".to_string());
-    toolsite::content::store::write_meta_blocking(config, name, &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 }
 
 /// Registers an MCP client on one runner, has `who` consent on the other,

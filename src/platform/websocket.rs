@@ -158,7 +158,7 @@ pub(crate) async fn upgrade(State(state): State<AppState>, request: Request) -> 
     if crate::content::store::is_hidden(&config, &app).await || !crate::content::store::app_exists(&config, &app).await {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let meta = crate::content::store::read_meta(&config, &app).await;
+    let meta = crate::content::catalog::meta(&config, &app).await;
     if !meta.sockets.contains(&within) {
         tracing::warn!(app = %app, path = %within, "404: websocket upgrade at a path the app does not declare as a socket");
         return (StatusCode::NOT_FOUND, "not found").into_response();

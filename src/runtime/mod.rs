@@ -4,6 +4,7 @@
 pub mod access;
 pub mod blobs;
 pub mod db;
+pub mod events;
 pub mod limits;
 pub mod connections;
 pub mod migrate;

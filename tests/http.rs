@@ -1507,13 +1507,13 @@ async fn notes_survive_for_the_next_session_but_never_reach_a_visitor() {
     let (_dir, config) = server();
     write_page(&config, "notes-app/index", "<!doctype html><title>App</title>");
     let markdown = "## schema\n\ntodos(id, user_id, text)\n\nTODO: pagination is unfinished.";
-    toolsite::content::store::write_notes(&config, "notes-app", markdown)
+    toolsite::content::catalog::set_notes(&config, "notes-app", markdown)
         .await
         .unwrap();
 
     // A later session reads them back verbatim.
     assert_eq!(
-        toolsite::content::store::read_notes(&config, "notes-app").await.unwrap(),
+        toolsite::content::catalog::notes(&config, "notes-app").await.unwrap(),
         markdown
     );
 
@@ -2755,9 +2755,9 @@ async fn the_connections_tab_shows_a_resident_apps_instance() {
     let (_, page, _) = send(&config, get_as("/admin/apps/broker/connections", &session)).await;
     assert!(!page.contains("Resident instance"), "a plain app shows a resident panel");
 
-    let mut meta = toolsite::content::store::read_meta_blocking(&config, "broker");
+    let mut meta = toolsite::content::catalog::meta_blocking(&config, "broker");
     meta.resident = Some(toolsite::content::store::ResidentMeta { memory_mb: Some(64), tick_ms: Some(250) });
-    toolsite::content::store::write_meta_blocking(&config, "broker", &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(&config, "broker", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
     let (status, page, _) = send(&config, get_as("/admin/apps/broker/connections", &session)).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(page.contains("Resident instance"), "{page}");
@@ -3720,7 +3720,7 @@ async fn roles_an_app_declares_are_offered_when_granting_but_never_required() {
         .await
         .unwrap();
     assert!(changed.iter().any(|c| c.contains("roles")), "{changed:?}");
-    let meta = toolsite::content::store::read_meta(&config, "board").await;
+    let meta = toolsite::content::catalog::meta(&config, "board").await;
     assert_eq!(meta.roles, ["editor", "approver"]);
 
     // Offered on the app's Access tab, as the Role in app column.
@@ -3747,7 +3747,7 @@ async fn roles_an_app_declares_are_offered_when_granting_but_never_required() {
 
     // Withdrawing the hint leaves the grant alone.
     toolsite::platform::manifest::apply(&config, "board", "roles = []\n").await.unwrap();
-    assert!(toolsite::content::store::read_meta(&config, "board").await.roles.is_empty());
+    assert!(toolsite::content::catalog::meta(&config, "board").await.roles.is_empty());
     assert_eq!(
         toolsite::accounts::users::role_for(&config, &account_id(&config, "reader@example.com"), "board").as_deref(),
         Some("auditor")
@@ -3968,7 +3968,7 @@ async fn app_in(config: &Config, app: &str, in_folder: &str) {
         gate: Some("granted".to_string()),
         ..Default::default()
     };
-    toolsite::content::store::write_meta(config, app, &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(config, app, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
 }
 
 fn scope(config: &Config, email: &str, prefix: &str, scope: &str) {
@@ -4005,7 +4005,7 @@ async fn an_editor_publishes_in_its_folder_and_is_refused_everywhere_else() {
     let path = upload.trim_end_matches('\'').strip_prefix(BASE).unwrap().to_string();
     let (status, body, _) = send(&config, put_bytes(&path, "text/html", b"<title>WH</title>")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let meta = toolsite::content::store::read_meta(&config, "wh-tool").await;
+    let meta = toolsite::content::catalog::meta(&config, "wh-tool").await;
     assert_eq!(meta.project.as_deref(), Some("ops/warehouse"), "the new app did not land in the editor's folder");
     assert!(meta.created_by.is_some(), "the creator was not recorded");
 
@@ -4069,7 +4069,7 @@ async fn several_scopes_on_one_account_each_apply_in_their_own_folder() {
     let (is_error, text) = mcp.call("push_page", serde_json::json!({ "slug": "wh-page", "html": "<title>wh</title>" })).await;
     assert!(!is_error, "{text}");
     assert_eq!(
-        toolsite::content::store::read_meta(&config, "wh-page").await.project.as_deref(),
+        toolsite::content::catalog::meta(&config, "wh-page").await.project.as_deref(),
         Some("ops/warehouse")
     );
     // And the viewer's app is open to them at the door.
@@ -4091,7 +4091,7 @@ async fn an_editor_removes_only_the_apps_it_created() {
         .call("push_app", serde_json::json!({ "app": "theirs", "project": "ops", "pages": { "index": "<title>theirs</title>" } }))
         .await;
     assert!(!is_error, "{text}");
-    assert_eq!(toolsite::content::store::read_meta(&config, "theirs").await.project.as_deref(), Some("ops"));
+    assert_eq!(toolsite::content::catalog::meta(&config, "theirs").await.project.as_deref(), Some("ops"));
 
     let token = mcp_token_for(&config, "ed@example.com", "correct horse").await;
     let mut mcp = Mcp::open(&config, &token).await;
@@ -4218,12 +4218,12 @@ async fn the_project_tree_is_never_served_and_a_moved_app_keeps_its_url() {
     let token = form_token_from(&page);
     let (status, ..) = send(&config, post_form("/admin/move", &boss, format!("token={token}&app=tool&folder=ops"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(toolsite::content::store::read_meta(&config, "tool").await.project.as_deref(), Some("ops"));
+    assert_eq!(toolsite::content::catalog::meta(&config, "tool").await.project.as_deref(), Some("ops"));
     let (status, ..) = send(&config, get("/p/tool/")).await;
     assert_eq!(status, StatusCode::OK, "the URL changed when the app moved");
     let (status, ..) = send(&config, post_form("/admin/move", &boss, format!("token={token}&app=tool&folder=nowhere"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "a bad folder should come back with a message, not a bare error");
-    assert_eq!(toolsite::content::store::read_meta(&config, "tool").await.project.as_deref(), Some("ops"));
+    assert_eq!(toolsite::content::catalog::meta(&config, "tool").await.project.as_deref(), Some("ops"));
 }
 
 #[tokio::test]
@@ -4233,7 +4233,7 @@ async fn a_static_token_keeps_every_power() {
     let mut platform = Mcp::open(&config, TOKEN).await;
     let (is_error, text) = platform.call("push_page", serde_json::json!({ "slug": "anywhere", "html": "<title>a</title>" })).await;
     assert!(!is_error, "{text}");
-    assert_eq!(toolsite::content::store::read_meta(&config, "anywhere").await.project, None, "a static token's app went into a folder it did not name");
+    assert_eq!(toolsite::content::catalog::meta(&config, "anywhere").await.project, None, "a static token's app went into a folder it did not name");
     let (is_error, text) = platform.call("create_user", serde_json::json!({ "email": "made@example.com" })).await;
     assert!(!is_error, "{text}");
     let (is_error, text) = platform.call("remove_page", serde_json::json!({ "slug": "anywhere", "confirm": "anywhere" })).await;
@@ -4393,7 +4393,7 @@ async fn a_policy_in_the_manifest_becomes_a_view_and_triggers_and_leaves_with_it
     let inner = objects.rows.iter().filter(|r| r[0] == "view" && r[1].as_str().unwrap().starts_with("ts_")).count();
     let triggers = objects.rows.iter().filter(|r| r[0] == "trigger").count();
     assert_eq!((inner, triggers), (2, 6), "{objects:?}");
-    let meta = toolsite::content::store::read_meta(&config, "ledger").await;
+    let meta = toolsite::content::catalog::meta(&config, "ledger").await;
     assert_eq!(meta.generated.len(), 10, "{:?}", meta.generated);
     assert!(meta.access_salt.is_some());
 
@@ -4444,7 +4444,7 @@ async fn a_policy_that_cannot_hold_is_refused_at_apply() {
     assert!(error.contains("does not parse"), "{error}");
 
     // Nothing of the above landed.
-    let meta = toolsite::content::store::read_meta(&config, "ledger").await;
+    let meta = toolsite::content::catalog::meta(&config, "ledger").await;
     assert!(meta.policies.is_empty() && meta.generated.is_empty());
     let tables = toolsite::runtime::db::run(&config, "ledger", "select count(*) from sqlite_master where name = 'orders'", &[]).unwrap();
     assert_eq!(tables.rows[0][0], serde_json::json!(1));
@@ -4735,7 +4735,7 @@ async fn search_finds_by_title_and_slug_and_fetch_returns_words_notes_and_the_sa
          <body><h1>Quarterly &amp; annual</h1><p>Totals by region.</p></body></html>",
     );
     write_page(&config, "intranet-links", "<title>Links</title><ul><li>HR</li></ul>");
-    toolsite::content::store::write_notes(&config, "reports", "Built from the ledger export. Owner: finance.").await.unwrap();
+    toolsite::content::catalog::set_notes(&config, "reports", "Built from the ledger export. Owner: finance.").await.unwrap();
 
     let by_title = mcp_tool_raw(&config, "/mcp", TOKEN, "search", serde_json::json!({ "query": "quarterly" })).await;
     let ids: Vec<&str> = by_title["structuredContent"]["results"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
@@ -4783,11 +4783,10 @@ async fn search_and_fetch_show_each_account_only_what_it_may_open() {
     let (_dir, config) = scoped_site();
     write_page(&config, "brochure/index", "<title>Brochure</title><p>Public.</p>");
     write_page(&config, "internal/index", "<title>Internal Plan</title><p>Secret numbers.</p>");
-    toolsite::content::store::write_meta(
-        &config,
-        "internal",
-        &toolsite::content::store::PageMeta { gate: Some("granted".to_string()), ..Default::default() },
-    )
+    toolsite::content::catalog::update_meta(&config, "internal", |meta| {
+        *meta = toolsite::content::store::PageMeta { gate: Some("granted".to_string()), ..Default::default() };
+        Ok(())
+    })
     .await
     .unwrap();
     let alice = toolsite::accounts::users::sign_up(&config, "alice@example.com", "correct horse battery").unwrap();
@@ -4986,7 +4985,7 @@ async fn a_bundle_in_chunks_out_of_order_serves_exactly_as_the_put_does() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(from_inline, from_put, "the asset differs between the two paths");
     assert_eq!(from_inline, asset);
-    assert!(toolsite::content::store::read_meta(&config, "via-inline").await.spa, "spa was lost on the way");
+    assert!(toolsite::content::catalog::meta(&config, "via-inline").await.spa, "spa was lost on the way");
 }
 
 #[tokio::test]
@@ -5097,10 +5096,9 @@ async fn an_editor_whose_scope_went_away_is_refused_at_the_finish() {
 async fn a_preview_token_signs_a_browser_in_once_with_an_app_cookie() {
     let (_dir, config) = server();
     write_page(&config, "members/index", "<h1>members</h1>");
-    toolsite::content::store::write_meta(&config, "members", &{
-        let mut meta = toolsite::content::store::read_meta(&config, "members").await;
+    toolsite::content::catalog::update_meta(&config, "members", |meta| {
         meta.gate = Some("authenticated".to_string());
-        meta
+        Ok(())
     })
     .await
     .unwrap();
@@ -5303,9 +5301,9 @@ async fn a_browser_renders_the_page_as_the_named_account() {
     let page = "<!doctype html><html><body style='margin:0;background:#fff'><div style='width:100vw;height:100vh;background:#d62828'></div></body></html>";
     write_page(&config, "open/index", page);
     write_page(&config, "gated/index", page);
-    let mut meta = toolsite::content::store::read_meta(&config, "gated").await;
+    let mut meta = toolsite::content::catalog::meta(&config, "gated").await;
     meta.gate = Some("authenticated".to_string());
-    toolsite::content::store::write_meta(&config, "gated", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&config, "gated", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     // A page that draws red only once its handler has answered, after a delay.
     write_page(&config, "late/index", "<!doctype html><html><body style='margin:0;background:#fff'><div id=b style='width:100vw;height:100vh'></div><script>setTimeout(()=>fetch('api/echo').then(r=>r.text()).then(()=>{document.getElementById('b').style.background='#d62828'}),300)</script></body></html>");
     std::fs::write(dir.path().join("late/handler.wasm"), HANDLER).unwrap();
@@ -5356,7 +5354,7 @@ async fn open_app_in(config: &Config, app: &str, in_folder: &str) {
         gate: Some("public".to_string()),
         ..Default::default()
     };
-    toolsite::content::store::write_meta(config, app, &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(config, app, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
 }
 
 /// The List view of the app browser.
@@ -5704,7 +5702,7 @@ async fn moving_an_app_needs_admin_at_both_ends_and_a_real_target() {
 
     let (is_error, text) = ann.call("projects", serde_json::json!({ "action": "move", "app": "tracker", "path": "ops/yard" })).await;
     assert!(!is_error, "{text}");
-    assert_eq!(toolsite::content::store::read_meta(&config, "tracker").await.project.as_deref(), Some("ops/yard"));
+    assert_eq!(toolsite::content::catalog::meta(&config, "tracker").await.project.as_deref(), Some("ops/yard"));
 
     // The browser shows it in its new place.
     let session = sign_in(&config, "ann@example.com", "correct horse");
@@ -5768,7 +5766,7 @@ async fn a_static_token_runs_every_project_action() {
         let (is_error, text) = full.call("projects", args).await;
         assert!(!is_error, "{what}: {text}");
     }
-    assert_eq!(toolsite::content::store::read_meta(&config, "tracker").await.project.as_deref(), Some("ops"));
+    assert_eq!(toolsite::content::catalog::meta(&config, "tracker").await.project.as_deref(), Some("ops"));
 }
 
 #[tokio::test]
@@ -5796,7 +5794,7 @@ async fn the_old_word_granted_still_closes_an_app_and_is_stored_as_restricted() 
     // A manifest that still says granted applies, and what is written says restricted.
     write_page(&config, "man/index", "<title>Man</title>");
     toolsite::platform::manifest::apply(&config, "man", "gate = \"granted\"\n").await.unwrap();
-    let meta = toolsite::content::store::read_meta(&config, "man").await;
+    let meta = toolsite::content::catalog::meta(&config, "man").await;
     assert_eq!(meta.gate.as_deref(), Some("restricted"));
     let raw = std::fs::read_to_string(dir.path().join("man/index.meta"))
         .or_else(|_| std::fs::read_to_string(dir.path().join("man.meta")))
@@ -6498,7 +6496,7 @@ async fn only_an_empty_project_can_be_removed_and_its_access_goes_with_it() {
 async fn unset_app_in(config: &Config, app: &str, in_folder: &str) {
     write_page(config, &format!("{app}/index"), &format!("<title>{app}</title>"));
     let meta = toolsite::content::store::PageMeta { project: Some(in_folder.to_string()), ..Default::default() };
-    toolsite::content::store::write_meta(config, app, &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(config, app, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
 }
 
 #[tokio::test]
@@ -6518,9 +6516,9 @@ async fn an_app_without_access_of_its_own_inherits_from_its_projects_then_the_si
     let g = effective_gate(&config, "forklifts", "/").await;
     assert_eq!((g.gate.as_str(), g.source), ("authenticated", GateSource::Project("ops/yard".into())));
     // The app's own setting wins while nothing is locked.
-    let mut meta = toolsite::content::store::read_meta(&config, "forklifts").await;
+    let mut meta = toolsite::content::catalog::meta(&config, "forklifts").await;
     meta.gate = Some("public".into());
-    toolsite::content::store::write_meta(&config, "forklifts", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&config, "forklifts", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     let g = effective_gate(&config, "forklifts", "/").await;
     assert_eq!((g.gate.as_str(), g.source), ("public", GateSource::App));
 }
@@ -6532,10 +6530,10 @@ async fn under_a_locked_project_the_apps_own_access_and_route_rules_are_ignored(
     folder(&config, "", "ops").await;
     folder(&config, "ops", "yard").await;
     unset_app_in(&config, "forklifts", "ops/yard").await;
-    let mut meta = toolsite::content::store::read_meta(&config, "forklifts").await;
+    let mut meta = toolsite::content::catalog::meta(&config, "forklifts").await;
     meta.gate = Some("public".into());
     meta.rules = vec![PathRule { prefix: "/open".into(), gate: "public".into() }];
-    toolsite::content::store::write_meta(&config, "forklifts", &meta).await.unwrap();
+    toolsite::content::catalog::update_meta(&config, "forklifts", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();
     set_folder_gate(&config, "ops/yard", Some("public")).await.unwrap();
     set_folder_gate(&config, "ops", Some("restricted")).await.unwrap();
     set_locked(&config, "ops", true).await.unwrap();
@@ -6865,7 +6863,7 @@ async fn a_bad_tool_declaration_applies_nothing() {
         assert!(error.contains(says), "{says}: {error}");
     }
     assert_eq!(std::fs::read_to_string(config.data_dir.join("farm.tools")).unwrap(), before);
-    assert!(!toolsite::content::store::read_meta(&config, "farm").await.spa, "a refused manifest changed the app");
+    assert!(!toolsite::content::catalog::meta(&config, "farm").await.spa, "a refused manifest changed the app");
 }
 
 #[tokio::test]

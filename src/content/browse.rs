@@ -23,7 +23,7 @@ use crate::{
     content::{
         serve::{admits, icon_markup},
         store::{
-            self, collect_slugs, page_icon, page_path, page_title, read_meta, relative_time, Icon,
+            self, page_icon, page_path, page_title, relative_time, Icon,
         },
     },
     platform::admin,
@@ -158,8 +158,7 @@ fn count_label(n: usize) -> String {
 }
 
 async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
-    let mut slugs = Vec::new();
-    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
+    let slugs = crate::content::catalog::slugs(config).await;
 
     let pins = match viewer {
         Some(user) => {
@@ -170,12 +169,12 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
     };
     let mut entries = Vec::with_capacity(slugs.len());
     for slug in &slugs {
-        let meta = read_meta(config, slug).await;
+        let meta = crate::content::catalog::meta(config, slug).await;
         let app = slug.split('/').next().unwrap_or(slug).to_string();
         // Judged by the app, as serving judges it: the app's meta decides
         // hidden and access, with its rule for this page's path. A loose
         // page with no meta of its own must not read as open.
-        let app_meta = read_meta(config, &app).await;
+        let app_meta = crate::content::catalog::meta(config, &app).await;
         if meta.hidden || app_meta.hidden || !meta.listed {
             continue;
         }

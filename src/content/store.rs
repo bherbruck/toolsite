@@ -229,7 +229,7 @@ pub fn normalise_gate(word: &str) -> Option<&'static str> {
 /// Old metas say `granted`; a meta read from disk speaks the current words,
 /// so the next write stores them. An unknown word is left alone, and the
 /// gate treats it as closed.
-fn current_words(mut meta: PageMeta) -> PageMeta {
+pub(crate) fn current_words(mut meta: PageMeta) -> PageMeta {
     if let Some(gate) = meta.gate.as_deref().and_then(normalise_gate) {
         meta.gate = Some(gate.to_string());
     }
@@ -239,6 +239,15 @@ fn current_words(mut meta: PageMeta) -> PageMeta {
         }
     }
     meta
+}
+
+impl PageMeta {
+    /// What a meta that could not be read counts as: hidden, unlisted and
+    /// restricted, granting nothing. An outage takes an app down rather
+    /// than opening it.
+    pub fn closed() -> PageMeta {
+        PageMeta { listed: false, hidden: true, gate: Some("restricted".to_string()), ..PageMeta::default() }
+    }
 }
 
 pub(crate) fn yes() -> bool {
@@ -271,87 +280,6 @@ impl Default for PageMeta {
     }
 }
 
-/// Mirrors `icon_path`: a sidecar beside the page, or inside the app dir for
-/// an app root.
-pub(crate) async fn meta_path(config: &Config, slug: &str) -> PathBuf {
-    let direct = config.data_dir.join(format!("{slug}.meta"));
-    if fs::metadata(&direct).await.is_ok() {
-        return direct;
-    }
-    let inner = config.data_dir.join(format!("{slug}/index.meta"));
-    if fs::metadata(&inner).await.is_ok() {
-        return inner;
-    }
-    // Nothing written yet: put it wherever the page itself lives.
-    if fs::metadata(config.data_dir.join(format!("{slug}.html")))
-        .await
-        .is_ok()
-    {
-        direct
-    } else {
-        inner
-    }
-}
-
-/// The same read, without an async runtime. Host functions a guest calls run
-/// inside a blocking task, where awaiting is the wrong tool.
-pub fn read_meta_blocking(config: &Config, slug: &str) -> PageMeta {
-    for candidate in [
-        config.data_dir.join(format!("{slug}.meta")),
-        config.data_dir.join(format!("{slug}/index.meta")),
-    ] {
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
-            return current_words(serde_json::from_str(&text).unwrap_or_default());
-        }
-    }
-    PageMeta::default()
-}
-
-pub async fn read_meta(config: &Config, slug: &str) -> PageMeta {
-    let path = meta_path(config, slug).await;
-    match fs::read_to_string(&path).await {
-        Ok(text) => current_words(serde_json::from_str(&text).unwrap_or_default()),
-        Err(_) => PageMeta::default(),
-    }
-}
-
-pub async fn write_meta(config: &Config, slug: &str, meta: &PageMeta) -> std::io::Result<()> {
-    let meta = &current_words(meta.clone());
-    let path = meta_path(config, slug).await;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let json = serde_json::to_string(meta).map_err(std::io::Error::other)?;
-    fs::write(&path, json).await?;
-    close_if_hidden(config, slug, meta);
-    Ok(())
-}
-
-/// A hidden app keeps no live connection open, and no resident instance:
-/// retraction takes effect on the sockets now, not at their next check.
-fn close_if_hidden(config: &Config, slug: &str, meta: &PageMeta) {
-    if meta.hidden {
-        let app = slug.split('/').next().unwrap_or(slug);
-        config.connections.close_app(app);
-        config.residents.stop(app);
-    }
-}
-
-/// `write_meta` for a blocking task, which is where migrations run. Writes
-/// to the same file `read_meta_blocking` reads.
-pub fn write_meta_blocking(config: &Config, slug: &str, meta: &PageMeta) -> Result<(), String> {
-    let direct = config.data_dir.join(format!("{slug}.meta"));
-    let inner = config.data_dir.join(format!("{slug}/index.meta"));
-    let path = if direct.is_file() || !inner.is_file() { direct } else { inner };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string(meta).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    close_if_hidden(config, slug, meta);
-    Ok(())
-}
-
 /// Coarse "when did this change" for the index; exact timestamps aren't worth
 /// a date-formatting dependency here.
 pub(crate) fn relative_time(then: SystemTime) -> String {
@@ -366,40 +294,6 @@ pub(crate) fn relative_time(then: SystemTime) -> String {
         86_400..=2_591_999 => format!("{}d ago", secs / 86_400),
         _ => format!("{}mo ago", secs / 2_592_000),
     }
-}
-
-/// Whatever the last agent wanted the next one to know: schema, decisions,
-/// what is half-finished. Kept beside the app rather than inside the bundle,
-/// so it is not served to visitors and does not need a place in the build.
-pub(crate) async fn notes_path(config: &Config, slug: &str) -> PathBuf {
-    let direct = config.data_dir.join(format!("{slug}.notes"));
-    if fs::metadata(&direct).await.is_ok() {
-        return direct;
-    }
-    let inner = config.data_dir.join(format!("{slug}/index.notes"));
-    if fs::metadata(&inner).await.is_ok() {
-        return inner;
-    }
-    if fs::metadata(config.data_dir.join(format!("{slug}.html")))
-        .await
-        .is_ok()
-    {
-        direct
-    } else {
-        inner
-    }
-}
-
-pub async fn read_notes(config: &Config, slug: &str) -> Option<String> {
-    fs::read_to_string(notes_path(config, slug).await).await.ok()
-}
-
-pub async fn write_notes(config: &Config, slug: &str, notes: &str) -> std::io::Result<()> {
-    let path = notes_path(config, slug).await;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    fs::write(path, notes).await
 }
 
 pub(crate) async fn page_title(path: &std::path::Path) -> Option<String> {
@@ -504,59 +398,11 @@ pub(crate) async fn is_hidden(config: &Config, slug: &str) -> bool {
             prefix.push('/');
         }
         prefix.push_str(segment);
-        if read_meta(config, &prefix).await.hidden {
+        if crate::content::catalog::meta(config, &prefix).await.hidden {
             return true;
         }
     }
     false
-}
-
-pub(crate) fn collect_slugs<'a>(
-    dir: &'a std::path::Path,
-    prefix: String,
-    out: &'a mut Vec<String>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-    Box::pin(async move {
-        // A directory with an index page is an app: list its root only. Its
-        // inner pages belong to the app's own navigation, not this index.
-        if !prefix.is_empty() && fs::metadata(dir.join("index.html")).await.is_ok() {
-            // A page of the same name may also exist; one slug, one entry.
-            if !out.contains(&prefix) {
-                out.push(prefix);
-            }
-            return;
-        }
-        let Ok(mut entries) = fs::read_dir(dir).await else {
-            return;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            // .trash and .site are the platform's, not anybody's app.
-            if name.starts_with('.') {
-                continue;
-            }
-            if path.is_dir() {
-                let child_prefix = if prefix.is_empty() {
-                    name
-                } else {
-                    format!("{prefix}/{name}")
-                };
-                collect_slugs(&path, child_prefix, out).await;
-            } else if path.extension().and_then(|e| e.to_str()) == Some("html") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    let slug = if prefix.is_empty() {
-                        stem.to_string()
-                    } else {
-                        format!("{prefix}/{stem}")
-                    };
-                    if !out.contains(&slug) {
-                        out.push(slug);
-                    }
-                }
-            }
-        }
-    })
 }
 
 // --- projects ----------------------------------------------------------------
@@ -731,7 +577,7 @@ pub struct EffectiveGate {
 /// skipped: the locked project's setting, or what it inherits, applies.
 pub async fn effective_gate(config: &Config, app: &str, within: &str) -> EffectiveGate {
     let app = app.split('/').next().unwrap_or(app);
-    let meta = read_meta(config, app).await;
+    let meta = crate::content::catalog::meta(config, app).await;
     let folders = list_folders(config).await;
     resolve_gate(&meta, &folders, &config.default_gate, within)
 }
@@ -975,13 +821,13 @@ pub async fn app_exists(config: &Config, app: &str) -> bool {
 
 /// The folder an app sits in, empty for the root.
 pub async fn app_folder(config: &Config, app: &str) -> String {
-    read_meta(config, app).await.project.unwrap_or_default()
+    crate::content::catalog::meta(config, app).await.project.unwrap_or_default()
 }
 
 /// Where an app sits in the tree: its folder path plus its slug, for
 /// display and for the scope rows an admin gives on the app itself.
 pub async fn logical_path(config: &Config, app: &str) -> String {
-    match read_meta(config, app).await.project {
+    match crate::content::catalog::meta(config, app).await.project {
         Some(folder) if !folder.is_empty() => format!("{folder}/{app}"),
         _ => app.to_string(),
     }
@@ -989,17 +835,10 @@ pub async fn logical_path(config: &Config, app: &str) -> String {
 
 /// Every app's slug with the folder it is in.
 pub async fn apps_with_folders(config: &Config) -> Vec<(String, String)> {
-    let mut slugs = Vec::new();
-    collect_slugs(&config.data_dir, String::new(), &mut slugs).await;
-    let mut apps: Vec<String> = slugs
-        .into_iter()
-        .map(|slug| slug.split('/').next().unwrap_or(&slug).to_string())
-        .collect();
-    apps.sort();
-    apps.dedup();
+    let apps = crate::content::catalog::apps(config).await;
     let mut out = Vec::with_capacity(apps.len());
     for app in apps {
-        let folder = read_meta(config, &app).await.project.unwrap_or_default();
+        let folder = crate::content::catalog::meta(config, &app).await.project.unwrap_or_default();
         out.push((app, folder));
     }
     out

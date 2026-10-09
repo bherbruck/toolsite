@@ -58,6 +58,22 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
         }
     }
 
+    // What the catalog held for the slug and everything under it. On files
+    // that is the sidecars just moved; on Postgres the rows, which are
+    // written beside the files here so the trash reads the same either way.
+    let retired = crate::content::catalog::of(config).retire_blocking(slug, at)?;
+    for (page, meta, notes) in &retired.pages {
+        let name = if page == slug { "slug".to_string() } else { format!("slug{}", page[slug.len()..].replace('/', "-")) };
+        std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
+        if let Some(meta) = meta {
+            std::fs::write(destination.join(format!("{name}.meta")), meta).map_err(|e| e.to_string())?;
+        }
+        if let Some(notes) = notes {
+            std::fs::write(destination.join(format!("{name}.notes")), notes).map_err(|e| e.to_string())?;
+        }
+        moved.push(format!("{page} (catalog)"));
+    }
+
     if moved.is_empty() {
         return Err(format!("nothing published at '{slug}'"));
     }
@@ -66,8 +82,8 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
     // path starts with nobody on it. A copy stays with the files, so putting
     // the app back can put its people back too.
     if !slug.contains('/') {
-        config.connections.close_app(slug);
-        config.residents.stop(slug);
+        use crate::state::events::{AppChange, AppEvents};
+        config.app_events().app_changed(AppChange { app: slug, hidden: false, removed: true });
         let project = std::fs::read_to_string(destination.join("slug.meta"))
             .or_else(|_| std::fs::read_to_string(destination.join("app/index.meta")))
             .ok()

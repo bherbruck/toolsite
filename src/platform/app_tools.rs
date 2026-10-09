@@ -20,7 +20,6 @@
 use crate::{
     accounts::users::User,
     config::Config,
-    content::store::read_meta,
     runtime::wasm::Runtime,
 };
 use rmcp::model::{CallToolResult, ContentBlock, Icon, MetaObject, Tool, ToolAnnotations};
@@ -329,7 +328,7 @@ pub async fn pinned_tools(config: &Arc<Config>, user: Option<&User>) -> Vec<Tool
             continue;
         }
         let title = app_title(config, &app).await;
-        let project = read_meta(config, &app).await.project.unwrap_or_default();
+        let project = crate::content::catalog::meta(config, &app).await.project.unwrap_or_default();
         for tool in &tools {
             listed.push(to_mcp(config, &app, &title, &project, tool, true));
         }
@@ -530,7 +529,7 @@ impl rmcp::ServerHandler for AppHost {
             let declared = reachable(&self.config, &app, user.as_ref()).await;
             if !declared.is_empty() {
                 let title = app_title(&self.config, &app).await;
-                let project = read_meta(&self.config, &app).await.project.unwrap_or_default();
+                let project = crate::content::catalog::meta(&self.config, &app).await.project.unwrap_or_default();
                 tools = declared
                     .iter()
                     .map(|tool| to_mcp(&self.config, &app, &title, &project, tool, false))

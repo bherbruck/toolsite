@@ -17,7 +17,7 @@ use tokio::{
 };
 use toolsite::{
     build_router,
-    content::store::{self, PageMeta, PortProtocol, PortSocket},
+    content::store::{PageMeta, PortProtocol, PortSocket},
     runtime::{connections, wasm::Runtime},
     Config,
 };
@@ -87,9 +87,9 @@ async fn site(limits: connections::Limits, map: &str) -> Site {
 }
 
 fn edit_meta(config: &Config, name: &str, change: impl FnOnce(&mut PageMeta)) {
-    let mut meta = store::read_meta_blocking(config, name);
+    let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     change(&mut meta);
-    store::write_meta_blocking(config, name, &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 }
 
 /// An app with the test handler and `ports` declared.
@@ -265,7 +265,7 @@ async fn a_manifest_cannot_claim_a_system_port_and_a_map_cannot_give_one() {
         assert!(toolsite::platform::manifest::apply(&site.config, "decl", &manifest).await.is_err(), "port {port} declared");
         assert!(toolsite::platform::ports::parse(&format!("{port}=decl")).is_err(), "port {port} mapped");
     }
-    assert!(store::read_meta_blocking(&site.config, "decl").ports.is_empty());
+    assert!(toolsite::content::catalog::meta_blocking(&site.config, "decl").ports.is_empty());
 }
 
 // --- one app's handler against another's connections --------------------------

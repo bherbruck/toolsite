@@ -11,7 +11,7 @@
 
 use crate::{
     config::Config,
-    content::store::{page_path, page_title, page_url, read_meta, read_notes, relative_time},
+    content::store::{page_path, page_title, page_url, relative_time},
 };
 use serde::Serialize;
 
@@ -73,7 +73,7 @@ async fn score(config: &Config, slug: &str, needle: &str) -> Option<(u8, String)
         return Some((1, title));
     }
     let app = slug.split('/').next().unwrap_or(slug);
-    if let Some(notes) = read_notes(config, app).await
+    if let Some(notes) = crate::content::catalog::notes(config, app).await
         && notes.to_lowercase().contains(needle)
     {
         return Some((2, title));
@@ -134,7 +134,7 @@ pub async fn fetch_page(config: &Config, slug: &str, manages: bool) -> Option<Fe
     let title = page_title(&path).await.unwrap_or_else(|| slug.to_string());
     let app = slug.split('/').next().unwrap_or(slug).to_string();
     let mut text = visible_text(&html);
-    if let Some(notes) = read_notes(config, &app).await
+    if let Some(notes) = crate::content::catalog::notes(config, &app).await
         && !notes.trim().is_empty()
     {
         text.push_str("\n\nNotes kept with the app:\n");
@@ -147,7 +147,7 @@ pub async fn fetch_page(config: &Config, slug: &str, manages: bool) -> Option<Fe
         }
         text.truncate(cut);
     }
-    let meta = read_meta(config, &app).await;
+    let meta = crate::content::catalog::meta(config, &app).await;
     let modified = tokio::fs::metadata(&path)
         .await
         .ok()

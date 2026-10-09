@@ -11,7 +11,6 @@
 use crate::{
     accounts::users::{self, User},
     config::Config,
-    content::store::{collect_slugs, read_meta, read_meta_blocking},
     platform::knowledge::{self, FetchOutput, SearchOutput},
     runtime::db,
 };
@@ -87,14 +86,7 @@ impl MeHost {
 
     /// Apps this account may open, with what each shares.
     async fn apps_for(&self, user: &User) -> Vec<(String, db::Scope, Vec<(String, Vec<String>)>, Vec<String>)> {
-        let mut slugs = Vec::new();
-        collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
-        let mut apps: Vec<String> = slugs
-            .into_iter()
-            .map(|slug| slug.split('/').next().unwrap_or(&slug).to_string())
-            .collect();
-        apps.sort();
-        apps.dedup();
+        let apps = crate::content::catalog::apps(&self.config).await;
 
         let mut out = Vec::new();
         for app in apps {
@@ -103,7 +95,7 @@ impl MeHost {
             }
             let (config, name) = (self.config.clone(), app.clone());
             let (scope, views, writable) = tokio::task::spawn_blocking(move || {
-                let meta = read_meta_blocking(&config, &name);
+                let meta = crate::content::catalog::meta_blocking(&config, &name);
                 let scope = db::Scope::of(&meta);
                 let mut names: Vec<String> = scope.readable.iter().chain(scope.writable.iter()).cloned().collect();
                 names.sort();
@@ -148,7 +140,7 @@ impl MeHost {
     /// Whether this account may open the page at `slug`: the app's gate and
     /// hidden flag, decided as serving decides them.
     async fn may_see(&self, user: &User, slug: &str) -> bool {
-        if read_meta(&self.config, slug).await.hidden {
+        if crate::content::catalog::meta(&self.config, slug).await.hidden {
             return false;
         }
         let app = slug.split('/').next().unwrap_or(slug).to_string();
@@ -156,8 +148,7 @@ impl MeHost {
     }
 
     async fn visible_slugs(&self, user: &User) -> Vec<String> {
-        let mut slugs = Vec::new();
-        collect_slugs(&self.config.data_dir, String::new(), &mut slugs).await;
+        let slugs = crate::content::catalog::slugs(&self.config).await;
         let mut out = Vec::new();
         for slug in slugs {
             if self.may_see(user, &slug).await {
@@ -267,7 +258,7 @@ impl MeHost {
                 user_id: user.id.clone(),
                 email: user.email.clone(),
             };
-            let meta = read_meta_blocking(&config, &app);
+            let meta = crate::content::catalog::meta_blocking(&config, &app);
             let scope = db::Scope::of(&meta);
             tracing::info!(email = %user.email, app = %app, "me/mcp query");
             db::run_scoped(&config, &app, Some(&identity), &scope, &sql, &params)

@@ -3,6 +3,7 @@
 
 pub mod browse;
 pub mod bundle;
+pub mod catalog;
 pub mod favicon;
 pub mod origins;
 pub mod serve;

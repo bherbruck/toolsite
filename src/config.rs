@@ -71,6 +71,13 @@ impl Config {
         self.base_url.is_some()
     }
 
+    /// Where a hidden or removed app's change goes: this process's sockets
+    /// and resident instances. Built from this config's own registries, so
+    /// every copy of it reaches the same ones.
+    pub fn app_events(&self) -> crate::runtime::events::Local {
+        crate::runtime::events::Local { connections: self.connections.clone(), residents: self.residents.clone() }
+    }
+
     /// A standalone Config carrying only what a background task needs: the
     /// data directory and where URLs point.
     pub fn clone_for_task(&self) -> Config {

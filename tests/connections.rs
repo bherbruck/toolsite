@@ -57,9 +57,9 @@ fn app_with(config: &Config, name: &str, wasm: &[u8], sockets: &[&str]) {
 }
 
 fn edit_meta(config: &Config, name: &str, change: impl FnOnce(&mut PageMeta)) {
-    let mut meta = store::read_meta_blocking(config, name);
+    let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     change(&mut meta);
-    store::write_meta_blocking(config, name, &meta).unwrap();
+    toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
 }
 
 /// A signed-in person's cookie for one app, as the handoff would set it.
@@ -459,7 +459,7 @@ async fn toolsite_toml_declares_sockets_wholesale_within_limits() {
         async move { toolsite::platform::manifest::apply(&config, "decl", &text).await }
     };
     apply("[[socket]]\npath = \"/live/ws\"\n".into()).await.unwrap();
-    assert_eq!(store::read_meta_blocking(&site.config, "decl").sockets, vec!["/live/ws"]);
+    assert_eq!(toolsite::content::catalog::meta_blocking(&site.config, "decl").sockets, vec!["/live/ws"]);
     open(&site, "/p/decl/live/ws", None).await;
 
     let many: String = (0..17).map(|n| format!("[[socket]]\npath = \"/s{n}\"\n")).collect();
@@ -468,7 +468,7 @@ async fn toolsite_toml_declares_sockets_wholesale_within_limits() {
         assert!(apply(format!("[[socket]]\npath = \"{bad}\"\n")).await.is_err(), "{bad} was taken");
     }
     // A refused manifest changed nothing.
-    assert_eq!(store::read_meta_blocking(&site.config, "decl").sockets, vec!["/live/ws"]);
+    assert_eq!(toolsite::content::catalog::meta_blocking(&site.config, "decl").sockets, vec!["/live/ws"]);
 }
 
 /// Connects with an `Origin` header, as a browser always sends one.
@@ -597,7 +597,7 @@ async fn a_socket_agrees_to_the_first_declared_subprotocol_the_client_offers_and
     apply("[[socket]]\npath = \"/ws\"\nsubprotocols = [\"mqtt\", \"mqttv3.1\"]\n\n[[socket]]\npath = \"/plain\"\n")
         .await
         .unwrap();
-    let meta = store::read_meta_blocking(&site.config, "subs");
+    let meta = toolsite::content::catalog::meta_blocking(&site.config, "subs");
     assert_eq!(meta.socket_protocols.get("/ws"), Some(&vec!["mqtt".to_string(), "mqttv3.1".to_string()]));
 
     // The app's order wins over the client's.
@@ -619,7 +619,7 @@ async fn a_socket_agrees_to_the_first_declared_subprotocol_the_client_offers_and
     }
     // Withdrawn with the socket.
     apply("[[socket]]\npath = \"/ws\"\n").await.unwrap();
-    assert!(store::read_meta_blocking(&site.config, "subs").socket_protocols.is_empty());
+    assert!(toolsite::content::catalog::meta_blocking(&site.config, "subs").socket_protocols.is_empty());
     assert_eq!(chosen_subprotocol(&site, "/p/subs/ws", "mqtt").await, None);
 }
 
@@ -910,7 +910,7 @@ async fn toolsite_toml_declares_tcp_and_udp_ports_and_refuses_malformed_ones() {
     apply("[[socket]]\npath = \"/ws\"\n\n[[socket]]\nprotocol = \"tcp\"\nport = 1883\n\n[[socket]]\nprotocol = \"udp\"\nport = 5514\n")
         .await
         .unwrap();
-    let meta = store::read_meta_blocking(&site.config, "decl");
+    let meta = toolsite::content::catalog::meta_blocking(&site.config, "decl");
     assert_eq!(meta.sockets, vec!["/ws"]);
     assert_eq!(meta.ports, vec![tcp(1883), udp(5514)]);
     for bad in [
@@ -924,10 +924,10 @@ async fn toolsite_toml_declares_tcp_and_udp_ports_and_refuses_malformed_ones() {
     ] {
         assert!(apply(bad).await.is_err(), "{bad} was taken");
     }
-    assert_eq!(store::read_meta_blocking(&site.config, "decl").ports, vec![tcp(1883), udp(5514)]);
+    assert_eq!(toolsite::content::catalog::meta_blocking(&site.config, "decl").ports, vec![tcp(1883), udp(5514)]);
     // Withdrawn wholesale.
     apply("").await.unwrap();
-    assert!(store::read_meta_blocking(&site.config, "decl").ports.is_empty());
+    assert!(toolsite::content::catalog::meta_blocking(&site.config, "decl").ports.is_empty());
 }
 
 #[tokio::test]
