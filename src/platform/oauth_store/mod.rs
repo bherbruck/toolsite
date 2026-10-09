@@ -83,6 +83,21 @@ pub struct Redeemed {
     pub resource: Option<String>,
 }
 
+/// Whether a code checked out, judged by the flow's own rules: the client,
+/// the redirect URI and the PKCE verifier presented with it.
+pub type Fits = Arc<dyn Fn(&Redeemed) -> bool + Send + Sync>;
+
+/// What became of a code presented for exchange.
+#[derive(Debug)]
+pub enum Exchanged {
+    /// Unknown, expired, already spent, or revoked.
+    Unknown,
+    /// Spent, but it was issued to a different request.
+    Refused(Redeemed),
+    /// Spent, and this pair issued for it.
+    Issued(Redeemed, Issued),
+}
+
 #[derive(Debug)]
 pub struct Issued {
     pub access_token: String,
@@ -111,6 +126,14 @@ pub trait OAuthStore: Send + Sync {
     /// expired; an expired code is spent all the same.
     async fn redeem_code(&self, code: &str) -> Option<Redeemed>;
 
+    /// Spends a code and, if `fits` accepts what it was issued for, issues a
+    /// pair for that person, client and resource, all within one turn of the
+    /// account's lock: the turn `revoke_for_user` takes. A revocation lands
+    /// wholly before (the code is gone) or wholly after (the pair is), never
+    /// between a spent code and its tokens, where it would find neither and
+    /// the pair would outlive it. The code is spent whatever `fits` answers.
+    async fn exchange_code(&self, code: &str, fits: Fits) -> Result<Exchanged, String>;
+
     /// A fresh access/refresh pair for this person and client, bound to the
     /// resource the grant named.
     async fn issue_tokens(&self, client_id: &str, user_id: &str, resource: Option<&str>) -> Result<Issued, String>;
@@ -128,8 +151,8 @@ pub trait OAuthStore: Send + Sync {
     async fn access_token_grant(&self, token: &str) -> Option<(String, String, Option<String>)>;
 
     /// Ends every connection an account's clients hold: its access and
-    /// refresh tokens and any code not yet exchanged. Returns how many rows
-    /// went.
+    /// refresh tokens and any code not yet exchanged, at once, in the
+    /// account's turn (see `exchange_code`). Returns how many rows went.
     async fn revoke_for_user(&self, user_id: &str) -> Result<usize, String>;
 
     /// Expired rows go opportunistically rather than on a timer, as sessions

@@ -191,7 +191,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/settings", get(secrets::entry_form_query).post(secrets::entry_submit))
         .route(
             "/auth/setup",
-            get(users::setup_form).post(users::setup_submit),
+            get(users::setup_form).post(platform::account::setup_submit),
         )
         .route("/admin", get(admin::accounts_page))
         .route("/admin/apps", get(admin::apps_page))

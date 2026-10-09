@@ -2162,11 +2162,16 @@ pub async fn change_active(
     let outcome =
         tokio::task::spawn_blocking(move || users::set_active(&config2, &form.email, active)).await;
     match outcome {
-        Ok(Ok(())) => redirect_flash(
-            &back,
-            true,
-            if active { format!("Account {email} is enabled.") } else { format!("Account {email} is disabled.") },
-        ),
+        Ok(Ok(user_id)) => {
+            if !active {
+                crate::platform::account::revoke_clients(&config, &user_id, &email, "account disabled").await;
+            }
+            redirect_flash(
+                &back,
+                true,
+                if active { format!("Account {email} is enabled.") } else { format!("Account {email} is disabled.") },
+            )
+        }
         Ok(Err(message)) => redirect_flash(&back, false, message),
         Err(_) => redirect_flash(&back, false, "The account was not changed."),
     }

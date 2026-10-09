@@ -6,11 +6,11 @@
 //! runs them on a blocking thread.
 
 use super::{
-    hash, now, Client, Grant, Issued, OAuthStore, Redeemed, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME,
+    hash, now, Client, Exchanged, Fits, Grant, Issued, OAuthStore, Redeemed, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME,
     REFRESH_LIFETIME, TOKEN_LEN,
 };
 use crate::{config::Config, content::slug::random_token, runtime::db};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use rusqlite_migration::{Migrations, M};
 use std::{path::PathBuf, sync::LazyLock};
 
@@ -129,6 +129,47 @@ impl SqliteOAuth {
         (expires_at >= now() as i64).then_some(redeemed)
     }
 
+    /// One write transaction, taken before the code is read: the file's
+    /// write lock is this store's account lock, wider than one account but
+    /// the same promise `revoke_for_user` keeps by taking it too.
+    pub fn exchange_code(&self, code: &str, fits: &Fits) -> Result<Exchanged, String> {
+        let mut conn = self.open()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let found = tx
+            .query_row(
+                "select client_id, user_id, redirect_uri, code_challenge, expires_at, resource
+                   from codes where code_hash = ?",
+                [hash(code)],
+                |row| {
+                    Ok((
+                        Redeemed {
+                            client_id: row.get(0)?,
+                            user_id: row.get(1)?,
+                            redirect_uri: row.get(2)?,
+                            code_challenge: row.get(3)?,
+                            resource: row.get(5)?,
+                        },
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((redeemed, expires_at)) = found else { return Ok(Exchanged::Unknown) };
+        tx.execute("delete from codes where code_hash = ?", [hash(code)]).map_err(|e| e.to_string())?;
+        // An expired or mismatched code is spent all the same.
+        let expired = expires_at < now() as i64;
+        if expired || !fits(&redeemed) {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(if expired { Exchanged::Unknown } else { Exchanged::Refused(redeemed) });
+        }
+        let issued = issue_tokens_on(&tx, &redeemed.client_id, &redeemed.user_id, redeemed.resource.as_deref())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Exchanged::Issued(redeemed, issued))
+    }
+
     pub fn issue_tokens(&self, client_id: &str, user_id: &str, resource: Option<&str>) -> Result<Issued, String> {
         let conn = self.open()?;
         issue_tokens_on(&conn, client_id, user_id, resource)
@@ -174,10 +215,17 @@ impl SqliteOAuth {
         .flatten()
     }
 
+    /// Both deletes in one transaction: an exchange between them would
+    /// write its tokens after the first and spend its code before the
+    /// second, and outlive the revocation.
     pub fn revoke_for_user(&self, user_id: &str) -> Result<usize, String> {
-        let conn = self.open()?;
-        let tokens = conn.execute("delete from tokens where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
-        let codes = conn.execute("delete from codes where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
+        let mut conn = self.open()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let tokens = tx.execute("delete from tokens where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
+        let codes = tx.execute("delete from codes where user_id = ?", [user_id]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(tokens + codes)
     }
 
@@ -281,6 +329,13 @@ impl OAuthStore for SqliteOAuth {
     async fn redeem_code(&self, code: &str) -> Option<Redeemed> {
         let (this, code) = (self.clone(), code.to_string());
         blocking(move || SqliteOAuth::redeem_code(&this, &code)).await.flatten()
+    }
+
+    async fn exchange_code(&self, code: &str, fits: Fits) -> Result<Exchanged, String> {
+        let (this, code) = (self.clone(), code.to_string());
+        blocking(move || SqliteOAuth::exchange_code(&this, &code, &fits))
+            .await
+            .unwrap_or_else(|| Err(TASK_FAILED.into()))
     }
 
     async fn issue_tokens(&self, client_id: &str, user_id: &str, resource: Option<&str>) -> Result<Issued, String> {

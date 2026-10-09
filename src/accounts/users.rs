@@ -1798,10 +1798,11 @@ pub struct Account {
     pub mfa: bool,
 }
 
-/// Turns an account off, or back on. Existing sessions are dropped rather
-/// than left to expire, so access ends now; the session lookup also refuses a
-/// disabled account, which covers anything issued in between.
-pub fn set_active(config: &Config, email: &str, active: bool) -> Result<(), String> {
+/// Turns an account off, or back on, and answers its id. Existing sessions
+/// are dropped rather than left to expire, so access ends now; the session
+/// lookup also refuses a disabled account, which covers anything issued in
+/// between. Its MCP clients are the platform's to end, with the id.
+pub fn set_active(config: &Config, email: &str, active: bool) -> Result<String, String> {
     let accounts = store::of(config);
     let email = normalise(email);
     let Some(user_id) = accounts.set_disabled(&email, if active { None } else { Some(now() as i64) })? else {
@@ -1810,7 +1811,7 @@ pub fn set_active(config: &Config, email: &str, active: bool) -> Result<(), Stri
     if !active {
         accounts.delete_sessions_for(&user_id, None)?;
     }
-    Ok(())
+    Ok(user_id)
 }
 
 pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
@@ -2024,31 +2025,3 @@ pub async fn setup_form(
     Html(markup.into_string()).into_response()
 }
 
-#[derive(serde::Deserialize)]
-pub struct NewPassword {
-    token: String,
-    password: String,
-}
-
-pub async fn setup_submit(
-    State(config): State<Arc<Config>>,
-    Form(form): Form<NewPassword>,
-) -> Response {
-    let config2 = config.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        accept_invite(&config2, &form.token, &form.password)
-    })
-    .await;
-
-    match outcome {
-        // Signed in on the spot: having just proved they hold the link and
-        // chosen the password, asking them to type it again is theatre. A
-        // code, though, is still owed if the account has two-step sign-in.
-        Ok(Ok(user)) => {
-            let next = if user.is_admin { "/admin" } else { "/" };
-            crate::accounts::mfa::sign_in(&config, user, crate::accounts::mfa::Primary::Password, next).await
-        }
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "The password was not set.").into_response(),
-    }
-}

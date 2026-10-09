@@ -23,8 +23,9 @@ pub const DEFAULT_POOL_SIZE: usize = 16;
 /// half names the object, or is 0 when the purpose has none.
 pub const LOCK_MIGRATE: i32 = 1;
 /// One account's OAuth rows, keyed by `hashtext(user_id)`: a revocation and
-/// a rotation or issue for the same account take turns, so a pair written
-/// but not yet committed cannot slip past the revocation's delete.
+/// a rotation, an issue or a code's exchange for the same account take
+/// turns, so a pair written but not yet committed, or a code spent and its
+/// pair not yet written, cannot slip past the revocation's delete.
 pub const LOCK_OAUTH_USER: i32 = 2;
 /// The project tree: a change reads every row and writes the difference,
 /// so changes take turns.

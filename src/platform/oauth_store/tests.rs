@@ -68,6 +68,7 @@ macro_rules! suite {
             one_code_redeemed_by_many_at_once_yields_one_token,
             one_refresh_rotated_by_many_at_once_yields_one_new_refresh,
             a_rotation_racing_a_revocation_leaves_nothing_live,
+            an_exchange_spends_its_code_and_cannot_outlive_a_revocation,
         );
     };
     (@each $fixture:ident, #[$attr:meta], $($name:ident),* $(,)?) => {

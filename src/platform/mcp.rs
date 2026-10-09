@@ -1965,12 +1965,15 @@ impl PageHost {
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match outcome {
-            Ok(()) if active => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            Ok(_) if active => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "{email} is active again"
             ))])),
-            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "{email} is disabled; its sessions are gone"
-            ))])),
+            Ok(user_id) => {
+                crate::platform::account::revoke_clients(&self.config, &user_id, &email, "account disabled").await;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "{email} is disabled; its sessions and MCP clients are gone"
+                ))]))
+            }
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         }
     }

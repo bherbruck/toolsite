@@ -360,14 +360,41 @@ async fn account_shell(config: &Arc<Config>, user: &User, title: &str, body: Mar
 /// Ends every connection a client holds for this account. Turning two-step
 /// sign-in on does it, so a client connected with a password alone must
 /// sign in again with a code; so do a new password and an admin's reset,
-/// which close whatever the old password or the lost phone opened. `why`
-/// says which, for the log.
+/// which close whatever the old password or the lost phone opened, a setup
+/// link, which is a reset, and an account turned off, so turning it back on
+/// does not revive them. `why` says which, for the log.
 pub(crate) async fn revoke_clients(config: &Arc<Config>, user_id: &str, email: &str, why: &str) {
     let (worker, id) = (config.clone(), user_id.to_string());
     match tokio::task::spawn_blocking(move || crate::platform::oauth_store::revoke_for_user(&worker, &id)).await {
         Ok(Ok(count)) => tracing::info!(%email, revoked = count, "{why}: OAuth tokens of this account revoked"),
         Ok(Err(error)) => tracing::warn!(%email, %error, "{why}: OAuth tokens were not revoked"),
         Err(_) => tracing::warn!(%email, "{why}: OAuth tokens were not revoked"),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct NewPassword {
+    token: String,
+    password: String,
+}
+
+/// `POST /auth/setup`: a setup link spent. Here rather than in `accounts`
+/// because the link is also the reset for a forgotten or leaked password,
+/// and the clients the old password connected are the platform's to end.
+pub async fn setup_submit(State(config): State<Arc<Config>>, Form(form): Form<NewPassword>) -> Response {
+    let worker = config.clone();
+    let outcome = tokio::task::spawn_blocking(move || users::accept_invite(&worker, &form.token, &form.password)).await;
+    match outcome {
+        // Signed in on the spot: having just proved they hold the link and
+        // chosen the password, asking them to type it again is theatre. A
+        // code, though, is still owed if the account has two-step sign-in.
+        Ok(Ok(user)) => {
+            revoke_clients(&config, &user.id, &user.email, "password set by link").await;
+            let next = if user.is_admin { "/admin" } else { "/" };
+            mfa::sign_in(&config, user, mfa::Primary::Password, next).await
+        }
+        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "The password was not set.").into_response(),
     }
 }
 

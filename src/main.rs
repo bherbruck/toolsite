@@ -655,11 +655,13 @@ fn run_user_command(
             Ok(())
         }
         UserCommand::Disable { email } => report(
-            users::set_active(&config, &email, false),
-            "disabled; its sessions are gone",
+            users::set_active(&config, &email, false).and_then(|user_id| {
+                toolsite::platform::oauth_store::revoke_for_user(&config, &user_id).map(drop)
+            }),
+            "disabled; its sessions and MCP client tokens are gone",
         ),
         UserCommand::Enable { email } => {
-            report(users::set_active(&config, &email, true), "active again")
+            report(users::set_active(&config, &email, true).map(drop), "active again")
         }
         UserCommand::ResetMfa { email } => {
             let (user_id, was_on) = toolsite::accounts::mfa::reset(&config, &email).map_err(anyhow::Error::msg)?;

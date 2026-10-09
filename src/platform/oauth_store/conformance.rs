@@ -2,7 +2,7 @@
 //! backend by `tests.rs`. Each function is one property; the name says
 //! which.
 
-use super::{Aged, Backdoor, Grant, OAuthStore, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME, REFRESH_LIFETIME};
+use super::{Aged, Backdoor, Exchanged, Grant, OAuthStore, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME, REFRESH_LIFETIME};
 use std::{sync::Arc, time::Duration};
 
 const CB: &str = "https://c.test/cb";
@@ -327,6 +327,66 @@ pub(super) async fn a_rotation_racing_a_revocation_leaves_nothing_live<S: OAuthS
         assert!(live.is_empty(), "round {round}: a refresh that raced a revocation left {live:?} live");
         if let Some(rotated) = rotated {
             assert!(store.access_token_grant(&rotated.access_token).await.is_none(), "round {round}: the new pair outlived the revocation");
+        }
+    }
+}
+
+/// An exchange spends its code whatever it finds, issues only when the
+/// check passes, and works once however many present the code; one racing
+/// a revocation leaves nothing live, whichever lands first.
+pub(super) async fn an_exchange_spends_its_code_and_cannot_outlive_a_revocation<
+    S: OAuthStore + Backdoor + 'static,
+>(
+    store: Arc<S>,
+) {
+    let client = registered(&*store).await;
+    let refused = code_for(&*store, &client, "u1", None).await;
+    let outcome = store.exchange_code(&refused, Arc::new(|_| false)).await.unwrap();
+    assert!(matches!(outcome, Exchanged::Refused(_)), "{outcome:?}");
+    assert!(store.stored_tokens().await.is_empty(), "a refused exchange issued tokens");
+    let outcome = store.exchange_code(&refused, Arc::new(|_| true)).await.unwrap();
+    assert!(matches!(outcome, Exchanged::Unknown), "a refused code was not spent: {outcome:?}");
+
+    let expired = code_for(&*store, &client, "u1", None).await;
+    store.age(Aged::Codes, (CODE_LIFETIME + Duration::from_secs(1)).as_secs() as i64).await;
+    let outcome = store.exchange_code(&expired, Arc::new(|_| true)).await.unwrap();
+    assert!(matches!(outcome, Exchanged::Unknown), "an expired code was exchanged: {outcome:?}");
+
+    let code = code_for(&*store, &client, "u1", Some("https://r.test/mcp")).await;
+    let start = Arc::new(tokio::sync::Barrier::new(RACERS));
+    let racers: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let (store, start, code) = (store.clone(), start.clone(), code.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                matches!(store.exchange_code(&code, Arc::new(|_| true)).await, Ok(Exchanged::Issued(..)))
+            })
+        })
+        .collect();
+    let mut won = 0;
+    for racer in racers {
+        won += racer.await.unwrap() as usize;
+    }
+    assert_eq!(won, 1, "one code was exchanged {won} times");
+    let stored = store.stored_tokens().await;
+    assert_eq!(stored.len(), 2, "one pair, not more");
+
+    for round in 0..40u64 {
+        let code = code_for(&*store, &client, "u2", None).await;
+        let revoker = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_micros(round * 50)).await;
+                store.revoke_for_user("u2").await.unwrap();
+            })
+        };
+        let outcome = store.exchange_code(&code, Arc::new(|_| true)).await.unwrap();
+        revoker.await.unwrap();
+        if let Exchanged::Issued(_, issued) = outcome {
+            assert!(
+                store.access_token_grant(&issued.access_token).await.is_none(),
+                "round {round}: an exchange outlived a revocation"
+            );
         }
     }
 }

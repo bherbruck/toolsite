@@ -602,37 +602,44 @@ pub(crate) async fn token_endpoint(
             let (Some(code), Some(verifier)) = (body.code.clone(), body.code_verifier.clone()) else {
                 return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
             };
-            let redeemed = store::of(&config).redeem_code(&code).await;
-            let Some(redeemed) = redeemed else {
-                tracing::warn!(%client_id, "token refused: unknown, expired or spent code");
-                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
-            };
-            if redeemed.client_id != client_id
-                || body.redirect_uri.as_deref() != Some(redeemed.redirect_uri.as_str())
-                || !pkce_matches(&verifier, &redeemed.code_challenge)
-            {
-                tracing::warn!(
-                    %client_id,
-                    client_matches = redeemed.client_id == client_id,
-                    redirect_matches = body.redirect_uri.as_deref() == Some(redeemed.redirect_uri.as_str()),
-                    "token refused: code was issued to a different request"
-                );
-                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
-            }
-            let Some(user) = publishing_user(&config, &redeemed.user_id).await else {
-                tracing::warn!(%client_id, "token refused: account can no longer publish");
-                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
-            };
-            let issued = store::of(&config)
-                .issue_tokens(&client_id, &user.id, redeemed.resource.as_deref())
-                .await;
-            match issued {
-                Ok(issued) => token_response(issued),
+            // The checks run inside the exchange, so the code is spent and
+            // its tokens written in one turn of the account's lock: a
+            // revocation cannot land between them.
+            let (expected_client, redirect_uri) = (client_id.clone(), body.redirect_uri.clone());
+            let fits: store::Fits = Arc::new(move |redeemed: &store::Redeemed| {
+                redeemed.client_id == expected_client
+                    && redirect_uri.as_deref() == Some(redeemed.redirect_uri.as_str())
+                    && pkce_matches(&verifier, &redeemed.code_challenge)
+            });
+            let (redeemed, issued) = match store::of(&config).exchange_code(&code, fits).await {
+                Ok(store::Exchanged::Issued(redeemed, issued)) => (redeemed, issued),
+                Ok(store::Exchanged::Unknown) => {
+                    tracing::warn!(%client_id, "token refused: unknown, expired or spent code");
+                    return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
+                }
+                Ok(store::Exchanged::Refused(redeemed)) => {
+                    tracing::warn!(
+                        %client_id,
+                        client_matches = redeemed.client_id == client_id,
+                        redirect_matches = body.redirect_uri.as_deref() == Some(redeemed.redirect_uri.as_str()),
+                        "token refused: code was issued to a different request"
+                    );
+                    return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
+                }
                 Err(error) => {
                     tracing::warn!(%client_id, %error, "token refused: tokens could not be stored");
-                    oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
                 }
+            };
+            // An account turned off since it consented. The pair is refused
+            // on every request, and turning the account off revokes it: that
+            // revocation is either the one that is still to come, or it came
+            // first and the code was gone.
+            if publishing_user(&config, &redeemed.user_id).await.is_none() {
+                tracing::warn!(%client_id, "token refused: account can no longer publish");
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
             }
+            token_response(issued)
         }
         "refresh_token" => {
             let Some(refresh_token) = body.refresh_token.clone() else {

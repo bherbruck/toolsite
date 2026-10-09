@@ -7,7 +7,7 @@
 //! Every value is a bound parameter; the SQL text is constant.
 
 use super::{
-    hash, now, Client, Grant, Issued, OAuthStore, Redeemed, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME,
+    hash, now, Client, Exchanged, Fits, Grant, Issued, OAuthStore, Redeemed, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME,
     REFRESH_LIFETIME, TOKEN_LEN,
 };
 use crate::content::slug::random_token;
@@ -91,6 +91,48 @@ impl PostgresOAuth {
                 resource: row.get(5),
             })
         }))
+    }
+
+    async fn exchange(&self, code: &str, fits: Fits) -> Result<Exchanged, String> {
+        let mut conn = self.connection().await?;
+        let tx = conn.transaction().await.map_err(|e| why("could not begin an exchange", &e))?;
+        // Whose code it is, to take that account's turn before spending it,
+        // as a rotation does. The delete checks the row again, so a code
+        // revoked or redeemed in between is simply not found.
+        let Some(holder) = tx
+            .query_opt("select user_id from oauth.codes where code_hash = $1", &[&hash(code)])
+            .await
+            .map_err(|e| why("could not read the code", &e))?
+        else {
+            return Ok(Exchanged::Unknown);
+        };
+        hold_account(&tx, &holder.get::<_, String>(0)).await?;
+        let row = tx
+            .query_opt(
+                "delete from oauth.codes where code_hash = $1
+                 returning client_id, user_id, redirect_uri, code_challenge, expires_at, resource",
+                &[&hash(code)],
+            )
+            .await
+            .map_err(|e| why("could not redeem the code", &e))?;
+        let Some(row) = row else { return Ok(Exchanged::Unknown) };
+        let expires_at: i64 = row.get(4);
+        let redeemed = Redeemed {
+            client_id: row.get(0),
+            user_id: row.get(1),
+            redirect_uri: row.get(2),
+            code_challenge: row.get(3),
+            resource: row.get(5),
+        };
+        // An expired or mismatched code is spent all the same.
+        let expired = expires_at < now() as i64;
+        if expired || !fits(&redeemed) {
+            tx.commit().await.map_err(|e| why("could not spend the code", &e))?;
+            return Ok(if expired { Exchanged::Unknown } else { Exchanged::Refused(redeemed) });
+        }
+        let issued = insert_pair(&tx, &redeemed.client_id, &redeemed.user_id, redeemed.resource.as_deref()).await?;
+        tx.commit().await.map_err(|e| why("could not commit the exchange", &e))?;
+        Ok(Exchanged::Issued(redeemed, issued))
     }
 
     async fn rotate(&self, client_id: &str, refresh_token: &str) -> Result<Option<Issued>, String> {
@@ -272,6 +314,10 @@ impl OAuthStore for PostgresOAuth {
 
     async fn redeem_code(&self, code: &str) -> Option<Redeemed> {
         logged("redeeming a code", self.take_code(code).await)
+    }
+
+    async fn exchange_code(&self, code: &str, fits: Fits) -> Result<Exchanged, String> {
+        self.exchange(code, fits).await
     }
 
     async fn issue_tokens(&self, client_id: &str, user_id: &str, resource: Option<&str>) -> Result<Issued, String> {
