@@ -237,7 +237,10 @@ fn a_handler_reads_its_own_settings_and_no_one_elses() {
 
     assert_eq!(call(&runtime, &site, "app", request("/api/secret")).0, 404);
 
-    toolsite::platform::secrets::set(&site, "app", "API_KEY", Some("hunter2")).unwrap();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(toolsite::platform::secrets::set(&site, "app", "API_KEY", Some("hunter2")))
+        .unwrap();
     assert_eq!(
         call(&runtime, &site, "app", request("/api/secret")),
         (200, "key=hunter2".into())

@@ -722,11 +722,11 @@ impl PageHost {
             )]));
         }
         let config = &self.config;
+        let installs = github::installations(config).await;
         let pick_installation = |given: Option<u64>| -> Result<u64, String> {
             if let Some(id) = given {
                 return Ok(id);
             }
-            let installs = github::installations(config);
             match installs.as_slice() {
                 [one] => Ok(one.id),
                 [] => Err("the GitHub App is not installed anywhere yet; install it from /admin/github".into()),
@@ -781,11 +781,8 @@ impl PageHost {
                 .await
                 .map(|p| format!("pulled commit {} into the source archive of {app} ({} bytes)", &p.sha[..p.sha.len().min(7)], p.bytes)),
             "disconnect" => {
-                let (config2, app2) = (config.clone(), app.clone());
-                tokio::task::spawn_blocking(move || github::disconnect(&config2, &app2))
+                github::disconnect(config, &app)
                     .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r)
                     .map(|link| format!("{app} is no longer mirrored at {}; the repository is untouched", link.full_name()))
             }
             other => Err(format!("action must be status, installations, discover, create, import, pull or disconnect, not '{other}'")),
@@ -816,15 +813,15 @@ impl PageHost {
         }
         let config = self.config.clone();
         let url = deploy::deploy_url(&config, &app);
-        let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
-            "create" => deploy::create(&config, &app, &label.unwrap_or_default()).map(|(entry, token)| {
+        let outcome: Result<String, String> = async { match action.as_str() {
+            "create" => deploy::create(&config, &app, &label.unwrap_or_default()).await.map(|(entry, token)| {
                 format!(
                     "Token {} for {app} ({}). Shown once:\n\n{token}\n\nUse it as\n\n  tar -czf - -C dist . | curl -f -H 'Authorization: Bearer {token}' -T - '{url}?bundle'",
                     entry.id, entry.label
                 )
             }),
             "list" => {
-                let tokens = deploy::list(&config, &app);
+                let tokens = deploy::list(&config, &app).await;
                 if tokens.is_empty() {
                     return Ok(format!("no deploy tokens for {app}"));
                 }
@@ -838,11 +835,11 @@ impl PageHost {
                     .join("\n"))
             }
             "revoke" => deploy::revoke(&config, &app, &id.unwrap_or_default())
+                .await
                 .map(|()| "revoked; whatever holds it gets 401 from now on".to_string()),
             other => Err(format!("action must be create, list or revoke, not '{other}'")),
-        })
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        } }
+        .await;
         Ok(match outcome {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
@@ -868,8 +865,8 @@ impl PageHost {
         }
         let config = self.config.clone();
         let url = crate::platform::export::export_url(&config, &app);
-        let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
-            "create" => crate::platform::export::create(&config, &app, &label.unwrap_or_default()).map(
+        let outcome: Result<String, String> = async { match action.as_str() {
+            "create" => crate::platform::export::create(&config, &app, &label.unwrap_or_default()).await.map(
                 |(entry, token)| {
                     format!(
                         "Token {} for {app} ({}). Shown once:\n\n{token}\n\nUse it as\n\n  curl -H 'Authorization: Bearer {token}' -o {app}.sqlite {url}\n\nIn the reporting tool: a sqlite connection with URL {url} and that bearer token.",
@@ -878,7 +875,7 @@ impl PageHost {
                 },
             ),
             "list" => {
-                let tokens = crate::platform::export::list(&config, &app);
+                let tokens = crate::platform::export::list(&config, &app).await;
                 if tokens.is_empty() {
                     return Ok(format!("no export tokens for {app}"));
                 }
@@ -900,11 +897,11 @@ impl PageHost {
                     .join("\n"))
             }
             "revoke" => crate::platform::export::revoke(&config, &app, &id.unwrap_or_default())
-                .map(|()| format!("revoked; the tool holding it will get 401 from now on")),
+                .await
+                .map(|()| "revoked; the tool holding it will get 401 from now on".to_string()),
             other => Err(format!("action must be create, list or revoke, not '{other}'")),
-        })
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        } }
+        .await;
 
         Ok(match outcome {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
@@ -931,15 +928,15 @@ impl PageHost {
             )]));
         }
         let config = self.config.clone();
-        let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
-            "create" => devices::create(&config, &app, &label.unwrap_or_default()).map(|(entry, token)| {
+        let outcome: Result<String, String> = async { match action.as_str() {
+            "create" => devices::create(&config, &app, &label.unwrap_or_default()).await.map(|(entry, token)| {
                 format!(
                     "Token {} for {app} ({}). Shown once:\n\n{token}\n\nThe device presents it however the app's protocol says (a first line, a password field); the handler calls auth.check-token(token), which returns \"{}\".",
                     entry.id, entry.label, entry.label
                 )
             }),
             "list" => {
-                let tokens = devices::list(&config, &app);
+                let tokens = devices::list(&config, &app).await;
                 if tokens.is_empty() {
                     return Ok(format!("no device tokens for {app}"));
                 }
@@ -961,11 +958,11 @@ impl PageHost {
                     .join("\n"))
             }
             "revoke" => devices::revoke(&config, &app, &id.unwrap_or_default())
+                .await
                 .map(|()| "revoked; auth.check-token returns nothing for it from now on".to_string()),
             other => Err(format!("action must be create, list or revoke, not '{other}'")),
-        })
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        } }
+        .await;
         Ok(match outcome {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
@@ -1886,24 +1883,23 @@ impl PageHost {
             ))]));
         }
 
-        let config = self.config.clone();
-        let outcome = tokio::task::spawn_blocking(move || match name {
-            Some(name) => crate::platform::secrets::set(&config, &app, &name, value.as_deref())
+        let config = &self.config;
+        let outcome = match name {
+            Some(name) => crate::platform::secrets::set(config, &app, &name, value.as_deref())
+                .await
                 .map(|()| match value {
                     Some(_) => format!("{name} is set for {app}"),
                     None => format!("{name} is gone from {app}"),
                 }),
             None => {
-                let names = crate::platform::secrets::names(&config, &app);
+                let names = crate::platform::secrets::names(config, &app).await;
                 Ok(if names.is_empty() {
                     format!("{app} has no settings")
                 } else {
                     format!("{app}: {}", names.join(", "))
                 })
             }
-        })
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        };
 
         match outcome {
             Ok(message) => Ok(CallToolResult::success(vec![ContentBlock::text(message)])),

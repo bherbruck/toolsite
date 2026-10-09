@@ -9,60 +9,68 @@
 use crate::{
     config::Config,
     content::slug::valid_slug,
+    platform::records,
     seal::{open, seal},
 };
-use std::{collections::BTreeMap, path::PathBuf};
+use std::collections::BTreeMap;
 
-/// Beside the app, like the other sidecars, and refused by the public route.
-fn path(config: &Config, app: &str) -> Option<PathBuf> {
-    valid_slug(app).then(|| config.data_dir.join(format!("{app}.secrets")))
+/// Names to sealed values, as stored; none, logged, when they cannot be
+/// read. Kept in the records store (`<app>.secrets` on files), beside the
+/// app, and refused by the public route.
+async fn read_sealed(config: &Config, app: &str) -> BTreeMap<String, String> {
+    if !valid_slug(app) {
+        return BTreeMap::new();
+    }
+    records::of(config).settings(app).await.unwrap_or_else(|why| {
+        tracing::warn!(app, %why, "settings could not be read");
+        BTreeMap::new()
+    })
 }
 
-/// Names to sealed values, as stored.
-fn read_sealed(config: &Config, app: &str) -> BTreeMap<String, String> {
-    let Some(path) = path(config, app) else {
+fn read_sealed_blocking(config: &Config, app: &str) -> BTreeMap<String, String> {
+    if !valid_slug(app) {
         return BTreeMap::new();
-    };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    }
+    records::of(config).settings_blocking(app).unwrap_or_else(|why| {
+        tracing::warn!(app, %why, "settings could not be read");
+        BTreeMap::new()
+    })
 }
 
 /// Names only. There is deliberately no function returning every value: a
 /// handler asks for one at a time, and nothing else asks at all.
-pub fn names(config: &Config, app: &str) -> Vec<String> {
-    read_sealed(config, app).into_keys().collect()
+pub async fn names(config: &Config, app: &str) -> Vec<String> {
+    read_sealed(config, app).await.into_keys().collect()
 }
 
-pub fn get(config: &Config, app: &str, name: &str) -> Option<String> {
-    open(config, read_sealed(config, app).get(name)?)
+/// `names` for a handler's host call, on a blocking thread.
+pub fn names_blocking(config: &Config, app: &str) -> Vec<String> {
+    read_sealed_blocking(config, app).into_keys().collect()
+}
+
+pub async fn get(config: &Config, app: &str, name: &str) -> Option<String> {
+    open(config, read_sealed(config, app).await.get(name)?)
+}
+
+/// `get` for a handler's host call, on a blocking thread.
+pub fn get_blocking(config: &Config, app: &str, name: &str) -> Option<String> {
+    open(config, read_sealed_blocking(config, app).get(name)?)
 }
 
 /// Setting an existing name replaces it; passing no value removes it.
-pub fn set(config: &Config, app: &str, name: &str, value: Option<&str>) -> Result<(), String> {
-    let path = path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+pub async fn set(config: &Config, app: &str, name: &str, value: Option<&str>) -> Result<(), String> {
+    if !valid_slug(app) {
+        return Err(format!("invalid app name '{app}'"));
+    }
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err("a setting's name must be letters, numbers or '_'".into());
     }
-
-    let mut all = read_sealed(config, app);
-    match value {
-        Some(value) => {
-            all.insert(name.to_string(), seal(config, value)?);
-        }
-        None => {
-            if all.remove(name).is_none() {
-                return Err(format!("{app} has no setting called {name}"));
-            }
-        }
+    let sealed = value.map(|value| seal(config, value)).transpose()?;
+    let had = records::of(config).set_setting(app, name, sealed.as_deref()).await?;
+    if value.is_none() && !had {
+        return Err(format!("{app} has no setting called {name}"));
     }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -75,22 +83,22 @@ mod tests {
         (dir, config)
     }
 
-    #[test]
-    fn a_setting_round_trips_and_can_be_replaced() {
+    #[tokio::test]
+    async fn a_setting_round_trips_and_can_be_replaced() {
         let (_dir, config) = config();
-        set(&config, "app", "API_KEY", Some("first")).unwrap();
-        assert_eq!(get(&config, "app", "API_KEY").as_deref(), Some("first"));
-        set(&config, "app", "API_KEY", Some("second")).unwrap();
-        assert_eq!(get(&config, "app", "API_KEY").as_deref(), Some("second"));
+        set(&config, "app", "API_KEY", Some("first")).await.unwrap();
+        assert_eq!(get(&config, "app", "API_KEY").await.as_deref(), Some("first"));
+        set(&config, "app", "API_KEY", Some("second")).await.unwrap();
+        assert_eq!(get(&config, "app", "API_KEY").await.as_deref(), Some("second"));
     }
 
-    #[test]
-    fn listing_gives_names_and_never_values() {
+    #[tokio::test]
+    async fn listing_gives_names_and_never_values() {
         let (_dir, config) = config();
-        set(&config, "app", "API_KEY", Some("hunter2")).unwrap();
-        set(&config, "app", "ENDPOINT", Some("https://example.com")).unwrap();
+        set(&config, "app", "API_KEY", Some("hunter2")).await.unwrap();
+        set(&config, "app", "ENDPOINT", Some("https://example.com")).await.unwrap();
 
-        let listed = names(&config, "app");
+        let listed = names(&config, "app").await;
         assert_eq!(listed, ["API_KEY", "ENDPOINT"]);
         assert!(
             !format!("{listed:?}").contains("hunter2"),
@@ -98,52 +106,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn one_app_cannot_see_anothers() {
+    #[tokio::test]
+    async fn one_app_cannot_see_anothers() {
         let (_dir, config) = config();
-        set(&config, "mine", "API_KEY", Some("hunter2")).unwrap();
-        assert!(get(&config, "theirs", "API_KEY").is_none());
-        assert!(names(&config, "theirs").is_empty());
+        set(&config, "mine", "API_KEY", Some("hunter2")).await.unwrap();
+        assert!(get(&config, "theirs", "API_KEY").await.is_none());
+        assert!(names(&config, "theirs").await.is_empty());
     }
 
-    #[test]
-    fn removing_says_so_when_there_was_nothing_there() {
+    #[tokio::test]
+    async fn removing_says_so_when_there_was_nothing_there() {
         let (_dir, config) = config();
-        set(&config, "app", "API_KEY", Some("hunter2")).unwrap();
-        set(&config, "app", "API_KEY", None).unwrap();
-        assert!(get(&config, "app", "API_KEY").is_none());
-        assert!(set(&config, "app", "API_KEY", None).is_err());
+        set(&config, "app", "API_KEY", Some("hunter2")).await.unwrap();
+        set(&config, "app", "API_KEY", None).await.unwrap();
+        assert!(get(&config, "app", "API_KEY").await.is_none());
+        assert!(set(&config, "app", "API_KEY", None).await.is_err());
     }
 
-    #[test]
-    fn a_value_is_not_readable_from_the_file_it_is_stored_in() {
+    #[tokio::test]
+    async fn a_value_is_not_readable_from_the_file_it_is_stored_in() {
         let (dir, config) = config();
-        set(&config, "app", "API_KEY", Some("hunter2")).unwrap();
+        set(&config, "app", "API_KEY", Some("hunter2")).await.unwrap();
 
         // Whoever gets hold of the volume gets ciphertext, not keys.
         let stored = std::fs::read_to_string(dir.path().join("app.secrets")).unwrap();
         assert!(stored.contains("API_KEY"), "names are not secret, values are");
         assert!(!stored.contains("hunter2"), "the value was stored in the clear");
-        assert_eq!(get(&config, "app", "API_KEY").as_deref(), Some("hunter2"));
+        assert_eq!(get(&config, "app", "API_KEY").await.as_deref(), Some("hunter2"));
     }
 
-    #[test]
-    fn the_same_value_stored_twice_does_not_look_the_same() {
+    #[tokio::test]
+    async fn the_same_value_stored_twice_does_not_look_the_same() {
         let (dir, config) = config();
-        set(&config, "one", "K", Some("same")).unwrap();
-        set(&config, "two", "K", Some("same")).unwrap();
+        set(&config, "one", "K", Some("same")).await.unwrap();
+        set(&config, "two", "K", Some("same")).await.unwrap();
 
         let first = std::fs::read_to_string(dir.path().join("one.secrets")).unwrap();
         let second = std::fs::read_to_string(dir.path().join("two.secrets")).unwrap();
         assert_ne!(first, second, "identical values produced identical ciphertext");
     }
 
-    #[test]
-    fn a_name_that_could_leave_the_data_directory_is_refused() {
+    #[tokio::test]
+    async fn a_name_that_could_leave_the_data_directory_is_refused() {
         let (_dir, config) = config();
-        assert!(set(&config, "../etc", "API_KEY", Some("x")).is_err());
-        assert!(set(&config, "app", "../../escape", Some("x")).is_err());
-        assert!(set(&config, "app", "has space", Some("x")).is_err());
+        assert!(set(&config, "../etc", "API_KEY", Some("x")).await.is_err());
+        assert!(set(&config, "app", "../../escape", Some("x")).await.is_err());
+        assert!(set(&config, "app", "has space", Some("x")).await.is_err());
     }
 }
 
@@ -201,7 +209,7 @@ pub async fn entry_form(
         )
             .into_response();
     };
-    let existing = names(&state.config, &app);
+    let existing = names(&state.config, &app).await;
 
     let markup = crate::ui::form_page(
         &format!("Settings for {app}"),
@@ -243,28 +251,19 @@ pub async fn entry_submit(
         return (StatusCode::GONE, "This link has expired. Ask for a new link.").into_response();
     };
 
-    let config = state.config.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut saved = 0usize;
-        for (name, value) in parse_pasted(&form.pasted) {
-            set(&config, &app, &name, Some(&value))?;
-            saved += 1;
+    let mut saved = 0usize;
+    for (name, value) in parse_pasted(&form.pasted) {
+        if let Err(message) = set(&state.config, &app, &name, Some(&value)).await {
+            return (StatusCode::BAD_REQUEST, message).into_response();
         }
-        Ok::<_, String>(saved)
-    })
-    .await;
-
-    match outcome {
-        Ok(Ok(0)) => (
-            StatusCode::BAD_REQUEST,
-            "No line has the format NAME=value. Check the format.",
-        )
-            .into_response(),
-        // Back to the form, which now lists the names — and never the values.
-        Ok(Ok(_)) => Redirect::to(&format!("/settings/{}", form.token)).into_response(),
-        Ok(Err(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "The settings were not saved.").into_response(),
+        saved += 1;
     }
+
+    if saved == 0 {
+        return (StatusCode::BAD_REQUEST, "No line has the format NAME=value. Check the format.").into_response();
+    }
+    // Back to the form, which now lists the names — and never the values.
+    Redirect::to(&format!("/settings/{}", form.token)).into_response()
 }
 
 /// `NAME=value` per line, the way a hosting dashboard accepts them. Blank

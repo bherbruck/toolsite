@@ -65,6 +65,26 @@ column oauth.tokens.kind text not null
 column oauth.tokens.resource text
 column oauth.tokens.token_hash text not null
 column oauth.tokens.user_id text not null
+column platform.app_migrations.app text not null
+column platform.app_migrations.files json not null
+column platform.app_migrations.updated_at bigint not null
+column platform.app_settings.app text not null
+column platform.app_settings.name text not null
+column platform.app_settings.sealed text not null
+column platform.app_settings.updated_at bigint not null
+column platform.app_tokens.app text not null
+column platform.app_tokens.created_at bigint not null
+column platform.app_tokens.hash text not null
+column platform.app_tokens.id text not null
+column platform.app_tokens.kind text not null
+column platform.app_tokens.label text not null
+column platform.app_tokens.last_used bigint
+column platform.app_tools.app text not null
+column platform.app_tools.tools json not null
+column platform.app_tools.updated_at bigint not null
+column platform.github_installations.fetched_at bigint not null
+column platform.github_installations.installations json not null
+column platform.github_installations.one boolean not null default true
 column platform.host_labels.app text not null
 column platform.host_labels.issued_at bigint not null
 column platform.host_labels.label text not null
@@ -91,6 +111,14 @@ column platform.removed_pages.meta json not null
 column platform.removed_pages.notes text
 column platform.removed_pages.removed_at bigint not null
 column platform.removed_pages.slug text not null
+column platform.removed_records.app text not null
+column platform.removed_records.id bigint not null default nextval('platform.removed_records_id_seq'::regclass)
+column platform.removed_records.kind text not null
+column platform.removed_records.record json not null
+column platform.removed_records.removed_at bigint not null
+column platform.repo_links.app text not null
+column platform.repo_links.link json not null
+column platform.repo_links.updated_at bigint not null
 column platform.site_flags.at bigint not null
 column platform.site_flags.name text not null
 column platform.site_flags.value text not null
@@ -138,12 +166,21 @@ constraint oauth.codes codes_pkey: PRIMARY KEY (code_hash)
 constraint oauth.tokens tokens_client_id_fkey: FOREIGN KEY (client_id) REFERENCES oauth.clients(id)
 constraint oauth.tokens tokens_kind_check: CHECK ((kind = ANY (ARRAY['access'::text, 'refresh'::text])))
 constraint oauth.tokens tokens_pkey: PRIMARY KEY (token_hash)
+constraint platform.app_migrations app_migrations_pkey: PRIMARY KEY (app)
+constraint platform.app_settings app_settings_pkey: PRIMARY KEY (app, name)
+constraint platform.app_tokens app_tokens_kind_check: CHECK ((kind = ANY (ARRAY['export'::text, 'deploy'::text, 'device'::text])))
+constraint platform.app_tokens app_tokens_pkey: PRIMARY KEY (app, kind, id)
+constraint platform.app_tools app_tools_pkey: PRIMARY KEY (app)
+constraint platform.github_installations github_installations_one_check: CHECK (one)
+constraint platform.github_installations github_installations_pkey: PRIMARY KEY (one)
 constraint platform.host_labels host_labels_pkey: PRIMARY KEY (label)
 constraint platform.pages pages_pkey: PRIMARY KEY (slug)
 constraint platform.projects projects_pkey: PRIMARY KEY (path)
 constraint platform.relocations relocations_one_check: CHECK (one)
 constraint platform.relocations relocations_pkey: PRIMARY KEY (one)
 constraint platform.removed_pages removed_pages_pkey: PRIMARY KEY (id)
+constraint platform.removed_records removed_records_pkey: PRIMARY KEY (id)
+constraint platform.repo_links repo_links_pkey: PRIMARY KEY (app)
 constraint platform.site_flags site_flags_pkey: PRIMARY KEY (name)
 constraint state.migrations migrations_pkey: PRIMARY KEY (store, version)
 constraint state.runners runners_pkey: PRIMARY KEY (id)
@@ -178,11 +215,20 @@ index oauth CREATE UNIQUE INDEX codes_pkey ON oauth.codes USING btree (code_hash
 index oauth CREATE UNIQUE INDEX tokens_pkey ON oauth.tokens USING btree (token_hash)
 index platform CREATE INDEX host_labels_app ON platform.host_labels USING btree (app)
 index platform CREATE INDEX removed_pages_slug ON platform.removed_pages USING btree (slug)
+index platform CREATE INDEX removed_records_app ON platform.removed_records USING btree (app)
+index platform CREATE UNIQUE INDEX app_migrations_pkey ON platform.app_migrations USING btree (app)
+index platform CREATE UNIQUE INDEX app_settings_pkey ON platform.app_settings USING btree (app, name)
+index platform CREATE UNIQUE INDEX app_tokens_hash ON platform.app_tokens USING btree (kind, hash)
+index platform CREATE UNIQUE INDEX app_tokens_pkey ON platform.app_tokens USING btree (app, kind, id)
+index platform CREATE UNIQUE INDEX app_tools_pkey ON platform.app_tools USING btree (app)
+index platform CREATE UNIQUE INDEX github_installations_pkey ON platform.github_installations USING btree (one)
 index platform CREATE UNIQUE INDEX host_labels_pkey ON platform.host_labels USING btree (label)
 index platform CREATE UNIQUE INDEX pages_pkey ON platform.pages USING btree (slug)
 index platform CREATE UNIQUE INDEX projects_pkey ON platform.projects USING btree (path)
 index platform CREATE UNIQUE INDEX relocations_pkey ON platform.relocations USING btree (one)
 index platform CREATE UNIQUE INDEX removed_pages_pkey ON platform.removed_pages USING btree (id)
+index platform CREATE UNIQUE INDEX removed_records_pkey ON platform.removed_records USING btree (id)
+index platform CREATE UNIQUE INDEX repo_links_pkey ON platform.repo_links USING btree (app)
 index platform CREATE UNIQUE INDEX site_flags_pkey ON platform.site_flags USING btree (name)
 index state CREATE INDEX tickets_expires_at ON state.tickets USING btree (expires_at)
 index state CREATE UNIQUE INDEX migrations_pkey ON state.migrations USING btree (store, version)

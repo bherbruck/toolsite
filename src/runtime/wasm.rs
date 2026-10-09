@@ -566,11 +566,11 @@ impl self::toolsite::app::auth::Host for StoreState {
 
 impl self::toolsite::app::secrets::Host for StoreState {
     fn get(&mut self, name: String) -> Option<String> {
-        crate::platform::secrets::get(&self.site, &self.app, &name)
+        crate::platform::secrets::get_blocking(&self.site, &self.app, &name)
     }
 
     fn names(&mut self) -> Vec<String> {
-        crate::platform::secrets::names(&self.site, &self.app)
+        crate::platform::secrets::names_blocking(&self.site, &self.app)
     }
 }
 

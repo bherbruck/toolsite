@@ -41,6 +41,21 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
     }
     let mut moved = Vec::new();
 
+    // An app's records and tokens go first: a removal that fails after
+    // this leaves tokens that open nothing, never tokens that would open
+    // the next app published at this name. On files they are sidecars,
+    // moved below; on Postgres they are rows, written here as the sidecars
+    // they would have been, so the trash reads the same either way.
+    if !slug.contains('/') {
+        let records = crate::platform::records::of(config).retire_blocking(slug, at)?;
+        let tokens = crate::platform::tokens::of(config).retire_blocking(slug, at)?;
+        for (extension, text) in records.into_iter().chain(tokens) {
+            std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
+            std::fs::write(destination.join(format!("slug.{extension}")), text).map_err(|e| e.to_string())?;
+            moved.push(format!("{slug}.{extension} (records)"));
+        }
+    }
+
     let app_dir = config.data_dir.join(slug);
     if app_dir.is_dir() {
         std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;

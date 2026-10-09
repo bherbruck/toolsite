@@ -184,7 +184,7 @@ fn read_site_json<T: serde::de::DeserializeOwned + Default>(path: &Path, what: &
 
 /// Writes `bytes` to a dotted temporary file beside `path` and renames it
 /// into place.
-fn write_aside(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_aside(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("a sidecar has no directory")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let name = path.file_name().and_then(|n| n.to_str()).ok_or("a sidecar has no name")?;

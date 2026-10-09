@@ -202,7 +202,7 @@ async fn gather(config: &Arc<Config>, viewer: Option<&User>) -> Tree {
             Some(user) => admin::held_on(config, user, &app).await,
             None => None,
         };
-        let tools = viewer.is_some() && *slug == app && !crate::platform::app_tools::read(config, &app).is_empty();
+        let tools = viewer.is_some() && *slug == app && !crate::platform::app_tools::read(config, &app).await.is_empty();
         let pinned = tools && pins.contains(&app);
         let (href, connector) = {
             let (config, slug, app) = (config.clone(), slug.clone(), app.clone());

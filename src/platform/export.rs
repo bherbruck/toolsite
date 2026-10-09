@@ -12,161 +12,51 @@
 //! live file: the database runs in WAL mode, so a raw copy mid-write would be
 //! torn, and a reader that saw it would blame its own tooling.
 //!
-//! Tokens live hashed in `<app>.exports` beside the app's other sidecars, so
-//! removing the app takes them along, and a copy of the data directory is
-//! not a set of live credentials.
+//! Tokens live hashed in the `tokens` store (`<app>.exports` on files)
+//! beside the app's other records, so removing the app takes them along,
+//! and a copy of the data directory is not a set of live credentials.
 
 use crate::{
     config::Config,
-    content::slug::{random_token, valid_slug},
+    content::slug::random_token,
+    platform::tokens::{self, Kind},
     runtime::db,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::{
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::PathBuf;
 
-/// Recognisable at a glance in a config field, and in a leak.
-const PREFIX: &str = "tse_";
-const MAX_LABEL: usize = 60;
+pub use crate::platform::tokens::seconds_since;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ExportToken {
-    /// Short, public, names the token in a listing and a revocation.
-    pub id: String,
-    pub label: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub last_used: Option<u64>,
-    pub created_at: u64,
-    /// The token itself, hashed.
-    hash: String,
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-/// For "3 days ago" in a listing.
-pub fn seconds_since(then: u64) -> u64 {
-    now().saturating_sub(then)
-}
-
-fn hash(token: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
-}
+pub type ExportToken = tokens::Token;
 
 /// An app here is a top-level directory with a `data.db`, which is the first
 /// segment of any slug. A nested name would make the sidecar path ambiguous.
 pub fn valid_app(app: &str) -> bool {
-    valid_slug(app) && !app.contains('/')
-}
-
-fn path(config: &Config, app: &str) -> Option<PathBuf> {
-    valid_app(app).then(|| config.data_dir.join(format!("{app}.exports")))
-}
-
-fn read(config: &Config, app: &str) -> Vec<ExportToken> {
-    let Some(path) = path(config, app) else {
-        return Vec::new();
-    };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-fn write(config: &Config, app: &str, tokens: &[ExportToken]) -> Result<(), String> {
-    let path = path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
-    if tokens.is_empty() {
-        match std::fs::remove_file(&path) {
-            Ok(()) | Err(_) => return Ok(()),
-        }
-    }
-    let text = serde_json::to_string_pretty(tokens).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| e.to_string())
+    tokens::valid_app(app)
 }
 
 /// Mints a token for `app`. The plain token is returned exactly once, here;
 /// after this only its hash exists.
-pub fn create(config: &Config, app: &str, label: &str) -> Result<(ExportToken, String), String> {
-    if !valid_app(app) {
-        return Err("app must be one path segment of letters, numbers, '-' or '_'".into());
-    }
-    let label = label.trim();
-    if label.is_empty() || label.chars().count() > MAX_LABEL {
-        return Err(format!("label must be 1 to {MAX_LABEL} characters: say what will hold the token"));
-    }
-    let token = format!("{PREFIX}{}", random_token(40));
-    let entry = ExportToken {
-        id: random_token(8),
-        label: label.to_string(),
-        last_used: None,
-        created_at: now(),
-        hash: hash(&token),
-    };
-    let mut tokens = read(config, app);
-    tokens.push(entry.clone());
-    write(config, app, &tokens)?;
-    Ok((entry, token))
+pub async fn create(config: &Config, app: &str, label: &str) -> Result<(ExportToken, String), String> {
+    tokens::create(config, app, Kind::Export, label, "what will hold the token").await
 }
 
-pub fn list(config: &Config, app: &str) -> Vec<ExportToken> {
-    read(config, app)
+pub async fn list(config: &Config, app: &str) -> Vec<ExportToken> {
+    tokens::list(config, app, Kind::Export).await
 }
 
-/// Every app's tokens, for the admin page. Found by their sidecars, so an app
-/// with none costs nothing to skip.
-pub fn list_all(config: &Config) -> Vec<(String, ExportToken)> {
-    let Ok(entries) = std::fs::read_dir(&config.data_dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(app) = name.strip_suffix(".exports") else {
-            continue;
-        };
-        if !valid_app(app) {
-            continue;
-        }
-        for token in read(config, app) {
-            out.push((app.to_string(), token));
-        }
-    }
-    out.sort_by(|a, b| (&a.0, a.1.created_at).cmp(&(&b.0, b.1.created_at)));
-    out
+/// Every app's tokens, for the admin page.
+pub async fn list_all(config: &Config) -> Vec<(String, ExportToken)> {
+    tokens::list_all(config, Kind::Export).await
 }
 
-pub fn revoke(config: &Config, app: &str, id: &str) -> Result<(), String> {
-    let mut tokens = read(config, app);
-    let before = tokens.len();
-    tokens.retain(|token| token.id != id);
-    if tokens.len() == before {
-        return Err(format!("no export token {id} on {app}"));
-    }
-    write(config, app, &tokens)
+pub async fn revoke(config: &Config, app: &str, id: &str) -> Result<(), String> {
+    tokens::revoke(config, app, Kind::Export, id).await
 }
 
 /// Whether `presented` is a live export token for `app`. Marks it used, so a
 /// listing can say which tokens still earn their keep.
-pub fn authorize(config: &Config, app: &str, presented: &str) -> bool {
-    if !presented.starts_with(PREFIX) {
-        return false;
-    }
-    let wanted = hash(presented);
-    let mut tokens = read(config, app);
-    let Some(token) = tokens.iter_mut().find(|token| token.hash == wanted) else {
-        return false;
-    };
-    token.last_used = Some(now());
-    let _ = write(config, app, &tokens);
-    true
+pub async fn authorize(config: &Config, app: &str, presented: &str) -> bool {
+    tokens::check(config, app, Kind::Export, presented).await.is_some()
 }
 
 /// A consistent copy of the app's database as a file the caller owns and
@@ -219,14 +109,9 @@ pub(crate) async fn download(
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
     }
     let presented = crate::platform::bearer::presented_token(&headers).map(str::to_string);
-    let authorized = {
-        let (config, app) = (config.clone(), app.clone());
-        let presented = presented.clone();
-        tokio::task::spawn_blocking(move || {
-            presented.is_some_and(|token| authorize(&config, &app, &token))
-        })
-        .await
-        .unwrap_or(false)
+    let authorized = match &presented {
+        Some(token) => authorize(&config, &app, token).await,
+        None => false,
     };
     if !authorized {
         // The same wording whether the app, the token or both are wrong, so
@@ -290,44 +175,44 @@ mod tests {
         (dir, config)
     }
 
-    #[test]
-    fn a_token_is_shown_once_and_stored_only_as_a_hash() {
+    #[tokio::test]
+    async fn a_token_is_shown_once_and_stored_only_as_a_hash() {
         let (dir, config) = config();
-        let (entry, token) = create(&config, "sales", "reporting").unwrap();
+        let (entry, token) = create(&config, "sales", "reporting").await.unwrap();
         assert!(token.starts_with("tse_"));
         let stored = std::fs::read_to_string(dir.path().join("sales.exports")).unwrap();
         assert!(!stored.contains(&token), "the plain token is on disk");
         assert!(stored.contains(&entry.id));
-        assert!(authorize(&config, "sales", &token));
-        assert_eq!(list(&config, "sales")[0].label, "reporting");
-        assert!(list(&config, "sales")[0].last_used.is_some(), "use was not recorded");
+        assert!(authorize(&config, "sales", &token).await);
+        assert_eq!(list(&config, "sales").await[0].label, "reporting");
+        assert!(list(&config, "sales").await[0].last_used.is_some(), "use was not recorded");
     }
 
-    #[test]
-    fn a_token_opens_one_app_and_no_other() {
+    #[tokio::test]
+    async fn a_token_opens_one_app_and_no_other() {
         let (_dir, config) = config();
-        let (_, token) = create(&config, "sales", "x").unwrap();
-        assert!(!authorize(&config, "hr", &token));
-        assert!(!authorize(&config, "sales", "publish-token"), "the publish token was accepted");
-        assert!(!authorize(&config, "sales", ""));
-        assert!(!authorize(&config, "../sales", &token));
+        let (_, token) = create(&config, "sales", "x").await.unwrap();
+        assert!(!authorize(&config, "hr", &token).await);
+        assert!(!authorize(&config, "sales", "publish-token").await, "the publish token was accepted");
+        assert!(!authorize(&config, "sales", "").await);
+        assert!(!authorize(&config, "../sales", &token).await);
     }
 
-    #[test]
-    fn revoking_ends_it_and_an_empty_list_leaves_no_file() {
+    #[tokio::test]
+    async fn revoking_ends_it_and_an_empty_list_leaves_no_file() {
         let (dir, config) = config();
-        let (entry, token) = create(&config, "sales", "x").unwrap();
-        revoke(&config, "sales", &entry.id).unwrap();
-        assert!(!authorize(&config, "sales", &token));
+        let (entry, token) = create(&config, "sales", "x").await.unwrap();
+        revoke(&config, "sales", &entry.id).await.unwrap();
+        assert!(!authorize(&config, "sales", &token).await);
         assert!(!dir.path().join("sales.exports").exists());
-        assert!(revoke(&config, "sales", &entry.id).is_err());
+        assert!(revoke(&config, "sales", &entry.id).await.is_err());
     }
 
-    #[test]
-    fn an_app_name_that_could_leave_the_data_directory_is_refused() {
+    #[tokio::test]
+    async fn an_app_name_that_could_leave_the_data_directory_is_refused() {
         let (dir, config) = config();
         for app in ["../x", "a/b", ".site", "", "a b"] {
-            assert!(create(&config, app, "x").is_err(), "{app:?} accepted");
+            assert!(create(&config, app, "x").await.is_err(), "{app:?} accepted");
         }
         assert!(!dir.path().join("x.exports").exists());
     }

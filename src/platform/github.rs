@@ -45,7 +45,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -254,24 +253,20 @@ pub struct Installation {
     pub kind: String,
 }
 
-fn installations_path(config: &Config) -> PathBuf {
-    config.data_dir.join(".site").join("github.json")
-}
-
-pub fn installations(config: &Config) -> Vec<Installation> {
-    std::fs::read_to_string(installations_path(config))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-fn write_installations(config: &Config, list: &[Installation]) -> Result<(), String> {
-    let path = installations_path(config);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+/// The installations GitHub last listed; none, logged, when they cannot be
+/// read. Kept in the records store (`.site/github.json` on files).
+pub async fn installations(config: &Config) -> Vec<Installation> {
+    match crate::platform::records::of(config).installations().await {
+        Ok(text) => text.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default(),
+        Err(why) => {
+            tracing::warn!(%why, "the GitHub installations could not be read");
+            Vec::new()
+        }
     }
-    std::fs::write(&path, serde_json::to_string_pretty(list).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+}
+
+async fn write_installations(config: &Config, list: &[Installation]) -> Result<(), String> {
+    crate::platform::records::of(config).set_installations(&crate::platform::records::pretty(list)?).await
 }
 
 /// Asks GitHub which accounts the App is installed on and remembers them.
@@ -297,12 +292,12 @@ pub async fn refresh_installations(config: &Config) -> Result<Vec<Installation>,
                 .collect()
         })
         .unwrap_or_default();
-    write_installations(config, &list)?;
+    write_installations(config, &list).await?;
     Ok(list)
 }
 
 async fn installation(config: &Config, id: u64) -> Result<Installation, String> {
-    if let Some(found) = installations(config).into_iter().find(|i| i.id == id) {
+    if let Some(found) = installations(config).await.into_iter().find(|i| i.id == id) {
         return Ok(found);
     }
     refresh_installations(config)
@@ -366,48 +361,81 @@ pub fn valid_app(app: &str) -> bool {
     valid_slug(app) && !app.contains('/')
 }
 
-fn link_path(config: &Config, app: &str) -> Option<PathBuf> {
-    valid_app(app).then(|| config.data_dir.join(format!("{app}.repo")))
+fn parse_link(text: &str) -> Option<RepoLink> {
+    serde_json::from_str(text).ok()
 }
 
-fn read_link_raw(config: &Config, app: &str) -> Option<RepoLink> {
-    let path = link_path(config, app)?;
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+/// The app's live link, if it has one. Kept in the records store
+/// (`<app>.repo` on files).
+pub async fn link(config: &Config, app: &str) -> Option<RepoLink> {
+    if !valid_app(app) {
+        return None;
+    }
+    match crate::platform::records::of(config).repo_link(app).await {
+        Ok(text) => text.as_deref().and_then(parse_link).filter(|link| link.disconnected_at.is_none()),
+        Err(why) => {
+            tracing::warn!(app, %why, "a repository link could not be read");
+            None
+        }
+    }
 }
 
-/// The app's live link, if it has one.
-pub fn link(config: &Config, app: &str) -> Option<RepoLink> {
-    read_link_raw(config, app).filter(|link| link.disconnected_at.is_none())
+/// Records a new link for the app, replacing whatever was there.
+async fn write_link(config: &Config, app: &str, link: &RepoLink) -> Result<(), String> {
+    if !valid_app(app) {
+        return Err(format!("invalid app name '{app}'"));
+    }
+    let text = serde_json::to_string_pretty(link).map_err(|e| e.to_string())?;
+    crate::platform::records::of(config).update_repo_link(app, Box::new(move |_| Ok(text))).await?;
+    Ok(())
 }
 
-fn write_link(config: &Config, app: &str, link: &RepoLink) -> Result<(), String> {
-    let path = link_path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
-    std::fs::write(&path, serde_json::to_string_pretty(link).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+/// Changes the app's live link with it held, so two changes at once (a
+/// push and a webhook, say) both land. Answers the link as stored, or an
+/// error when the app has no live link.
+async fn update_link(
+    config: &Config,
+    app: &str,
+    edit: impl FnOnce(&mut RepoLink) + Send,
+) -> Result<RepoLink, String> {
+    if !valid_app(app) {
+        return Err(format!("invalid app name '{app}'"));
+    }
+    let not_connected = format!("{app} is not connected to a repository");
+    let stored = crate::platform::records::of(config)
+        .update_repo_link(
+            app,
+            Box::new(move |current| {
+                let mut link = current
+                    .and_then(parse_link)
+                    .filter(|link| link.disconnected_at.is_none())
+                    .ok_or(not_connected)?;
+                edit(&mut link);
+                serde_json::to_string_pretty(&link).map_err(|e| e.to_string())
+            }),
+        )
+        .await?;
+    parse_link(&stored).ok_or_else(|| "a repository link could not be read back".to_string())
 }
 
 /// Every live link on the site, by app.
-pub fn linked_apps(config: &Config) -> Vec<(String, RepoLink)> {
-    let Ok(entries) = std::fs::read_dir(&config.data_dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(String, RepoLink)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let app = name.strip_suffix(".repo")?.to_string();
-            let link = link(config, &app)?;
-            Some((app, link))
+pub async fn linked_apps(config: &Config) -> Vec<(String, RepoLink)> {
+    let links = crate::platform::records::of(config).repo_links().await.unwrap_or_else(|why| {
+        tracing::warn!(%why, "the repository links could not be listed");
+        Vec::new()
+    });
+    links
+        .into_iter()
+        .filter_map(|(app, text)| {
+            let link = parse_link(&text).filter(|link| link.disconnected_at.is_none())?;
+            valid_app(&app).then_some((app, link))
         })
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+        .collect()
 }
 
-fn link_for_repo(config: &Config, full_name: &str) -> Option<(String, RepoLink)> {
+async fn link_for_repo(config: &Config, full_name: &str) -> Option<(String, RepoLink)> {
     linked_apps(config)
+        .await
         .into_iter()
         .find(|(_, link)| link.full_name().eq_ignore_ascii_case(full_name))
 }
@@ -800,13 +828,13 @@ const DISCOVER_PAGES: usize = 10;
 /// imported until someone says so.
 pub async fn discover(config: &Config) -> Result<Vec<Discovered>, String> {
     let app = app_of(config)?;
-    let linked: Vec<String> = linked_apps(config)
+    let linked: Vec<String> = linked_apps(config).await
         .into_iter()
         .map(|(_, link)| link.full_name().to_lowercase())
         .collect();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for inst in installations(config) {
+    for inst in installations(config).await {
         let token = app.token(inst.id).await?;
         for page in 1..=DISCOVER_PAGES {
             let (status, body) = call(
@@ -885,16 +913,12 @@ fn valid_sha(sha: &str) -> bool {
 
 /// Remembers which commit the live app was published from. Nothing happens
 /// for an app without a live link or for a sha that is not one.
-pub fn record_deployed(config: &Config, app: &str, sha: &str) -> bool {
+pub async fn record_deployed(config: &Config, app: &str, sha: &str) -> bool {
     let sha = sha.trim().to_lowercase();
     if !valid_sha(&sha) {
         return false;
     }
-    let Some(mut link) = link(config, app) else {
-        return false;
-    };
-    link.deployed = Some(Deployed { sha, at: now() });
-    write_link(config, app, &link).is_ok()
+    update_link(config, app, |link| link.deployed = Some(Deployed { sha, at: now() })).await.is_ok()
 }
 
 /// A README for a repository toolsite made, when the project brought none.
@@ -919,7 +943,7 @@ pub async fn create(
     if !valid_app(app_name) {
         return Err("app must be one path segment of letters, numbers, '-' or '_'".into());
     }
-    if let Some(existing) = link(config, app_name) {
+    if let Some(existing) = link(config, app_name).await {
         return Err(format!("{app_name} is already connected to {}; disconnect it first", existing.full_name()));
     }
     // toolsite-<app> by default, so the repositories this site made are
@@ -992,7 +1016,7 @@ pub async fn create(
         deployed: Some(Deployed { sha, at: now() }),
         disconnected_at: None,
     };
-    write_link(config, app_name, &link)?;
+    write_link(config, app_name, &link).await?;
     tracing::info!(app = %app_name, repo = %link.full_name(), "repository created");
     Ok(link)
 }
@@ -1017,7 +1041,7 @@ pub async fn import(
     if !valid_app(app_name) {
         return Err("app must be one path segment of letters, numbers, '-' or '_'".into());
     }
-    if let Some(existing) = link(config, app_name) {
+    if let Some(existing) = link(config, app_name).await {
         return Err(format!("{app_name} is already connected to {}; disconnect it first", existing.full_name()));
     }
     let (owner, name) = full_name
@@ -1054,7 +1078,7 @@ pub async fn import(
     };
     let pulled = pull_into(config, app_name, &repo, &link).await?;
     link.last_push = Some(Push { at: now(), sha: pulled.sha });
-    write_link(config, app_name, &link)?;
+    write_link(config, app_name, &link).await?;
     tracing::info!(app = %app_name, repo = %full, bytes = pulled.bytes, "repository imported and pulled");
     Ok(link)
 }
@@ -1062,11 +1086,11 @@ pub async fn import(
 /// Pulls the linked branch into the app's source archive again.
 pub async fn pull(config: &Config, app_name: &str) -> Result<Pulled, String> {
     let app = app_of(config)?;
-    let mut link = link(config, app_name).ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
+    let link = link(config, app_name).await.ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
     let repo = open_repo(app, link.installation_id, &link.owner, &link.repo).await?;
     let pulled = pull_into(config, app_name, &repo, &link).await?;
-    link.last_push = Some(Push { at: now(), sha: pulled.sha.clone() });
-    write_link(config, app_name, &link)?;
+    let sha = pulled.sha.clone();
+    update_link(config, app_name, |link| link.last_push = Some(Push { at: now(), sha })).await?;
     Ok(pulled)
 }
 
@@ -1147,7 +1171,7 @@ pub async fn push_source(
     message: Option<&str>,
 ) -> Result<SourcePush, String> {
     let app = app_of(config)?;
-    let mut link = link(config, app_name).ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
+    let link = link(config, app_name).await.ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
     let files = crate::content::bundle::read_all_files(archive, MAX_SOURCE_FILES, MAX_SOURCE_BYTES)?;
     if files.is_empty() {
         return Err("the source archive holds no files".into());
@@ -1178,9 +1202,12 @@ pub async fn push_source(
     let message = commit_message(message, &format!("Update {app_name} from toolsite"));
     match repo.commit_tree(&link.branch, &upserts, &deletions, &message).await? {
         Some(sha) => {
-            link.last_push = Some(Push { at: now(), sha: sha.clone() });
-            link.deployed = Some(Deployed { sha: sha.clone(), at: now() });
-            write_link(config, app_name, &link)?;
+            let pushed = sha.clone();
+            update_link(config, app_name, |link| {
+                link.last_push = Some(Push { at: now(), sha: pushed.clone() });
+                link.deployed = Some(Deployed { sha: pushed, at: now() });
+            })
+            .await?;
             tracing::info!(app = %app_name, repo = %link.full_name(), %sha, "source pushed");
             Ok(SourcePush::Pushed(sha))
         }
@@ -1190,13 +1217,11 @@ pub async fn push_source(
 
 /// Forgets the link and revokes any token an older link minted. The
 /// repository stays.
-pub fn disconnect(config: &Config, app_name: &str) -> Result<RepoLink, String> {
-    let mut link = link(config, app_name).ok_or_else(|| format!("{app_name} is not connected to a repository"))?;
+pub async fn disconnect(config: &Config, app_name: &str) -> Result<RepoLink, String> {
+    let link = update_link(config, app_name, |link| link.disconnected_at = Some(now())).await?;
     if !link.token_id.is_empty() {
-        let _ = deploy::revoke(config, app_name, &link.token_id);
+        let _ = deploy::revoke(config, app_name, &link.token_id).await;
     }
-    link.disconnected_at = Some(now());
-    write_link(config, app_name, &link)?;
     tracing::info!(app = %app_name, repo = %link.full_name(), "repository disconnected");
     Ok(link)
 }
@@ -1251,7 +1276,7 @@ fn short(sha: &str) -> &str {
 
 /// The link, the drift and the newest commits, for a tool call.
 pub async fn status_text(config: &Config, app_name: &str) -> String {
-    let Some(link) = link(config, app_name) else {
+    let Some(link) = link(config, app_name).await else {
         return format!("{app_name} is not connected to a repository");
     };
     let mut text = format!("{app_name} is mirrored at {} ({})", link.url(), link.branch);
@@ -1345,16 +1370,12 @@ pub(crate) async fn webhook(State(config): State<Arc<Config>>, headers: HeaderMa
         Err(_) => return (StatusCode::BAD_REQUEST, "not JSON\n").into_response(),
     };
     let full_name = payload["repository"]["full_name"].as_str().unwrap_or("").to_string();
-    let recorded = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || record_event(&config, &event, &full_name, &payload)).await
-    };
-    match recorded {
-        Ok(Some(Recorded::Ours { full_name })) => {
+    match record_event(&config, &event, &full_name, &payload).await {
+        Some(Recorded::Ours { full_name }) => {
             tracing::info!(repo = %full_name, "webhook: our own push, nothing to pull");
             (StatusCode::ACCEPTED, "recorded\n").into_response()
         }
-        Ok(Some(Recorded::Push { app, full_name })) => match pull(&config, &app).await {
+        Some(Recorded::Push { app, full_name }) => match pull(&config, &app).await {
             Ok(pulled) => {
                 tracing::info!(app = %app, repo = %full_name, bytes = pulled.bytes, sha = %pulled.sha, "webhook: branch pulled into the source archive");
                 (StatusCode::ACCEPTED, "recorded and pulled\n").into_response()
@@ -1364,8 +1385,7 @@ pub(crate) async fn webhook(State(config): State<Arc<Config>>, headers: HeaderMa
                 (StatusCode::ACCEPTED, "recorded; pull failed\n").into_response()
             }
         },
-        Ok(None) => (StatusCode::ACCEPTED, "ignored\n").into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not record the event\n").into_response(),
+        None => (StatusCode::ACCEPTED, "ignored\n").into_response(),
     }
 }
 
@@ -1376,11 +1396,11 @@ enum Recorded {
     Push { app: String, full_name: String },
 }
 
-fn record_event(config: &Config, event: &str, full_name: &str, payload: &serde_json::Value) -> Option<Recorded> {
+async fn record_event(config: &Config, event: &str, full_name: &str, payload: &serde_json::Value) -> Option<Recorded> {
     if event != "push" {
         return None;
     }
-    let (app, mut link) = link_for_repo(config, full_name)?;
+    let (app, link) = link_for_repo(config, full_name).await?;
     let reference = payload["ref"].as_str().unwrap_or("");
     if reference != format!("refs/heads/{}", link.branch) {
         return None;
@@ -1392,8 +1412,7 @@ fn record_event(config: &Config, event: &str, full_name: &str, payload: &serde_j
     if link.last_push.as_ref().is_some_and(|p| p.sha == sha) {
         return Some(Recorded::Ours { full_name: full_name.to_string() });
     }
-    link.last_push = Some(Push { at: now(), sha });
-    write_link(config, &app, &link).ok()?;
+    update_link(config, &app, |link| link.last_push = Some(Push { at: now(), sha })).await.ok()?;
     Some(Recorded::Push { app, full_name: full_name.to_string() })
 }
 
@@ -1444,7 +1463,7 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
         .unwrap_or_else(|| config.local_base.clone());
     let body = match config.github.as_ref() {
         None => setup_guide(&base),
-        Some(app) if installations(&config).is_empty() => ui::panel(
+        Some(app) if installations(&config).await.is_empty() => ui::panel(
             "Install the App",
             Some("The App is configured. Install the App on the account or organization that owns the repositories. GitHub returns you to this page."),
             html! {
@@ -1465,8 +1484,8 @@ pub(crate) async fn github_page(State(config): State<Arc<Config>>, headers: Head
             },
         ),
         Some(app) => {
-            let installs = installations(&config);
-            let linked = linked_apps(&config);
+            let installs = installations(&config).await;
+            let linked = linked_apps(&config).await;
             let discovered = discover(&config).await;
             html! {
                 (ui::panel("Installations", Some("The App can create and read repositories in these accounts."), html! {
@@ -1679,10 +1698,10 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
 
 /// The Repo tab on an app's page.
 pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, back: &str, fresh_token: Option<&str>) -> Markup {
-    let link = link(config, app);
-    let installs = installations(config);
+    let link = link(config, app).await;
+    let installs = installations(config).await;
     let has_source = config.data_dir.join(format!("{app}.source")).is_file();
-    let tokens = deploy::list(config, app);
+    let tokens = deploy::list(config, app).await;
     let inspected = match &link {
         Some(link) if config.github.is_some() => Some(inspect(config, link).await),
         _ => None,
@@ -1882,32 +1901,22 @@ pub(crate) async fn repo_action(
         "pull" | "sync" => pull(&config, &app)
             .await
             .map(|pulled| Some(format!("Pulled commit {} into the source archive ({} bytes).", short(&pulled.sha), pulled.bytes))),
-        "disconnect" => {
-            let (config2, app2) = (config.clone(), app.clone());
-            match tokio::task::spawn_blocking(move || disconnect(&config2, &app2)).await {
-                Ok(result) => result.map(|link| Some(format!("Repository {} is disconnected.", link.full_name()))),
-                Err(_) => Err("The repository was not disconnected.".into()),
-            }
-        }
+        "disconnect" => disconnect(&config, &app)
+            .await
+            .map(|link| Some(format!("Repository {} is disconnected.", link.full_name()))),
         "token-create" => {
             let label = form.label.unwrap_or_default();
-            let (config2, app2) = (config.clone(), app.clone());
-            match tokio::task::spawn_blocking(move || deploy::create(&config2, &app2, &label)).await {
-                Ok(Ok((_, token))) => {
+            match deploy::create(&config, &app, &label).await {
+                Ok((_, token)) => {
                     tracing::info!(admin = %admin.email, app = %app, "deploy token created");
                     return admin::app_tab(config, headers, app, "repo".into(), Some(admin::Fresh::DeployToken(token))).await;
                 }
-                Ok(Err(why)) => Err(why),
-                Err(_) => Err("The token was not created.".into()),
+                Err(why) => Err(why),
             }
         }
         "token-revoke" => {
             let id = form.id.unwrap_or_default();
-            let (config2, app2) = (config.clone(), app.clone());
-            match tokio::task::spawn_blocking(move || deploy::revoke(&config2, &app2, &id)).await {
-                Ok(result) => result.map(|()| Some("The token is revoked.".to_string())),
-                Err(_) => Err("The token was not revoked.".into()),
-            }
+            deploy::revoke(&config, &app, &id).await.map(|()| Some("The token is revoked.".to_string()))
         }
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     };
@@ -1946,7 +1955,11 @@ pub(crate) async fn repos_search(
     if q.trim().is_empty() {
         return Json(Vec::<String>::new()).into_response();
     }
-    let installation = match query.installation.or_else(|| installations(&config).first().map(|i| i.id)) {
+    let installation = match query.installation {
+        Some(id) => Some(id),
+        None => installations(&config).await.first().map(|i| i.id),
+    };
+    let installation = match installation {
         Some(id) => id,
         None => return Json(Vec::<String>::new()).into_response(),
     };
@@ -2082,21 +2095,21 @@ mod tests {
         assert!(clean_directory(Some("../x")).is_err());
     }
 
-    #[test]
-    fn a_disconnected_link_is_kept_but_not_live() {
+    #[tokio::test]
+    async fn a_disconnected_link_is_kept_but_not_live() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::local(dir.path().to_path_buf(), "t");
-        let (entry, token) = deploy::create(&config, "shop", "github:o/r").unwrap();
+        let (entry, token) = deploy::create(&config, "shop", "github:o/r").await.unwrap();
         write_link(&config, "shop", &RepoLink {
             owner: "o".into(), repo: "r".into(), branch: "main".into(), directory: String::new(),
             installation_id: 1, token_id: entry.id, connected_at: now(), last_push: None, deployed: None, disconnected_at: None,
-        }).unwrap();
-        assert_eq!(linked_apps(&config).len(), 1);
-        assert_eq!(link_for_repo(&config, "O/R").map(|(app, _)| app), Some("shop".to_string()));
-        disconnect(&config, "shop").unwrap();
-        assert!(link(&config, "shop").is_none());
-        assert!(linked_apps(&config).is_empty());
+        }).await.unwrap();
+        assert_eq!(linked_apps(&config).await.len(), 1);
+        assert_eq!(link_for_repo(&config, "O/R").await.map(|(app, _)| app), Some("shop".to_string()));
+        disconnect(&config, "shop").await.unwrap();
+        assert!(link(&config, "shop").await.is_none());
+        assert!(linked_apps(&config).await.is_empty());
         assert!(dir.path().join("shop.repo").exists(), "the record was destroyed");
-        assert!(!deploy::authorize(&config, "shop", &token), "an older link's token outlived it");
+        assert!(!deploy::authorize(&config, "shop", &token).await, "an older link's token outlived it");
     }
 }

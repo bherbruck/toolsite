@@ -100,7 +100,7 @@ async fn refusals_are_logged_at_warn_without_tokens_or_payload_bytes() {
         PortSocket { protocol: PortProtocol::Udp, port: dgram },
     ];
     toolsite::content::catalog::update_meta_blocking(&config, "broker", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
-    let (_, token) = toolsite::platform::devices::create(&config, "broker", "boiler").unwrap();
+    let (_, token) = toolsite::platform::devices::create(&config, "broker", "boiler").await.unwrap();
 
     // A token accepted, a wrong one refused, a payload echoed.
     let mut device = TcpStream::connect(("127.0.0.1", port)).await.unwrap();

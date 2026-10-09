@@ -16,6 +16,9 @@ use tempfile::TempDir;
 use toolsite::{build_router, platform::github::App, platform::upload::UploadTicket, runtime::wasm::Runtime, Config};
 use tower::ServiceExt;
 
+mod common;
+use common::blocking;
+
 const TOKEN: &str = "publish-token";
 const SITE: &str = "https://site.test";
 const KEY_PEM: &str = include_str!("fixtures/oidc-test-key.pem");
@@ -117,9 +120,38 @@ fn github_server(api: &str) -> (TempDir, Arc<Config>) {
     (dir, config)
 }
 
+/// `github_server` on the backend asked for: on Postgres the links, the
+/// installations and the accounts live in a database of their own, dropped
+/// by `finish`.
+async fn github_server_on(api: &str, postgres: bool) -> (TempDir, Arc<Config>, Option<common::Database>) {
+    if !postgres {
+        let (dir, config) = github_server(api);
+        return (dir, config, None);
+    }
+    let database = common::Database::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new("12345", KEY_PEM, Some("toolsite-app".into()), Some("hook-secret".into()), Some(api.into())).unwrap();
+    let config = Arc::new(Config {
+        base_url: Some(SITE.to_string()),
+        github: Some(app),
+        stores: database.stores(),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    (dir, config, Some(database))
+}
+
+async fn finish(config: Arc<Config>, database: Option<common::Database>) {
+    drop(config);
+    if let Some(database) = database {
+        database.drop().await;
+    }
+}
+
 fn admin(config: &Config) -> String {
-    toolsite::accounts::users::sign_up_as(config, "boss@example.com", "correct horse battery", true).unwrap();
-    toolsite::accounts::users::log_in(config, "boss@example.com", "correct horse battery").unwrap().1
+    blocking(|| {
+        toolsite::accounts::users::sign_up_as(config, "boss@example.com", "correct horse battery", true).unwrap();
+        toolsite::accounts::users::log_in(config, "boss@example.com", "correct horse battery").unwrap().1
+    })
 }
 
 fn visitor(config: &Config) -> String {
@@ -694,7 +726,7 @@ mod fake_github {
 #[tokio::test]
 async fn a_deploy_token_publishes_one_app_and_nothing_else() {
     let (_dir, config) = plain_server();
-    let (_, token) = toolsite::platform::deploy::create(&config, "shop", "ci").unwrap();
+    let (_, token) = toolsite::platform::deploy::create(&config, "shop", "ci").await.unwrap();
     let bundle = tgz(&[("./index.html", b"<title>Shop</title>")]);
 
     let (status, body, _) = send(&config, put_bytes("/deploy/shop?bundle", &token, bundle.clone())).await;
@@ -721,8 +753,8 @@ async fn a_deploy_token_publishes_one_app_and_nothing_else() {
     let (status, ..) = send(&config, put_bytes("/deploy/shop?config", &token, b"x".to_vec())).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     // Revoked is refused.
-    let id = toolsite::platform::deploy::list(&config, "shop")[0].id.clone();
-    toolsite::platform::deploy::revoke(&config, "shop", &id).unwrap();
+    let id = toolsite::platform::deploy::list(&config, "shop").await[0].id.clone();
+    toolsite::platform::deploy::revoke(&config, "shop", &id).await.unwrap();
     let (status, ..) = send(&config, put_bytes("/deploy/shop?bundle", &token, bundle)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     // The sidecar is never served.
@@ -773,9 +805,9 @@ async fn creating_a_repository_pushes_the_source_and_a_readme_in_one_commit() {
         assert!(repo.history[0].1.ends_with("Published from toolsite"));
         repo.head.clone()
     };
-    assert!(toolsite::platform::deploy::list(&config, "shop").is_empty(), "a deploy token was minted for a mirror");
+    assert!(toolsite::platform::deploy::list(&config, "shop").await.is_empty(), "a deploy token was minted for a mirror");
 
-    let link = toolsite::platform::github::link(&config, "shop").expect("no link recorded");
+    let link = toolsite::platform::github::link(&config, "shop").await.expect("no link recorded");
     assert_eq!((link.owner.as_str(), link.repo.as_str(), link.branch.as_str()), ("acme", "shop", "main"));
     assert_eq!(link.deployed.as_ref().map(|d| d.sha.as_str()), Some(head.as_str()), "the live app should be the commit just pushed");
     let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
@@ -813,7 +845,7 @@ async fn an_app_without_stored_source_cannot_become_a_repository() {
     .await;
     assert!(flash(&headers).contains("no stored source"), "{}", flash(&headers));
     assert!(fake.lock().unwrap().repos.is_empty(), "a repository was created with nothing to put in it");
-    assert!(toolsite::platform::github::link(&config, "shop").is_none());
+    assert!(toolsite::platform::github::link(&config, "shop").await.is_none());
 }
 
 #[tokio::test]
@@ -858,7 +890,7 @@ async fn importing_a_repository_pulls_its_branch_into_the_source_archive() {
     }
     let archive = std::fs::read(dir.path().join("dash.source")).expect("the branch was not stored as the source archive");
     assert_eq!(archive_paths(&archive), ["package.json"], "only the project directory, without node_modules");
-    let link = toolsite::platform::github::link(&config, "dash").unwrap();
+    let link = toolsite::platform::github::link(&config, "dash").await.unwrap();
     assert_eq!(link.directory, "web/");
     assert_eq!(link.branch, "main");
     assert!(link.deployed.is_none(), "nothing was published, so nothing is live");
@@ -874,7 +906,7 @@ async fn importing_a_repository_pulls_its_branch_into_the_source_archive() {
     )
     .await;
     assert!(flash(&headers).starts_with("error:"));
-    assert!(toolsite::platform::github::link(&config, "ghost").is_none());
+    assert!(toolsite::platform::github::link(&config, "ghost").await.is_none());
 }
 
 #[tokio::test]
@@ -915,7 +947,7 @@ async fn publishing_source_to_a_linked_app_pushes_one_commit_with_the_publishers
         sha.clone()
     };
     assert_eq!(std::fs::read(dir.path().join("shop.source")).unwrap(), next, "the archive was not stored");
-    let link = toolsite::platform::github::link(&config, "shop").unwrap();
+    let link = toolsite::platform::github::link(&config, "shop").await.unwrap();
     assert_eq!(link.last_push.as_ref().map(|p| p.sha.as_str()), Some(head.as_str()));
     assert_eq!(link.deployed.as_ref().map(|d| d.sha.as_str()), Some(head.as_str()), "what was just published is what is live");
 
@@ -951,7 +983,7 @@ async fn a_source_archive_arriving_by_deploy_token_is_stored_but_never_pushed_ba
     let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
     let token = form_token_from(&page);
     send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
-    let (_, deploy_token) = toolsite::platform::deploy::create(&config, "shop", "ci").unwrap();
+    let (_, deploy_token) = toolsite::platform::deploy::create(&config, "shop", "ci").await.unwrap();
 
     let from_ci = tgz(&[("./package.json", b"{}"), ("./src/ci.js", b"built elsewhere")]);
     let (status, body, _) = send(&config, put_bytes("/deploy/shop?source&commit=0123456789abcdef0123456789abcdef01234567", &deploy_token, from_ci.clone())).await;
@@ -960,12 +992,12 @@ async fn a_source_archive_arriving_by_deploy_token_is_stored_but_never_pushed_ba
     assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1, "the repository must not gain a commit");
     assert_eq!(std::fs::read(dir.path().join("shop.source")).unwrap(), from_ci);
     // The pipeline said which commit it built: that is what is live now.
-    let link = toolsite::platform::github::link(&config, "shop").unwrap();
+    let link = toolsite::platform::github::link(&config, "shop").await.unwrap();
     assert_eq!(link.deployed.as_ref().map(|d| d.sha.as_str()), Some("0123456789abcdef0123456789abcdef01234567"));
     // Something that is not a sha is ignored, not stored.
     let (status, ..) = send(&config, put_bytes("/deploy/shop?bundle&commit=not-a-sha", &deploy_token, tgz(&[("./index.html", b"<title>x</title>")]))).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(toolsite::platform::github::link(&config, "shop").unwrap().deployed.unwrap().sha, "0123456789abcdef0123456789abcdef01234567");
+    assert_eq!(toolsite::platform::github::link(&config, "shop").await.unwrap().deployed.unwrap().sha, "0123456789abcdef0123456789abcdef01234567");
 }
 
 #[tokio::test]
@@ -980,7 +1012,7 @@ async fn a_disconnected_link_does_not_push() {
     let token = form_token_from(&page);
     send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
     send(&config, post_form("/admin/repo", &session, format!("token={token}&action=disconnect&app=shop&back=/admin/apps/shop/repo"))).await;
-    assert!(toolsite::platform::github::link(&config, "shop").is_none());
+    assert!(toolsite::platform::github::link(&config, "shop").await.is_none());
 
     let ticket = upload_ticket(&config, "shop").await;
     let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source"), tgz(&[("./package.json", b"{}"), ("./new.js", b"1")]))).await;
@@ -1015,18 +1047,28 @@ async fn the_repo_tab_says_when_the_repository_is_ahead_of_the_live_app() {
     assert!(status.contains("2 commits ahead"), "{status}");
 
     // A publish that names the head catches up.
-    let (_, deploy_token) = toolsite::platform::deploy::create(&config, "shop", "laptop").unwrap();
+    let (_, deploy_token) = toolsite::platform::deploy::create(&config, "shop", "laptop").await.unwrap();
     let (status, ..) = send(&config, put_bytes(&format!("/deploy/shop?bundle&commit={newest}"), &deploy_token, tgz(&[("./index.html", b"<title>v2</title>")]))).await;
     assert_eq!(status, StatusCode::OK);
     let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
     assert!(page.contains("The live app is the repository's head."), "{page}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_webhook_must_be_signed_and_a_push_from_elsewhere_is_pulled_in() {
+    webhook_pulls(common::wants_postgres()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_webhook_must_be_signed_and_a_push_from_elsewhere_is_pulled_in_on_postgres() {
+    webhook_pulls(true).await;
+}
+
+async fn webhook_pulls(postgres: bool) {
     let (fake, api) = fake_github::start().await;
     fake.lock().unwrap().add_repo("acme", "dashboard", true);
-    let (dir, config) = github_server(&api);
+    let (dir, config, database) = github_server_on(&api, postgres).await;
     let session = admin(&config);
     install(&config, &session).await;
     let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
@@ -1044,13 +1086,13 @@ async fn a_webhook_must_be_signed_and_a_push_from_elsewhere_is_pulled_in() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "a webhook signed with another secret was taken");
     let (status, ..) = send(&config, webhook("push", Some(&sign("hook-secret", b"{}")), &push)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "a signature over a different body was taken");
-    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, first_head);
+    assert_eq!(toolsite::platform::github::link(&config, "dash").await.unwrap().last_push.unwrap().sha, first_head);
     assert_eq!(fake.lock().unwrap().repo("acme/dashboard").tarball_downloads, 1);
 
     let (status, body, _) = send(&config, webhook("push", Some(&sign("hook-secret", push.as_bytes())), &push)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(body.contains("pulled"), "{body}");
-    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, pushed);
+    assert_eq!(toolsite::platform::github::link(&config, "dash").await.unwrap().last_push.unwrap().sha, pushed);
     assert_eq!(fake.lock().unwrap().repo("acme/dashboard").tarball_downloads, 2);
     let archive = std::fs::read(dir.path().join("dash.source")).unwrap();
     assert_eq!(archive_paths(&archive), ["README.md", "app.js"], "the pushed branch is not the source archive");
@@ -1065,20 +1107,34 @@ async fn a_webhook_must_be_signed_and_a_push_from_elsewhere_is_pulled_in() {
     // Another branch is noise.
     let other = r#"{"ref":"refs/heads/feature","after":"ffff","repository":{"full_name":"acme/dashboard"}}"#;
     send(&config, webhook("push", Some(&sign("hook-secret", other.as_bytes())), other)).await;
-    assert_eq!(toolsite::platform::github::link(&config, "dash").unwrap().last_push.unwrap().sha, pushed);
+    assert_eq!(toolsite::platform::github::link(&config, "dash").await.unwrap().last_push.unwrap().sha, pushed);
 
     // A repository nobody linked is acknowledged and ignored.
     let stranger = r#"{"ref":"refs/heads/main","after":"1","repository":{"full_name":"someone/else"}}"#;
     let (status, body, _) = send(&config, webhook("push", Some(&sign("hook-secret", stranger.as_bytes())), stranger)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(body.contains("ignored"));
+    // The link and the installations are where the backend keeps them.
+    assert_eq!(dir.path().join("dash.repo").exists(), database.is_none());
+    assert_eq!(dir.path().join(".site/github.json").exists(), database.is_none());
+    finish(config, database).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pulling_refreshes_the_source_archive_and_disconnecting_leaves_the_repository_alone() {
+    pull_and_disconnect(common::wants_postgres()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn pulling_refreshes_the_source_archive_and_disconnecting_leaves_the_repository_alone_on_postgres() {
+    pull_and_disconnect(true).await;
+}
+
+async fn pull_and_disconnect(postgres: bool) {
     let (fake, api) = fake_github::start().await;
     fake.lock().unwrap().add_repo("acme", "dashboard", true);
-    let (dir, config) = github_server(&api);
+    let (dir, config, database) = github_server_on(&api, postgres).await;
     publish_app(&config, "dash");
     let session = admin(&config);
     install(&config, &session).await;
@@ -1099,10 +1155,11 @@ async fn pulling_refreshes_the_source_archive_and_disconnecting_leaves_the_repos
     let (status, _, headers) = send(&config, post_form("/admin/repo", &session, format!("token={token}&action=disconnect&app=dash&back=/admin/apps/dash/repo"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(flash(&headers).starts_with("ok:"));
-    assert!(toolsite::platform::github::link(&config, "dash").is_none());
+    assert!(toolsite::platform::github::link(&config, "dash").await.is_none());
     assert!(fake.lock().unwrap().repo("acme/dashboard").files.contains_key("index.html"));
     let (_, page, _) = send(&config, get_as("/admin/apps/dash/repo", &session)).await;
     assert!(page.contains("Create a repository"), "the tab should offer to connect again");
+    finish(config, database).await;
 }
 
 #[tokio::test]
@@ -1246,7 +1303,7 @@ async fn tagged_repositories_are_proposed_for_import_and_linked_or_untagged_ones
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(flash(&headers).starts_with("ok:"), "{}", flash(&headers));
-    assert!(toolsite::platform::github::link(&config, "shop").is_some());
+    assert!(toolsite::platform::github::link(&config, "shop").await.is_some());
     assert!(toolsite::platform::github::discover(&config).await.unwrap().is_empty());
     let (_, page, _) = send(&config, get_as("/admin/github", &session)).await;
     assert!(page.contains("No tagged repository is waiting"));

@@ -584,9 +584,9 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
     }
 
     // Tools are declared wholesale too.
-    let current_tools = crate::platform::app_tools::read(config, app);
+    let current_tools = crate::platform::app_tools::read(config, app).await;
     if current_tools != tools {
-        crate::platform::app_tools::write(config, app, &tools)?;
+        crate::platform::app_tools::write(config, app, &tools).await?;
         changed.push(if tools.is_empty() {
             "tools withdrawn".to_string()
         } else {

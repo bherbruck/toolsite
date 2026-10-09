@@ -11,18 +11,15 @@
 
 use crate::{config::Config, content::slug::valid_slug, runtime::db};
 use rusqlite_migration::{Migrations, M};
-use std::path::PathBuf;
-
-/// Kept as a sidecar rather than inside the app directory, so no spelling of
-/// a URL reaches an app's DDL.
-fn path(config: &Config, app: &str) -> Option<PathBuf> {
-    valid_slug(app).then(|| config.data_dir.join(format!("{app}.migrations")))
-}
 
 /// Numbered files, in the order their names sort — `001_initial.sql`,
-/// `002_add_column.sql`.
+/// `002_add_column.sql`. Kept in the records store (a sidecar on files)
+/// rather than inside the app directory, so no spelling of a URL reaches an
+/// app's DDL.
 pub fn store(config: &Config, app: &str, files: Vec<(String, String)>) -> Result<(), String> {
-    let path = path(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
+    if !valid_slug(app) {
+        return Err(format!("invalid app name '{app}'"));
+    }
     let mut files = files;
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -32,21 +29,22 @@ pub fn store(config: &Config, app: &str, files: Vec<(String, String)>) -> Result
             return Err(format!("{name} is empty"));
         }
     }
-    let json = serde_json::to_string_pretty(&files).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    let json = crate::platform::records::pretty(&files)?;
+    crate::platform::records::of(config).set_migrations_blocking(app, &json)
 }
 
+/// The app's ladder; none, logged, when it cannot be read.
 pub fn stored(config: &Config, app: &str) -> Vec<(String, String)> {
-    let Some(path) = path(config, app) else {
+    if !valid_slug(app) {
         return Vec::new();
-    };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    }
+    match crate::platform::records::of(config).migrations_blocking(app) {
+        Ok(text) => text.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default(),
+        Err(why) => {
+            tracing::warn!(app, %why, "an app's migrations could not be read");
+            Vec::new()
+        }
+    }
 }
 
 /// Brings an app's database up to its latest migration, returning the version

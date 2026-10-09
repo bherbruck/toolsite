@@ -36,6 +36,9 @@ pub const LOCK_RELOCATION: i32 = 4;
 /// Host labels: held while a free label is chosen and issued, so two apps
 /// never choose the same one. The primary key refuses it besides.
 pub const LOCK_LABELS: i32 = 5;
+/// One app's records, keyed by `hashtext(app)`: a repository link is read,
+/// changed and written under it, and a removal takes the records under it.
+pub const LOCK_RECORDS: i32 = 6;
 
 /// One store's schema, as the steps that build it. Version `n` is
 /// `steps[n - 1]`; a step never changes once released, the ladder only grows.
@@ -69,6 +72,7 @@ pub const LADDERS: &[Ladder] = &[
         steps: &[
             include_str!("../../migrations/postgres/platform/001_pages.sql"),
             include_str!("../../migrations/postgres/platform/002_projects_labels.sql"),
+            include_str!("../../migrations/postgres/platform/003_records_tokens.sql"),
         ],
     },
 ];
@@ -580,7 +584,7 @@ mod tests {
             scanned.push(name);
         }
         scanned.sort();
-        for expected in ["accounts/store/postgres.rs", "content/catalog/postgres.rs", "platform/oauth_store/postgres.rs", "state/pg.rs", "state/runners.rs", "state/tickets.rs"] {
+        for expected in ["accounts/store/postgres.rs", "content/catalog/postgres.rs", "platform/oauth_store/postgres.rs", "platform/records/postgres.rs", "platform/tokens/postgres.rs", "state/pg.rs", "state/runners.rs", "state/tickets.rs"] {
             assert!(scanned.iter().any(|f| f == expected), "{expected} was not scanned: {scanned:?}");
         }
         assert!(statements > 80, "the scan found only {statements} statements");

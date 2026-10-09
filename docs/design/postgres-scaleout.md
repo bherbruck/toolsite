@@ -196,16 +196,16 @@ Rules behind the choices:
 | `projects.json` | `platform.projects` (one row per project; `renamed_from text[]`) | Row updates under a transaction replace the whole-file rewrite |
 | `relocating.json` | `platform.relocations` (at most one row) | Resumed under an advisory lock, so two runners cannot resume one move. PR 7: the lock is held for a whole move, not only a resume, since two moves at once share the one row; moves in one process also queue in memory before taking a connection, or waiters would hold the whole pool while the mover needs one |
 | `labels.json` | `platform.host_labels (label primary key, app, issued_at)` | Uniqueness by constraint, not by a process mutex |
-| `github.json` | `platform.github_installations` | Small, shared |
+| `github.json` | `platform.github_installations` | Small, shared. PR 8: one row (`one boolean primary key`) holding the list as `json` |
 | `grants-adopted` | `platform.site_flags (name primary key, value, at)` | One-time markers |
 | `.meta` | `platform.pages (slug primary key, meta json, generation bigint, notes, created_at, updated_at)` | One row per page or app. `meta` keeps the `PageMeta` serde shape so the struct does not change. `json`, not `jsonb` (PR 6): `jsonb` refuses `\u0000`, which a meta string may hold, and `json` returns the text exactly as stored |
 | `.notes` | `platform.pages.notes text` | Small text |
 | `.secrets` | `platform.app_settings (app, name, sealed, primary key (app, name))` | Values stay sealed with the site key |
 | `.jobs` | `platform.jobs (app, name, schedule, path, last_* columns)` | Single-row updates; no file lock |
-| `.migrations` | `platform.app_migrations (app primary key, files jsonb)` | Small |
-| `.exports`, `.deploys`, `.devices` | `platform.app_tokens (app, kind, id, label, hash unique, created_at, last_used)` with `kind in ('export','deploy','device')` | One row per token fixes today's lost-update race |
-| `.repo` | `platform.repo_links (app primary key, link jsonb, disconnected_at)` | Small |
-| `.tools` | `platform.app_tools (app primary key, tools jsonb)` | Small |
+| `.migrations` | `platform.app_migrations (app primary key, files jsonb)` | Small. PR 8: `json`, as metas are, for the same reason |
+| `.exports`, `.deploys`, `.devices` | `platform.app_tokens (app, kind, id, label, hash unique, created_at, last_used)` with `kind in ('export','deploy','device')` | One row per token fixes today's lost-update race. PR 8: primary key `(app, kind, id)`, digest unique per kind; a check reads the app's digests of that kind and compares each in constant time. On files each list now changes under a lock and a rename too, so the race is gone there as well. A removal moves an app's tokens and records into `platform.removed_records`, in their sidecar's shape, and the trash writes them as sidecars |
+| `.repo` | `platform.repo_links (app primary key, link jsonb, disconnected_at)` | Small. PR 8: `link json` only; `disconnected_at` stays inside the link, which `github.rs` reads. A change holds `LOCK_RECORDS` for the app |
+| `.tools` | `platform.app_tools (app primary key, tools jsonb)` | Small. PR 8: `json` |
 | `.icon`, `.source`, `.html`, bundle files, `handler.wasm` | Bucket objects under `.toolsite/content/` (section 2.3), with the generation in `platform.pages` | Bytes, possibly large |
 | `<app>/data.db` | Stays on the volume in step 1. Moves to a Postgres schema in step 3 for apps on the `postgres` engine | SQLite needs a local file. See question 1 |
 | Blobs, local backend | Refused: Postgres mode requires the bucket | A volume-local blob store cannot be shared |

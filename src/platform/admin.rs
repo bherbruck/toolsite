@@ -837,7 +837,7 @@ async fn app_tab_with(
         Err(response) => return response,
     };
     let is_admin_here = held_on(&config, &admin, &app).await == Some(Scope::Admin);
-    let tools = crate::platform::app_tools::read(&config, &app);
+    let tools = crate::platform::app_tools::read(&config, &app).await;
     if tab == "tools" && tools.is_empty() {
         return (StatusCode::NOT_FOUND, "this app declares no tools").into_response();
     }
@@ -868,12 +868,7 @@ async fn app_tab_with(
             crate::platform::github::render_repo_tab(&config, &app, &token, &back, fresh_token).await
         }
         "exports" => {
-            let tokens = {
-                let (config, app) = (config.clone(), app.clone());
-                tokio::task::spawn_blocking(move || export::list(&config, &app))
-                    .await
-                    .unwrap_or_default()
-            };
+            let tokens = export::list(&config, &app).await;
             let fresh_token = match &fresh {
                 Some(Fresh::ExportToken(value)) => Some(value.as_str()),
                 _ => None,
@@ -881,12 +876,7 @@ async fn app_tab_with(
             render_exports_tab(&config, &app, &tokens, &token, &back, fresh_token)
         }
         "connections" => {
-            let tokens = {
-                let (config, app) = (config.clone(), app.clone());
-                tokio::task::spawn_blocking(move || crate::platform::devices::list(&config, &app))
-                    .await
-                    .unwrap_or_default()
-            };
+            let tokens = crate::platform::devices::list(&config, &app).await;
             let fresh_token = match &fresh {
                 Some(Fresh::DeviceToken(value)) => Some(value.as_str()),
                 _ => None,
@@ -894,7 +884,7 @@ async fn app_tab_with(
             render_connections_tab(&config, &app, &meta, &tokens, &token, &back, fresh_token)
         }
         "settings" => {
-            let names = crate::platform::secrets::names(&config, &app);
+            let names = crate::platform::secrets::names(&config, &app).await;
             let link = match &fresh {
                 Some(Fresh::SettingsLink(url)) => Some(url.as_str()),
                 _ => None,
@@ -1938,12 +1928,7 @@ pub async fn exports_page(
         Ok(admin) => admin,
         Err(response) => return response,
     };
-    let tokens = {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || export::list_all(&config))
-            .await
-            .unwrap_or_default()
-    };
+    let tokens = export::list_all(&config).await;
     let count = tokens.len();
     let listing = paginate(tokens, &query, |(app, entry)| format!("{app} {} {}", entry.label, entry.id));
     admin_page(
@@ -2510,30 +2495,24 @@ pub async fn change_export(
     match form.action.as_str() {
         "create" => {
             let label = form.label.unwrap_or_default();
-            let (config2, app) = (config.clone(), form.app.clone());
-            let outcome = tokio::task::spawn_blocking(move || export::create(&config2, &app, &label)).await;
-            match outcome {
-                Ok(Ok((_, token))) => {
+            match export::create(&config, &form.app, &label).await {
+                Ok((_, token)) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "export token created");
                     // Rendered, not redirected: the token exists in this
                     // response and nowhere else.
                     app_tab(config, headers, form.app, "exports".into(), Some(Fresh::ExportToken(token))).await
                 }
-                Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "The token was not created."),
+                Err(message) => redirect_flash(&back, false, message),
             }
         }
         "revoke" => {
             let id = form.id.unwrap_or_default();
-            let (config2, app) = (config.clone(), form.app.clone());
-            let outcome = tokio::task::spawn_blocking(move || export::revoke(&config2, &app, &id)).await;
-            match outcome {
-                Ok(Ok(())) => {
+            match export::revoke(&config, &form.app, &id).await {
+                Ok(()) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "export token revoked");
                     redirect_flash(&back, true, "The token is revoked.")
                 }
-                Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "The token was not revoked."),
+                Err(message) => redirect_flash(&back, false, message),
             }
         }
         _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),
@@ -2556,30 +2535,24 @@ pub async fn change_devices(
     match form.action.as_str() {
         "create" => {
             let label = form.label.unwrap_or_default();
-            let (config2, app) = (config.clone(), form.app.clone());
-            let outcome = tokio::task::spawn_blocking(move || crate::platform::devices::create(&config2, &app, &label)).await;
-            match outcome {
-                Ok(Ok((_, token))) => {
+            match crate::platform::devices::create(&config, &form.app, &label).await {
+                Ok((_, token)) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "device token created");
                     // Rendered, not redirected: the token exists in this
                     // response and nowhere else.
                     app_tab(config, headers, form.app, "connections".into(), Some(Fresh::DeviceToken(token))).await
                 }
-                Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "The token was not created."),
+                Err(message) => redirect_flash(&back, false, message),
             }
         }
         "revoke" => {
             let id = form.id.unwrap_or_default();
-            let (config2, app) = (config.clone(), form.app.clone());
-            let outcome = tokio::task::spawn_blocking(move || crate::platform::devices::revoke(&config2, &app, &id)).await;
-            match outcome {
-                Ok(Ok(())) => {
+            match crate::platform::devices::revoke(&config, &form.app, &id).await {
+                Ok(()) => {
                     tracing::info!(admin = %admin.email, app = %form.app, "device token revoked");
                     redirect_flash(&back, true, "The token is revoked.")
                 }
-                Ok(Err(message)) => redirect_flash(&back, false, message),
-                Err(_) => redirect_flash(&back, false, "The token was not revoked."),
+                Err(message) => redirect_flash(&back, false, message),
             }
         }
         _ => (StatusCode::BAD_REQUEST, "unknown action").into_response(),

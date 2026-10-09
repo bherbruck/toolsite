@@ -24,7 +24,7 @@ use crate::{
 };
 use rmcp::model::{CallToolResult, ContentBlock, Icon, MetaObject, Tool, ToolAnnotations};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 /// MCP limits a tool name to 64 characters of letters, digits, `_` and `-`.
 pub const MAX_TOOL_NAME: usize = 64;
@@ -73,33 +73,29 @@ impl AppTool {
     }
 }
 
-fn path(config: &Config, app: &str) -> PathBuf {
-    config.data_dir.join(format!("{app}.tools"))
-}
-
-/// The tools an app declares. Nothing when it declares none.
-pub fn read(config: &Config, app: &str) -> Vec<AppTool> {
+/// The tools an app declares. Nothing when it declares none, or when they
+/// cannot be read (logged): an app's tools are offered, never required.
+pub async fn read(config: &Config, app: &str) -> Vec<AppTool> {
     if !crate::platform::export::valid_app(app) {
         return Vec::new();
     }
-    std::fs::read_to_string(path(config, app))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    match crate::platform::records::of(config).tools(app).await {
+        Ok(Some(text)) => serde_json::from_str(&text).unwrap_or_default(),
+        Ok(None) => Vec::new(),
+        Err(why) => {
+            tracing::warn!(app, %why, "an app's tools could not be read");
+            Vec::new()
+        }
+    }
 }
 
-/// Replaces an app's tools wholesale. An empty list removes the sidecar.
-pub fn write(config: &Config, app: &str, tools: &[AppTool]) -> Result<(), String> {
+/// Replaces an app's tools wholesale. An empty list removes them.
+pub async fn write(config: &Config, app: &str, tools: &[AppTool]) -> Result<(), String> {
     if !crate::platform::export::valid_app(app) {
         return Err("invalid app name".into());
     }
-    let file = path(config, app);
-    if tools.is_empty() {
-        let _ = std::fs::remove_file(&file);
-        return Ok(());
-    }
-    let text = serde_json::to_string_pretty(tools).map_err(|e| e.to_string())?;
-    std::fs::write(file, text).map_err(|e| e.to_string())
+    let text = if tools.is_empty() { None } else { Some(crate::platform::records::pretty(tools)?) };
+    crate::platform::records::of(config).set_tools(app, text.as_deref()).await
 }
 
 /// `<app>__<tool>`: the name a main connector lists an app's tool under.
@@ -283,7 +279,7 @@ pub async fn reachable(config: &Arc<Config>, app: &str, user: Option<&User>) -> 
         return Vec::new();
     }
     let mut out = Vec::new();
-    for tool in read(config, app) {
+    for tool in read(config, app).await {
         if may_reach(config, app, &tool, user).await {
             out.push(tool);
         }
@@ -291,22 +287,12 @@ pub async fn reachable(config: &Arc<Config>, app: &str, user: Option<&User>) -> 
     out
 }
 
-/// Every app that declares tools, found by its sidecar.
+/// Every app that declares tools.
 pub async fn apps_with_tools(config: &Config) -> Vec<String> {
-    let Ok(mut entries) = tokio::fs::read_dir(&config.data_dir).await else {
-        return Vec::new();
-    };
-    let mut apps = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(app) = name.strip_suffix(".tools")
-            && crate::platform::export::valid_app(app)
-        {
-            apps.push(app.to_string());
-        }
-    }
-    apps.sort();
-    apps
+    crate::platform::records::of(config).apps_with_tools().await.unwrap_or_else(|why| {
+        tracing::warn!(%why, "the apps with tools could not be listed");
+        Vec::new()
+    })
 }
 
 /// The typed tools a main connector lists for this caller: the tools of

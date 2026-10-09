@@ -1106,7 +1106,7 @@ async fn two_apps_tools_can_never_share_one_typed_name() {
         let error = toolsite::platform::manifest::apply(&w.config, "x", &one_tool(name, "/api/tool", "")).await.unwrap_err();
         assert!(error.contains("starts with a letter"), "{name:?}: {error}");
     }
-    assert!(toolsite::platform::app_tools::read(&w.config, "x").is_empty());
+    assert!(toolsite::platform::app_tools::read(&w.config, "x").await.is_empty());
     // And none of the platform's own names can be made: they hold no `__`.
     offer_tools(&w.config, "x", &one_tool("call_app_tool", "/api/tool", "")).await;
     let names = listed(&w.config, "/mcp", TOKEN).await;
@@ -1139,7 +1139,7 @@ async fn a_tool_path_cannot_leave_the_handlers_api_by_any_spelling() {
         let error = toolsite::platform::manifest::apply(&w.config, "yard", &one_tool("t", path, "")).await.unwrap_err();
         assert!(error.contains("under /api/"), "{path:?}: {error}");
     }
-    assert!(toolsite::platform::app_tools::read(&w.config, "yard").is_empty());
+    assert!(toolsite::platform::app_tools::read(&w.config, "yard").await.is_empty());
 }
 
 #[tokio::test]
@@ -1179,7 +1179,7 @@ async fn a_tool_declaration_cannot_flood_the_model_or_the_server() {
         let deep = format!("x = {}1{}", open.repeat(100_000), close.repeat(100_000));
         assert!(toolsite::platform::manifest::apply(&w.config, "yard", &deep).await.is_err());
     }
-    assert!(toolsite::platform::app_tools::read(&w.config, "yard").is_empty());
+    assert!(toolsite::platform::app_tools::read(&w.config, "yard").await.is_empty());
 }
 
 #[tokio::test]
@@ -1506,7 +1506,7 @@ async fn the_tools_sidecar_never_leaves_through_a_download_pull_or_export() {
 #[tokio::test]
 async fn only_a_manager_of_the_app_mints_lists_or_revokes_its_device_tokens_over_mcp_or_the_form() {
     let w = world().await;
-    let (entry, token) = toolsite::platform::devices::create(&w.config, "yard", "boiler").unwrap();
+    let (entry, token) = toolsite::platform::devices::create(&w.config, "yard", "boiler").await.unwrap();
 
     // A viewer, or an account with nothing, never reaches the tools at all.
     for who in ["fin@x.test", "nobody@x.test"] {
@@ -1551,7 +1551,7 @@ async fn only_a_manager_of_the_app_mints_lists_or_revokes_its_device_tokens_over
     }
     let (status, page, _) = send(&w.config, get_as("/admin/apps/yard/connections", &ed)).await;
     assert!(!page.contains("boiler"), "an editor saw the device tokens ({status})");
-    let tokens = toolsite::platform::devices::list(&w.config, "yard");
+    let tokens = toolsite::platform::devices::list(&w.config, "yard").await;
     assert_eq!(tokens.len(), 1, "a token was minted");
     assert_eq!(toolsite::platform::devices::check(&w.config, "yard", &token).as_deref(), Some("boiler"));
 
@@ -1571,7 +1571,7 @@ async fn only_a_manager_of_the_app_mints_lists_or_revokes_its_device_tokens_over
 #[tokio::test]
 async fn the_devices_sidecar_never_leaves_through_a_url_a_pull_or_an_export() {
     let w = world().await;
-    let (_, token) = toolsite::platform::devices::create(&w.config, "yard", "boiler").unwrap();
+    let (_, token) = toolsite::platform::devices::create(&w.config, "yard", "boiler").await.unwrap();
     let mut meta = toolsite::content::catalog::meta(&w.config, "yard").await;
     meta.gate = Some("public".to_string());
     toolsite::content::catalog::update_meta(&w.config, "yard", { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).await.unwrap();

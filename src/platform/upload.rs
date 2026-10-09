@@ -326,7 +326,7 @@ pub(crate) async fn store_for_slug(
     // compares it with the branch head. Nothing else depends on it.
     if let Some(sha) = &meta.commit {
         let app = slug.split('/').next().unwrap_or(&slug).to_string();
-        if !crate::platform::github::record_deployed(config, &app, sha) {
+        if !crate::platform::github::record_deployed(config, &app, sha).await {
             tracing::info!(app = %app, "commit named on upload was not recorded: no live link, or not a sha");
         }
     }
@@ -411,7 +411,7 @@ pub(crate) async fn store_for_slug(
                     format!("{app}: applied {}\n", changed.join(", "))
                 };
                 // Where people connect to what was just declared.
-                if !crate::platform::app_tools::read(config, &app).is_empty() {
+                if !crate::platform::app_tools::read(config, &app).await.is_empty() {
                     reply.push_str(&format!(
                         "Tools are live at {}. Add it as a connector in Claude or ChatGPT; people sign in with their toolsite account.\n",
                         crate::platform::app_tools::connector_url(config, &app)
@@ -448,7 +448,7 @@ pub(crate) async fn store_for_slug(
         );
         // A linked repository gets the same archive as a commit. Reported,
         // never fatal: the upload itself has already succeeded.
-        if meta.push && let Some(link) = crate::platform::github::link(config, &app) {
+        if meta.push && let Some(link) = crate::platform::github::link(config, &app).await {
             match crate::platform::github::push_source(config, &app, &body, meta.message.as_deref()).await {
                 Ok(crate::platform::github::SourcePush::Pushed(sha)) => {
                     text.push_str(&format!("pushed to {}@{} as {}\n", link.full_name(), link.branch, &sha[..sha.len().min(7)]));

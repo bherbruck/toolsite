@@ -1640,7 +1640,7 @@ async fn an_owner_pastes_settings_through_a_link_the_agent_never_reads() {
     assert_eq!(status, StatusCode::SEE_OTHER);
 
     // Names come back; values never do.
-    let listed = toolsite::platform::secrets::names(&config, "scraper");
+    let listed = toolsite::platform::secrets::names(&config, "scraper").await;
     assert_eq!(listed, ["API_KEY", "ENDPOINT"]);
     let (_, form, _) = send(&config, get(&format!("/settings/{token}"))).await;
     assert!(form.contains("API_KEY"), "the form should say what is set");
@@ -1648,7 +1648,7 @@ async fn an_owner_pastes_settings_through_a_link_the_agent_never_reads() {
 
     // Only the app's own code can read one.
     assert_eq!(
-        toolsite::platform::secrets::get(&config, "scraper", "API_KEY").as_deref(),
+        toolsite::platform::secrets::get(&config, "scraper", "API_KEY").await.as_deref(),
         Some("hunter2")
     );
 }
@@ -1678,7 +1678,7 @@ async fn a_settings_link_is_scoped_and_expires() {
 async fn settings_are_absent_from_everything_a_visitor_or_agent_can_fetch() {
     let (_dir, config) = server();
     write_page(&config, "scraper/index", "<!doctype html><title>Scraper</title>");
-    toolsite::platform::secrets::set(&config, "scraper", "API_KEY", Some("hunter2")).unwrap();
+    toolsite::platform::secrets::set(&config, "scraper", "API_KEY", Some("hunter2")).await.unwrap();
 
     // Not under /p/, by any spelling.
     for path in ["/p/scraper.secrets", "/p/scraper/secrets", "/p/scraper/.secrets"] {
@@ -2610,7 +2610,7 @@ fn seed_db(config: &Config, app: &str) {
 async fn an_export_token_downloads_a_working_copy_of_that_apps_database() {
     let (dir, config) = server();
     seed_db(&config, "sales");
-    let (_, token) = toolsite::platform::export::create(&config, "sales", "reporting").unwrap();
+    let (_, token) = toolsite::platform::export::create(&config, "sales", "reporting").await.unwrap();
 
     let (status, body, headers) = send_bytes_with_headers(&config, bearer_get("/export/sales.sqlite", &token)).await;
     assert_eq!(status, StatusCode::OK);
@@ -2651,7 +2651,7 @@ async fn an_export_token_opens_one_app_and_the_publish_token_opens_none() {
     let (_dir, config) = server();
     seed_db(&config, "sales");
     seed_db(&config, "hr");
-    let (_, token) = toolsite::platform::export::create(&config, "sales", "x").unwrap();
+    let (_, token) = toolsite::platform::export::create(&config, "sales", "x").await.unwrap();
 
     let (status, ..) = send(&config, bearer_get("/export/hr.sqlite", &token)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "sales's token read hr");
@@ -2670,10 +2670,10 @@ async fn an_export_token_opens_one_app_and_the_publish_token_opens_none() {
 async fn a_revoked_export_token_stops_working_at_once() {
     let (_dir, config) = server();
     seed_db(&config, "sales");
-    let (entry, token) = toolsite::platform::export::create(&config, "sales", "x").unwrap();
+    let (entry, token) = toolsite::platform::export::create(&config, "sales", "x").await.unwrap();
     let (status, ..) = send(&config, bearer_get("/export/sales.sqlite", &token)).await;
     assert_eq!(status, StatusCode::OK);
-    toolsite::platform::export::revoke(&config, "sales", &entry.id).unwrap();
+    toolsite::platform::export::revoke(&config, "sales", &entry.id).await.unwrap();
     let (status, ..) = send(&config, bearer_get("/export/sales.sqlite", &token)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
@@ -2682,7 +2682,7 @@ async fn a_revoked_export_token_stops_working_at_once() {
 async fn the_token_file_is_never_served_and_the_platform_db_is_never_exported() {
     let (_dir, config) = server();
     account(&config, "someone@example.com", "correct horse");
-    let (_, token) = toolsite::platform::export::create(&config, "sales", "x").unwrap();
+    let (_, token) = toolsite::platform::export::create(&config, "sales", "x").await.unwrap();
 
     let (status, ..) = send(&config, get("/p/sales.exports")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2734,7 +2734,7 @@ async fn an_admin_mints_a_token_on_the_exports_page_and_sees_it_once() {
     let (_, page, _) = send(&config, get_as("/admin/exports", &session)).await;
     assert!(page.contains("reporting"));
     assert!(!page.contains(&token), "the token is shown again on a later visit");
-    let id = toolsite::platform::export::list(&config, "sales")[0].id.clone();
+    let id = toolsite::platform::export::list(&config, "sales").await[0].id.clone();
     let body = format!("token={form_token}&action=revoke&app=sales&id={id}");
     let (status, ..) = send(&config, form_post("/admin/exports", &body, Some(&session))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -2800,7 +2800,7 @@ async fn an_admin_mints_a_device_token_on_the_connections_tab_and_sees_it_once()
     let (_, page, _) = send(&config, get_as("/admin/apps/broker/connections", &session)).await;
     assert!(page.contains("boiler"));
     assert!(!page.contains(&token), "the token is shown again on a later visit");
-    let id = toolsite::platform::devices::list(&config, "broker")[0].id.clone();
+    let id = toolsite::platform::devices::list(&config, "broker").await[0].id.clone();
     let body = format!("token={form_token}&action=revoke&app=broker&id={id}");
     let (status, ..) = send(&config, form_post("/admin/devices", &body, Some(&session))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -2814,7 +2814,7 @@ async fn an_admin_mints_a_device_token_on_the_connections_tab_and_sees_it_once()
     let body = format!("token={form_token}&action=create&app=broker&label=intruder");
     let (status, ..) = send(&config, form_post("/admin/devices", &body, Some(&reader))).await;
     assert_ne!(status, StatusCode::OK);
-    assert!(toolsite::platform::devices::list(&config, "broker").is_empty());
+    assert!(toolsite::platform::devices::list(&config, "broker").await.is_empty());
 }
 
 // --- signing in through a provider ----------------------------------------
@@ -7013,7 +7013,7 @@ async fn a_schema_can_come_from_the_stored_source() {
     std::fs::write(config.data_dir.join("farm.source"), &archive).unwrap();
     let manifest = "[[tool]]\nname = \"count\"\ndescription = \"x\"\npath = \"/api/tool\"\ninput = \"tools/count.json\"\n";
     toolsite::platform::manifest::apply(&config, "farm", manifest).await.unwrap();
-    let tools = toolsite::platform::app_tools::read(&config, "farm");
+    let tools = toolsite::platform::app_tools::read(&config, "farm").await;
     assert_eq!(tools.len(), 1, "the declaration replaced the old tools wholesale");
     assert_eq!(tools[0].input["properties"]["house"]["type"], "string");
 }

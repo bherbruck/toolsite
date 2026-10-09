@@ -324,7 +324,7 @@ async fn a_resident_instance_reads_its_own_app_s_secrets_only() {
     let site = site().await;
     resident(&site.config, "keeper");
     resident(&site.config, "snoop");
-    toolsite::platform::secrets::set(&site.config, "keeper", "API_KEY", Some("hunter2")).unwrap();
+    toolsite::platform::secrets::set(&site.config, "keeper", "API_KEY", Some("hunter2")).await.unwrap();
     let mut keeper = open(&site, "keeper").await;
     let mut snoop = open(&site, "snoop").await;
     assert_eq!(ask(&mut keeper, "secret").await.as_deref(), Some("secret:true"));

@@ -935,9 +935,9 @@ async fn a_device_token_lets_a_device_in_and_a_revoked_or_another_apps_token_doe
     let port = free_tcp_port();
     let site = site_with_ports(connections::Limits::default(), &format!("{port}=broker")).await;
     app_on(&site.config, "broker", &[tcp(port)]);
-    let (entry, token) = toolsite::platform::devices::create(&site.config, "broker", "boiler").unwrap();
-    let (_, elsewhere) = toolsite::platform::devices::create(&site.config, "syslog", "boiler").unwrap();
-    let (_, export) = toolsite::platform::export::create(&site.config, "broker", "reporting").unwrap();
+    let (entry, token) = toolsite::platform::devices::create(&site.config, "broker", "boiler").await.unwrap();
+    let (_, elsewhere) = toolsite::platform::devices::create(&site.config, "syslog", "boiler").await.unwrap();
+    let (_, export) = toolsite::platform::export::create(&site.config, "broker", "reporting").await.unwrap();
 
     let (mut device, _) = Device::open(port).await;
     device.say(&format!("token {token}\n")).await;
@@ -950,7 +950,7 @@ async fn a_device_token_lets_a_device_in_and_a_revoked_or_another_apps_token_doe
         assert!(device.ends().await);
     }
 
-    toolsite::platform::devices::revoke(&site.config, "broker", &entry.id).unwrap();
+    toolsite::platform::devices::revoke(&site.config, "broker", &entry.id).await.unwrap();
     let (mut device, _) = Device::open(port).await;
     device.say(&format!("token {token}\n")).await;
     assert_eq!(device.line().await.as_deref(), Some("denied"), "a revoked token let a device in");
@@ -1112,7 +1112,7 @@ async fn a_hidden_apps_udp_port_takes_nothing() {
 async fn the_device_tokens_sidecar_is_never_served_and_goes_to_the_trash_with_the_app() {
     let site = site(connections::Limits::default()).await;
     app(&site.config, "broker");
-    toolsite::platform::devices::create(&site.config, "broker", "boiler").unwrap();
+    toolsite::platform::devices::create(&site.config, "broker", "boiler").await.unwrap();
     assert!(site.config.data_dir.join("broker.devices").is_file());
     for path in ["/p/broker.devices", "/p/broker/../broker.devices"] {
         let status = reqwest::get(format!("http://{}{path}", site.addr)).await.unwrap().status().as_u16();

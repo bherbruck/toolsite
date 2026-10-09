@@ -226,7 +226,7 @@ async fn a_port_reaches_nothing_for_an_app_that_is_hidden_removed_or_does_not_de
     // Removed: not, and a device token of the removed app is no token for
     // whatever is published at its name next.
     edit_meta(&site.config, "broker", |meta| meta.hidden = false);
-    let (_, token) = toolsite::platform::devices::create(&site.config, "broker", "boiler").unwrap();
+    let (_, token) = toolsite::platform::devices::create(&site.config, "broker", "boiler").await.unwrap();
     toolsite::platform::trash::remove(&site.config, "broker", 1).unwrap();
     assert!(turned_away(port).await, "a removed app took a connection");
     let late = udp_device(dgram).await;
@@ -552,8 +552,8 @@ async fn a_device_presenting_any_token_but_its_own_apps_live_one_is_denied() {
     let port = free_tcp_port();
     let site = site(roomy(), &format!("{port}=broker")).await;
     app_on(&site.config, "broker", &[tcp(port)]);
-    let (_, real) = toolsite::platform::devices::create(&site.config, "broker", "boiler").unwrap();
-    let (_, other) = toolsite::platform::devices::create(&site.config, "syslog", "boiler").unwrap();
+    let (_, real) = toolsite::platform::devices::create(&site.config, "broker", "boiler").await.unwrap();
+    let (_, other) = toolsite::platform::devices::create(&site.config, "syslog", "boiler").await.unwrap();
     let near_miss = format!("{}{}", &real[..real.len() - 1], if real.ends_with('a') { 'b' } else { 'a' });
     let long = format!("tsv_{}", "a".repeat(3_000));
     let wrong = [other, near_miss, long, "tsv_".to_string(), real.to_uppercase(), format!("{real}x")];

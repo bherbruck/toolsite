@@ -525,7 +525,7 @@ async fn kitchen_sink_says_whether_a_setting_is_set_and_never_what_it_is() {
     let (_, before) = call(&config, &s.alice_app, "GET", "/p/kitchen-sink/api/settings", serde_json::Value::Null).await;
     assert_eq!(before["greeting_set"], false, "{before}");
 
-    toolsite::platform::secrets::set(&config, "kitchen-sink", "GREETING", Some("s3cret-hello-value")).unwrap();
+    toolsite::platform::secrets::set(&config, "kitchen-sink", "GREETING", Some("s3cret-hello-value")).await.unwrap();
     let (_, after) = call(&config, &s.alice_app, "GET", "/p/kitchen-sink/api/settings", serde_json::Value::Null).await;
     assert_eq!(after["greeting_set"], true, "{after}");
     assert_eq!(after["names"], serde_json::json!(["GREETING"]));
@@ -1006,7 +1006,7 @@ async fn mqtt_broker() -> Mqtt {
     publish_with(&config, "mqtt-broker", &manifest.replace("port = 1883", &format!("port = {port}"))).await;
     let addr = listen(&config).await;
     toolsite::platform::ports::listen(config.clone(), Runtime::new().unwrap()).await.unwrap();
-    let (_, token) = toolsite::platform::devices::create(&config, "mqtt-broker", "sensor-1").unwrap();
+    let (_, token) = toolsite::platform::devices::create(&config, "mqtt-broker", "sensor-1").await.unwrap();
     // The first connection starts the resident instance, which compiles
     // the handler. Done here, unhurried, so the tests' own timings measure
     // the broker and not a busy machine compiling seven handlers at once.
@@ -1182,12 +1182,12 @@ async fn mqtt_broker_lets_a_device_in_by_its_token_and_refuses_any_other_with_th
     // app: each is turned away with a CONNACK saying why.
     assert_eq!(refusal(device(broker.port, "bad", Some("tsv_not-a-token"), true).await), ConnectReturnCode::BadUserNamePassword);
     assert_eq!(refusal(device(broker.port, "none", None, true).await), ConnectReturnCode::NotAuthorized);
-    let (_, theirs) = toolsite::platform::devices::create(&broker.config, "live-board", "theirs").unwrap();
+    let (_, theirs) = toolsite::platform::devices::create(&broker.config, "live-board", "theirs").await.unwrap();
     assert_eq!(refusal(device(broker.port, "theirs", Some(&theirs), true).await), ConnectReturnCode::BadUserNamePassword);
 
     // A revoked token stops working at once.
-    let (minted, revoked) = toolsite::platform::devices::create(&broker.config, "mqtt-broker", "old").unwrap();
-    toolsite::platform::devices::revoke(&broker.config, "mqtt-broker", &minted.id).unwrap();
+    let (minted, revoked) = toolsite::platform::devices::create(&broker.config, "mqtt-broker", "old").await.unwrap();
+    toolsite::platform::devices::revoke(&broker.config, "mqtt-broker", &minted.id).await.unwrap();
     assert_eq!(refusal(device(broker.port, "old", Some(&revoked), true).await), ConnectReturnCode::BadUserNamePassword);
 }
 
@@ -1434,10 +1434,10 @@ async fn mqtt_broker_speaks_mqtt_5_to_a_v5_client_on_the_same_port() {
 #[tokio::test]
 async fn mqtt_broker_takes_a_device_off_once_its_token_is_revoked() {
     let broker = mqtt_broker().await;
-    let (minted, token) = toolsite::platform::devices::create(&broker.config, "mqtt-broker", "pump-7").unwrap();
+    let (minted, token) = toolsite::platform::devices::create(&broker.config, "mqtt-broker", "pump-7").await.unwrap();
     let mut stream = raw_device(broker.port, "pump-7", &token, 60, None).await;
     let mut kept = raw_device(broker.port, "sensor-1", &broker.token, 60, None).await;
-    toolsite::platform::devices::revoke(&broker.config, "mqtt-broker", &minted.id).unwrap();
+    toolsite::platform::devices::revoke(&broker.config, "mqtt-broker", &minted.id).await.unwrap();
     // Tokens are checked again every 10 seconds.
     assert!(closed_within(&mut stream, Duration::from_secs(13)).await, "a revoked device stayed connected");
     assert!(!closed_within(&mut kept, Duration::from_millis(200)).await, "a device with a live token was closed too");
@@ -1505,7 +1505,7 @@ impl Talker {
 
     /// Connected and signed in with a device token of `label`.
     async fn signed_in(chat: &Chat, label: &str) -> Talker {
-        let (_, token) = toolsite::platform::devices::create(&chat.config, "tcp-chat", label).unwrap();
+        let (_, token) = toolsite::platform::devices::create(&chat.config, "tcp-chat", label).await.unwrap();
         let mut talker = Talker::connect(chat.port).await;
         talker.write(format!("token {token}\n").as_bytes()).await;
         assert!(talker.until("Welcome, ").await.contains(label));
@@ -1620,7 +1620,7 @@ async fn tcp_chat_closes_a_client_without_a_valid_token() {
     let mut bo = Talker::signed_in(&chat, "bo").await;
     // Another app's token is not this app's.
     publish(&chat.config, "live-board").await;
-    let (_, foreign) = toolsite::platform::devices::create(&chat.config, "live-board", "eve").unwrap();
+    let (_, foreign) = toolsite::platform::devices::create(&chat.config, "live-board", "eve").await.unwrap();
     for first in ["token tsv_not-a-token\n".to_string(), format!("token {foreign}\n"), "hello\n".to_string()] {
         let mut eve = Talker::connect(chat.port).await;
         eve.write(first.as_bytes()).await;
@@ -1736,7 +1736,7 @@ async fn syslog_stores_rfc_5424_and_rfc_3164_with_their_fields_and_filters_them(
 #[tokio::test]
 async fn syslog_drops_a_datagram_from_a_source_outside_allowed_sources() {
     let s = syslog().await;
-    toolsite::platform::secrets::set(&s.config, "syslog", "ALLOWED_SOURCES", Some(" 10.9.9.9, 127.0.0.2 ")).unwrap();
+    toolsite::platform::secrets::set(&s.config, "syslog", "ALLOWED_SOURCES", Some(" 10.9.9.9, 127.0.0.2 ")).await.unwrap();
     datagram(&s, "127.0.0.1", b"<14>from outside the list").await;
     datagram(&s, "127.0.0.2", b"<14>from the list").await;
     stored(&s, "from the list", Duration::from_secs(10)).await;
@@ -1745,7 +1745,7 @@ async fn syslog_drops_a_datagram_from_a_source_outside_allowed_sources() {
     assert!(!messages.contains(&"from outside the list".into()), "{messages:?}");
 
     // An empty list lets every source in again.
-    toolsite::platform::secrets::set(&s.config, "syslog", "ALLOWED_SOURCES", Some("")).unwrap();
+    toolsite::platform::secrets::set(&s.config, "syslog", "ALLOWED_SOURCES", Some("")).await.unwrap();
     datagram(&s, "127.0.0.1", b"<14>back in").await;
     stored(&s, "back in", Duration::from_secs(10)).await;
 }
