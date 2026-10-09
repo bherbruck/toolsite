@@ -1804,15 +1804,18 @@ impl PageHost {
             }
             (Some(name), Some(schedule), Some(path), _) => {
                 crate::platform::schedule::set_job(&self.config, &app, &name, &schedule, &path)
+                    .await
                     .map(|next| format!("{name} scheduled; {next}"))
             }
             (Some(name), None, None, _) => {
                 crate::platform::schedule::remove_job(&self.config, &app, &name)
+                    .await
                     .map(|()| format!("{name} is no longer scheduled"))
             }
             (Some(_), _, _, _) => Err("give both schedule and path, or neither to remove".into()),
             (None, _, _, _) => {
-                let jobs = crate::platform::schedule::read_jobs(&self.config, &app);
+                let jobs = crate::platform::schedule::jobs(&self.config, &app).await;
+                let running = crate::platform::schedule::running(&self.config, &app).await;
                 Ok(if jobs.is_empty() {
                     format!("{app} has no scheduled jobs")
                 } else {
@@ -1834,8 +1837,7 @@ impl PageHost {
                                     line.push_str(&format!(", {label} {value}"));
                                 }
                             }
-                            let running = self.config.jobs.is_running(&app, name);
-                            line.push_str(&format!(", running {running})"));
+                            line.push_str(&format!(", running {})", running.contains(name)));
                             line
                         })
                         .collect::<Vec<_>>()

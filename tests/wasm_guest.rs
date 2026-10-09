@@ -269,6 +269,7 @@ async fn a_scheduled_job_runs_the_apps_handler_and_records_what_happened() {
 
     // /api/count writes to the app's database and returns how many times.
     toolsite::platform::schedule::set_job(&config, "app", "tick", "0 * * * * *", "/api/count")
+        .await
         .unwrap();
 
     let status = toolsite::platform::schedule::run_job(&state, "app", "tick")
@@ -297,6 +298,7 @@ async fn a_job_for_an_app_with_no_handler_says_so_rather_than_failing_silently()
         runtime: Runtime::new().unwrap(),
     };
     toolsite::platform::schedule::set_job(&config, "static", "tick", "0 * * * * *", "/api/x")
+        .await
         .unwrap();
 
     let error = toolsite::platform::schedule::run_job(&state, "static", "tick")

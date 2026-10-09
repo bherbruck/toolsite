@@ -7,7 +7,9 @@
 //! to start when the choice would split a site's state in two.
 
 pub mod events;
+pub mod leases;
 pub mod pg;
+pub mod rate;
 pub mod runners;
 pub mod tickets;
 
@@ -42,6 +44,10 @@ pub struct Stores {
     /// Upload URLs, settings links, inline uploads, browser uploads,
     /// provider sign-ins, previews and handoff codes.
     pub tickets: tickets::Tickets,
+    /// Names held by one holder at a time: a job's running slot.
+    pub leases: leases::Leases,
+    /// Counts under a key in a sliding window: an app's job starts.
+    pub rates: rate::RateWindows,
 }
 
 impl Stores {
@@ -49,14 +55,22 @@ impl Stores {
     /// `TOOLSITE_SECRET_KEY`, as the boot guard already insists, so every
     /// runner opens what any runner sealed.
     pub fn new(backend: Backend, runner: Option<Arc<runners::Runner>>, secret_key: Option<&str>) -> Result<Stores, String> {
-        let tickets = match &backend {
-            Backend::Files => tickets::Tickets::memory(),
+        let (tickets, leases, rates) = match &backend {
+            Backend::Files => (tickets::Tickets::memory(), leases::Leases::memory(), rate::RateWindows::memory()),
             Backend::Postgres(postgres) => {
                 let key = secret_key.ok_or("TOOLSITE_SECRET_KEY is required on Postgres")?;
-                tickets::Tickets::postgres(postgres.pool.clone(), &crate::seal::parse_key(key)?)
+                // Leases are held in the runner's name, so a row says which
+                // process has a job; without a registry entry (a command, a
+                // test) a name of its own does.
+                let holder = runner.as_ref().map_or_else(|| crate::content::slug::random_token(12), |runner| runner.id.clone());
+                (
+                    tickets::Tickets::postgres(postgres.pool.clone(), &crate::seal::parse_key(key)?),
+                    leases::Leases::postgres(postgres.pool.clone(), &holder),
+                    rate::RateWindows::postgres(postgres.pool.clone()),
+                )
             }
         };
-        Ok(Stores { backend, runner, tickets })
+        Ok(Stores { backend, runner, tickets, leases, rates })
     }
 
     pub fn is_postgres(&self) -> bool {

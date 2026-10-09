@@ -1,7 +1,7 @@
 //! Per-app records as files under `DATA_DIR`, as they always were:
 //! `<app>.secrets` (name to sealed value), `<app>.tools`,
-//! `<app>.migrations` and `<app>.repo` beside the app, and
-//! `.site/github.json` for the site.
+//! `<app>.migrations`, `<app>.repo` and `<app>.jobs` (name to job) beside
+//! the app, and `.site/github.json` for the site.
 //!
 //! Each sidecar changes under a lock of its own in this process and is
 //! written to a dotted temporary file renamed into place, so a reader never
@@ -78,6 +78,49 @@ impl Files {
             Some(text) => serde_json::from_str(&text).map_err(|e| format!("{app}'s settings could not be read: {e}")),
             None => Ok(BTreeMap::new()),
         }
+    }
+
+    /// A jobs file, by name. One that exists but does not parse is an
+    /// error, as a settings file is: a change written over it would lose
+    /// every job.
+    fn read_jobs(&self, app: &str) -> Result<BTreeMap<String, serde_json::Value>, String> {
+        match read(&self.sidecar(app, "jobs"))? {
+            Some(text) => serde_json::from_str(&text).map_err(|e| format!("{app}'s jobs could not be read: {e}")),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    fn jobs_text(&self, app: &str) -> Result<BTreeMap<String, String>, String> {
+        Ok(self.read_jobs(app)?.into_iter().map(|(name, job)| (name, job.to_string())).collect())
+    }
+
+    /// Changes an app's jobs file with it held, written by rename, as every
+    /// job file has been since a reader caught one half written.
+    fn change_jobs<T>(
+        &self,
+        app: &str,
+        change: impl FnOnce(&mut BTreeMap<String, serde_json::Value>) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        let path = self.sidecar(app, "jobs");
+        let lock = lock_for(&path);
+        let _one_writer = held(&lock);
+        let mut jobs = self.read_jobs(app)?;
+        let (answer, write) = change(&mut jobs)?;
+        if write {
+            write_aside(&path, super::pretty(&jobs)?.as_bytes())?;
+        }
+        Ok(answer)
+    }
+
+    fn update_job_now(&self, app: &str, name: &str, edit: DocEdit<'_>) -> Result<bool, String> {
+        self.change_jobs(app, |jobs| {
+            let Some(job) = jobs.get_mut(name) else {
+                return Ok((false, false));
+            };
+            let next = edit(Some(&job.to_string()))?;
+            *job = serde_json::from_str(&next).map_err(|e| format!("a job is not JSON: {e}"))?;
+            Ok((true, true))
+        })
     }
 
     /// Every app with a sidecar of this kind, sorted. Names that are not an
@@ -192,6 +235,56 @@ impl AppRecords for Files {
         let lock = lock_for(&path);
         let _one_writer = held(&lock);
         write(&path, Some(installations))
+    }
+
+    async fn jobs(&self, app: &str) -> Result<BTreeMap<String, String>, String> {
+        self.jobs_text(app)
+    }
+
+    fn jobs_blocking(&self, app: &str) -> Result<BTreeMap<String, String>, String> {
+        self.jobs_text(app)
+    }
+
+    async fn all_jobs(&self) -> Result<Vec<(String, String, String)>, String> {
+        let mut out = Vec::new();
+        for app in self.apps_with("jobs") {
+            // One app's torn file does not stop every other app's jobs.
+            match self.jobs_text(&app) {
+                Ok(jobs) => out.extend(jobs.into_iter().map(|(name, job)| (app.clone(), name, job))),
+                Err(why) => tracing::warn!(app, %why, "jobs skipped"),
+            }
+        }
+        Ok(out)
+    }
+
+    async fn set_job(&self, app: &str, name: &str, job: &str, most: usize) -> Result<Result<(), usize>, String> {
+        let job: serde_json::Value = serde_json::from_str(job).map_err(|e| format!("a job is not JSON: {e}"))?;
+        self.change_jobs(app, |jobs| {
+            if !jobs.contains_key(name) && jobs.len() >= most {
+                return Ok((Err(jobs.len()), false));
+            }
+            jobs.insert(name.to_string(), job);
+            Ok((Ok(()), true))
+        })
+    }
+
+    async fn remove_job(&self, app: &str, name: &str) -> Result<bool, String> {
+        self.change_jobs(app, |jobs| {
+            let had = jobs.remove(name).is_some();
+            Ok((had, had))
+        })
+    }
+
+    async fn update_job(&self, app: &str, name: &str, edit: DocEdit<'_>) -> Result<bool, String> {
+        self.update_job_now(app, name, edit)
+    }
+
+    fn update_job_blocking(&self, app: &str, name: &str, edit: DocEdit<'_>) -> Result<bool, String> {
+        self.update_job_now(app, name, edit)
+    }
+
+    async fn fire(&self, _app: &str, _name: &str, _due_at: u64) -> Result<bool, String> {
+        Ok(true)
     }
 
     /// Nothing to take: the sidecars are files, and the trash moves them.

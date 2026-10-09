@@ -1,11 +1,11 @@
 //! Small per-app records that are not credentials: an app's settings (sealed
 //! by the caller before they arrive here), the tools it declares, its own
-//! migration ladder, the repository it mirrors to, and the site's GitHub App
-//! installations.
+//! migration ladder, the repository it mirrors to, its jobs, and the site's
+//! GitHub App installations.
 //!
 //! Two implementations: `files`, today's sidecars under `DATA_DIR`
-//! (`<app>.secrets`, `<app>.tools`, `<app>.migrations`, `<app>.repo` and
-//! `.site/github.json`, the default), and `postgres`, schema `platform`,
+//! (`<app>.secrets`, `<app>.tools`, `<app>.migrations`, `<app>.repo`,
+//! `<app>.jobs` and `.site/github.json`, the default), and `postgres`, schema `platform`,
 //! when the site runs on `DATABASE_URL`. The records are kept as their
 //! owners shape them: settings as name to sealed value, the rest as the JSON
 //! text their module writes. What a record means stays with its module.
@@ -68,6 +68,30 @@ pub trait AppRecords: Send + Sync {
     /// The GitHub App's installations as JSON text, if any were fetched.
     async fn installations(&self) -> Result<Option<String>, String>;
     async fn set_installations(&self, installations: &str) -> Result<(), String>;
+
+    /// An app's jobs: name to the job as JSON text.
+    async fn jobs(&self, app: &str) -> Result<BTreeMap<String, String>, String>;
+    /// `jobs` for a synchronous caller.
+    fn jobs_blocking(&self, app: &str) -> Result<BTreeMap<String, String>, String>;
+    /// Every job on the site as (app, name, JSON text), sorted: what the
+    /// scheduler scans.
+    async fn all_jobs(&self) -> Result<Vec<(String, String, String)>, String>;
+    /// Adds or replaces a job. A new name for an app that already has
+    /// `most` is refused, with how many it has: `Ok(Err(count))`.
+    async fn set_job(&self, app: &str, name: &str, job: &str, most: usize) -> Result<Result<(), usize>, String>;
+    /// Removes a job. Answers whether there was one.
+    async fn remove_job(&self, app: &str, name: &str) -> Result<bool, String>;
+    /// Runs `edit` on a job with it held and stores what it answers. Of any
+    /// number of changes at once, every one lands. False, with nothing run,
+    /// when there is no such job.
+    async fn update_job(&self, app: &str, name: &str, edit: DocEdit<'_>) -> Result<bool, String>;
+    /// `update_job` for a synchronous caller.
+    fn update_job_blocking(&self, app: &str, name: &str, edit: DocEdit<'_>) -> Result<bool, String>;
+    /// Claims one scheduled turn of a job, `due_at` in Unix seconds: true
+    /// for the first claim of that turn on the site, false for every other.
+    /// Files have one scheduler per data directory, so there it is always
+    /// the first.
+    async fn fire(&self, app: &str, name: &str, due_at: u64) -> Result<bool, String>;
 
     /// Takes every record of `app` out of the store, as a removal does, and
     /// answers each as the sidecar it is on files: (extension, contents).

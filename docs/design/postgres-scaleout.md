@@ -201,7 +201,7 @@ Rules behind the choices:
 | `.meta` | `platform.pages (slug primary key, meta json, generation bigint, notes, created_at, updated_at)` | One row per page or app. `meta` keeps the `PageMeta` serde shape so the struct does not change. `json`, not `jsonb` (PR 6): `jsonb` refuses `\u0000`, which a meta string may hold, and `json` returns the text exactly as stored |
 | `.notes` | `platform.pages.notes text` | Small text |
 | `.secrets` | `platform.app_settings (app, name, sealed, primary key (app, name))` | Values stay sealed with the site key |
-| `.jobs` | `platform.jobs (app, name, schedule, path, last_* columns)` | Single-row updates; no file lock |
+| `.jobs` | `platform.jobs (app, name, schedule, path, last_* columns)` | Single-row updates; no file lock. PR 9: `platform.jobs (app, name, job json)`, a row per job in `Job`'s serde shape, as the other records are; a change is `select ... for update` on the row, a new job is counted under `LOCK_JOBS` for the app |
 | `.migrations` | `platform.app_migrations (app primary key, files jsonb)` | Small. PR 8: `json`, as metas are, for the same reason |
 | `.exports`, `.deploys`, `.devices` | `platform.app_tokens (app, kind, id, label, hash unique, created_at, last_used)` with `kind in ('export','deploy','device')` | One row per token fixes today's lost-update race. PR 8: primary key `(app, kind, id)`, digest unique per kind; a check reads the app's digests of that kind and compares each in constant time. On files each list now changes under a lock and a rename too, so the race is gone there as well. A removal moves an app's tokens and records into `platform.removed_records`, in their sidecar's shape, and the trash writes them as sidecars |
 | `.repo` | `platform.repo_links (app primary key, link jsonb, disconnected_at)` | Small. PR 8: `link json` only; `disconnected_at` stays inside the link, which `github.rs` reads. A change holds `LOCK_RECORDS` for the app |
@@ -214,8 +214,8 @@ Rules behind the choices:
 | `.tmp/` scratch | Stays per process (`TOOLSITE_SCRATCH_DIR`, default `DATA_DIR/.tmp`) | Never shared, never read after the call |
 | Upload, settings-link, blob-upload, provider-login, preview, handoff tickets | `state.tickets (kind, id_hash primary key, payload, sealed bool, expires_at)` | Any runner can mint or redeem |
 | Inline upload chunks | Bucket `.toolsite/tmp/inline/<id>/<n>`; the ticket row holds the chunk map | Chunks can arrive at any runner |
-| Job slots (`Jobs.running`) | `state.leases` rows `job:<app>/<name>` with holder, epoch, expiry | One run per job across runners |
-| Job start rate (`Jobs.starts`) | `state.rate_windows (key, window_start, count)` | Site-wide limit |
+| Job slots (`Jobs.running`) | `state.leases` rows `job:<app>/<name>` with holder, epoch, expiry | One run per job across runners. PR 9: `grp` (the app) counts the per-app ceiling under `LOCK_LEASES`; `again` is the queued rerun, spent or released in one statement; expiry is in milliseconds by the database's clock; a slot lasts 30 s and a run renews it every 10 s; an expired lease still asked to go again is an orphan the next scheduler wake takes over |
+| Job start rate (`Jobs.starts`) | `state.rate_windows (key, window_start, count)` | Site-wide limit. PR 9: sliding, not fixed: a row per sixtieth of the window, summed under `LOCK_RATES`, so a burst across a minute boundary is still held to the rate |
 | MFA wrong-code counter | Stays in `accounts.mfa_failures` | Already a table |
 | Socket limits (`Hub` counts) | Stay per runner in step 1 and 2 | See question 4 |
 | Compiled handler cache | Per process, keyed by `(app, generation)` | No invalidation message needed |
@@ -682,7 +682,12 @@ in step 1, a `Leases` lease `scheduler` in step 2. Correctness does not depend
 on the lease alone: a fired turn is recorded in `platform.job_fires (app,
 name, due_at, primary key (app, name, due_at))`, inserted before the run
 starts. A second leader in a split-brain moment gets a conflict and skips.
-Step 1 hook: `job_fires` exists and `tick` inserts before it runs. In step 4,
+Step 1 hook: `job_fires` exists and `tick` inserts before it runs. PR 9:
+every runner runs a scheduler already, since a turn is claimed in
+`job_fires` and a run's slot is a lease; `due_at` is the latest scheduled
+time at or before the tick, so two schedulers that read the job at
+different moments still name the same turn. Fires a day older than the
+one claimed are pruned with it. In step 4,
 the leader (control) inserts into `platform.job_queue`, and workers claim
 with `select ... for update skip locked`.
 

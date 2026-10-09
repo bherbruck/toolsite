@@ -896,13 +896,9 @@ async fn app_tab_with(
             render_tools_tab(&config, &app, &tools, pinned, &token, &back)
         }
         "jobs" => {
-            let jobs = {
-                let (config, app) = (config.clone(), app.clone());
-                tokio::task::spawn_blocking(move || crate::platform::schedule::read_jobs(&config, &app))
-                    .await
-                    .unwrap_or_default()
-            };
-            render_jobs_tab(&config, &app, &jobs, &token, &back, is_admin_here)
+            let jobs = crate::platform::schedule::jobs(&config, &app).await;
+            let running = crate::platform::schedule::running(&config, &app).await;
+            render_jobs_tab(&app, &jobs, &running, &token, &back, is_admin_here)
         }
         _ => {
             let notes = crate::content::catalog::notes(&config, &app).await;
@@ -1400,9 +1396,9 @@ fn render_tools_tab(
 }
 
 fn render_jobs_tab(
-    config: &Config,
     app: &str,
     jobs: &std::collections::BTreeMap<String, crate::platform::schedule::Job>,
+    running: &std::collections::BTreeSet<String>,
     token: &str,
     back: &str,
     is_admin_here: bool,
@@ -1426,7 +1422,7 @@ fn render_jobs_tab(
                                 }
                                 td."muted small" { @match job.last_duration_ms { Some(ms) => { (ms) " ms" } None => "—" } }
                                 td {
-                                    @if config.jobs.is_running(app, name) { span."badge" { "running" } " " }
+                                    @if running.contains(name) { span."badge" { "running" } " " }
                                     @match job.last_status.as_deref() {
                                         Some(status) if status.starts_with("ok") || status.starts_with("200") => span."badge ok" { (status) },
                                         Some(status) => span."badge warn" { (status) },

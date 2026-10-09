@@ -1,6 +1,8 @@
 //! Per-app records on Postgres, schema `platform`: `app_settings` (a row per
 //! setting, its value sealed by the caller), `app_tools`, `app_migrations`
-//! and `repo_links` (a row per app), and `github_installations` (one row).
+//! and `repo_links` (a row per app), `jobs` (a row per job) with
+//! `job_fires` (a row per scheduled turn fired), and `github_installations`
+//! (one row).
 //!
 //! Records are `json`, not `jsonb`, as metas are: `json` keeps the text as
 //! written, so a `\u0000` in a tool's description comes back as it went in.
@@ -9,7 +11,7 @@
 //! an app's rows into `platform.removed_records`.
 
 use super::{AppRecords, DocEdit};
-use crate::state::pg::LOCK_RECORDS;
+use crate::state::pg::{LOCK_JOBS, LOCK_RECORDS};
 use async_trait::async_trait;
 use deadpool_postgres::Pool;
 use std::collections::BTreeMap;
@@ -87,6 +89,19 @@ impl Postgres {
             if let Some(row) = text {
                 out.push((extension, row.get::<_, String>(0)));
             }
+        }
+        let jobs: BTreeMap<String, serde_json::Value> = transaction
+            .query("delete from platform.jobs where app = $1 returning name, job::text", &[&app])
+            .await
+            .map_err(failed("take an app's jobs"))?
+            .iter()
+            .map(|row| {
+                let text: String = row.get(1);
+                (row.get(0), serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+            })
+            .collect();
+        if !jobs.is_empty() {
+            out.push(("jobs", super::pretty(&jobs)?));
         }
         for (kind, text) in &out {
             transaction
@@ -281,6 +296,119 @@ impl AppRecords for Postgres {
             .await
             .map_err(failed("store the GitHub installations"))?;
         Ok(())
+    }
+
+    async fn jobs(&self, app: &str) -> Result<BTreeMap<String, String>, String> {
+        let rows = self
+            .client()
+            .await?
+            .query("select name, job::text from platform.jobs where app = $1", &[&app])
+            .await
+            .map_err(failed("read an app's jobs"))?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    fn jobs_blocking(&self, app: &str) -> Result<BTreeMap<String, String>, String> {
+        crate::state::wait_in_place(self.jobs(app))
+    }
+
+    async fn all_jobs(&self) -> Result<Vec<(String, String, String)>, String> {
+        let rows = self
+            .client()
+            .await?
+            .query("select app, name, job::text from platform.jobs", &[])
+            .await
+            .map_err(failed("list the jobs"))?;
+        let mut jobs: Vec<(String, String, String)> = rows.iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect();
+        jobs.sort();
+        Ok(jobs)
+    }
+
+    async fn set_job(&self, app: &str, name: &str, job: &str, most: usize) -> Result<Result<(), usize>, String> {
+        let mut client = self.client().await?;
+        let transaction = client.transaction().await.map_err(failed("begin setting a job"))?;
+        transaction
+            .execute("select pg_advisory_xact_lock($1::int4, hashtext($2))", &[&LOCK_JOBS, &app])
+            .await
+            .map_err(failed("hold an app's jobs"))?;
+        let row = transaction
+            .query_one(
+                "select count(*), count(*) filter (where name = $2) from platform.jobs where app = $1",
+                &[&app, &name],
+            )
+            .await
+            .map_err(failed("count an app's jobs"))?;
+        let (count, this): (i64, i64) = (row.get(0), row.get(1));
+        if this == 0 && count as usize >= most {
+            return Ok(Err(count as usize));
+        }
+        transaction
+            .execute(
+                "insert into platform.jobs (app, name, job, updated_at) values ($1, $2, $3::text::json, $4)
+                 on conflict (app, name) do update set job = excluded.job, updated_at = excluded.updated_at",
+                &[&app, &name, &job, &now()],
+            )
+            .await
+            .map_err(failed("store a job"))?;
+        transaction.commit().await.map_err(failed("commit a job"))?;
+        Ok(Ok(()))
+    }
+
+    async fn remove_job(&self, app: &str, name: &str) -> Result<bool, String> {
+        Ok(self
+            .client()
+            .await?
+            .execute("delete from platform.jobs where app = $1 and name = $2", &[&app, &name])
+            .await
+            .map_err(failed("remove a job"))?
+            > 0)
+    }
+
+    async fn update_job(&self, app: &str, name: &str, edit: DocEdit<'_>) -> Result<bool, String> {
+        let mut client = self.client().await?;
+        let transaction = client.transaction().await.map_err(failed("begin a job change"))?;
+        let Some(row) = transaction
+            .query_opt("select job::text from platform.jobs where app = $1 and name = $2 for update", &[&app, &name])
+            .await
+            .map_err(failed("read a job"))?
+        else {
+            return Ok(false);
+        };
+        let current: String = row.get(0);
+        let next = edit(Some(&current))?;
+        transaction
+            .execute(
+                "update platform.jobs set job = $3::text::json, updated_at = $4 where app = $1 and name = $2",
+                &[&app, &name, &next, &now()],
+            )
+            .await
+            .map_err(failed("store a job"))?;
+        transaction.commit().await.map_err(failed("commit a job change"))?;
+        Ok(true)
+    }
+
+    fn update_job_blocking(&self, app: &str, name: &str, edit: DocEdit<'_>) -> Result<bool, String> {
+        crate::state::wait_in_place(self.update_job(app, name, edit))
+    }
+
+    async fn fire(&self, app: &str, name: &str, due_at: u64) -> Result<bool, String> {
+        // A turn only ever conflicts with the same turn seconds apart, so
+        // the job's fires older than a day are pruned on the way.
+        let due_at = due_at as i64;
+        let fired = self
+            .client()
+            .await?
+            .execute(
+                "with pruned as (
+                     delete from platform.job_fires where app = $1 and name = $2 and due_at < $3::bigint - 86400
+                 )
+                 insert into platform.job_fires (app, name, due_at, fired_at) values ($1, $2, $3, $4)
+                 on conflict (app, name, due_at) do nothing",
+                &[&app, &name, &due_at, &now()],
+            )
+            .await
+            .map_err(failed("fire a job's turn"))?;
+        Ok(fired > 0)
     }
 
     fn retire_blocking(&self, app: &str, at: u64) -> Result<Vec<(&'static str, String)>, String> {

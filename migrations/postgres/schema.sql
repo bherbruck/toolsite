@@ -88,6 +88,14 @@ column platform.github_installations.one boolean not null default true
 column platform.host_labels.app text not null
 column platform.host_labels.issued_at bigint not null
 column platform.host_labels.label text not null
+column platform.job_fires.app text not null
+column platform.job_fires.due_at bigint not null
+column platform.job_fires.fired_at bigint not null
+column platform.job_fires.name text not null
+column platform.jobs.app text not null
+column platform.jobs.job json not null
+column platform.jobs.name text not null
+column platform.jobs.updated_at bigint not null
 column platform.pages.created_at bigint not null
 column platform.pages.generation bigint not null default 0
 column platform.pages.meta json not null default '{}'::json
@@ -122,9 +130,18 @@ column platform.repo_links.updated_at bigint not null
 column platform.site_flags.at bigint not null
 column platform.site_flags.name text not null
 column platform.site_flags.value text not null
+column state.leases.again boolean not null default false
+column state.leases.epoch bigint not null
+column state.leases.expires_at bigint not null
+column state.leases.grp text
+column state.leases.holder text not null
+column state.leases.name text not null
 column state.migrations.applied_at bigint not null
 column state.migrations.store text not null
 column state.migrations.version integer not null
+column state.rate_windows.count integer not null
+column state.rate_windows.key text not null
+column state.rate_windows.window_start bigint not null
 column state.runners.address text
 column state.runners.draining boolean not null default false
 column state.runners.heartbeat_at bigint not null
@@ -174,6 +191,8 @@ constraint platform.app_tools app_tools_pkey: PRIMARY KEY (app)
 constraint platform.github_installations github_installations_one_check: CHECK (one)
 constraint platform.github_installations github_installations_pkey: PRIMARY KEY (one)
 constraint platform.host_labels host_labels_pkey: PRIMARY KEY (label)
+constraint platform.job_fires job_fires_pkey: PRIMARY KEY (app, name, due_at)
+constraint platform.jobs jobs_pkey: PRIMARY KEY (app, name)
 constraint platform.pages pages_pkey: PRIMARY KEY (slug)
 constraint platform.projects projects_pkey: PRIMARY KEY (path)
 constraint platform.relocations relocations_one_check: CHECK (one)
@@ -182,7 +201,9 @@ constraint platform.removed_pages removed_pages_pkey: PRIMARY KEY (id)
 constraint platform.removed_records removed_records_pkey: PRIMARY KEY (id)
 constraint platform.repo_links repo_links_pkey: PRIMARY KEY (app)
 constraint platform.site_flags site_flags_pkey: PRIMARY KEY (name)
+constraint state.leases leases_pkey: PRIMARY KEY (name)
 constraint state.migrations migrations_pkey: PRIMARY KEY (store, version)
+constraint state.rate_windows rate_windows_pkey: PRIMARY KEY (key, window_start)
 constraint state.runners runners_pkey: PRIMARY KEY (id)
 constraint state.tickets tickets_pkey: PRIMARY KEY (id_hash)
 index accounts CREATE INDEX grants_by_app ON accounts.grants USING btree (app)
@@ -223,6 +244,8 @@ index platform CREATE UNIQUE INDEX app_tokens_pkey ON platform.app_tokens USING 
 index platform CREATE UNIQUE INDEX app_tools_pkey ON platform.app_tools USING btree (app)
 index platform CREATE UNIQUE INDEX github_installations_pkey ON platform.github_installations USING btree (one)
 index platform CREATE UNIQUE INDEX host_labels_pkey ON platform.host_labels USING btree (label)
+index platform CREATE UNIQUE INDEX job_fires_pkey ON platform.job_fires USING btree (app, name, due_at)
+index platform CREATE UNIQUE INDEX jobs_pkey ON platform.jobs USING btree (app, name)
 index platform CREATE UNIQUE INDEX pages_pkey ON platform.pages USING btree (slug)
 index platform CREATE UNIQUE INDEX projects_pkey ON platform.projects USING btree (path)
 index platform CREATE UNIQUE INDEX relocations_pkey ON platform.relocations USING btree (one)
@@ -230,7 +253,10 @@ index platform CREATE UNIQUE INDEX removed_pages_pkey ON platform.removed_pages 
 index platform CREATE UNIQUE INDEX removed_records_pkey ON platform.removed_records USING btree (id)
 index platform CREATE UNIQUE INDEX repo_links_pkey ON platform.repo_links USING btree (app)
 index platform CREATE UNIQUE INDEX site_flags_pkey ON platform.site_flags USING btree (name)
+index state CREATE INDEX leases_grp ON state.leases USING btree (grp) WHERE (grp IS NOT NULL)
 index state CREATE INDEX tickets_expires_at ON state.tickets USING btree (expires_at)
+index state CREATE UNIQUE INDEX leases_pkey ON state.leases USING btree (name)
 index state CREATE UNIQUE INDEX migrations_pkey ON state.migrations USING btree (store, version)
+index state CREATE UNIQUE INDEX rate_windows_pkey ON state.rate_windows USING btree (key, window_start)
 index state CREATE UNIQUE INDEX runners_pkey ON state.runners USING btree (id)
 index state CREATE UNIQUE INDEX tickets_pkey ON state.tickets USING btree (id_hash)

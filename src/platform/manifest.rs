@@ -596,11 +596,11 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
 
     // Jobs too, but their history survives: a schedule that did not change
     // keeps when it last ran and how it went.
-    let existing = schedule::read_jobs(config, app);
+    let existing = schedule::jobs(config, app).await;
     let declared_names: Vec<String> = manifest.jobs.iter().map(|job| job.name.clone()).collect();
     for name in existing.keys() {
         if !declared_names.contains(name) {
-            let _ = schedule::remove_job(config, app, name);
+            let _ = schedule::remove_job(config, app, name).await;
             changed.push(format!("job {name} removed"));
         }
     }
@@ -611,7 +611,7 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
         if unchanged {
             continue;
         }
-        schedule::set_job(config, app, &job.name, &job.schedule, &job.path)?;
+        schedule::set_job(config, app, &job.name, &job.schedule, &job.path).await?;
         changed.push(format!("job {}", job.name));
     }
 

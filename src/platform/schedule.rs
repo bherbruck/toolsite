@@ -8,20 +8,33 @@
 //! what it can do.
 //!
 //! One run per job at a time, however it was started: by its schedule, by a
-//! person, or by the app through `jobs.run`. A schedule that comes round
-//! while its job still runs is skipped, and the skip recorded. Asked for
-//! while it runs, a job runs once more as soon as it finishes, which is how
-//! an app chains stages back to back.
+//! person, or by the app through `jobs.run`, and on whichever runner. A
+//! schedule that comes round while its job still runs is skipped, and the
+//! skip recorded. Asked for while it runs, a job runs once more as soon as
+//! it finishes, which is how an app chains stages back to back.
+//!
+//! The rules live here; the state is the site's. Job records are
+//! `AppRecords` (`<app>.jobs` on files, `platform.jobs` on Postgres), a
+//! run's slot and a rerun queued behind it are a lease, an app's starts are
+//! a rate window, and a scheduled turn is claimed in `platform.job_fires`
+//! before it runs. On files all of that is this process's, as it always
+//! was; on Postgres every runner shares it.
 
-use crate::{config::Config, content::slug::valid_slug, runtime::wasm::Runtime, AppState};
+use crate::{
+    config::Config,
+    content::slug::valid_slug,
+    platform::records,
+    runtime::wasm::Runtime,
+    state::leases::{Ended, Lease, Taken},
+    AppState,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// The longest the scheduler sleeps without looking again, whatever the
@@ -50,8 +63,8 @@ pub const DEFAULT_STARTS_PER_MINUTE: usize = 600;
 pub const DEFAULT_RUNNING_PER_APP: usize = 4;
 
 /// Jobs one app may declare. The scheduler reads and plans every one on
-/// each wake, and records each skipped turn in the app's job file, so a
-/// thousand every-second jobs would have it rewriting that file a thousand
+/// each wake, and records each skipped turn in the app's job record, so a
+/// thousand every-second jobs would have it rewriting records a thousand
 /// times a second.
 pub const MAX_JOBS_PER_APP: usize = 100;
 
@@ -80,16 +93,25 @@ pub struct Job {
     pub last_skipped_at: Option<u64>,
 }
 
-/// Every job in progress in this process, and what is waiting on them. One
-/// per process, shared by every copy of the config like `connections`, so
-/// the scheduler, a person and an app's handler all see the same runs.
+/// How long a run's slot lasts without renewal. A run renews it every third
+/// of this while it goes, so a runner that dies mid-run lets the job go this
+/// long after, and a run it owed is taken over by another runner.
+pub const SLOT_TTL: Duration = Duration::from_secs(30);
+
+/// What every job's slot is named under, in the site's leases.
+const SLOT_PREFIX: &str = "job:";
+
+/// The tries a start makes when the slot it saw changes hands underneath it:
+/// held when asked for, gone when asked to go again.
+const TRIES: usize = 8;
+
+/// How this process takes part in the site's jobs: the limits, the runtime
+/// a job started from inside a handler runs on, and the wake-up for the
+/// scheduler. Which jobs are running, and what is queued behind them, are
+/// the site's: leases in `config.stores`, held in this process's memory on
+/// files and in Postgres otherwise, so the scheduler, a person and an app's
+/// handler on any runner all see the same runs.
 pub struct Jobs {
-    /// Each job in progress, by app and name, and whether another run is
-    /// queued behind it. A pair rather than `app/job`, since an app's slug
-    /// may itself hold a `/`.
-    running: Mutex<HashMap<(String, String), bool>>,
-    /// When each app's recent `jobs.run` starts happened, the last minute's.
-    starts: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// What a job started from inside a handler runs on: the runtime and
     /// the async runtime of the server, set once they exist.
     attached: Mutex<Option<(Weak<Runtime>, tokio::runtime::Handle)>>,
@@ -100,8 +122,11 @@ pub struct Jobs {
     /// `TOOLSITE_JOB_STARTS_PER_MINUTE`.
     pub starts_per_minute: usize,
     /// Jobs of one app running at once, from
-    /// `TOOLSITE_JOBS_RUNNING_PER_APP`.
+    /// `TOOLSITE_JOBS_RUNNING_PER_APP`, counted across every runner.
     pub running_per_app: usize,
+    /// How long a slot lasts unrenewed: `SLOT_TTL`, shorter in tests that
+    /// watch a runner die.
+    pub slot_ttl: Duration,
 }
 
 impl Default for Jobs {
@@ -117,6 +142,8 @@ enum Busy {
     Running,
     /// The app already runs as many jobs as it may at once.
     App(usize),
+    /// The slots could not be read: nothing was started.
+    Failed(String),
 }
 
 fn too_many(app: &str, running: usize) -> String {
@@ -132,30 +159,31 @@ pub enum Ran {
     Queued,
 }
 
-fn key(app: &str, name: &str) -> (String, String) {
-    (app.to_string(), name.to_string())
-}
-
-/// Jobs of `app` in progress, from the running map.
-fn running_of(running: &HashMap<(String, String), bool>, app: &str) -> usize {
-    running.keys().filter(|(of, _)| of == app).count()
+/// The lease a run of `app`'s job `name` holds. Grouped by app, so an app
+/// whose name starts another's is never counted with it.
+pub fn slot(app: &str, name: &str) -> String {
+    format!("{SLOT_PREFIX}{app}/{name}")
 }
 
 impl Jobs {
     pub fn new(starts_per_minute: usize) -> Self {
         Self {
-            running: Mutex::default(),
-            starts: Mutex::default(),
             attached: Mutex::default(),
             changed: tokio::sync::Notify::new(),
             starts_per_minute,
             running_per_app: DEFAULT_RUNNING_PER_APP,
+            slot_ttl: SLOT_TTL,
         }
     }
 
     /// The same, letting `running` jobs of one app run at once.
     pub fn with_running_per_app(self, running: usize) -> Self {
         Self { running_per_app: running.max(1), ..self }
+    }
+
+    /// The same, with slots that last `ttl` unrenewed.
+    pub fn with_slot_ttl(self, ttl: Duration) -> Self {
+        Self { slot_ttl: ttl.max(Duration::from_millis(30)), ..self }
     }
 
     /// Gives jobs started from inside a handler somewhere to run. Called
@@ -167,140 +195,183 @@ impl Jobs {
         }
     }
 
-    pub fn is_running(&self, app: &str, name: &str) -> bool {
-        self.running.lock().unwrap().contains_key(&key(app, name))
-    }
-
     /// Tells the scheduler that what it planned around has changed.
     pub fn changed(&self) {
         self.changed.notify_one();
     }
+}
 
-    /// Takes the job's one slot, or says why not: it is running, or its
-    /// app runs as many jobs as it may.
-    fn claim(&self, app: &str, name: &str) -> Result<(), Busy> {
-        let mut running = self.running.lock().unwrap();
-        self.claim_in(&mut running, app, name)
-    }
+/// Whether `app`'s job `name` is running now, on any runner. For a
+/// synchronous caller; `running` answers for a whole app.
+pub fn is_running(config: &Config, app: &str, name: &str) -> bool {
+    config.stores.leases.state_blocking(&slot(app, name)).ok().flatten().is_some()
+}
 
-    /// Takes the job's slot or, when it is running, queues one more run of
-    /// it, under the one lock: checked and queued apart, a run that ended in
-    /// between would leave the caller told "queued" with nothing to run.
-    fn claim_or_queue(&self, app: &str, name: &str) -> Result<(), Busy> {
-        let mut running = self.running.lock().unwrap();
-        let claimed = self.claim_in(&mut running, app, name);
-        if let Err(Busy::Running) = claimed {
-            if let Some(again) = running.get_mut(&key(app, name)) {
-                *again = true;
-            }
+/// The names of `app`'s jobs running now, on any runner.
+pub async fn running(config: &Config, app: &str) -> BTreeSet<String> {
+    let prefix = slot(app, "");
+    match config.stores.leases.live(app).await {
+        Ok(names) => names.iter().filter_map(|lease| lease.strip_prefix(&prefix)).map(str::to_string).collect(),
+        Err(why) => {
+            tracing::warn!(app, %why, "running jobs could not be read");
+            BTreeSet::new()
         }
-        claimed
-    }
-
-    fn claim_in(&self, running: &mut HashMap<(String, String), bool>, app: &str, name: &str) -> Result<(), Busy> {
-        let key = key(app, name);
-        if running.contains_key(&key) {
-            return Err(Busy::Running);
-        }
-        let of_app = running_of(running, app);
-        if of_app >= self.running_per_app {
-            return Err(Busy::App(of_app));
-        }
-        running.insert(key, false);
-        Ok(())
-    }
-
-    /// After a run: true, with the slot still held, when another run was
-    /// queued behind it; otherwise the slot is given up.
-    fn again_or_release(&self, app: &str, name: &str) -> bool {
-        let mut running = self.running.lock().unwrap();
-        let key = key(app, name);
-        match running.get_mut(&key) {
-            Some(again) if *again => {
-                *again = false;
-                true
-            }
-            _ => {
-                running.remove(&key);
-                false
-            }
-        }
-    }
-
-    /// Counts one start against the app's rate, or refuses it.
-    fn count_start(&self, app: &str) -> Result<(), String> {
-        let mut starts = self.starts.lock().unwrap();
-        let recent = starts.entry(app.to_string()).or_default();
-        let minute_ago = Instant::now().checked_sub(Duration::from_secs(60));
-        while recent.front().is_some_and(|at| minute_ago.is_some_and(|ago| *at < ago)) {
-            recent.pop_front();
-        }
-        if recent.len() >= self.starts_per_minute {
-            return Err(format!(
-                "{app} has started {} jobs in the last minute, which is this site's limit; try again shortly",
-                recent.len()
-            ));
-        }
-        recent.push_back(Instant::now());
-        Ok(())
     }
 }
 
-/// One lock for every job file in the process: runs finishing together
-/// would otherwise each write over the other's record.
-static FILES: Mutex<()> = Mutex::new(());
-
-fn path_for(config: &Config, app: &str) -> Option<PathBuf> {
-    valid_slug(app).then(|| config.data_dir.join(format!("{app}.jobs")))
+/// Takes the job's one slot, or says why not: it is running, or its app
+/// runs as many jobs as it may, on whichever runners.
+async fn claim(config: &Config, app: &str, name: &str) -> Result<Lease, Busy> {
+    let group = Some((app, config.jobs.running_per_app));
+    match config.stores.leases.acquire(&slot(app, name), group, config.jobs.slot_ttl).await {
+        Ok(Taken::Lease(lease)) => Ok(lease),
+        Ok(Taken::Held) => Err(Busy::Running),
+        Ok(Taken::Full(running)) => Err(Busy::App(running)),
+        Err(why) => Err(Busy::Failed(why)),
+    }
 }
 
-pub fn read_jobs(config: &Config, app: &str) -> BTreeMap<String, Job> {
-    let Some(path) = path_for(config, app) else {
+/// After a run: true, with the slot still held, when another run was
+/// queued behind it; otherwise the slot is given up. A slot that was lost
+/// (it ran out and another runner took it over) is the other runner's to
+/// settle, so this one stops.
+async fn again_or_release(config: &Config, app: &str, name: &str, lease: &Lease) -> bool {
+    match config.stores.leases.again_or_release(lease, config.jobs.slot_ttl).await {
+        Ok(Ended::Again) => true,
+        Ok(Ended::Released) => false,
+        Ok(Ended::Lost) => {
+            tracing::warn!(app, job = name, "the job's slot ran out during the run and was taken over");
+            false
+        }
+        Err(why) => {
+            // Left to run out: no other runner starts it until then.
+            tracing::warn!(app, job = name, %why, "the job's slot could not be settled");
+            false
+        }
+    }
+}
+
+/// Counts one start against the app's rate, for the whole site, or
+/// refuses it.
+async fn count_start(config: &Config, app: &str) -> Result<(), String> {
+    let key = format!("job-starts:{app}");
+    match config.stores.rates.spend(&key, config.jobs.starts_per_minute, Duration::from_secs(60)).await? {
+        Ok(()) => Ok(()),
+        Err(count) => Err(format!(
+            "{app} has started {count} jobs in the last minute, which is this site's limit; try again shortly"
+        )),
+    }
+}
+
+/// Keeps a run's slot while the run goes: renewed every third of its life,
+/// until this is dropped.
+struct Keeping(tokio::task::JoinHandle<()>);
+
+impl Drop for Keeping {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn keep(config: &Arc<Config>, app: &str, name: &str, lease: &Lease) -> Keeping {
+    let (config, app, name, lease) = (config.clone(), app.to_string(), name.to_string(), lease.clone());
+    Keeping(tokio::spawn(async move {
+        let ttl = config.jobs.slot_ttl;
+        loop {
+            tokio::time::sleep(ttl / 3).await;
+            match config.stores.leases.renew(&lease, ttl).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(app, job = name, "the job's slot was taken over while it ran");
+                    return;
+                }
+                Err(why) => tracing::warn!(app, job = name, %why, "the job's slot could not be renewed"),
+            }
+        }
+    }))
+}
+
+fn valid_app(app: &str) -> bool {
+    valid_slug(app)
+}
+
+/// Jobs from their stored text. One that does not parse is passed over and
+/// said, rather than taking the app's other jobs with it.
+fn parse_jobs(app: &str, texts: BTreeMap<String, String>) -> BTreeMap<String, Job> {
+    texts
+        .into_iter()
+        .filter_map(|(name, text)| match serde_json::from_str(&text) {
+            Ok(job) => Some((name, job)),
+            Err(why) => {
+                tracing::warn!(app, job = name, %why, "a job could not be read");
+                None
+            }
+        })
+        .collect()
+}
+
+fn unreadable(app: &str, why: String) -> BTreeMap<String, String> {
+    tracing::warn!(app, %why, "jobs could not be read");
+    BTreeMap::new()
+}
+
+/// An app's jobs, by name.
+pub async fn jobs(config: &Config, app: &str) -> BTreeMap<String, Job> {
+    if !valid_app(app) {
         return BTreeMap::new();
-    };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    }
+    let texts = records::of(config).jobs(app).await.unwrap_or_else(|why| unreadable(app, why));
+    parse_jobs(app, texts)
 }
 
-fn write_jobs(config: &Config, app: &str, jobs: &BTreeMap<String, Job>) -> Result<(), String> {
-    let path = path_for(config, app).ok_or_else(|| format!("invalid app name '{app}'"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+/// `jobs`, for a synchronous caller.
+pub fn read_jobs(config: &Config, app: &str) -> BTreeMap<String, Job> {
+    if !valid_app(app) {
+        return BTreeMap::new();
     }
-    let json = serde_json::to_string_pretty(jobs).map_err(|e| e.to_string())?;
-    // Written beside and renamed over, never rewritten in place: readers
-    // take no lock, and one that opened the file mid-write would read it
-    // empty and decide the app has no jobs at all.
-    let temp = path.with_extension(format!("jobs.{}.tmp", std::process::id()));
-    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&temp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        e.to_string()
+    let texts = records::of(config).jobs_blocking(app).unwrap_or_else(|why| unreadable(app, why));
+    parse_jobs(app, texts)
+}
+
+fn job_text(job: &Job) -> Result<String, String> {
+    serde_json::to_string(job).map_err(|e| e.to_string())
+}
+
+/// The edit `update` hands the store: the stored job, changed.
+fn edit_job(change: impl FnOnce(&mut Job) + Send + 'static) -> crate::platform::records::DocEdit<'static> {
+    Box::new(move |current| {
+        let mut job: Job = serde_json::from_str(current.unwrap_or_default()).map_err(|e| format!("a job could not be read: {e}"))?;
+        change(&mut job);
+        job_text(&job)
     })
 }
 
-/// Changes one job's record under the file lock. Nothing happens if the job
-/// is gone.
-fn update(config: &Config, app: &str, name: &str, change: impl FnOnce(&mut Job)) {
-    let _held = FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut jobs = read_jobs(config, app);
-    if let Some(job) = jobs.get_mut(name) {
-        change(job);
-        let _ = write_jobs(config, app, &jobs);
+/// Changes one job's record with it held, on any runner. Nothing happens if
+/// the job is gone.
+async fn update(config: &Config, app: &str, name: &str, change: impl FnOnce(&mut Job) + Send + 'static) {
+    if let Err(why) = records::of(config).update_job(app, name, edit_job(change)).await {
+        tracing::warn!(app, job = name, %why, "the job's record could not be written");
     }
+}
+
+/// Marks a run started: before the start is answered or the turn passed
+/// on, so the next plan, here or on another runner, counts from it.
+async fn begin(config: &Config, app: &str, name: &str, at: u64) {
+    update(config, app, name, move |job| job.last_started_at = Some(at)).await;
 }
 
 /// Adds or replaces a job. The schedule is parsed here so a bad expression is
 /// refused while someone is watching, rather than silently never firing.
-pub fn set_job(
+pub async fn set_job(
     config: &Config,
     app: &str,
     name: &str,
     schedule: &str,
     path: &str,
 ) -> Result<String, String> {
+    if !valid_app(app) {
+        return Err(format!("invalid app name '{app}'"));
+    }
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err("a job's name must be letters, numbers, '-' or '_'".into());
     }
@@ -315,39 +386,17 @@ pub fn set_job(
         .next()
         .ok_or("that schedule never fires")?;
 
-    {
-        let _held = FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut jobs = read_jobs(config, app);
-        if !jobs.contains_key(name) && jobs.len() >= MAX_JOBS_PER_APP {
-            return Err(format!("{app} already has {} jobs, the most one app may declare", jobs.len()));
-        }
-        jobs.insert(
-            name.to_string(),
-            Job {
-                schedule: schedule.to_string(),
-                path: path.to_string(),
-                last_run: None,
-                last_status: None,
-                last_started_at: None,
-                last_finished_at: None,
-                last_duration_ms: None,
-                last_skipped_at: None,
-            },
-        );
-        write_jobs(config, app, &jobs)?;
+    let job = Job { schedule: schedule.to_string(), path: path.to_string(), ..Job::default() };
+    if let Err(count) = records::of(config).set_job(app, name, &job_text(&job)?, MAX_JOBS_PER_APP).await? {
+        return Err(format!("{app} already has {count} jobs, the most one app may declare"));
     }
     config.jobs.changed();
     Ok(format!("next run {}", next.to_rfc3339()))
 }
 
-pub fn remove_job(config: &Config, app: &str, name: &str) -> Result<(), String> {
-    {
-        let _held = FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut jobs = read_jobs(config, app);
-        if jobs.remove(name).is_none() {
-            return Err(format!("{app} has no job called {name}"));
-        }
-        write_jobs(config, app, &jobs)?;
+pub async fn remove_job(config: &Config, app: &str, name: &str) -> Result<(), String> {
+    if !valid_app(app) || !records::of(config).remove_job(app, name).await? {
+        return Err(format!("{app} has no job called {name}"));
     }
     config.jobs.changed();
     Ok(())
@@ -390,11 +439,25 @@ fn is_due(job: &Job, at: u64) -> bool {
     next_due(job, at).is_some_and(|next| next <= at)
 }
 
+/// The turn a due job fires for at `at`: the latest scheduled time not after
+/// `at`. Every scheduler that finds the job due at `at` names the same turn,
+/// whatever it last read, so two of them on one database claim it once.
+fn turn(job: &Job, at: u64) -> Option<u64> {
+    if !is_due(job, at) {
+        return None;
+    }
+    let first = next_due(job, at)?;
+    let schedule = cron::Schedule::from_str(&job.schedule).ok()?;
+    let after = chrono::DateTime::from_timestamp(at as i64 + 1, 0)?;
+    let latest = schedule.after(&after).next_back().map(|turn| turn.timestamp() as u64);
+    Some(latest.filter(|latest| *latest >= first && *latest <= at).unwrap_or(first))
+}
+
 /// Runs a job once, as the scheduler would, and records the outcome. The
-/// caller holds its slot.
-async fn run_once(state: &AppState, app: &str, name: &str) -> Result<String, String> {
-    let jobs = read_jobs(&state.config, app);
-    let job = jobs.get(name).cloned().ok_or_else(|| format!("{app} has no job called {name}"))?;
+/// caller holds its slot, has recorded the start, and settles the slot
+/// after; the slot is kept alive here while the handler runs.
+async fn run_once(state: &AppState, app: &str, name: &str, lease: &Lease) -> Result<String, String> {
+    let job = jobs(&state.config, app).await.remove(name).ok_or_else(|| format!("{app} has no job called {name}"))?;
 
     let wasm = tokio::fs::read(state.config.data_dir.join(app).join("handler.wasm"))
         .await
@@ -411,8 +474,8 @@ async fn run_once(state: &AppState, app: &str, name: &str) -> Result<String, Str
     };
 
     let guards = crate::runtime::limits::of(&state.config, app).await.job;
+    let _keeping = keep(&state.config, app, name, lease);
     let started_ms = now_ms();
-    update(&state.config, app, name, |job| job.last_started_at = Some(started_ms / 1000));
     let runtime = state.runtime.clone();
     let config = state.config.clone();
     let owned_app = app.to_string();
@@ -428,20 +491,23 @@ async fn run_once(state: &AppState, app: &str, name: &str) -> Result<String, Str
         Err(error) => format!("failed: {error}"),
     };
     let finished_ms = now_ms();
-    update(&state.config, app, name, |job| {
+    let recorded = status.clone();
+    update(&state.config, app, name, move |job| {
         job.last_run = Some(finished_ms / 1000);
         job.last_finished_at = Some(finished_ms / 1000);
         job.last_duration_ms = Some(finished_ms.saturating_sub(started_ms));
-        job.last_status = Some(status.clone());
-    });
+        job.last_status = Some(recorded);
+    })
+    .await;
     Ok(status)
 }
 
 /// Runs whatever was queued behind a run that just ended, one after the
 /// other, until nothing is; then gives the slot up.
-async fn run_queued(state: &AppState, app: &str, name: &str) {
-    while state.config.jobs.again_or_release(app, name) {
-        match run_once(state, app, name).await {
+async fn run_queued(state: &AppState, app: &str, name: &str, lease: &Lease) {
+    while again_or_release(&state.config, app, name, lease).await {
+        begin(&state.config, app, name, now()).await;
+        match run_once(state, app, name, lease).await {
             Ok(status) => tracing::info!(app, job = name, status, "queued job ran"),
             Err(error) => tracing::warn!(app, job = name, error, "queued job failed"),
         }
@@ -449,110 +515,166 @@ async fn run_queued(state: &AppState, app: &str, name: &str) {
     state.config.jobs.changed();
 }
 
+/// Runs a job whose slot is held and whose start is recorded, then what is
+/// queued behind it, in the background.
+fn spawn_runs(
+    on: &tokio::runtime::Handle,
+    state: AppState,
+    app: String,
+    name: String,
+    lease: Lease,
+    how: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    on.spawn(async move {
+        match run_once(&state, &app, &name, &lease).await {
+            Ok(status) => tracing::info!(app, job = name, status, how, "job ran"),
+            Err(error) => tracing::warn!(app, job = name, error, how, "job failed"),
+        }
+        run_queued(&state, &app, &name, &lease).await;
+    })
+}
+
 /// Runs one job now, whatever its schedule says, for a person, and answers
-/// how it went. Already running, it queues one more run behind the current
-/// one instead. The same path a schedule takes, so the two cannot behave
-/// differently.
+/// how it went. Already running, on this runner or another, it queues one
+/// more run behind the current one instead. The same path a schedule takes,
+/// so the two cannot behave differently.
 pub async fn run_job(state: &AppState, app: &str, name: &str) -> Result<Ran, String> {
     state.config.jobs.attach(&state.runtime);
-    if !read_jobs(&state.config, app).contains_key(name) {
+    if !jobs(&state.config, app).await.contains_key(name) {
         return Err(format!("{app} has no job called {name}"));
     }
-    match state.config.jobs.claim_or_queue(app, name) {
-        Ok(()) => {}
-        Err(Busy::Running) => return Ok(Ran::Queued),
-        Err(Busy::App(running)) => return Err(too_many(app, running)),
+    let mut held = None;
+    for _ in 0..TRIES {
+        match claim(&state.config, app, name).await {
+            Ok(lease) => {
+                held = Some(lease);
+                break;
+            }
+            // Asked of the holder only while it holds: a run that ended in
+            // between leaves this to take the slot itself.
+            Err(Busy::Running) => match state.config.stores.leases.ask_again(&slot(app, name)).await? {
+                Some(_) => return Ok(Ran::Queued),
+                None => continue,
+            },
+            Err(Busy::App(running)) => return Err(too_many(app, running)),
+            Err(Busy::Failed(why)) => return Err(why),
+        }
     }
-    let outcome = run_once(state, app, name).await;
+    let lease = held.ok_or_else(|| format!("{name} changed hands too often to start; try again"))?;
+    begin(&state.config, app, name, now()).await;
+    let outcome = run_once(state, app, name, &lease).await;
     // The slot is settled before answering, so a caller who asks again
     // once this returns gets a run of its own. Whatever was queued
     // meanwhile runs on without the caller.
-    if state.config.jobs.again_or_release(app, name) {
-        let (state, app, name) = (state.clone(), app.to_string(), name.to_string());
-        tokio::spawn(async move {
-            if let Err(error) = run_once(&state, &app, &name).await {
-                tracing::warn!(app, job = name, error, "queued job failed");
-            }
-            run_queued(&state, &app, &name).await;
-        });
+    if again_or_release(&state.config, app, name, &lease).await {
+        begin(&state.config, app, name, now()).await;
+        spawn_runs(&tokio::runtime::Handle::current(), state.clone(), app.to_string(), name.to_string(), lease, "queued");
     } else {
         state.config.jobs.changed();
     }
     outcome.map(Ran::Finished)
 }
 
-
 /// `jobs.run` from inside an app's handler: starts one of the app's own
-/// jobs in the background, or queues one more run of it if it is running.
-/// `app` is the running app, never anything the guest said.
+/// jobs in the background, or queues one more run of it if it is running
+/// on any runner. `app` is the running app, never anything the guest said.
+/// Called on the blocking thread a handler runs on.
 pub fn start_from_app(config: &Arc<Config>, app: &str, name: &str) -> Result<String, String> {
     if !read_jobs(config, app).contains_key(name) {
         return Err(format!("{app} declares no job called {name:?}"));
     }
-    let jobs = &config.jobs;
-    // Decided under the one lock, so a run that ends meanwhile either sees
-    // the queued flag or has already let the slot go and this starts anew.
-    let mut running = jobs.running.lock().unwrap();
-    if let Some(again) = running.get_mut(&key(app, name)) {
-        if !*again {
-            jobs.count_start(app)?;
-            *again = true;
-        }
-        return Ok("queued".to_string());
-    }
-    let Some((runtime, handle)) = jobs.attached.lock().unwrap().clone() else {
+    let Some((runtime, handle)) = config.jobs.attached.lock().unwrap().clone() else {
         return Err("jobs cannot be started on this server yet".to_string());
     };
     let Some(runtime) = runtime.upgrade() else {
         return Err("jobs cannot be started on this server yet".to_string());
     };
-    let of_app = running_of(&running, app);
-    if of_app >= jobs.running_per_app {
-        return Err(too_many(app, of_app));
-    }
-    jobs.count_start(app)?;
-    jobs.claim_in(&mut running, app, name).map_err(|_| too_many(app, of_app))?;
-    drop(running);
     let state = AppState { config: config.clone(), runtime };
-    let (app, name) = (app.to_string(), name.to_string());
-    handle.spawn(async move {
-        match run_once(&state, &app, &name).await {
-            Ok(status) => tracing::info!(app, job = name, status, "job ran, started by the app"),
-            Err(error) => tracing::warn!(app, job = name, error, "job failed, started by the app"),
+    handle.block_on(start(state, handle.clone(), app, name))
+}
+
+async fn start(state: AppState, on: tokio::runtime::Handle, app: &str, name: &str) -> Result<String, String> {
+    let (config, leases, slot) = (&state.config, &state.config.stores.leases, slot(app, name));
+    // A start is counted once, however many times a slot changing hands
+    // sends this round again.
+    let mut counted = false;
+    for _ in 0..TRIES {
+        match leases.state(&slot).await? {
+            // Queued already: one more ask is the same run.
+            Some(true) => return Ok("queued".to_string()),
+            Some(false) => {
+                if !counted {
+                    count_start(config, app).await?;
+                    counted = true;
+                }
+                // Made only of a live holder, who sees it as it finishes.
+                if leases.ask_again(&slot).await?.is_some() {
+                    return Ok("queued".to_string());
+                }
+                continue;
+            }
+            None => {}
         }
-        run_queued(&state, &app, &name).await;
-    });
-    Ok("started".to_string())
+        let lease = match claim(config, app, name).await {
+            Ok(lease) => lease,
+            Err(Busy::Running) => continue,
+            Err(Busy::App(running)) => return Err(too_many(app, running)),
+            Err(Busy::Failed(why)) => return Err(why),
+        };
+        if !counted && let Err(why) = count_start(config, app).await {
+            // Given back. A run someone queued in that moment counted its
+            // own start, so it runs.
+            if again_or_release(config, app, name, &lease).await {
+                begin(config, app, name, now()).await;
+                spawn_runs(&on, state.clone(), app.to_string(), name.to_string(), lease, "started by the app");
+            }
+            return Err(why);
+        }
+        // Recorded before "started" is answered: the run's own task may not
+        // get going for a while, and a schedule planned meanwhile must count
+        // from this start, not from whenever that is.
+        begin(config, app, name, now()).await;
+        spawn_runs(&on, state.clone(), app.to_string(), name.to_string(), lease, "started by the app");
+        return Ok("started".to_string());
+    }
+    Err(format!("{name} changed hands too often to start; try again"))
 }
 
 /// Records an outcome against a job, as if it had just finished. For tests
 /// that need a job to look as though it has run.
 pub fn record_run(config: &Config, app: &str, name: &str, status: &str) {
-    let at = now();
-    update(config, app, name, |job| {
+    let (at, status) = (now(), status.to_string());
+    let edit = edit_job(move |job| {
         job.last_run = Some(at);
         job.last_finished_at = Some(at);
-        job.last_status = Some(status.to_string());
+        job.last_status = Some(status);
     });
+    if let Err(why) = records::of(config).update_job_blocking(app, name, edit) {
+        tracing::warn!(app, job = name, %why, "the job's record could not be written");
+    }
 }
 
-/// Every app that has jobs, found the same way the index finds pages.
-async fn apps_with_jobs(config: &Config) -> Vec<String> {
-    let Ok(mut entries) = tokio::fs::read_dir(&config.data_dir).await else {
-        return Vec::new();
-    };
-    let mut apps = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(app) = name.strip_suffix(".jobs") {
-            apps.push(app.to_string());
-        }
-    }
-    apps
+/// Every job on the site, read in one scan.
+async fn all_jobs(config: &Config) -> Vec<(String, String, Job)> {
+    let all = records::of(config).all_jobs().await.unwrap_or_else(|why| {
+        tracing::warn!(%why, "jobs could not be listed");
+        Vec::new()
+    });
+    all.into_iter()
+        .filter_map(|(app, name, text)| match serde_json::from_str(&text) {
+            Ok(job) => Some((app, name, job)),
+            Err(why) => {
+                tracing::warn!(app, job = name, %why, "a job could not be read");
+                None
+            }
+        })
+        .collect()
 }
 
 /// What runs an app's jobs on their schedules. A process starts one, from
-/// `main`, for the data directory it serves: two would each fire every job.
+/// `main`. On files that is the only one for the data directory; on Postgres
+/// every runner starts one, and each turn of each job is claimed in the
+/// database before it runs, so it fires once however many are looking.
 #[derive(Clone)]
 pub struct Scheduler {
     state: AppState,
@@ -585,53 +707,84 @@ impl Scheduler {
     /// `MIN_SLEEP` and `MAX_SLEEP`.
     pub async fn until_next(&self, at_ms: u64) -> Duration {
         let at = at_ms / 1000;
-        let mut soonest: Option<u64> = None;
-        for app in apps_with_jobs(&self.state.config).await {
-            for job in read_jobs(&self.state.config, &app).values() {
-                if let Some(next) = next_due(job, at) {
-                    soonest = Some(soonest.map_or(next, |s| s.min(next)));
-                }
-            }
-        }
+        let soonest = all_jobs(&self.state.config).await.iter().filter_map(|(_, _, job)| next_due(job, at)).min();
         match soonest {
             Some(next) => Duration::from_millis((next * 1000).saturating_sub(at_ms)).clamp(MIN_SLEEP, MAX_SLEEP),
             None => MAX_SLEEP,
         }
     }
 
-    /// Starts every job due at `at`, in Unix seconds. One still running is
-    /// skipped and the skip recorded, which also counts the turn as taken.
+    /// Starts every job due at `at`, in Unix seconds, whose turn no other
+    /// scheduler has claimed. One still running, here or on another runner,
+    /// is skipped and the skip recorded, which also counts the turn as
+    /// taken. A run some runner owed when it stopped is taken over too.
     /// Returns the runs it started, which finish on their own; awaiting
     /// them is for whoever wants to know when.
     pub async fn tick(&self, at: u64) -> Vec<tokio::task::JoinHandle<()>> {
+        let config = &self.state.config;
+        let records = records::of(config);
         let mut started = Vec::new();
-        for app in apps_with_jobs(&self.state.config).await {
-            for (name, job) in read_jobs(&self.state.config, &app) {
-                if !is_due(&job, at) {
+        for (app, name, job) in all_jobs(config).await {
+            let Some(due) = turn(&job, at) else {
+                continue;
+            };
+            match records.fire(&app, &name, due).await {
+                Ok(true) => {}
+                // Another scheduler has this turn.
+                Ok(false) => continue,
+                Err(why) => {
+                    tracing::warn!(app, job = name, %why, "the turn could not be claimed; left for the next wake");
                     continue;
                 }
-                if let Err(busy) = self.state.config.jobs.claim(&app, &name) {
+            }
+            let lease = match claim(config, &app, &name).await {
+                Ok(lease) => lease,
+                Err(busy) => {
                     match busy {
                         Busy::Running => tracing::warn!(app, job = name, "still running; skipping this turn"),
                         Busy::App(running) => {
                             tracing::warn!(app, job = name, running, "the app runs as many jobs as it may; skipping this turn")
                         }
+                        Busy::Failed(why) => tracing::warn!(app, job = name, %why, "the job's slot could not be read; skipping this turn"),
                     }
-                    update(&self.state.config, &app, &name, |job| job.last_skipped_at = Some(at));
+                    update(config, &app, &name, move |job| job.last_skipped_at = Some(at)).await;
                     continue;
                 }
-                // Marked started now, not when the task gets round to it,
-                // so the next wake is planned from this turn.
-                update(&self.state.config, &app, &name, |job| job.last_started_at = Some(at));
-                let (state, app) = (self.state.clone(), app.clone());
-                started.push(tokio::spawn(async move {
-                    match run_once(&state, &app, &name).await {
-                        Ok(status) => tracing::info!(app, job = name, status, "job ran"),
-                        Err(error) => tracing::warn!(app, job = name, error, "job failed"),
-                    }
-                    run_queued(&state, &app, &name).await;
-                }));
-            }
+            };
+            // Marked started now, not when the task gets round to it, so
+            // the next wake is planned from this turn.
+            begin(config, &app, &name, at).await;
+            started.push(spawn_runs(&tokio::runtime::Handle::current(), self.state.clone(), app, name, lease, "scheduled"));
+        }
+        started.extend(self.take_over().await);
+        started
+    }
+
+    /// Runs owed by a runner that stopped: a job asked to go again whose
+    /// slot ran out unsettled. Taking the slot spends the request, so one
+    /// scheduler runs it.
+    async fn take_over(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let config = &self.state.config;
+        let orphans = config.stores.leases.orphans(SLOT_PREFIX).await.unwrap_or_else(|why| {
+            tracing::warn!(%why, "runs owed by stopped runners could not be read");
+            Vec::new()
+        });
+        let mut started = Vec::new();
+        for (lease, group) in orphans {
+            let Some(app) = group else {
+                continue;
+            };
+            let Some(name) = lease.strip_prefix(&slot(&app, "")).map(str::to_string) else {
+                continue;
+            };
+            // Held or full: another runner took it, or the app has no room
+            // yet. Still owed, so the next wake looks again.
+            let Ok(lease) = claim(config, &app, &name).await else {
+                continue;
+            };
+            tracing::info!(app, job = name, "running a queued run whose runner stopped");
+            begin(config, &app, &name, now()).await;
+            started.push(spawn_runs(&tokio::runtime::Handle::current(), self.state.clone(), app, name, lease, "taken over"));
         }
         started
     }
@@ -647,15 +800,15 @@ mod tests {
         (dir, config)
     }
 
-    #[test]
-    fn a_schedule_is_checked_when_it_is_set_not_when_it_should_fire() {
+    #[tokio::test]
+    async fn a_schedule_is_checked_when_it_is_set_not_when_it_should_fire() {
         let (_dir, config) = config();
-        assert!(set_job(&config, "app", "refresh", "0 */5 * * * *", "/api/refresh").is_ok());
+        assert!(set_job(&config, "app", "refresh", "0 */5 * * * *", "/api/refresh").await.is_ok());
 
-        let error = set_job(&config, "app", "refresh", "not a schedule", "/api/x").unwrap_err();
+        let error = set_job(&config, "app", "refresh", "not a schedule", "/api/x").await.unwrap_err();
         assert!(error.contains("Six fields"), "the error should show the shape: {error}");
         // A path a handler could never receive is refused too.
-        assert!(set_job(&config, "app", "refresh", "0 * * * * *", "api/x").is_err());
+        assert!(set_job(&config, "app", "refresh", "0 * * * * *", "api/x").await.is_err());
     }
 
     #[test]
@@ -705,12 +858,15 @@ mod tests {
         assert!(!is_due(&new_year, now()));
     }
 
-    #[test]
-    fn jobs_belong_to_one_app() {
+    #[tokio::test]
+    async fn jobs_belong_to_one_app() {
         let (_dir, config) = config();
-        set_job(&config, "mine", "refresh", "0 * * * * *", "/api/x").unwrap();
+        set_job(&config, "mine", "refresh", "0 * * * * *", "/api/x").await.unwrap();
         assert!(read_jobs(&config, "theirs").is_empty());
-        assert!(remove_job(&config, "theirs", "refresh").is_err());
+        assert!(remove_job(&config, "theirs", "refresh").await.is_err());
+        // A name that is not an app's reaches no file.
+        assert!(set_job(&config, "../mine", "refresh", "0 * * * * *", "/api/x").await.is_err());
+        assert!(read_jobs(&config, "../mine").is_empty());
     }
 
     #[test]
@@ -758,55 +914,59 @@ mod tests {
         assert_eq!(next_due(&job, START + 10), Some(START + 20));
     }
 
-    #[test]
-    fn a_job_runs_once_at_a_time_and_one_more_run_queues_behind_it() {
-        let jobs = Jobs::new(10);
-        assert!(jobs.claim("app", "work").is_ok());
-        assert_eq!(jobs.claim("app", "work"), Err(Busy::Running), "a second run got the slot");
-        // Asking while it runs queues exactly one more, in the same step.
-        assert_eq!(jobs.claim_or_queue("app", "work"), Err(Busy::Running));
-        assert!(jobs.again_or_release("app", "work"), "the queued run was lost");
-        assert!(!jobs.again_or_release("app", "work"));
-        assert!(jobs.claim("app", "work").is_ok(), "the slot was not given back");
-        assert!(jobs.claim("app", "other").is_ok(), "another job of the app was held up");
+    #[tokio::test]
+    async fn a_job_runs_once_at_a_time_and_one_more_run_queues_behind_it() {
+        let (_dir, config) = config();
+        let work = claim(&config, "app", "work").await.unwrap();
+        assert_eq!(claim(&config, "app", "work").await, Err(Busy::Running), "a second run got the slot");
+        // Asking while it runs queues exactly one more.
+        assert_eq!(config.stores.leases.ask_again(&slot("app", "work")).await.unwrap(), Some(false));
+        assert_eq!(config.stores.leases.ask_again(&slot("app", "work")).await.unwrap(), Some(true));
+        assert!(again_or_release(&config, "app", "work", &work).await, "the queued run was lost");
+        assert!(is_running(&config, "app", "work"));
+        assert!(!again_or_release(&config, "app", "work", &work).await);
+        let again = claim(&config, "app", "work").await.expect("the slot was not given back");
+        claim(&config, "app", "other").await.expect("another job of the app was held up");
+        assert_eq!(running(&config, "app").await, BTreeSet::from(["other".to_string(), "work".to_string()]));
         // Nothing queued: finishing lets the slot go.
-        assert!(!jobs.again_or_release("app", "work"));
-        assert!(!jobs.is_running("app", "work"));
+        assert!(!again_or_release(&config, "app", "work", &again).await);
+        assert!(!is_running(&config, "app", "work"));
     }
 
-    #[test]
-    fn an_app_runs_at_most_its_share_of_jobs_at_once_and_another_app_is_not_held_up() {
-        let jobs = Jobs::new(100).with_running_per_app(2);
-        assert!(jobs.claim("busy", "one").is_ok());
-        assert!(jobs.claim("busy", "two").is_ok());
-        assert_eq!(jobs.claim("busy", "three"), Err(Busy::App(2)));
+    #[tokio::test]
+    async fn an_app_runs_at_most_its_share_of_jobs_at_once_and_another_app_is_not_held_up() {
+        let (_dir, config) = config();
+        let config = Config { jobs: Arc::new(Jobs::new(100).with_running_per_app(2)), ..config };
+        let one = claim(&config, "busy", "one").await.unwrap();
+        claim(&config, "busy", "two").await.unwrap();
+        assert_eq!(claim(&config, "busy", "three").await, Err(Busy::App(2)));
         // Another app, even one whose slug starts with this one's, runs.
-        assert!(jobs.claim("busy/sub", "one").is_ok());
-        assert!(jobs.claim("quiet", "one").is_ok());
+        claim(&config, "busy/sub", "one").await.unwrap();
+        claim(&config, "quiet", "one").await.unwrap();
         // One finishing frees a place.
-        assert!(!jobs.again_or_release("busy", "one"));
-        assert!(jobs.claim("busy", "three").is_ok());
+        assert!(!again_or_release(&config, "busy", "one", &one).await);
+        claim(&config, "busy", "three").await.unwrap();
     }
 
-    #[test]
-    fn an_app_declares_at_most_a_hundred_jobs() {
+    #[tokio::test]
+    async fn an_app_declares_at_most_a_hundred_jobs() {
         let (_dir, config) = config();
         for n in 0..MAX_JOBS_PER_APP {
-            set_job(&config, "app", &format!("job{n}"), "0 0 3 * * *", "/api/x").unwrap();
+            set_job(&config, "app", &format!("job{n}"), "0 0 3 * * *", "/api/x").await.unwrap();
         }
-        let error = set_job(&config, "app", "one-more", "0 0 3 * * *", "/api/x").unwrap_err();
+        let error = set_job(&config, "app", "one-more", "0 0 3 * * *", "/api/x").await.unwrap_err();
         assert!(error.contains("most"), "{error}");
         // Changing one it has is still fine.
-        set_job(&config, "app", "job0", "0 0 4 * * *", "/api/y").unwrap();
+        set_job(&config, "app", "job0", "0 0 4 * * *", "/api/y").await.unwrap();
         assert_eq!(read_jobs(&config, "app").len(), MAX_JOBS_PER_APP);
     }
 
-    #[test]
-    fn a_schedule_that_never_fires_is_refused_at_once_and_never_spins_the_scheduler() {
+    #[tokio::test]
+    async fn a_schedule_that_never_fires_is_refused_at_once_and_never_spins_the_scheduler() {
         let (_dir, config) = config();
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         for never in ["0 0 0 30 2 *", "0 0 0 31 4 *", "0 0 0 1 1 * 2001"] {
-            let error = set_job(&config, "app", "never", never, "/api/x").unwrap_err();
+            let error = set_job(&config, "app", "never", never, "/api/x").await.unwrap_err();
             assert!(error.contains("never fires"), "{never}: {error}");
             // A job file written by hand, or by an older server, with one.
             let job = Job { schedule: never.to_string(), path: "/api/x".into(), ..Job::default() };
@@ -815,14 +975,37 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     }
 
-    #[test]
-    fn starts_past_the_rate_are_refused() {
-        let jobs = Jobs::new(3);
+    #[tokio::test]
+    async fn starts_past_the_rate_are_refused() {
+        let (_dir, config) = config();
+        let config = Config { jobs: Arc::new(Jobs::new(3)), ..config };
         for _ in 0..3 {
-            jobs.count_start("busy").unwrap();
+            count_start(&config, "busy").await.unwrap();
         }
-        assert!(jobs.count_start("busy").unwrap_err().contains("limit"));
+        assert!(count_start(&config, "busy").await.unwrap_err().contains("limit"));
         // The rate is per app.
-        jobs.count_start("quiet").unwrap();
+        count_start(&config, "quiet").await.unwrap();
+    }
+
+    /// Two schedulers that read the job at different moments, one before
+    /// and one after the other recorded its start, still name one turn: the
+    /// latest scheduled time, not the first after whatever each last read.
+    #[test]
+    fn a_due_job_fires_for_its_latest_turn_whatever_was_last_read() {
+        const START: u64 = 1_000_000_000; // a multiple of ten
+        let job = Job { schedule: "*/2 * * * * *".to_string(), path: "/api/x".to_string(), ..Job::default() };
+        // Never run: the fallback window reaches back thirty seconds, but
+        // the turn is the latest one.
+        assert_eq!(turn(&job, START + 1), Some(START));
+        assert_eq!(turn(&job, START + 2), Some(START + 2));
+        // Down for an hour: one turn, the latest.
+        let gone = Job { last_run: Some(START - 3600), ..job.clone() };
+        assert_eq!(turn(&gone, START + 3), Some(START + 2));
+        // Started at the turn: nothing more due until the next.
+        let started = Job { last_started_at: Some(START + 2), ..job.clone() };
+        assert_eq!(turn(&started, START + 3), None);
+        assert_eq!(turn(&started, START + 4), Some(START + 4));
+        let every_second = Job { schedule: "* * * * * *".to_string(), ..job };
+        assert_eq!(turn(&every_second, START + 7), Some(START + 7));
     }
 }

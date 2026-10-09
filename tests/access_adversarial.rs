@@ -1612,7 +1612,7 @@ async fn a_person_without_manage_cannot_run_a_job_by_mcp_or_the_admin_page() {
     let w = world().await;
     std::fs::create_dir_all(w.config.data_dir.join("yard")).unwrap();
     std::fs::write(w.config.data_dir.join("yard/handler.wasm"), include_bytes!("fixtures/handler.wasm")).unwrap();
-    toolsite::platform::schedule::set_job(&w.config, "yard", "mark", "0 0 0 1 1 *", "/api/job-mark").unwrap();
+    toolsite::platform::schedule::set_job(&w.config, "yard", "mark", "0 0 0 1 1 *", "/api/job-mark").await.unwrap();
     let marks = |config: &Config| {
         toolsite::runtime::db::run(config, "yard", "select count(*) from marks", &[])
             .map(|out| out.rows[0][0].as_i64().unwrap())
@@ -1643,7 +1643,7 @@ async fn a_person_without_manage_cannot_run_a_job_by_mcp_or_the_admin_page() {
 #[tokio::test]
 async fn a_jobs_status_is_shown_to_its_editors_and_never_to_a_viewer() {
     let w = world().await;
-    toolsite::platform::schedule::set_job(&w.config, "ledger", "close", "0 0 0 1 1 *", "/api/close").unwrap();
+    toolsite::platform::schedule::set_job(&w.config, "ledger", "close", "0 0 0 1 1 *", "/api/close").await.unwrap();
     toolsite::platform::schedule::record_run(&w.config, "ledger", "close", "failed: wrote 4411-2222 to the books");
     let leaks = |text: &str| text.contains("4411-2222");
 
