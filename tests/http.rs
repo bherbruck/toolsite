@@ -2529,6 +2529,75 @@ async fn a_browser_uploads_straight_to_storage_and_the_handler_serves_it_back() 
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// What DuckDB-WASM and a video element do: ask for the bytes they need. A
+/// file the handler points at is served in part, never past its ends, and
+/// only when the handler's answer was a plain 200.
+#[tokio::test]
+async fn a_file_the_handler_points_at_is_served_in_ranges() {
+    let (_dir, config) = server();
+    publish_handler(&config, "drive");
+    toolsite::runtime::blobs::put(&config, "drive", "data.parquet", "application/octet-stream", b"0123456789").unwrap();
+    let ranged = |range: &str| {
+        Request::builder()
+            .uri("/p/drive/api/blob-serve?key=data.parquet")
+            .header("range", range)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let header = |headers: &[(String, String)], name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+
+    // The whole file says ranges are welcome.
+    let (status, body, headers) = send(&config, get("/p/drive/api/blob-serve?key=data.parquet")).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "0123456789"));
+    assert_eq!(header(&headers, "accept-ranges").as_deref(), Some("bytes"));
+
+    for (range, part, content_range) in [
+        ("bytes=2-4", "234", "bytes 2-4/10"),
+        ("bytes=7-", "789", "bytes 7-9/10"),
+        ("bytes=-3", "789", "bytes 7-9/10"),
+        ("bytes=8-1000", "89", "bytes 8-9/10"),
+        ("bytes=-1000", "0123456789", "bytes 0-9/10"),
+    ] {
+        let (status, body, headers) = send(&config, ranged(range)).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(body, part, "{range}");
+        assert_eq!(header(&headers, "content-range").as_deref(), Some(content_range), "{range}");
+        assert_eq!(header(&headers, "content-length"), Some(part.len().to_string()), "{range}");
+        assert_eq!(header(&headers, "content-type").as_deref(), Some("application/octet-stream"));
+        assert_eq!(header(&headers, "content-disposition").as_deref(), Some("attachment; filename=\"data.parquet\""));
+    }
+
+    // Past the end: nothing, and the size, so the client can ask again.
+    let (status, body, headers) = send(&config, ranged("bytes=10-20")).await;
+    assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(body.is_empty(), "{body}");
+    assert_eq!(header(&headers, "content-range").as_deref(), Some("bytes */10"));
+
+    // Several ranges, or one that makes no sense, get the whole file.
+    for range in ["bytes=0-1,4-5", "bytes=5-2", "lines=1-2"] {
+        let (status, body, _) = send(&config, ranged(range)).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "0123456789"), "{range}");
+    }
+
+    // If-Range with nothing to match it is a changed file: the whole of it.
+    let request = Request::builder()
+        .uri("/p/drive/api/blob-serve?key=data.parquet")
+        .header("range", "bytes=0-1")
+        .header("if-range", "\"stale\"")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(&config, request).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "0123456789"));
+
+    // A range never reaches a file the handler did not point at.
+    let request = Request::builder()
+        .uri("/p/drive/api/blob-serve?key=missing.parquet")
+        .header("range", "bytes=0-1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&config, request).await.0, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn a_browser_upload_stops_at_the_handlers_limit() {
     let (dir, config) = server();
