@@ -15,7 +15,7 @@ use axum::{
     body::Body,
     extract::{Path, State},
     http::{header, Request, StatusCode},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Redirect, Response},
 };
 
 /// Ceiling on a request body handed to a guest.
@@ -57,6 +57,103 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
         "webmanifest" => "application/manifest+json",
         _ => "application/octet-stream",
     }
+}
+
+/// How long a content-hashed asset may be kept: a year, the most anyone
+/// honours. Its name changes whenever its bytes do, so it never goes stale.
+const IMMUTABLE_CACHE: &str = "max-age=31536000, immutable";
+
+/// Whether a bundle path names a build output whose file name carries a
+/// hash of its content, the way Vite, Rollup, esbuild and webpack name what
+/// they emit. Such a file can be cached for good: new content arrives under
+/// a new name, and the index.html that names it is revalidated.
+///
+/// Deliberately narrow, since a false yes keeps a changed file stale for a
+/// year: the file must sit in an `assets` directory, Vite's default output
+/// folder, and its name must carry a hash in one of two shapes:
+///
+/// - `<name>-<8 characters>.<ext>`, the hash from `A-Z a-z 0-9 _ -` with
+///   a digit in it, or a capital past its first letter, so a word such as
+///   `-overview` or `-Overview` is not one (Vite, Rollup, esbuild);
+/// - `<name>.<8 or more hex digits>.<ext>`, with at least one digit
+///   (webpack's `[contenthash]`).
+///
+/// An HTML file is never one: it is what names the others.
+pub(crate) fn is_content_hashed(path: &str) -> bool {
+    let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if !dirs.split('/').any(|dir| dir == "assets") {
+        return false;
+    }
+    if matches!(content_type_for(name), "text/html; charset=utf-8") {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    let hash_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    let dashed = (1..bytes.len().saturating_sub(9)).any(|dash| {
+        let hash = &bytes[dash + 1..dash + 9];
+        bytes[dash] == b'-'
+            && bytes[dash + 9] == b'.'
+            && hash.iter().all(|c| hash_char(*c))
+            && (hash.iter().any(u8::is_ascii_digit) || hash[1..].iter().any(u8::is_ascii_uppercase))
+    });
+    let parts: Vec<&str> = name.split('.').collect();
+    let dotted = parts.len() >= 3
+        && parts[1..parts.len() - 1].iter().any(|part| {
+            part.len() >= 8
+                && part.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                && part.bytes().any(|c| c.is_ascii_digit())
+        });
+    dashed || dotted
+}
+
+/// A validator for a body served from disk: a digest of exactly the bytes
+/// sent, so a browser that has them can revalidate and get a 304.
+fn etag_of(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body);
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("\"{hex}\"")
+}
+
+/// Whether `If-None-Match` already names `etag`. The comparison is the weak
+/// one the header calls for, so a `W/` prefix a proxy added still matches.
+fn already_has(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|tag| tag.trim())
+        .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag)
+}
+
+/// A file from the app's directory, with its validator and, when it has
+/// one, its cache policy; or 304 when the browser already holds these bytes.
+fn file_response(
+    request_headers: &axum::http::HeaderMap,
+    content_type: &'static str,
+    cache: Option<String>,
+    body: Vec<u8>,
+) -> Response {
+    let etag = etag_of(&body);
+    let mut builder = Response::builder().header(header::ETAG, &etag);
+    if let Some(cache) = &cache {
+        builder = builder.header(header::CACHE_CONTROL, cache);
+    }
+    let response = if already_has(request_headers, &etag) {
+        builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
+    } else {
+        builder.header(header::CONTENT_TYPE, content_type).body(Body::from(body))
+    };
+    response.unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// An HTML page of the app's, with its favicon links, through
+/// `file_response`. Pages are what name the hashed assets, so they get a
+/// validator and no lifetime: a browser asks again and is told 304.
+fn page_response(request_headers: &axum::http::HeaderMap, app: &str, html: String) -> Response {
+    let html = crate::content::favicon::add_links(app, html);
+    file_response(request_headers, "text/html; charset=utf-8", None, html.into_bytes())
 }
 
 
@@ -218,11 +315,21 @@ pub(crate) async fn serve_page(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
-    // A file inside a bundle: styles, scripts, images, fonts.
+    // A file inside a bundle: styles, scripts, images, fonts. One whose
+    // name is a hash of its content is kept for good, privately unless the
+    // app is public; the rest revalidate.
     let asset = config.data_dir.join(slug);
     if asset.is_file() {
         if let Ok(bytes) = fs::read(&asset).await {
-            return ([(header::CONTENT_TYPE, content_type_for(slug))], bytes).into_response();
+            let cache = if is_content_hashed(rest) {
+                let within = uri_path.strip_prefix(&format!("/p/{app}")).unwrap_or(&uri_path);
+                let gate = crate::content::store::effective_gate(config, app, within).await.gate;
+                let scope = if gate == "public" { "public" } else { "private" };
+                Some(format!("{scope}, {IMMUTABLE_CACHE}"))
+            } else {
+                None
+            };
+            return file_response(request.headers(), content_type_for(slug), cache, bytes);
         }
     }
 
@@ -240,7 +347,7 @@ pub(crate) async fn serve_page(
 
     let direct = config.data_dir.join(format!("{slug}.html"));
     if let Ok(html) = fs::read_to_string(&direct).await {
-        return Html(crate::content::favicon::add_links(app, html)).into_response();
+        return page_response(request.headers(), app, html);
     }
     // App root without a filename: serve that app's 'index' page. Redirect to
     // the trailing-slash form first so relative links inside the app resolve
@@ -250,7 +357,7 @@ pub(crate) async fn serve_page(
         if !had_trailing_slash {
             return Redirect::permanent(&format!("/p/{slug}/")).into_response();
         }
-        return Html(crate::content::favicon::add_links(app, html)).into_response();
+        return page_response(request.headers(), app, html);
     }
 
     // Nothing on disk, but the app ships code: let it answer for its own
@@ -262,7 +369,7 @@ pub(crate) async fn serve_page(
     // Client-routed bundle: /p/app/some/route is the app's own concern, so
     // hand back its index and let the router sort it out.
     if let Some(html) = spa_fallback(config, slug).await {
-        return Html(crate::content::favicon::add_links(app, html)).into_response();
+        return page_response(request.headers(), app, html);
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
@@ -713,5 +820,61 @@ mod tests {
         for (name, value) in [("set-cookie", "theme=dark; Path=/p/a/"), ("content-type", "text/html"), ("cache-control", "no-store")] {
             assert!(!refused_response_header("a", name, value), "{name}: {value}");
         }
+    }
+
+    #[test]
+    fn only_a_build_output_named_for_its_content_is_cached_for_good() {
+        for hashed in [
+            // Vite and Rollup: base64url, which may itself hold a '-' or '_'.
+            "assets/index-BqLnBTZ0.js",
+            "assets/index-DiwrgTda.css",
+            "assets/index-D-Lg3MvU.js",
+            "assets/vendor_react-a1b2c3d4.js",
+            "assets/index-BqLnBTZ0.js.map",
+            "assets/handler_bg-Q2ZJ6NJX.wasm",
+            "assets/fonts/inter-latin-400-normal-C38fXH4l.woff2",
+            "dist/assets/logo-7Hc9_kQe.svg",
+            // webpack's [contenthash], 8 or 20 hex digits.
+            "assets/main.3f2a9c1b.js",
+            "assets/js/chunk.3f2a9c1b4e5d6f7a8b9c.js",
+        ] {
+            assert!(is_content_hashed(hashed), "{hashed} should be immutable");
+        }
+        for plain in [
+            // Not in an assets directory, however hashed it looks.
+            "index-BqLnBTZ0.js",
+            "static/js/main.3f2a9c1b.js",
+            // Names a person chose: words, dates, versions, camera files.
+            "assets/logo.png",
+            "assets/main.js",
+            "assets/report-overview.pdf",
+            "assets/Annual-Overview.pdf",
+            "assets/icons-v2.svg",
+            "assets/main-4f2a.js",
+            "assets/deadbeef.js",
+            "assets/style.deadbeef.css",
+            // What names the rest is never kept.
+            "assets/index-BqLnBTZ0.html",
+            "assets/page.3f2a9c1b.html",
+        ] {
+            assert!(!is_content_hashed(plain), "{plain} should revalidate");
+        }
+    }
+
+    #[test]
+    fn a_validator_is_matched_however_the_browser_lists_it() {
+        let etag = etag_of(b"body{}");
+        assert_eq!(etag, etag_of(b"body{}"));
+        assert_ne!(etag, etag_of(b"body{ }"));
+        let with = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, value.parse().unwrap());
+            headers
+        };
+        assert!(already_has(&with(&etag), &etag));
+        assert!(already_has(&with(&format!("\"other\", W/{etag}")), &etag));
+        assert!(already_has(&with("*"), &etag));
+        assert!(!already_has(&with("\"other\""), &etag));
+        assert!(!already_has(&axum::http::HeaderMap::new(), &etag));
     }
 }
