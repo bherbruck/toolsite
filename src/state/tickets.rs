@@ -507,6 +507,27 @@ mod tests {
         assert_eq!(tickets.get::<String>(Kind::Upload, &id).await.unwrap().as_deref(), Some("app"));
     }
 
+    /// One site key, three uses: what seals a ticket is neither the key that
+    /// seals settings and two-step secrets nor the key form tokens come from,
+    /// so a value made for one use never opens or forges another.
+    #[tokio::test]
+    async fn the_ticket_key_is_its_own_and_not_the_site_or_form_key() {
+        let site = [42u8; 32];
+        let ticket_key = crate::seal::derive(&site, KEY_LABEL);
+        assert_ne!(ticket_key, site);
+        assert_ne!(ticket_key, crate::seal::derive(&site, crate::seal::FORM_KEY_LABEL));
+        assert_ne!(KEY_LABEL, crate::seal::FORM_KEY_LABEL);
+
+        let store: Arc<dyn TicketStore> = Arc::new(Memory::default());
+        let minted = Tickets::with_store(store.clone(), &ticket_key);
+        let id = minted.put(Kind::Upload, Duration::from_secs(60), &"app").await.unwrap();
+        for wrong in [site, crate::seal::derive(&site, crate::seal::FORM_KEY_LABEL)] {
+            let other = Tickets::with_store(store.clone(), &wrong);
+            assert!(other.get::<String>(Kind::Upload, &id).await.is_err(), "a ticket opened under another use's key");
+        }
+        assert_eq!(minted.get::<String>(Kind::Upload, &id).await.unwrap().as_deref(), Some("app"));
+    }
+
     #[tokio::test]
     async fn a_ticket_sealed_under_another_key_does_not_open() {
         let one = Tickets::memory();

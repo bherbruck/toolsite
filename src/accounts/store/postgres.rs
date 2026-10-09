@@ -638,10 +638,40 @@ impl AccountStore for PostgresAccounts {
         })
     }
 
-    fn record_failure(&self, user_id: &str, at: i64, forget_before: i64) -> Result<(), String> {
+    fn try_attempt(&self, user_id: &str, at: i64, since: i64, limit: i64) -> Result<bool, String> {
         self.run(async |c| {
-            let _ = c.execute("delete from accounts.mfa_failures where at <= $1", &[&forget_before]).await;
-            c.execute("insert into accounts.mfa_failures (user_id, at) values ($1, $2)", &[&user_id, &at]).await?;
+            let tx = c.transaction().await?;
+            // The account's row is the turn every count for it waits on, so
+            // two callers cannot both read a count under the limit.
+            if tx
+                .query_opt("select 1 from accounts.users where id = $1 for no key update", &[&user_id])
+                .await?
+                .is_none()
+            {
+                return Ok(false);
+            }
+            tx.execute("delete from accounts.mfa_failures where at <= $1", &[&since]).await?;
+            let counted: i64 = tx
+                .query_one("select count(*) from accounts.mfa_failures where user_id = $1 and at > $2", &[&user_id, &since])
+                .await?
+                .get(0);
+            if counted >= limit {
+                return Ok(false);
+            }
+            tx.execute("insert into accounts.mfa_failures (user_id, at) values ($1, $2)", &[&user_id, &at]).await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    fn release_attempt(&self, user_id: &str, at: i64) -> Result<(), String> {
+        self.run(async |c| {
+            c.execute(
+                "delete from accounts.mfa_failures
+                  where ctid = (select ctid from accounts.mfa_failures where user_id = $1 and at = $2 limit 1)",
+                &[&user_id, &at],
+            )
+            .await?;
             Ok(())
         })
     }
@@ -673,12 +703,13 @@ impl AccountStore for PostgresAccounts {
         })
     }
 
-    fn fail_pending(&self, hash: &str) -> Result<Option<i64>, String> {
+    fn try_pending(&self, hash: &str, limit: i64) -> Result<Option<i64>, String> {
         self.run(async |c| {
             let row = c
                 .query_opt(
-                    "update accounts.mfa_pending set failures = failures + 1 where token_hash = $1 returning failures",
-                    &[&hash],
+                    "update accounts.mfa_pending set failures = failures + 1
+                      where token_hash = $1 and failures < $2 returning failures",
+                    &[&hash, &limit],
                 )
                 .await?;
             Ok(row.map(|row| row.get(0)))

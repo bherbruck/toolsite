@@ -67,6 +67,7 @@ macro_rules! suite {
             hostile_values_are_kept_exactly_as_given,
             one_code_redeemed_by_many_at_once_yields_one_token,
             one_refresh_rotated_by_many_at_once_yields_one_new_refresh,
+            a_rotation_racing_a_revocation_leaves_nothing_live,
         );
     };
     (@each $fixture:ident, #[$attr:meta], $($name:ident),* $(,)?) => {

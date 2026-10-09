@@ -55,8 +55,11 @@ impl SqliteAccounts {
     }
 }
 
-/// `prefix = path or prefix starts with path/`, as SQL over `?1`, `?2`, `?3`.
-const AT_OR_BELOW: &str = "prefix = ?1 or substr(prefix, 1, ?2) = ?3";
+/// `prefix = path or prefix starts with path/`, as SQL over `?1` (the path)
+/// and `?2` (the path and a slash). The length is SQLite's own, in
+/// characters as `substr` counts them: a length in bytes from Rust would
+/// cut a path with a letter of more than one byte short, and miss its tree.
+const AT_OR_BELOW: &str = "prefix = ?1 or substr(prefix, 1, length(?2)) = ?2";
 
 impl AccountStore for SqliteAccounts {
     fn insert_user(&self, user: &User, password_hash: Option<&str>, created_at: i64) -> Result<bool, String> {
@@ -395,9 +398,9 @@ impl AccountStore for SqliteAccounts {
         let tx = conn.transaction().map_err(err)?;
         let changed = tx
             .execute(
-                "update or replace scopes set prefix = ?1 || substr(prefix, ?2)
-                  where prefix = ?3 or substr(prefix, 1, ?4) = ?5",
-                rusqlite::params![to, (from.len() + 1) as i64, from, (from.len() + 1) as i64, format!("{from}/")],
+                "update or replace scopes set prefix = ?3 || substr(prefix, length(?1) + 1)
+                  where prefix = ?1 or substr(prefix, 1, length(?2)) = ?2",
+                rusqlite::params![from, format!("{from}/"), to],
             )
             .map_err(err)?;
         tx.commit().map_err(err)?;
@@ -408,7 +411,7 @@ impl AccountStore for SqliteAccounts {
         self.open()?
             .execute(
                 &format!("delete from scopes where {AT_OR_BELOW}"),
-                rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")],
+                rusqlite::params![path, format!("{path}/")],
             )
             .map_err(err)
     }
@@ -416,12 +419,12 @@ impl AccountStore for SqliteAccounts {
     fn forget_app(&self, app: &str, path: &str) -> Result<serde_json::Value, String> {
         let mut conn = self.open()?;
         let tx = conn.transaction().map_err(err)?;
-        let below = rusqlite::params![path, (path.len() + 1) as i64, format!("{path}/")];
+        let below = rusqlite::params![path, format!("{path}/")];
         let rows: Vec<serde_json::Value> = {
             let mut statement = tx
                 .prepare(
                     "select users.email, scopes.prefix, scopes.scope from scopes join users on users.id = scopes.user_id
-                      where scopes.prefix = ?1 or substr(scopes.prefix, 1, ?2) = ?3",
+                      where scopes.prefix = ?1 or substr(scopes.prefix, 1, length(?2)) = ?2",
                 )
                 .map_err(err)?;
             let found = statement
@@ -582,10 +585,29 @@ impl AccountStore for SqliteAccounts {
             .map_err(err)
     }
 
-    fn record_failure(&self, user_id: &str, at: i64, forget_before: i64) -> Result<(), String> {
-        let conn = self.open()?;
-        let _ = conn.execute("delete from mfa_failures where at <= ?", [forget_before]);
-        conn.execute("insert into mfa_failures (user_id, at) values (?, ?)", rusqlite::params![user_id, at])
+    fn try_attempt(&self, user_id: &str, at: i64, since: i64, limit: i64) -> Result<bool, String> {
+        let mut conn = self.open()?;
+        // Immediate: the write lock is taken before the count is read, so
+        // two callers cannot both read a count under the limit.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(err)?;
+        tx.execute("delete from mfa_failures where at <= ?", [since]).map_err(err)?;
+        let counted: i64 = tx
+            .query_row("select count(*) from mfa_failures where user_id = ? and at > ?", rusqlite::params![user_id, since], |row| row.get(0))
+            .map_err(err)?;
+        if counted >= limit {
+            return Ok(false);
+        }
+        tx.execute("insert into mfa_failures (user_id, at) values (?, ?)", rusqlite::params![user_id, at]).map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(true)
+    }
+
+    fn release_attempt(&self, user_id: &str, at: i64) -> Result<(), String> {
+        self.open()?
+            .execute(
+                "delete from mfa_failures where rowid = (select rowid from mfa_failures where user_id = ? and at = ? limit 1)",
+                rusqlite::params![user_id, at],
+            )
             .map(drop)
             .map_err(err)
     }
@@ -614,11 +636,11 @@ impl AccountStore for SqliteAccounts {
             .map_err(err)
     }
 
-    fn fail_pending(&self, hash: &str) -> Result<Option<i64>, String> {
+    fn try_pending(&self, hash: &str, limit: i64) -> Result<Option<i64>, String> {
         self.open()?
             .query_row(
-                "update mfa_pending set failures = failures + 1 where token_hash = ? returning failures",
-                [hash],
+                "update mfa_pending set failures = failures + 1 where token_hash = ? and failures < ? returning failures",
+                rusqlite::params![hash, limit],
                 |row| row.get(0),
             )
             .optional()

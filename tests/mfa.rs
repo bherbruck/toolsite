@@ -568,6 +568,52 @@ async fn ten_wrong_codes_across_sign_ins_stop_the_account_for_fifteen_minutes() 
     assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
 }
 
+/// Wrong codes sent all at once, each from its own request, are checked no
+/// more often than one at a time would be. A limit read before the code is
+/// checked and counted after lets a burst through whole: every request
+/// reads "under the limit" before any of them has counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn wrong_codes_sent_at_once_are_checked_no_more_often_than_the_limits_allow() {
+    let (_dir, config) = site(Policy::Off);
+    let jo = person(&config, "jo@example.com", false);
+    let (secret, _) = enable(&config, &jo, &session(&config, "jo@example.com")).await;
+    let wrong = wrong_code(&config, &secret);
+    let burst = |pending: String| {
+        let (config, wrong) = (config.clone(), wrong.clone());
+        async move {
+            let sent: Vec<_> = (0..40)
+                .map(|_| {
+                    let (config, pending, wrong) = (config.clone(), pending.clone(), wrong.clone());
+                    tokio::spawn(async move { submit_code(&config, &pending, &wrong).await.status })
+                })
+                .collect();
+            for request in sent {
+                assert_ne!(request.await.unwrap(), StatusCode::SEE_OTHER);
+            }
+        }
+    };
+    let checked = || toolsite::accounts::store::of(&config).failures_since(&jo.id, 0).unwrap();
+
+    // One sign-in: five codes checked, however many arrive together.
+    let (_, pending) = password(&config, "jo@example.com", "/").await;
+    burst(pending.unwrap()).await;
+    assert!(checked() <= 5, "one sign-in had {} codes checked", checked());
+
+    // Three more sign-ins at once: the account's ten, and no more.
+    let mut pendings = Vec::new();
+    for _ in 0..3 {
+        pendings.push(password(&config, "jo@example.com", "/").await.1.unwrap());
+    }
+    let bursts: Vec<_> = pendings.into_iter().map(|pending| tokio::spawn(burst(pending))).collect();
+    for b in bursts {
+        b.await.unwrap();
+    }
+    assert!(checked() <= 10, "the account had {} codes checked", checked());
+    let (_, pending) = password(&config, "jo@example.com", "/").await;
+    let reply = submit_code(&config, &pending.unwrap(), &next_code(&config, &secret)).await;
+    assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS, "{}", reply.body);
+}
+
 // --- policy -------------------------------------------------------------------
 
 #[tokio::test]

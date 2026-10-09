@@ -96,6 +96,20 @@ impl PostgresOAuth {
     async fn rotate(&self, client_id: &str, refresh_token: &str) -> Result<Option<Issued>, String> {
         let mut conn = self.connection().await?;
         let tx = conn.transaction().await.map_err(|e| why("could not begin a rotation", &e))?;
+        // Whose token it is, to take that account's turn before touching it.
+        // The delete below checks the row again, so a token rotated or
+        // revoked in between is simply not found.
+        let Some(holder) = tx
+            .query_opt(
+                "select user_id from oauth.tokens where token_hash = $1 and kind = 'refresh' and client_id = $2",
+                &[&hash(refresh_token), &client_id],
+            )
+            .await
+            .map_err(|e| why("could not read the refresh token", &e))?
+        else {
+            return Ok(None);
+        };
+        hold_account(&tx, &holder.get::<_, String>(0)).await?;
         let row = tx
             .query_opt(
                 "delete from oauth.tokens
@@ -160,6 +174,18 @@ impl PostgresOAuth {
     }
 }
 
+/// Takes this account's turn until the transaction ends. See
+/// `state::pg::LOCK_OAUTH_USER`.
+async fn hold_account(tx: &Transaction<'_>, user_id: &str) -> Result<(), String> {
+    tx.execute(
+        "select pg_advisory_xact_lock($1::int4, hashtext($2))",
+        &[&crate::state::pg::LOCK_OAUTH_USER, &user_id],
+    )
+    .await
+    .map_err(|e| why("could not take the account's turn", &e))?;
+    Ok(())
+}
+
 async fn insert_pair(
     tx: &Transaction<'_>,
     client_id: &str,
@@ -222,8 +248,10 @@ impl OAuthStore for PostgresOAuth {
 
     async fn issue_code(&self, grant: &Grant<'_>) -> Result<String, String> {
         let code = random_token(TOKEN_LEN);
-        let conn = self.connection().await?;
-        conn.execute(
+        let mut conn = self.connection().await?;
+        let tx = conn.transaction().await.map_err(|e| why("could not begin issuing a code", &e))?;
+        hold_account(&tx, grant.user_id).await?;
+        tx.execute(
             "insert into oauth.codes (code_hash, client_id, user_id, redirect_uri, code_challenge, expires_at, resource)
              values ($1, $2, $3, $4, $5, $6, $7)",
             &[
@@ -238,6 +266,7 @@ impl OAuthStore for PostgresOAuth {
         )
         .await
         .map_err(|e| why("could not issue a code", &e))?;
+        tx.commit().await.map_err(|e| why("could not commit the code", &e))?;
         Ok(code)
     }
 
@@ -248,6 +277,7 @@ impl OAuthStore for PostgresOAuth {
     async fn issue_tokens(&self, client_id: &str, user_id: &str, resource: Option<&str>) -> Result<Issued, String> {
         let mut conn = self.connection().await?;
         let tx = conn.transaction().await.map_err(|e| why("could not begin issuing tokens", &e))?;
+        hold_account(&tx, user_id).await?;
         let issued = insert_pair(&tx, client_id, user_id, resource).await?;
         tx.commit().await.map_err(|e| why("could not commit the tokens", &e))?;
         Ok(issued)
@@ -264,6 +294,9 @@ impl OAuthStore for PostgresOAuth {
     async fn revoke_for_user(&self, user_id: &str) -> Result<usize, String> {
         let mut conn = self.connection().await?;
         let tx = conn.transaction().await.map_err(|e| why("could not begin a revocation", &e))?;
+        // Waits out any rotation or issue for this account in flight, and
+        // holds the next one off until these deletes are committed.
+        hold_account(&tx, user_id).await?;
         let tokens = tx
             .execute("delete from oauth.tokens where user_id = $1", &[&user_id])
             .await

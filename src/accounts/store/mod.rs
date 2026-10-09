@@ -18,7 +18,8 @@
 //! Single use and replay rest on conditional writes, never on a read and a
 //! later write: `advance_step`, `spend_recovery_code`, `take_invite` and
 //! `enable_mfa` each say in their answer whether this call was the one that
-//! moved the row, and that holds the same on both backends under any
+//! moved the row, and `try_pending` and `try_attempt` count a code before it
+//! is checked rather than after, and that holds the same on both backends under any
 //! number of concurrent callers.
 
 pub mod postgres;
@@ -182,18 +183,24 @@ pub trait AccountStore: Send + Sync {
     fn spend_recovery_code(&self, user_id: &str, hash: &str, now: i64) -> Result<bool, String>;
     /// Removes the secret, the recovery codes and pending sign-ins.
     fn remove_mfa(&self, user_id: &str) -> Result<(), String>;
-    /// Wrong codes counted against the account after `since`.
+    /// Codes counted against the account after `since`.
     fn failures_since(&self, user_id: &str, since: i64) -> Result<i64, String>;
-    /// Counts a wrong code at `at`, forgetting every count from
-    /// `forget_before` or earlier.
-    fn record_failure(&self, user_id: &str, at: i64, forget_before: i64) -> Result<(), String>;
+    /// Counts a code about to be checked against the account at `at`, if
+    /// fewer than `limit` were counted after `since`, forgetting every count
+    /// from `since` or earlier. Whether it was counted: of any number of
+    /// callers at once, no more than `limit` are answered `true`.
+    fn try_attempt(&self, user_id: &str, at: i64, since: i64, limit: i64) -> Result<bool, String>;
+    /// Takes back one count made at `at`: the code turned out right.
+    fn release_attempt(&self, user_id: &str, at: i64) -> Result<(), String>;
     /// Stores a pending sign-in, sweeping those expired before `now`.
     fn insert_pending(&self, hash: &str, user_id: &str, stage: &str, next: &str, expires_at: i64, now: i64) -> Result<(), String>;
     /// A live pending sign-in of an active account.
     fn pending(&self, hash: &str, now: i64) -> Result<Option<PendingRow>, String>;
-    /// Counts one more wrong code against a pending sign-in; answers the
-    /// count, or `None` when it is gone.
-    fn fail_pending(&self, hash: &str) -> Result<Option<i64>, String>;
+    /// Counts one more code against a pending sign-in if it has fewer than
+    /// `limit`: answers the count with this one, or `None` when it is gone
+    /// or has had its `limit`. Of any number of callers at once, no more than
+    /// `limit` get a count.
+    fn try_pending(&self, hash: &str, limit: i64) -> Result<Option<i64>, String>;
     fn delete_pending(&self, hash: &str) -> Result<(), String>;
     /// Removes every pending sign-in of an account.
     fn delete_pending_for(&self, user_id: &str) -> Result<(), String>;

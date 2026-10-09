@@ -45,6 +45,7 @@ pub(crate) fn run(store: &dyn AccountStore) {
     sessions_answer_only_for_their_own_scope_and_account(store);
     an_invitation_is_spent_once(store);
     grants_and_scopes_stay_with_their_account_and_path(store);
+    a_scope_tree_is_matched_by_its_text_never_as_a_pattern(store);
     two_step_rows_belong_to_one_account(store);
     single_use_writes_let_exactly_one_caller_through(store);
 }
@@ -279,6 +280,32 @@ fn grants_and_scopes_stay_with_their_account_and_path(store: &dyn AccountStore) 
     assert_eq!(store.pins_for(&fay.id).unwrap(), vec!["board".to_string()]);
 }
 
+/// The rules only ever pass slugs here, but the store's promise is "this
+/// path and below", whatever the text: a wildcard, an escape, a quote or a
+/// letter of more than one byte is matched as itself, on both backends.
+fn a_scope_tree_is_matched_by_its_text_never_as_a_pattern(store: &dyn AccountStore) {
+    let kim = person(store, "kim@example.com");
+    for (path, neighbour) in [("a%", "ab"), ("a_", "ab"), ("a\\", "a\\x"), ("o'k", "ok"), ("caf\u{e9}", "cafe"), ("\u{e9}t\u{e9}", "\u{e9}t")] {
+        let below = format!("{path}/x");
+        let lookalike = format!("{neighbour}/x");
+        for prefix in [path, below.as_str(), neighbour, lookalike.as_str()] {
+            store.set_scope(&kim.id, prefix, "viewer", None, NOW).unwrap();
+        }
+        assert_eq!(store.move_scope_tree(path, "moved").unwrap(), 2, "{path:?}");
+        let mut held: Vec<String> = store.scopes_for(&kim.id).unwrap().into_iter().map(|(p, _)| p).collect();
+        held.sort();
+        let mut want = vec!["moved".to_string(), "moved/x".to_string(), neighbour.to_string(), lookalike.clone()];
+        want.sort();
+        assert_eq!(held, want, "a move of {path:?} took the wrong rows");
+        store.rename_scope("moved", path).unwrap();
+        assert_eq!(store.remove_scope_tree("moved").unwrap(), 1, "{path:?}");
+        assert_eq!(store.remove_scope_tree(path).unwrap(), 1, "{path:?}");
+        let kept = store.forget_app("none", neighbour).unwrap();
+        assert_eq!(kept["access"].as_array().unwrap().len(), 2, "{path:?}: {kept}");
+        assert!(store.scopes_for(&kim.id).unwrap().is_empty(), "{path:?}");
+    }
+}
+
 fn two_step_rows_belong_to_one_account(store: &dyn AccountStore) {
     let hal = person(store, "hal@example.com");
     let ivy = person(store, "ivy@example.com");
@@ -323,21 +350,34 @@ fn two_step_rows_belong_to_one_account(store: &dyn AccountStore) {
     assert!(!store.spend_recovery_code(&hal.id, "h2", NOW).unwrap(), "a replaced code still works");
     assert_eq!(store.recovery_left(&ivy.id).unwrap(), 1);
 
-    store.record_failure(&hal.id, NOW - 1000, NOW - 2000).unwrap();
-    store.record_failure(&hal.id, NOW, NOW - 900).unwrap();
-    store.record_failure(&hal.id, NOW, NOW - 900).unwrap();
+    assert!(store.try_attempt(&hal.id, NOW - 1000, NOW - 2000, 3).unwrap());
+    assert!(store.try_attempt(&hal.id, NOW, NOW - 900, 3).unwrap());
+    assert!(store.try_attempt(&hal.id, NOW, NOW - 900, 3).unwrap());
     assert_eq!(store.failures_since(&hal.id, NOW - 900).unwrap(), 2);
     assert_eq!(store.failures_since(&hal.id, NOW - 5000).unwrap(), 2, "a count from before the window was kept");
     assert_eq!(store.failures_since(&ivy.id, NOW - 900).unwrap(), 0);
+    assert!(store.try_attempt(&hal.id, NOW, NOW - 900, 3).unwrap());
+    assert!(!store.try_attempt(&hal.id, NOW, NOW - 900, 3).unwrap(), "a count past the limit was made");
+    assert!(store.try_attempt(&ivy.id, NOW, NOW - 900, 3).unwrap(), "one account's limit stopped another");
+    store.release_attempt(&hal.id, NOW).unwrap();
+    assert_eq!(store.failures_since(&hal.id, NOW - 900).unwrap(), 2, "a release took back more than one count");
+    store.release_attempt(&hal.id, NOW).unwrap();
+    store.release_attempt(&hal.id, NOW).unwrap();
+    store.release_attempt(&hal.id, NOW).unwrap();
+    assert_eq!(store.failures_since(&hal.id, NOW - 900).unwrap(), 0);
+    assert_eq!(store.failures_since(&ivy.id, NOW - 900).unwrap(), 1, "a release reached another account");
+    assert!(!store.try_attempt("nobody", NOW, NOW - 900, 3).unwrap_or(false));
 
     store.insert_pending("p-old", &hal.id, "code", "/", NOW - 1, NOW - 10).unwrap();
     store.insert_pending("p-1", &hal.id, "code", "/after", NOW + 300, NOW).unwrap();
     assert_eq!(store.pending("p-old", NOW).unwrap(), None);
     let pending = store.pending("p-1", NOW).unwrap().unwrap();
     assert_eq!((pending.user, pending.stage.as_str(), pending.next.as_str(), pending.failures), (hal.clone(), "code", "/after", 0));
-    assert_eq!(store.fail_pending("p-1").unwrap(), Some(1));
-    assert_eq!(store.fail_pending("p-1").unwrap(), Some(2));
-    assert_eq!(store.fail_pending("nope").unwrap(), None);
+    assert_eq!(store.try_pending("p-1", 3).unwrap(), Some(1));
+    assert_eq!(store.try_pending("p-1", 3).unwrap(), Some(2));
+    assert_eq!(store.try_pending("p-1", 3).unwrap(), Some(3));
+    assert_eq!(store.try_pending("p-1", 3).unwrap(), None, "a try past the limit was given");
+    assert_eq!(store.try_pending("nope", 3).unwrap(), None);
     assert_eq!(store.pending("p-1", NOW + 301).unwrap(), None, "an expired pending sign-in answered");
     assert!(store.insert_pending("p-bad", &hal.id, "session", "/", NOW + 300, NOW).is_err(), "a stage outside code and setup was stored");
     store.insert_pending("p-ivy", &ivy.id, "setup", "/", NOW + 300, NOW).unwrap();
@@ -366,8 +406,11 @@ fn single_use_writes_let_exactly_one_caller_through(store: &dyn AccountStore) {
     store.replace_invite(&jo.id, "jo-invite", NOW + 100).unwrap();
     assert_eq!(race(CALLERS, || store.take_invite("jo-invite", NOW).unwrap().is_some()), 1, "one invitation was spent several times");
     store.insert_pending("jo-pending", &jo.id, "code", "/", NOW + 300, NOW).unwrap();
-    race(CALLERS, || store.fail_pending("jo-pending").unwrap().is_some());
-    assert_eq!(store.pending("jo-pending", NOW).unwrap().unwrap().failures, CALLERS as i64, "concurrent wrong codes were lost");
+    race(CALLERS, || store.try_pending("jo-pending", 100).unwrap().is_some());
+    assert_eq!(store.pending("jo-pending", NOW).unwrap().unwrap().failures, CALLERS as i64, "concurrent tries were lost");
+    store.insert_pending("jo-limited", &jo.id, "code", "/", NOW + 300, NOW).unwrap();
+    assert_eq!(race(CALLERS * 2, || store.try_pending("jo-limited", 3).unwrap().is_some()), 3, "tries at once passed the limit");
+    assert_eq!(race(CALLERS * 2, || store.try_attempt(&jo.id, NOW, NOW - 900, 3).unwrap()), 3, "counts at once passed the limit");
 }
 
 #[test]

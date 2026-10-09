@@ -142,7 +142,18 @@ pub fn check(settings: &Settings, data_dir: &Path) -> Result<(), String> {
                     to 32 random bytes in base64 (`openssl rand -base64 32`)"
             .into());
     };
-    crate::seal::parse_key(key)?;
+    let bytes = crate::seal::parse_key(key)?;
+    // 32 random bytes take about 30 distinct values; a key typed by hand,
+    // copied from an example or left as zeros takes a handful. On Postgres
+    // this one key opens every sealed value and every ticket on every
+    // runner, so a guessable one is refused rather than used.
+    let distinct = bytes.iter().collect::<std::collections::HashSet<_>>().len();
+    if distinct < 16 {
+        return Err(format!(
+            "TOOLSITE_SECRET_KEY has only {distinct} distinct bytes in 32, so it was not generated at random: \
+             set it to `openssl rand -base64 32`"
+        ));
+    }
     if !settings.bucket {
         return Err("DATABASE_URL is set but no bucket is: on Postgres apps' files must be shared \
                     between runners, so set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET"
@@ -293,6 +304,19 @@ mod tests {
             assert!(why.contains("TOOLSITE_SECRET_KEY"), "{why}");
             assert!(!why.contains(bad), "the refusal repeated the key: {why}");
         }
+    }
+
+    #[test]
+    fn postgres_mode_refuses_a_secret_key_that_was_not_made_at_random_without_repeating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let zeros = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let typed = data_encoding::BASE64.encode(b"passwordpasswordpasswordpassword");
+        for weak in [zeros, typed.as_str()] {
+            let why = check(&postgres(Some(weak), true), dir.path()).unwrap_err();
+            assert!(why.contains("TOOLSITE_SECRET_KEY") && why.contains("openssl rand"), "{why}");
+            assert!(!why.contains(weak), "the refusal repeated the key: {why}");
+        }
+        check(&postgres(Some(KEY), true), dir.path()).unwrap();
     }
 
     #[test]

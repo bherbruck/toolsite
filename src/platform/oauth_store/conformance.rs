@@ -295,3 +295,38 @@ pub(super) async fn one_refresh_rotated_by_many_at_once_yields_one_new_refresh<
     assert!(store.access_token_grant(&next.access_token).await.is_some());
     assert!(store.rotate_refresh(&client, &next.refresh_token).await.is_some(), "the winner's refresh token is dead");
 }
+
+/// A password change revokes while the person's client refreshes: whichever
+/// goes first, nothing of that account is left live. Serially that is plain;
+/// the race is a rotation that has written its new pair but not committed
+/// when the revocation looks for rows to delete.
+pub(super) async fn a_rotation_racing_a_revocation_leaves_nothing_live<S: OAuthStore + Backdoor + 'static>(
+    store: Arc<S>,
+) {
+    let client = registered(&*store).await;
+    for round in 0..40 {
+        let issued = store.issue_tokens(&client, "u1", None).await.unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let rotate = {
+            let (store, start, client, token) = (store.clone(), start.clone(), client.clone(), issued.refresh_token.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                store.rotate_refresh(&client, &token).await
+            })
+        };
+        let revoke = {
+            let (store, start) = (store.clone(), start.clone());
+            tokio::spawn(async move {
+                start.wait().await;
+                store.revoke_for_user("u1").await.unwrap()
+            })
+        };
+        let rotated = rotate.await.unwrap();
+        revoke.await.unwrap();
+        let live: Vec<_> = store.stored_tokens().await.into_iter().filter(|(_, _, user)| user == "u1").collect();
+        assert!(live.is_empty(), "round {round}: a refresh that raced a revocation left {live:?} live");
+        if let Some(rotated) = rotated {
+            assert!(store.access_token_grant(&rotated.access_token).await.is_none(), "round {round}: the new pair outlived the revocation");
+        }
+    }
+}

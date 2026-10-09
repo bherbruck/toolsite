@@ -22,6 +22,10 @@ pub const DEFAULT_POOL_SIZE: usize = 16;
 /// purpose, so two purposes never wait on each other by accident. The second
 /// half names the object, or is 0 when the purpose has none.
 pub const LOCK_MIGRATE: i32 = 1;
+/// One account's OAuth rows, keyed by `hashtext(user_id)`: a revocation and
+/// a rotation or issue for the same account take turns, so a pair written
+/// but not yet committed cannot slip past the revocation's delete.
+pub const LOCK_OAUTH_USER: i32 = 2;
 
 /// One store's schema, as the steps that build it. Version `n` is
 /// `steps[n - 1]`; a step never changes once released, the ladder only grows.
@@ -443,6 +447,27 @@ mod tests {
         assert!(mode("postgres://u@h/d?sslmode=sometimes").is_err());
     }
 
+    /// An operator who asked for a verified certificate never gets less:
+    /// in either form of the URL, a verifying mode verifies or the URL is
+    /// refused, and an unknown mode is refused rather than read as `prefer`.
+    #[test]
+    fn a_verifying_sslmode_is_never_quietly_downgraded() {
+        for url in [
+            "host=db.internal user=u password=p dbname=d sslmode=verify-full",
+            "host=db.internal user=u password=p dbname=d sslmode=verify-ca",
+        ] {
+            match parse(url) {
+                Ok(target) => assert!(matches!(target.tls, Tls::Verify(_)), "{url} was read as {:?}", target.tls),
+                Err(why) => assert!(!why.contains("password=p"), "{why}"),
+            }
+        }
+        for url in ["postgres://u@h/d?sslmode=VERIFY-FULL", "postgres://u@h/d?sslmode=", "host=h sslmode=sometimes"] {
+            assert!(parse(url).is_err(), "{url} was accepted");
+        }
+        // The last of two modes wins, as in libpq; a verifying one is kept.
+        assert!(matches!(parse("postgres://u@h/d?sslmode=disable&sslmode=verify-full").unwrap().tls, Tls::Verify(_)));
+    }
+
     #[test]
     fn every_tls_mode_builds_a_client() {
         client_config(&Tls::Off).unwrap();
@@ -462,6 +487,86 @@ mod tests {
         assert!(why.contains("127.0.0.1:1/site"), "{why}");
         // The cause, not just the kind.
         assert!(why.to_lowercase().contains("refused"), "{why}");
+    }
+
+    /// Every statement any Postgres store sends is a literal, so a value can
+    /// only ever arrive as a bound parameter. Every source file that reaches
+    /// Postgres is found, not listed, so a new store is scanned the day it
+    /// lands; every way a driver takes SQL text is looked at, not only
+    /// `query` and `execute`. The few calls that pass a name are counted by
+    /// file: each is bound to literals or a ladder step, and a new one has
+    /// to be looked at and added here.
+    #[test]
+    fn every_postgres_statement_in_every_store_is_a_literal() {
+        const CALLS: &[&str] = &[
+            ".query(", ".query_opt(", ".query_one(", ".query_raw(", ".query_typed(", ".query_typed_raw(",
+            ".execute(", ".execute_raw(", ".batch_execute(", ".simple_query(", ".prepare(",
+            ".prepare_cached(", ".prepare_typed(", ".copy_in(", ".copy_out(",
+        ];
+        // (file, the name passed, how many times). `step` is a ladder step,
+        // `include_str!` of a migration; each `sql` is chosen from string
+        // literals a line or two above.
+        const NAMED: &[(&str, &str, usize)] = &[
+            ("state/pg.rs", "step", 1),
+            ("accounts/store/postgres.rs", "sql", 1),
+            ("platform/oauth_store/postgres.rs", "sql", 1),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let mut scanned = Vec::new();
+        let mut statements = 0;
+        for path in files {
+            let name = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
+            let source = std::fs::read_to_string(&path).unwrap();
+            // Test-only modules build throwaway databases by name.
+            if name.ends_with("conformance.rs") || name.ends_with("/tests.rs") {
+                continue;
+            }
+            if !(source.contains("deadpool_postgres") || source.contains("tokio_postgres")) {
+                continue;
+            }
+            // Code below a file's own `mod tests` is the file's tests.
+            let source = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let mut named: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for call in CALLS {
+                for (at, _) in source.match_indices(call) {
+                    let argument = source[at + call.len()..].trim_start();
+                    statements += 1;
+                    if argument.starts_with('"') || argument.starts_with("r\"") || argument.starts_with("r#\"") {
+                        continue;
+                    }
+                    let ident: String = argument.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    assert!(
+                        !ident.is_empty() && NAMED.iter().any(|(file, allowed, _)| *file == name && *allowed == ident),
+                        "{name}: a statement that is not a literal: {}",
+                        &source[at..(at + 120).min(source.len())]
+                    );
+                    *named.entry(ident).or_default() += 1;
+                }
+            }
+            for (file, allowed, count) in NAMED {
+                if *file == name {
+                    assert_eq!(named.get(*allowed).copied().unwrap_or(0), *count, "{name}: calls passing `{allowed}` changed");
+                }
+            }
+            scanned.push(name);
+        }
+        scanned.sort();
+        for expected in ["accounts/store/postgres.rs", "platform/oauth_store/postgres.rs", "state/pg.rs", "state/runners.rs", "state/tickets.rs"] {
+            assert!(scanned.iter().any(|f| f == expected), "{expected} was not scanned: {scanned:?}");
+        }
+        assert!(statements > 80, "the scan found only {statements} statements");
     }
 
     #[test]

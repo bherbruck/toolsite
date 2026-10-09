@@ -315,29 +315,38 @@ fn users_now() -> u64 {
         .as_secs()
 }
 
-fn account_locked(config: &Config, accounts: &dyn AccountStore, user_id: &str) -> bool {
-    let since = config.mfa.clock.now().saturating_sub(ACCOUNT_WINDOW) as i64;
-    accounts.failures_since(user_id, since).map(|n| n >= MAX_FAILURES_PER_ACCOUNT).unwrap_or(true)
-}
-
-fn record_failure(config: &Config, accounts: &dyn AccountStore, user_id: &str) {
+/// Counts a code against the account before it is checked, so codes sent
+/// at once cannot all be checked under a limit none of them has counted
+/// yet. `Some` is the count to take back if the code is right; `None` when
+/// the account has had its limit, or the count could not be made.
+fn take_attempt(config: &Config, accounts: &dyn AccountStore, user_id: &str) -> Option<i64> {
     let now = config.mfa.clock.now();
-    let _ = accounts.record_failure(user_id, now as i64, now.saturating_sub(ACCOUNT_WINDOW) as i64);
+    let since = now.saturating_sub(ACCOUNT_WINDOW) as i64;
+    accounts
+        .try_attempt(user_id, now as i64, since, MAX_FAILURES_PER_ACCOUNT)
+        .ok()?
+        .then_some(now as i64)
 }
 
 /// Checks a code from a signed-in person (turning it off, new recovery
 /// codes), under the same per-account limit as sign-in.
 fn accept_from_account(config: &Config, accounts: &dyn AccountStore, user: &User, code: &str, allow_recovery: bool) -> Result<Used, String> {
-    if account_locked(config, accounts, &user.id) {
+    let Some(at) = take_attempt(config, accounts, &user.id) else {
         tracing::warn!(email = %user.email, "two-step code refused: too many wrong codes for this account");
         return Err("Too many wrong codes. Wait 15 minutes, then try again.".into());
-    }
-    match accept(config, accounts, &user.id, code, Secret::Enabled, allow_recovery)? {
-        Some(used) => Ok(used),
-        None => {
-            record_failure(config, accounts, &user.id);
+    };
+    match accept(config, accounts, &user.id, code, Secret::Enabled, allow_recovery) {
+        Ok(Some(used)) => {
+            let _ = accounts.release_attempt(&user.id, at);
+            Ok(used)
+        }
+        Ok(None) => {
             tracing::warn!(email = %user.email, "two-step code refused on the account page: not correct");
             Err("The code is not correct.".into())
+        }
+        Err(why) => {
+            let _ = accounts.release_attempt(&user.id, at);
+            Err(why)
         }
     }
 }
@@ -587,18 +596,30 @@ pub struct Finished {
     pub recovery_codes: Vec<String>,
 }
 
-/// Counts a wrong code against a pending sign-in, ending it at the limit.
-fn wrong_code(accounts: &dyn AccountStore, token: &str, pending: &Pending, what: &str) -> Refusal {
+/// Takes one of a pending sign-in's tries before its code is checked, so
+/// codes sent at once cannot all be checked: answers which try this is, or
+/// ends the sign-in when it has had them all.
+fn take_try(accounts: &dyn AccountStore, token: &str, pending: &Pending, what: &str) -> Result<i64, Refusal> {
     let hash = users::hash_token(token);
-    // Counted in the row, so wrong codes sent at once each count.
-    let failures = accounts.fail_pending(&hash).ok().flatten().unwrap_or(MAX_FAILURES_PER_PENDING);
-    tracing::warn!(email = %pending.user.email, failures, "{what}: the code is not correct");
-    if failures >= MAX_FAILURES_PER_PENDING {
-        let _ = accounts.delete_pending(&hash);
+    match accounts.try_pending(&hash, MAX_FAILURES_PER_PENDING).map_err(Refusal::Failed)? {
+        Some(tries) => Ok(tries),
+        None => {
+            let _ = accounts.delete_pending(&hash);
+            tracing::warn!(email = %pending.user.email, "{what}: too many codes, the pending sign-in ended");
+            Err(Refusal::Ended)
+        }
+    }
+}
+
+/// A wrong code on the `tries`th try, ending the sign-in on the last.
+fn wrong_code(accounts: &dyn AccountStore, token: &str, pending: &Pending, tries: i64, what: &str) -> Refusal {
+    tracing::warn!(email = %pending.user.email, failures = tries, "{what}: the code is not correct");
+    if tries >= MAX_FAILURES_PER_PENDING {
+        let _ = accounts.delete_pending(&users::hash_token(token));
         tracing::warn!(email = %pending.user.email, "{what}: too many wrong codes, the pending sign-in ended");
         return Refusal::Ended;
     }
-    Refusal::Wrong(MAX_FAILURES_PER_PENDING - failures)
+    Refusal::Wrong(MAX_FAILURES_PER_PENDING - tries)
 }
 
 fn finish(accounts: &dyn AccountStore, config: &Config, token: &str, pending: Pending, recovery_codes: Vec<String>) -> Result<Finished, Refusal> {
@@ -612,12 +633,14 @@ pub fn finish_with_code(config: &Config, token: &str, code: &str) -> Result<Fini
     let accounts = store::of(config);
     let accounts = &*accounts;
     let pending = load_pending(config, accounts, token).filter(|p| p.stage == "code").ok_or(Refusal::Expired)?;
-    if account_locked(config, accounts, &pending.user.id) {
+    let tries = take_try(accounts, token, &pending, "two-step sign-in refused")?;
+    let Some(at) = take_attempt(config, accounts, &pending.user.id) else {
         tracing::warn!(email = %pending.user.email, "two-step sign-in refused: too many wrong codes for this account");
         return Err(Refusal::Locked);
-    }
-    match accept(config, accounts, &pending.user.id, code, Secret::Enabled, true).map_err(Refusal::Failed)? {
-        Some(used) => {
+    };
+    match accept(config, accounts, &pending.user.id, code, Secret::Enabled, true) {
+        Ok(Some(used)) => {
+            let _ = accounts.release_attempt(&pending.user.id, at);
             tracing::info!(
                 email = %pending.user.email,
                 with = if used == Used::Recovery { "a recovery code" } else { "the authenticator app" },
@@ -625,9 +648,10 @@ pub fn finish_with_code(config: &Config, token: &str, code: &str) -> Result<Fini
             );
             finish(accounts, config, token, pending, Vec::new())
         }
-        None => {
-            record_failure(config, accounts, &pending.user.id);
-            Err(wrong_code(accounts, token, &pending, "two-step sign-in refused"))
+        Ok(None) => Err(wrong_code(accounts, token, &pending, tries, "two-step sign-in refused")),
+        Err(why) => {
+            let _ = accounts.release_attempt(&pending.user.id, at);
+            Err(Refusal::Failed(why))
         }
     }
 }
@@ -656,13 +680,14 @@ pub fn finish_setup(config: &Config, token: &str, code: &str) -> Result<Finished
         let _ = accounts.delete_pending(&users::hash_token(token));
         return Err(Refusal::Expired);
     }
+    let tries = take_try(accounts, token, &pending, "two-step setup refused")?;
     match accept(config, accounts, &pending.user.id, code, Secret::Setup(token), false).map_err(Refusal::Failed)? {
         Some(_) => {
             let codes = enable(config, accounts, &pending.user.id, None).map_err(Refusal::Failed)?;
             tracing::info!(email = %pending.user.email, "two-step sign-in turned on at sign-in, as the site requires");
             finish(accounts, config, token, pending, codes)
         }
-        None => Err(wrong_code(accounts, token, &pending, "two-step setup refused")),
+        None => Err(wrong_code(accounts, token, &pending, tries, "two-step setup refused")),
     }
 }
 
