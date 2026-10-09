@@ -573,13 +573,7 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
     }
 
     if let Some(icon) = manifest.icon {
-        let path = config.data_dir.join(format!("{app}.icon"));
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        tokio::fs::write(path, icon)
-            .await
-            .map_err(|e| e.to_string())?;
+        crate::content::files::publish(config, &format!("{app}.icon"), icon.into()).await?;
         changed.push("icon".to_string());
     }
 
@@ -644,9 +638,9 @@ async fn check_resident(
         ));
     }
     if let Some(runtime) = runtime
-        && let Some(wasm) = crate::content::serve::handler_wasm(config, app).await
+        && let Some(handler) = crate::content::serve::handler_wasm(config, app).await
     {
-        let takes = runtime.takes_connections(app, &wasm).map_err(|e| format!("could not read the handler: {e:#}"))?;
+        let takes = runtime.takes_connections(app, handler.generation, &handler.wasm).map_err(|e| format!("could not read the handler: {e:#}"))?;
         if !takes {
             return Err(format!(
                 "[resident] needs a handler that exports on-connection (the app-with-connections or app-resident \
@@ -729,7 +723,7 @@ async fn resolve_tools(
                 SchemaRef::Inline(table) => serde_json::to_value(table).map_err(|e| e.to_string())?,
                 SchemaRef::File(file) => {
                     if source.is_none() {
-                        let archive = std::fs::read(config.data_dir.join(format!("{app}.source"))).map_err(|_| {
+                        let archive = crate::content::files::read_blocking(config, &format!("{app}.source")).ok_or_else(|| {
                             format!("tool {name}: {which} names the file {file}, but no source is stored for {app}. Upload the project with ?source first, or put the schema inline.")
                         })?;
                         source = Some(crate::content::bundle::read_all_files(&archive, 5000, 64 * 1024 * 1024)?);

@@ -14,7 +14,7 @@ use crate::{
     content::store::{Folder, PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
     runtime::limits::Asked,
 };
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 /// Values that have broken stores before: quotes and SQL, a NUL, Unicode
 /// lookalikes, and a long string.
@@ -210,26 +210,17 @@ async fn notes_round_trip(catalog: &dyn Catalog) {
 
 async fn generations_count_per_app(catalog: &dyn Catalog) {
     assert_eq!(catalog.generation("gen-a").await.unwrap(), 0);
-    assert_eq!(catalog.bump_generation("gen-a").await.unwrap(), 1);
-    assert_eq!(catalog.bump_generation("gen-a").await.unwrap(), 2);
-    assert_eq!(catalog.generation("gen-a").await.unwrap(), 2);
+    let first = catalog.bump_generation("gen-a").await.unwrap();
+    let second = catalog.bump_generation("gen-a").await.unwrap();
+    assert!(first > 0 && second > first, "{first} then {second}");
+    assert_eq!(catalog.generation("gen-a").await.unwrap(), second);
     assert_eq!(catalog.generation("gen-b").await.unwrap(), 0);
+    // Another app's publish moves only its own.
+    assert!(catalog.bump_generation("gen-b").await.unwrap() > 0);
+    assert_eq!(catalog.generation("gen-a").await.unwrap(), second);
     // A meta change is not a publish.
     set(catalog, "gen-a", PageMeta { spa: true, ..PageMeta::default() }).await;
-    assert_eq!(catalog.generation("gen-a").await.unwrap(), 2);
-}
-
-async fn published_files_are_listed(catalog: &dyn Catalog, data_dir: &Path) {
-    std::fs::write(data_dir.join("note.html"), "<title>Note</title>").unwrap();
-    std::fs::create_dir_all(data_dir.join("board/inner")).unwrap();
-    std::fs::write(data_dir.join("board/index.html"), "x").unwrap();
-    std::fs::write(data_dir.join("board/inner/page.html"), "x").unwrap();
-    std::fs::create_dir_all(data_dir.join(".trash/1-old")).unwrap();
-    std::fs::write(data_dir.join(".trash/1-old/slug.html"), "x").unwrap();
-    let mut slugs = catalog.slugs().await.unwrap();
-    slugs.sort();
-    assert_eq!(slugs, vec!["board", "note"]);
-    assert_eq!(catalog.apps().await.unwrap(), vec!["board", "note"]);
+    assert_eq!(catalog.generation("gen-a").await.unwrap(), second);
 }
 
 fn folder(path: &str) -> Folder {
@@ -448,7 +439,7 @@ async fn markers_round_trip(catalog: &dyn Catalog) {
     assert_eq!(catalog.flag("other-marker").await.unwrap(), None);
 }
 
-async fn run(catalog: Arc<dyn Catalog>, data_dir: &Path) {
+async fn run(catalog: Arc<dyn Catalog>) {
     every_field_round_trips(&*catalog).await;
     slugs_are_apart(&*catalog).await;
     old_words_come_back_current(&*catalog).await;
@@ -456,7 +447,6 @@ async fn run(catalog: Arc<dyn Catalog>, data_dir: &Path) {
     concurrent_changes_all_land(catalog.clone(), "busy").await;
     notes_round_trip(&*catalog).await;
     generations_count_per_app(&*catalog).await;
-    published_files_are_listed(&*catalog, data_dir).await;
     the_tree_round_trips(&*catalog).await;
     concurrent_tree_changes_all_land(catalog.clone()).await;
     a_move_is_recorded_until_it_ends(catalog.clone()).await;
@@ -469,7 +459,7 @@ async fn run(catalog: Arc<dyn Catalog>, data_dir: &Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_files_catalog_conforms() {
     let dir = tempfile::tempdir().unwrap();
-    run(Arc::new(Files::new(dir.path().to_path_buf())), dir.path()).await;
+    run(Arc::new(Files::new(dir.path().to_path_buf()))).await;
 }
 
 /// The sidecar holds exactly the meta's serde text, so a file written
@@ -551,7 +541,7 @@ async fn the_postgres_catalog_conforms() {
     let (pool, name) = std::thread::spawn(postgres_database).join().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Postgres::new(pool.clone(), dir.path().to_path_buf()));
-    run(catalog.clone(), dir.path()).await;
+    run(catalog.clone()).await;
 
     // The row holds exactly the meta's serde text, as the sidecar does.
     let meta = set(&*catalog, "exact", everything()).await;
@@ -620,6 +610,8 @@ async fn a_removal_retires_the_rows_and_keeps_them_on_postgres() {
     set(&*catalog, "shop_x", PageMeta { gate: Some("public".into()), ..PageMeta::default() }).await;
     set(&*catalog, "shopx", PageMeta { gate: Some("public".into()), ..PageMeta::default() }).await;
 
+    let published = catalog.bump_generation("shop").await.unwrap();
+
     let retiring = catalog.clone();
     let retired = tokio::task::spawn_blocking(move || retiring.retire_blocking("shop", 77)).await.unwrap().unwrap();
     let slugs: Vec<&str> = retired.pages.iter().map(|(slug, _, _)| slug.as_str()).collect();
@@ -628,6 +620,10 @@ async fn a_removal_retires_the_rows_and_keeps_them_on_postgres() {
     assert_eq!(retired.pages[0].2.as_deref(), Some("old notes"));
 
     assert_eq!(json(&catalog.meta("shop").await.unwrap()), json(&PageMeta::default()));
+    // The next app at the name counts on from past the old one's
+    // generation, so no runner's cache of the old app is ever reached.
+    assert_eq!(catalog.generation("shop").await.unwrap(), 0);
+    assert!(catalog.bump_generation("shop").await.unwrap() > published, "a removed app's generation was handed out again");
     assert_eq!(catalog.notes("shop").await.unwrap(), None);
     assert_eq!(catalog.meta("shop_x").await.unwrap().gate.as_deref(), Some("public"));
     assert_eq!(catalog.meta("shopx").await.unwrap().gate.as_deref(), Some("public"));

@@ -79,9 +79,7 @@ fn put(uri: &str, body: &str) -> Request<Body> {
 }
 
 fn write_page(config: &Config, slug: &str, html: &str) {
-    let path = config.data_dir.join(format!("{slug}.html"));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, html).unwrap();
+    common::publish(config, &format!("{slug}.html"), html.to_string());
 }
 
 async fn place_app(config: &Config, app: &str, project: &str, gate: &str) {
@@ -149,7 +147,7 @@ async fn world_on(postgres: bool) -> World {
     // OAuth tokens are only honoured where the site knows its own address.
     let base = Config { base_url: Some("https://site.test".to_string()), ..Config::local(dir.path().to_path_buf(), TOKEN) };
     let config = Arc::new(match &database {
-        Some(database) => Config { stores: database.stores(), ..base },
+        Some(database) => Config { stores: database.stores(), blobs: database.blobs(), ..base },
         None => base,
     });
     blocking(|| {
@@ -436,7 +434,6 @@ async fn a_page_inside_a_restricted_app_is_not_listed_or_fetched_through_its_own
         base_url: Some("https://site.test".to_string()),
         ..Config::local(w.config.data_dir.clone(), TOKEN)
     });
-    std::fs::create_dir_all(config.data_dir.join("vault")).unwrap();
     write_page(&config, "vault/plans", "<title>vault plans title</title><p>secret plans</p>");
     let mut meta = toolsite::content::catalog::meta(&config, "vault").await;
     meta.gate = Some("restricted".to_string());
@@ -867,10 +864,7 @@ async fn a_removed_apps_permissions_do_not_pass_to_the_next_app_or_project_at_it
     assert_eq!(held(&w.config, "nobody@x.test", "rootapp"), None, "the old app's people held the new project");
 
     // What was removed is kept with the trash, so it can be put back.
-    let trash = std::fs::read_dir(w.config.data_dir.join(".trash")).unwrap();
-    let kept = trash
-        .filter_map(Result::ok)
-        .any(|entry| std::fs::read_to_string(entry.path().join("permissions.json")).is_ok_and(|t| t.contains("nobody@x.test")));
+    let kept = common::trash_files(&w.config, "permissions.json").iter().any(|t| t.contains("nobody@x.test"));
     assert!(kept, "the removed permissions were not kept with the trash");
 }
 
@@ -1049,9 +1043,7 @@ const HANDLER: &[u8] = include_bytes!("fixtures/handler.wasm");
 
 /// Gives an app the fixture handler and applies a manifest to it.
 async fn offer_tools(config: &Config, app: &str, manifest: &str) {
-    let dir = config.data_dir.join(app);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("handler.wasm"), HANDLER).unwrap();
+    common::publish(config, &format!("{app}/handler.wasm"), HANDLER);
     toolsite::platform::manifest::apply(config, app, manifest).await.unwrap();
 }
 
@@ -1200,7 +1192,7 @@ async fn a_schema_file_is_read_from_the_stored_source_and_nowhere_else() {
         tar.append_data(&mut link, "tools/link.json", std::io::empty()).unwrap();
         tar.into_inner().unwrap().finish().unwrap();
     }
-    std::fs::write(w.config.data_dir.join("yard.source"), &archive).unwrap();
+    common::publish(&w.config, "yard.source", archive);
     for file in ["tools/link.json", "../ledger.tools", "/etc/passwd", "../../.site/auth.db", "ledger.tools"] {
         let manifest = one_tool("t", "/api/tool", &format!("input = {}", serde_json::to_string(file).unwrap()));
         let error = toolsite::platform::manifest::apply(&w.config, "yard", &manifest).await.unwrap_err();
@@ -1225,7 +1217,7 @@ async fn a_source_that_claims_a_huge_entry_is_refused_without_reading_it_all() {
         tar.append_data(&mut header, "tools/big.json", std::io::Read::take(std::io::repeat(0), size)).unwrap();
         tar.into_inner().unwrap().finish().unwrap();
     }
-    std::fs::write(w.config.data_dir.join("yard.source"), &archive).unwrap();
+    common::publish(&w.config, "yard.source", archive);
     let error = toolsite::platform::manifest::apply(&w.config, "yard", &one_tool("t", "/api/tool", "input = \"tools/big.json\""))
         .await
         .unwrap_err();
@@ -1610,8 +1602,7 @@ async fn the_devices_sidecar_never_leaves_through_a_url_a_pull_or_an_export() {
 #[tokio::test]
 async fn a_person_without_manage_cannot_run_a_job_by_mcp_or_the_admin_page() {
     let w = world().await;
-    std::fs::create_dir_all(w.config.data_dir.join("yard")).unwrap();
-    std::fs::write(w.config.data_dir.join("yard/handler.wasm"), include_bytes!("fixtures/handler.wasm")).unwrap();
+    common::publish(&w.config, "yard/handler.wasm", &include_bytes!("fixtures/handler.wasm")[..]);
     toolsite::platform::schedule::set_job(&w.config, "yard", "mark", "0 0 0 1 1 *", "/api/job-mark").await.unwrap();
     let marks = |config: &Config| {
         toolsite::runtime::db::run(config, "yard", "select count(*) from marks", &[])

@@ -54,6 +54,7 @@ struct Site {
     _dir: tempfile::TempDir,
     config: Arc<Config>,
     database: Option<(Arc<pg::Postgres>, String)>,
+    bucket: Option<toolsite::runtime::blobs::S3>,
     panics_before: usize,
 }
 
@@ -67,9 +68,11 @@ impl Site {
     fn second_runner(&self) -> Arc<Config> {
         let local = Config::local(self.config.data_dir.clone(), TOKEN);
         Arc::new(match &self.database {
-            Some((postgres, _)) => {
-                Config { stores: Stores::new(Backend::Postgres(postgres.clone()), None, Some(KEY)).unwrap(), ..local }
-            }
+            Some((postgres, _)) => Config {
+                stores: Stores::new(Backend::Postgres(postgres.clone()), None, Some(KEY)).unwrap(),
+                blobs: common::blobs_in(self.bucket.as_ref().expect("a Postgres site has a bucket")),
+                ..local
+            },
             None => local,
         })
     }
@@ -156,7 +159,7 @@ async fn site_with(postgres: bool, shape: fn(Config) -> Config) -> Site {
     let dir = tempfile::tempdir().unwrap();
     if !postgres {
         let config = Arc::new(shape(Config::local(dir.path().to_path_buf(), TOKEN)));
-        return Site { _dir: dir, config, database: None, panics_before };
+        return Site { _dir: dir, config, database: None, bucket: None, panics_before };
     }
     let server = std::env::var("TOOLSITE_TEST_DATABASE_URL").expect(NEEDS);
     let name = format!("t_{}", toolsite::content::slug::random_token(12).to_lowercase());
@@ -168,8 +171,9 @@ async fn site_with(postgres: bool, shape: fn(Config) -> Config) -> Site {
     let postgres = Arc::new(pg::connect(url.as_str(), 8).await.unwrap());
     pg::migrate(&postgres.pool, pg::LADDERS).await.unwrap();
     let stores = Stores::new(Backend::Postgres(postgres.clone()), None, Some(KEY)).unwrap();
-    let config = Arc::new(Config { stores, ..shape(Config::local(dir.path().to_path_buf(), TOKEN)) });
-    Site { _dir: dir, config, database: Some((postgres, name)), panics_before }
+    let bucket = common::bucket().await;
+    let config = Arc::new(Config { stores, blobs: common::blobs_in(&bucket), ..shape(Config::local(dir.path().to_path_buf(), TOKEN)) });
+    Site { _dir: dir, config, database: Some((postgres, name)), bucket: Some(bucket), panics_before }
 }
 
 async fn call(config: &Arc<Config>, name: &str, arguments: serde_json::Value) -> (bool, String) {
@@ -350,13 +354,10 @@ async fn a_removed_app_leaves_nothing_for_the_next(site: Site) {
     call(config, "push_app", serde_json::json!({ "app": "gone", "pages": { "index": "<title>New</title>" } })).await;
     assert_eq!(get(config, "/p/gone/").await, StatusCode::OK);
 
-    let trash = std::fs::read_dir(config.data_dir.join(".trash")).unwrap().next().unwrap().unwrap().path();
-    let kept = std::fs::read_to_string(trash.join("slug.meta"))
-        .or_else(|_| std::fs::read_to_string(trash.join("app/index.meta")))
-        .expect("the removed meta was not kept");
-    assert!(kept.contains("\"hidden\":true"), "{kept}");
+    let kept = [common::trash_files(config, "slug.meta"), common::trash_files(config, "app/index.meta")].concat();
+    assert!(kept.iter().any(|meta| meta.contains("\"hidden\":true")), "the removed meta was not kept: {kept:?}");
     if site.on_postgres() {
-        assert_eq!(std::fs::read_to_string(trash.join("slug.notes")).unwrap(), "the old app's notes");
+        assert_eq!(common::trash_files(config, "slug.notes"), vec!["the old app's notes"]);
     }
     site.finish().await;
 }

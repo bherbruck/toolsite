@@ -1220,15 +1220,9 @@ impl PageHost {
         if is_new {
             crate::platform::upload::forget_stale_tokens(&self.config, &app).await;
         }
-        let path = self.config.data_dir.join(format!("{slug}.html"));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        }
-        fs::write(&path, html)
+        crate::content::files::publish(&self.config, &format!("{slug}.html"), html.into())
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(e, None))?;
         if is_new {
             crate::platform::upload::forget_stale_access(&self.config, &app, folder.as_deref()).await;
         }
@@ -1332,10 +1326,10 @@ impl PageHost {
                 "slug must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
             )]));
         }
-        let path = self.config.data_dir.join(format!("{slug}.html"));
-        match fs::read_to_string(&path).await {
-            Ok(html) => Ok(CallToolResult::success(vec![ContentBlock::text(html)])),
-            Err(_) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+        let html = crate::content::files::read(&self.config, &format!("{slug}.html")).await.and_then(|bytes| String::from_utf8(bytes).ok());
+        match html {
+            Some(html) => Ok(CallToolResult::success(vec![ContentBlock::text(html)])),
+            None => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "no page found for slug '{slug}'"
             ))])),
         }
@@ -1372,24 +1366,22 @@ impl PageHost {
             }
         }
 
-        let app_dir = self.config.data_dir.join(&app);
         let is_new = !crate::content::store::app_exists(&self.config, &app).await;
         if is_new {
             crate::platform::upload::forget_stale_tokens(&self.config, &app).await;
         }
-        fs::create_dir_all(&app_dir)
+        crate::content::files::hold_name(&self.config, &app)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(e, None))?;
         if is_new {
             crate::platform::upload::forget_stale_access(&self.config, &app, folder.as_deref()).await;
         }
 
         let mut urls = Vec::new();
         for (name, html) in &pages {
-            let path = app_dir.join(format!("{name}.html"));
-            fs::write(&path, html)
+            crate::content::files::publish(&self.config, &format!("{app}/{name}.html"), html.clone().into())
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                .map_err(|e| McpError::internal_error(e, None))?;
             // 'index' is what the app root serves, so report that URL for it.
             let slug = if name == "index" {
                 app.clone()
@@ -2162,12 +2154,12 @@ impl PageHost {
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         match outcome {
-            Ok(moved) => {
+            Ok(removed) => {
                 self.runtime.forget(&slug);
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "removed {}; kept under .trash/{at}-{} on the server",
-                    moved.join(", "),
-                    slug.replace('/', "-")
+                    "removed {}; kept in the trash on the server as {}",
+                    removed.moved.join(", "),
+                    removed.entry
                 ))]))
             }
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
@@ -2322,13 +2314,13 @@ impl PageHost {
         }
 
         // Sits beside the page file, matching however that page was resolved.
-        let path = match self.config.data_dir.join(format!("{slug}.html")) {
-            p if p.exists() => self.config.data_dir.join(format!("{slug}.icon")),
-            _ => self.config.data_dir.join(format!("{slug}/index.icon")),
+        let key = match crate::content::store::page_key(&self.config, &slug).await.as_deref() {
+            Some(page) if page.ends_with("/index.html") => format!("{slug}/index.icon"),
+            _ => format!("{slug}.icon"),
         };
-        fs::write(&path, icon)
+        crate::content::files::publish(&self.config, &key, icon.to_string().into())
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| McpError::internal_error(e, None))?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "icon set for {}",
@@ -2353,18 +2345,10 @@ impl PageHost {
                 "app must be non-empty and contain only letters, numbers, '-' or '_'",
             )]));
         }
-        let app_dir = self.config.data_dir.join(&app);
         let mut pages = HashMap::new();
-        if let Ok(mut entries) = fs::read_dir(&app_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("html") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        if let Ok(html) = fs::read_to_string(&path).await {
-                            pages.insert(stem.to_string(), html);
-                        }
-                    }
-                }
+        for (name, path) in crate::content::files::pages_in(&self.config, &app).await {
+            if let Ok(html) = fs::read_to_string(&path).await {
+                pages.insert(name, html);
             }
         }
         if pages.is_empty() {

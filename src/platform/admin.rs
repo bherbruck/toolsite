@@ -576,7 +576,7 @@ async fn app_row(config: &Config, app: &str) -> AppRow {
         follows_default: effective.source != crate::content::store::GateSource::App,
         follows: gate_source_label(&effective.source),
         hidden: meta.hidden,
-        has_handler: config.data_dir.join(app).join("handler.wasm").is_file(),
+        has_handler: crate::content::serve::has_handler(config, app).await,
         modified,
     }
 }
@@ -939,9 +939,10 @@ async fn render_overview(
     is_admin_here: bool,
 ) -> Markup {
     let folder = meta.project.clone().unwrap_or_default();
-    let dir = config.data_dir.join(app);
-    let has_handler = dir.join("handler.wasm").is_file();
-    let db_bytes = tokio::fs::metadata(dir.join("data.db")).await.ok().map(|m| m.len());
+    let has_handler = crate::content::serve::has_handler(config, app).await;
+    // The database stays on this runner's volume, whichever store keeps
+    // the app's published files.
+    let db_bytes = tokio::fs::metadata(config.data_dir.join(app).join("data.db")).await.ok().map(|m| m.len());
     let page = crate::content::store::page_path(config, app).await;
     let title = match &page {
         Some(path) => crate::content::store::page_title(path).await,
@@ -951,10 +952,10 @@ async fn render_overview(
         Some(path) => tokio::fs::metadata(path).await.ok().and_then(|m| m.modified().ok()),
         None => None,
     };
-    let source = tokio::fs::metadata(config.data_dir.join(format!("{app}.source")))
-        .await
-        .ok()
-        .map(|m| (m.len(), m.modified().ok()));
+    let source = match crate::content::files::path(config, &format!("{app}.source")).await {
+        Some(path) => tokio::fs::metadata(path).await.ok().map(|m| (m.len(), m.modified().ok())),
+        None => None,
+    };
     let page_url = crate::content::store::page_url(config, app);
     html! {
         div."grid-2" {
@@ -1049,10 +1050,12 @@ pub async fn download_source(
     if let Err(response) = require_app(&config, &headers, &app, Scope::Editor).await {
         return response;
     }
-    let path = config.data_dir.join(format!("{app}.source"));
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(file) => file,
-        Err(_) => return (StatusCode::NOT_FOUND, "no source stored for this app").into_response(),
+    let file = match crate::content::files::path(&config, &format!("{app}.source")).await {
+        Some(path) => tokio::fs::File::open(&path).await.ok(),
+        None => None,
+    };
+    let Some(file) = file else {
+        return (StatusCode::NOT_FOUND, "no source stored for this app").into_response();
     };
     let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     let stream = tokio_util::io::ReaderStream::new(file);

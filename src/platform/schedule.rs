@@ -461,9 +461,9 @@ fn turn(job: &Job, at: u64) -> Option<u64> {
 async fn run_once(state: &AppState, app: &str, name: &str, lease: &Lease) -> Result<String, String> {
     let job = jobs(&state.config, app).await.remove(name).ok_or_else(|| format!("{app} has no job called {name}"))?;
 
-    let wasm = tokio::fs::read(state.config.data_dir.join(app).join("handler.wasm"))
+    let handler = crate::content::serve::handler_wasm(&state.config, app)
         .await
-        .map_err(|_| format!("{app} has no handler to run"))?;
+        .ok_or_else(|| format!("{app} has no handler to run"))?;
 
     let request = crate::runtime::wasm::Request {
         method: "GET".to_string(),
@@ -483,7 +483,7 @@ async fn run_once(state: &AppState, app: &str, name: &str, lease: &Lease) -> Res
     let owned_app = app.to_string();
     let outcome = tokio::task::spawn_blocking(move || {
         // No identity: a scheduled run is the app acting on its own behalf.
-        runtime.handle(config, &owned_app, &wasm, None, request, guards)
+        runtime.handle_at(config, &owned_app, handler.generation, &handler.wasm, None, request, guards)
     })
     .await;
 

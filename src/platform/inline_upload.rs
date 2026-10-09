@@ -10,15 +10,16 @@
 //!
 //! The upload itself (what, for whom, which chunks have arrived) is a
 //! ticket in `state::Tickets`, updated per chunk with the ticket held, so
-//! two chunks at once both count. The bytes are spooled to this runner's
-//! disk under `.tmp/inline/<digest>/`, one file per index, so a 64 MB bundle
-//! never sits in memory twice, and a client that stops halfway leaves a
-//! directory the next `upload_begin` sweeps. The spool is named by the
-//! ticket's digest, never its id, and stays per runner until content moves
-//! to the bucket.
+//! two chunks at once both count. The bytes go to the `Files` store, one
+//! piece per index, so a 64 MB bundle never sits in memory twice: on files
+//! under `.tmp/inline/<digest>/`, on Postgres in the bucket under
+//! `.toolsite/tmp/inline/<digest>/`, so each chunk may arrive at any runner
+//! and the finish at any other. A client that stops halfway leaves pieces
+//! the next `upload_begin` sweeps. The pieces are named by the ticket's
+//! digest, never its id.
 //!
-//! Every function here blocks (on the spool, and on the store through
-//! `state::wait`), so callers run them on a blocking thread.
+//! Every function here blocks (on the store, through `state::wait` on
+//! Postgres), so callers run them on a blocking thread.
 
 use crate::{
     config::Config,
@@ -26,7 +27,7 @@ use crate::{
     state::tickets::{self, Kind},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 /// The most one chunk may hold once decoded. Base64 adds a third, so a
 /// chunk is about 1 MB on the wire, which every MCP client carries.
@@ -51,46 +52,30 @@ pub struct InlineUpload {
     pub chunks: BTreeMap<u32, u64>,
 }
 
-fn spool_root(config: &Config) -> PathBuf {
-    config.data_dir.join(".tmp").join("inline")
+/// An upload's pieces are named by the digest of its id: a hex name
+/// whatever the id says, so no id reaches a path or a key, and the id is
+/// not left in storage.
+fn pieces(id: &str) -> String {
+    tickets::digest(Kind::InlineUpload, id)
 }
 
-/// An upload's spool, by the digest of its id: a hex name whatever the id
-/// says, so no id reaches the path, and the id is not left on disk.
-fn spool_dir(config: &Config, id: &str) -> PathBuf {
-    spool_root(config).join(tickets::digest(Kind::InlineUpload, id))
-}
-
-/// Removes every spool older than an upload lives. A spool is made when
-/// its upload begins, which is when its ticket's clock starts, so one this
-/// old belongs to an upload that has expired, here or after a restart.
+/// Removes the pieces of every upload older than an upload lives. Its
+/// first piece is stored after its ticket's clock started, so pieces this
+/// old belong to an upload that has expired, here or after a restart.
 pub fn sweep(config: &Config) {
-    if let Ok(entries) = std::fs::read_dir(spool_root(config)) {
-        for entry in entries.flatten() {
-            let stale = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age > INLINE_TTL + Duration::from_secs(60));
-            if stale {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
+    crate::content::files::of(config).chunks_sweep_blocking(INLINE_TTL + Duration::from_secs(60));
 }
 
 const UNKNOWN: &str = "upload id unknown or expired; call upload_begin again";
 
-/// The answer for an id with no live upload. Its spool, if this runner has
-/// one, goes now rather than at the next sweep.
+/// The answer for an id with no live upload. Its pieces, if any arrived,
+/// go now rather than at the next sweep.
 fn unknown(config: &Config, id: &str) -> String {
-    let _ = std::fs::remove_dir_all(spool_dir(config, id));
+    crate::content::files::of(config).chunks_clear_blocking(&pieces(id));
     UNKNOWN.to_string()
 }
 
-/// Opens an upload and returns its id. The spool directory is created now,
-/// so the first chunk has somewhere to go.
+/// Opens an upload and returns its id.
 pub fn begin(
     config: &Config,
     slug: String,
@@ -101,9 +86,7 @@ pub fn begin(
 ) -> Result<String, String> {
     sweep(config);
     let upload = InlineUpload { slug, kind, meta, user, project, chunks: BTreeMap::new() };
-    let id = crate::state::wait(config.stores.tickets.put(Kind::InlineUpload, INLINE_TTL, &upload))?;
-    std::fs::create_dir_all(spool_dir(config, &id)).map_err(|e| format!("could not open a spool: {e}"))?;
-    Ok(id)
+    crate::state::wait(config.stores.tickets.put(Kind::InlineUpload, INLINE_TTL, &upload))
 }
 
 /// What a chunk left behind: the total so far and the indexes present.
@@ -161,24 +144,25 @@ pub(crate) fn chunk_within(config: &Config, id: &str, index: u32, data: &str, ce
         Err(why) => {
             if over {
                 // Over the ceiling the upload is lost either way; say so and
-                // clear the spool rather than hold it until expiry.
+                // clear its pieces rather than hold them until expiry.
                 let _ = crate::state::wait(config.stores.tickets.take::<InlineUpload>(Kind::InlineUpload, id));
-                let _ = std::fs::remove_dir_all(spool_dir(config, id));
+                crate::content::files::of(config).chunks_clear_blocking(&pieces(id));
             }
             return Err(why);
         }
     };
-    let dir = spool_dir(config, id);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("could not spool the chunk: {e}"))?;
-    std::fs::write(dir.join(format!("{index}.part")), &bytes).map_err(|e| format!("could not spool the chunk: {e}"))?;
+    crate::content::files::of(config)
+        .chunk_put_blocking(&pieces(id), index, &bytes)
+        .map_err(|why| format!("could not keep the chunk: {why}"))?;
     Ok(progress)
 }
 
 /// Closes the upload and returns it with its bytes in order, or the indexes
-/// that never arrived. Either way the id is spent and the spool is gone.
+/// that never arrived. Either way the id is spent and the pieces are gone.
 pub fn finish(config: &Config, id: &str, count: u32) -> Result<(InlineUpload, Vec<u8>), String> {
     let upload = crate::state::wait(config.stores.tickets.take::<InlineUpload>(Kind::InlineUpload, id));
-    let dir = spool_dir(config, id);
+    let files = crate::content::files::of(config);
+    let name = pieces(id);
     let outcome = (|| {
         let upload = upload?.ok_or_else(|| UNKNOWN.to_string())?;
         if count == 0 {
@@ -204,13 +188,14 @@ pub fn finish(config: &Config, id: &str, count: u32) -> Result<(InlineUpload, Ve
         let total: u64 = upload.chunks.values().sum();
         let mut bytes = Vec::with_capacity(total as usize);
         for index in 0..count {
-            let part = std::fs::read(dir.join(format!("{index}.part")))
-                .map_err(|e| format!("chunk {index} could not be read back: {e}"))?;
+            let part = files
+                .chunk_read_blocking(&name, index)?
+                .ok_or_else(|| format!("chunk {index} could not be read back"))?;
             bytes.extend_from_slice(&part);
         }
         Ok((upload, bytes))
     })();
-    let _ = std::fs::remove_dir_all(&dir);
+    files.chunks_clear_blocking(&name);
     outcome
 }
 
@@ -225,6 +210,11 @@ mod tests {
         let config = Config::local(dir.path().to_path_buf(), "t");
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
         (dir, config, runtime)
+    }
+
+    /// Where the files store keeps an upload's pieces on the volume.
+    fn spool_dir(config: &Config, id: &str) -> std::path::PathBuf {
+        config.data_dir.join(".tmp").join("inline").join(pieces(id))
     }
 
     fn meta() -> SourceMeta {

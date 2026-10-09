@@ -45,10 +45,6 @@ impl Files {
         Files { data_dir }
     }
 
-    pub(super) fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
     fn lock_for(&self, slug: &str) -> Arc<Mutex<()>> {
         held(&LOCKS).entry(self.data_dir.join(slug)).or_default().clone()
     }
@@ -244,16 +240,6 @@ impl Catalog for Files {
         tokio::fs::write(path, notes).await.map_err(|e| e.to_string())
     }
 
-    async fn slugs(&self) -> Result<Vec<String>, String> {
-        let mut slugs = Vec::new();
-        collect_slugs(&self.data_dir, String::new(), &mut slugs).await;
-        Ok(slugs)
-    }
-
-    async fn apps(&self) -> Result<Vec<String>, String> {
-        Ok(super::apps_among(self.slugs().await?))
-    }
-
     /// Nothing to take out: the sidecars are files, and the trash moves
     /// them with the rest.
     fn retire_blocking(&self, _slug: &str, _at: u64) -> Result<Retired, String> {
@@ -343,54 +329,4 @@ struct MoveHold(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
 #[async_trait]
 impl Held for MoveHold {
     async fn release(self: Box<Self>) {}
-}
-
-/// Every published slug under `dir`, the way the index lists them.
-pub(crate) fn collect_slugs<'a>(
-    dir: &'a Path,
-    prefix: String,
-    out: &'a mut Vec<String>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-    use tokio::fs;
-    Box::pin(async move {
-        // A directory with an index page is an app: list its root only. Its
-        // inner pages belong to the app's own navigation, not this index.
-        if !prefix.is_empty() && fs::metadata(dir.join("index.html")).await.is_ok() {
-            // A page of the same name may also exist; one slug, one entry.
-            if !out.contains(&prefix) {
-                out.push(prefix);
-            }
-            return;
-        }
-        let Ok(mut entries) = fs::read_dir(dir).await else {
-            return;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            // .trash and .site are the platform's, not anybody's app.
-            if name.starts_with('.') {
-                continue;
-            }
-            if path.is_dir() {
-                let child_prefix = if prefix.is_empty() {
-                    name
-                } else {
-                    format!("{prefix}/{name}")
-                };
-                collect_slugs(&path, child_prefix, out).await;
-            } else if path.extension().and_then(|e| e.to_str()) == Some("html")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            {
-                let slug = if prefix.is_empty() {
-                    stem.to_string()
-                } else {
-                    format!("{prefix}/{stem}")
-                };
-                if !out.contains(&slug) {
-                    out.push(slug);
-                }
-            }
-        }
-    })
 }

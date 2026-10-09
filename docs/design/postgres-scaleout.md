@@ -279,6 +279,25 @@ Snapshot deploys (each deploy a new prefix, flipped by one pointer) would
 also remove the short window in which a reader sees half of an overlay. That
 is a change in meaning (old files vanish), so it is not part of step 1.
 
+PR 10, as built: every published file keeps the key it had under
+`DATA_DIR` and lives at `.toolsite/content/<key>` (`shop.html`,
+`shop/index.html`, `shop.icon`, `shop.source`, `shop/handler.wasm`), so
+the local store and the bucket share one key space and one validation
+(`files::valid_key`, the bundle asset rule). Generations come from one
+sequence, `platform.generations`: counted per row, a removed app's row went
+away and the next app at the name started again at 1, which another
+runner's cache may still hold. A publish takes the app's turn (a process
+lock and `pg_advisory_lock(LOCK_PUBLISH, hashtext(app))`), writes, counts
+the generation and lets go, so two deploys land one after the other.
+Generation 0 reads as nothing published, and on the bucket "the app
+exists" is "its generation is above 0". The cache is
+`DATA_DIR/.tmp/content/<app>/<generation>/<sha256(key)>`, with a marker for
+a key that was absent. A removal moves objects to `.toolsite/trash/<entry>/`
+and writes the rows it took there as sidecars; an app's SQLite database,
+still on the volume, goes to that volume's `.trash/<entry>/app`.
+`platform::trash::restore` puts an entry back. Inline-upload pieces are
+`.toolsite/tmp/inline/<digest>/<n>`.
+
 ### 2.4 Guards at boot
 
 In Postgres mode the server refuses to start when:

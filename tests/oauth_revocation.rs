@@ -132,7 +132,7 @@ async fn a_code_exchanged_during_a_revocation_never_leaves_a_live_token_on_postg
     let runner = || {
         Arc::new(Config {
             base_url: Some(BASE.to_string()),
-            stores: database.stores(),
+            stores: database.stores(), blobs: database.blobs(),
             ..Config::local(dir.path().to_path_buf(), "t")
         })
     };

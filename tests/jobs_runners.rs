@@ -51,7 +51,7 @@ impl Site {
         let database = common::Database::new().await;
         let runner = || {
             let local = Config::local(dir.path().to_path_buf(), "test-token");
-            let config = Arc::new(Config { stores: database.stores(), jobs: Arc::new(jobs()), ..local });
+            let config = Arc::new(Config { stores: database.stores(), blobs: database.blobs(), jobs: Arc::new(jobs()), ..local });
             let runtime = Runtime::new().unwrap();
             config.jobs.attach(&runtime);
             Runner { config, runtime }
@@ -61,9 +61,7 @@ impl Site {
     }
 
     fn install(&self, app: &str) {
-        let data_dir = &self.a.config.data_dir;
-        std::fs::create_dir_all(data_dir.join(app)).unwrap();
-        std::fs::write(data_dir.join(app).join("handler.wasm"), HANDLER).unwrap();
+        common::publish(&self.a.config, &format!("{app}/handler.wasm"), HANDLER);
     }
 
     /// Marks the job routes wrote, read through runner A.

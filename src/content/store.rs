@@ -11,27 +11,42 @@ pub(crate) fn page_url(config: &Config, slug: &str) -> String {
     crate::content::origins::page_url(config, slug)
 }
 
+/// A local file holding the first of `names` (keys made from `slug`) that
+/// is published, read at one generation.
+async fn first_of(config: &Config, slug: &str, names: [String; 2]) -> Option<PathBuf> {
+    if !crate::content::slug::valid_slug(slug) {
+        return None;
+    }
+    let generation = crate::content::files::reading(config, crate::content::files::app_of(slug)).await;
+    for key in names {
+        if let Some(path) = crate::content::files::path_at(config, generation, &key).await {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// The file backing a slug: either the page itself or, for an app root, that
 /// app's index page.
 pub(crate) async fn page_path(config: &Config, slug: &str) -> Option<PathBuf> {
-    let direct = config.data_dir.join(format!("{slug}.html"));
-    if fs::metadata(&direct).await.is_ok() {
+    first_of(config, slug, [format!("{slug}.html"), format!("{slug}/index.html")]).await
+}
+
+/// The key a slug's page is at: the page itself, or its app's index page.
+pub(crate) async fn page_key(config: &Config, slug: &str) -> Option<String> {
+    let direct = format!("{slug}.html");
+    if crate::content::files::path(config, &direct).await.is_some() {
         return Some(direct);
     }
-    let index = config.data_dir.join(format!("{slug}/index.html"));
-    fs::metadata(&index).await.ok().map(|_| index)
+    let index = format!("{slug}/index.html");
+    crate::content::files::path(config, &index).await.map(|_| index)
 }
 
 /// Icons live next to their page as `<slug>.icon`. An app root accepts either
 /// spelling, since a ticket upload writes the sibling form before the app
 /// directory necessarily exists.
 pub(crate) async fn icon_path(config: &Config, slug: &str) -> Option<PathBuf> {
-    let direct = config.data_dir.join(format!("{slug}.icon"));
-    if fs::metadata(&direct).await.is_ok() {
-        return Some(direct);
-    }
-    let index = config.data_dir.join(format!("{slug}/index.icon"));
-    fs::metadata(&index).await.ok().map(|_| index)
+    first_of(config, slug, [format!("{slug}.icon"), format!("{slug}/index.icon")]).await
 }
 
 /// The extensions of the sidecars kept beside a page, or inside an app's
@@ -817,8 +832,7 @@ pub fn folder_chain(path: &str) -> Vec<String> {
 /// Whether anything has been published at `app` yet: its directory or a
 /// single page. A new app is placed in a folder on its first publish.
 pub async fn app_exists(config: &Config, app: &str) -> bool {
-    fs::metadata(config.data_dir.join(app)).await.is_ok()
-        || fs::metadata(config.data_dir.join(format!("{app}.html"))).await.is_ok()
+    crate::content::files::app_exists(config, app).await
 }
 
 /// The folder an app sits in, empty for the root.

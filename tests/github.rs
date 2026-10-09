@@ -134,7 +134,7 @@ async fn github_server_on(api: &str, postgres: bool) -> (TempDir, Arc<Config>, O
     let config = Arc::new(Config {
         base_url: Some(SITE.to_string()),
         github: Some(app),
-        stores: database.stores(),
+        stores: database.stores(), blobs: database.blobs(),
         ..Config::local(dir.path().to_path_buf(), TOKEN)
     });
     (dir, config, Some(database))
@@ -160,9 +160,7 @@ fn visitor(config: &Config) -> String {
 }
 
 fn publish_app(config: &Config, app: &str) {
-    let dir = config.data_dir.join(app);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("index.html"), "<title>App</title>").unwrap();
+    common::publish(config, &format!("{app}/index.html"), "<title>App</title>");
 }
 
 fn store_source(config: &Config, app: &str) {
@@ -171,7 +169,7 @@ fn store_source(config: &Config, app: &str) {
         ("./src/main.js", b"console.log('hi')"),
         ("./node_modules/left-pad/index.js", b"nope"),
     ]);
-    std::fs::write(config.data_dir.join(format!("{app}.source")), archive).unwrap();
+    common::publish(config, &format!("{app}.source"), archive);
 }
 
 /// An upload ticket for `slug`, the way create_upload mints one.
@@ -1094,7 +1092,7 @@ async fn webhook_pulls(postgres: bool) {
     assert!(body.contains("pulled"), "{body}");
     assert_eq!(toolsite::platform::github::link(&config, "dash").await.unwrap().last_push.unwrap().sha, pushed);
     assert_eq!(fake.lock().unwrap().repo("acme/dashboard").tarball_downloads, 2);
-    let archive = std::fs::read(dir.path().join("dash.source")).unwrap();
+    let archive = toolsite::content::files::read(&config, "dash.source").await.unwrap();
     assert_eq!(archive_paths(&archive), ["README.md", "app.js"], "the pushed branch is not the source archive");
     assert_eq!(fake.lock().unwrap().repo("acme/dashboard").commits_made, 0, "a pull must not push back");
 
@@ -1134,21 +1132,21 @@ async fn pulling_refreshes_the_source_archive_and_disconnecting_leaves_the_repos
 async fn pull_and_disconnect(postgres: bool) {
     let (fake, api) = fake_github::start().await;
     fake.lock().unwrap().add_repo("acme", "dashboard", true);
-    let (dir, config, database) = github_server_on(&api, postgres).await;
+    let (_dir, config, database) = github_server_on(&api, postgres).await;
     publish_app(&config, "dash");
     let session = admin(&config);
     install(&config, &session).await;
     let (_, page, _) = send(&config, get_as("/admin/apps/dash/repo", &session)).await;
     let token = form_token_from(&page);
     send(&config, post_form("/admin/repo", &session, format!("token={token}&action=import&app=dash&installation=1&repo=acme/dashboard&back=/admin/apps/dash/repo"))).await;
-    assert_eq!(archive_paths(&std::fs::read(dir.path().join("dash.source")).unwrap()), ["README.md"]);
+    assert_eq!(archive_paths(&toolsite::content::files::read(&config, "dash.source").await.unwrap()), ["README.md"]);
 
     // The branch moves without a webhook reaching us; Pull catches up.
     fake.lock().unwrap().commit_from_outside("acme/dashboard", "index.html", b"<title>d</title>", "Add a page");
     let (status, _, headers) = send(&config, post_form("/admin/repo", &session, format!("token={token}&action=pull&app=dash&back=/admin/apps/dash/repo"))).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(flash(&headers).starts_with("ok:Pulled commit"), "{}", flash(&headers));
-    assert_eq!(archive_paths(&std::fs::read(dir.path().join("dash.source")).unwrap()), ["README.md", "index.html"]);
+    assert_eq!(archive_paths(&toolsite::content::files::read(&config, "dash.source").await.unwrap()), ["README.md", "index.html"]);
     assert_eq!(fake.lock().unwrap().repo("acme/dashboard").commits_made, 0, "a pull must not write to the repository");
 
     // Disconnect: link gone from the live set, repository untouched.

@@ -156,13 +156,38 @@ pub(crate) fn read_all_files(
 }
 
 #[derive(Debug)]
-pub(crate) struct Unpacked {
-    pub(crate) files: Vec<String>,
-    pub(crate) skipped: Vec<&'static str>,
+pub struct Unpacked {
+    pub files: Vec<String>,
+    pub skipped: Vec<&'static str>,
 }
 
 /// `slug` is what `dest` serves as: the app, or a page inside one.
 pub(crate) fn unpack_bundle(body: &[u8], dest: &std::path::Path, slug: &str) -> Result<Unpacked, String> {
+    unpack_into(body, slug, &mut |rel, entry, _size| {
+        let out = dest.join(rel);
+        // Belt and braces: the path checks should make this impossible,
+        // but never write outside the destination.
+        if !out.starts_with(dest) {
+            return Err(format!("path escapes the app directory: {rel}"));
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
+        std::io::copy(entry, &mut file).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+/// Where one checked entry of a bundle goes: its path inside the app, its
+/// bytes and their length. The `Files` store gives one per backend; the
+/// checks above it are the same for all of them.
+pub(crate) type Sink<'a> = dyn FnMut(&str, &mut dyn std::io::Read, u64) -> Result<(), String> + 'a;
+
+/// Every entry of a bundle that passes the traversal defence, handed to
+/// `sink` in the archive's order. Every path is checked before the first is
+/// handed over, so an archive with one unsafe path writes nothing at all.
+pub(crate) fn unpack_into(body: &[u8], slug: &str, sink: &mut Sink<'_>) -> Result<Unpacked, String> {
     let paths = bundle_entry_paths(body)?;
     let strip = bundle_strip_prefix(&paths);
 
@@ -203,25 +228,20 @@ pub(crate) fn unpack_bundle(body: &[u8], dest: &std::path::Path, slug: &str) -> 
             continue;
         }
 
-        total += entry.header().size().unwrap_or(0);
+        let size = entry.header().size().unwrap_or(0);
+        total += size;
         if total > MAX_BUNDLE_UNPACKED {
             return Err(format!(
                 "bundle exceeds {} MB unpacked",
                 MAX_BUNDLE_UNPACKED / 1024 / 1024
             ));
         }
-
-        let out = dest.join(&rel);
-        // Belt and braces: the path checks above should make this impossible,
-        // but never write outside the destination.
-        if !out.starts_with(dest) {
-            return Err(format!("path escapes the app directory: {rel}"));
+        // Checked again here, after the strip, by the rule every store
+        // keys on: whatever a sink does with it, this path is a key.
+        if !valid_asset_path(&rel) {
+            return Err(format!("unsupported filename in bundle: {rel}"));
         }
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let mut file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut file).map_err(|e| e.to_string())?;
+        sink(&rel, &mut entry, size)?;
         written.push(rel);
     }
 
@@ -232,15 +252,16 @@ pub(crate) fn unpack_bundle(body: &[u8], dest: &std::path::Path, slug: &str) -> 
     })
 }
 
+/// Archives forged by hand, for the traversal tests here and for the same
+/// tests against every `Files` store.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod forged {
     use std::io::Write;
 
     /// Writes tar headers by hand. The `tar` crate's builder refuses to
     /// emit `..` or absolute paths, which is exactly what these tests need to
     /// forge — a real attacker is not constrained by our tar library either.
-    fn raw_entry(path: &str, body: &[u8], type_flag: u8, link: &str) -> Vec<u8> {
+    pub(crate) fn raw_entry(path: &str, body: &[u8], type_flag: u8, link: &str) -> Vec<u8> {
         let mut header = [0u8; 512];
         let put = |header: &mut [u8; 512], offset: usize, bytes: &[u8]| {
             header[offset..offset + bytes.len()].copy_from_slice(bytes);
@@ -269,7 +290,7 @@ mod tests {
 
     /// `entries` are (path, contents); a path ending in '@' is a symlink to
     /// /etc/passwd.
-    fn tarball(entries: &[(&str, &str)]) -> Vec<u8> {
+    pub(crate) fn tarball(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut tar = Vec::new();
         for (path, body) in entries {
             match path.strip_suffix('@') {
@@ -284,6 +305,12 @@ mod tests {
         encoder.write_all(&tar).unwrap();
         encoder.finish().unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forged::tarball;
+    use super::*;
 
     #[test]
     fn a_normal_build_output_unpacks_whole() {

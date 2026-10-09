@@ -49,6 +49,10 @@ pub const LOCK_JOBS: i32 = 7;
 pub const LOCK_LEASES: i32 = 8;
 /// One rate key, keyed by `hashtext(key)`: counted and spent in one turn.
 pub const LOCK_RATES: i32 = 9;
+/// One app's published files, keyed by `hashtext(app)`: a publish writes
+/// and counts its generation in one turn, so two deploys at once land one
+/// after the other rather than interleaved.
+pub const LOCK_PUBLISH: i32 = 10;
 
 /// One store's schema, as the steps that build it. Version `n` is
 /// `steps[n - 1]`; a step never changes once released, the ladder only grows.
@@ -86,6 +90,7 @@ pub const LADDERS: &[Ladder] = &[
             include_str!("../../migrations/postgres/platform/003_records_tokens.sql"),
             include_str!("../../migrations/postgres/platform/004_jobs.sql"),
             include_str!("../../migrations/postgres/platform/005_job_turns.sql"),
+            include_str!("../../migrations/postgres/platform/006_generations.sql"),
         ],
     },
 ];

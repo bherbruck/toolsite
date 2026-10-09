@@ -953,7 +953,7 @@ pub async fn create(
     if !valid_repo_name(repo_name) {
         return Err(format!("{repo_name} is not a repository name: letters, digits, '-', '_' and '.'"));
     }
-    let archive = std::fs::read(config.data_dir.join(format!("{app_name}.source"))).map_err(|_| {
+    let archive = crate::content::files::read(config, &format!("{app_name}.source")).await.ok_or_else(|| {
         format!(
             "{app_name} has no stored source to put in a repository. Publish the project first: \
              tar -czf - --exclude node_modules --exclude target . | curl -f -T - '<upload-url>?source'"
@@ -1102,7 +1102,8 @@ async fn pull_into(config: &Config, app_name: &str, repo: &Repo<'_>, link: &Repo
         .await
         .map_err(|_| "repacking the branch failed".to_string())??;
     let bytes = archive.len();
-    std::fs::write(config.data_dir.join(format!("{app_name}.source")), &archive)
+    crate::content::files::publish(config, &format!("{app_name}.source"), archive.into())
+        .await
         .map_err(|e| format!("could not store the source archive: {e}"))?;
     Ok(Pulled { bytes, sha })
 }
@@ -1700,7 +1701,7 @@ fn import_form(token: &str, installs: &[Installation], app: Option<&str>, back: 
 pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, back: &str, fresh_token: Option<&str>) -> Markup {
     let link = link(config, app).await;
     let installs = installations(config).await;
-    let has_source = config.data_dir.join(format!("{app}.source")).is_file();
+    let has_source = crate::content::files::path(config, &format!("{app}.source")).await.is_some();
     let tokens = deploy::list(config, app).await;
     let inspected = match &link {
         Some(link) if config.github.is_some() => Some(inspect(config, link).await),
@@ -1924,7 +1925,7 @@ pub(crate) async fn repo_action(
         Ok(Some(text)) => {
             // An import from the GitHub page lands on the app's Repo tab once
             // the app exists; before its first publish there is no app page.
-            let app_exists = config.data_dir.join(&app).is_dir();
+            let app_exists = crate::content::store::app_exists(&config, &app).await;
             let to = if form.action == "import" && back == "/admin/github" && app_exists { tab } else { back };
             admin::redirect_flash(&to, true, text)
         }

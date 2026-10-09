@@ -23,6 +23,8 @@ use toolsite::{
 };
 use tower::ServiceExt;
 
+mod common;
+
 const NEEDS: &str = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one";
 const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
@@ -307,11 +309,12 @@ const HANDLER: &[u8] = include_bytes!("fixtures/handler.wasm");
 
 /// One runner of a subdomain-mode site: its own process state, sharing the
 /// volume and the database with every other runner.
-fn runner_config(data_dir: &std::path::Path, stores: Stores) -> Arc<Config> {
+fn runner_config(data_dir: &std::path::Path, stores: Stores, bucket: &toolsite::runtime::blobs::S3) -> Arc<Config> {
     Arc::new(Config {
         base_url: Some(BASE.to_string()),
         apps: Some(AppsDomain::parse("apps.test", Some(BASE), None).unwrap()),
         stores,
+        blobs: common::blobs_in(bucket),
         ..Config::local(data_dir.to_path_buf(), "test-token")
     })
 }
@@ -359,10 +362,8 @@ async fn get(config: &Arc<Config>, host: &str, uri: &str, cookie: Option<&str>) 
 
 /// A gated app, written to the shared volume.
 fn app(config: &Config, name: &str) {
-    let dir = config.data_dir.join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("index.html"), format!("<title>{name}</title><h1>{name} home</h1>")).unwrap();
-    std::fs::write(dir.join("handler.wasm"), HANDLER).unwrap();
+    common::publish(config, &format!("{name}/index.html"), format!("<title>{name}</title><h1>{name} home</h1>"));
+    common::publish(config, &format!("{name}/handler.wasm"), HANDLER);
     let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     meta.gate = Some("authenticated".to_string());
     toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();
@@ -392,8 +393,9 @@ async fn a_handoff_begun_on_one_router_finishes_on_another_on_postgres() {
     let stores = |postgres: &Arc<pg::Postgres>| {
         Stores::new(Backend::Postgres(postgres.clone()), None, Some(KEY)).unwrap()
     };
-    let a = runner_config(volume.path(), stores(&pg_a));
-    let b = runner_config(volume.path(), stores(&pg_b));
+    let bucket = common::bucket().await;
+    let a = runner_config(volume.path(), stores(&pg_a), &bucket);
+    let b = runner_config(volume.path(), stores(&pg_b), &bucket);
 
     app(&a, "members");
     // Accounts live in Postgres here too, and an account call blocks its
@@ -429,8 +431,8 @@ async fn a_handoff_begun_on_one_router_finishes_on_another_on_postgres() {
 
     // Control: with each runner's tickets in its own memory, as in file
     // mode, B has never heard of A's code. This is what the shared store fixes.
-    let lone_a = runner_config(volume.path(), Stores { tickets: Tickets::memory(), ..stores(&pg_a) });
-    let lone_b = runner_config(volume.path(), Stores { tickets: Tickets::memory(), ..stores(&pg_b) });
+    let lone_a = runner_config(volume.path(), Stores { tickets: Tickets::memory(), ..stores(&pg_a) }, &bucket);
+    let lone_b = runner_config(volume.path(), Stores { tickets: Tickets::memory(), ..stores(&pg_b) }, &bucket);
     let (host, state, landing) = begin_handoff(&lone_a, "members", &site_token).await;
     let landed = get(&lone_b, &host, &landing, Some(&format!("__Host-ts_handoff={state}"))).await;
     assert_eq!(landed.status, StatusCode::BAD_REQUEST);

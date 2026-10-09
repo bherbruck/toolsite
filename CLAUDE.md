@@ -73,6 +73,7 @@ content/           what gets published, and how it is served
   slug.rs          naming rules (what may become a path), tokens, escaping
   store.rs         PageMeta, page/icon paths, titles, gates, the project tree
   catalog/         Catalog: each slug's meta, notes and generation, the project tree, a move's journal and hold, host labels, markers; on files or Postgres; update_meta and update_folders are the only ways to change a meta or the tree
+  files/           Files: published bytes by key (pages, bundles, icons, sources, handlers), the trash and inline-upload pieces; the volume on files, the bucket under .toolsite/ on Postgres, read through a cache keyed by the app's generation
   bundle.rs        tar unpacking, entry classification, traversal defence
   serve.rs         the public site: pages, assets, handler dispatch
   origins.rs       which origin serves an app: labels, app URLs, which host a request is on
@@ -84,6 +85,7 @@ runtime/           executing an app's own code and data
   db.rs            per-app SQLite, the identity functions, the authorizers (apps apart; a person inside the views)
   access.rs        row-level policies from toolsite.toml, realised as views and triggers
   blobs.rs         per-app files, on the volume or in a bucket, keyed like paths
+  objects.rs       raw objects in the site's bucket, for the platform's own content
   connections.rs   every open connection by app: topics, state, limits; no HTTP, no transport
   events.rs        the in-process AppEvents: closes a hidden or removed app's sockets and resident
 

@@ -2,7 +2,6 @@ use crate::{
     config::Config,
     state::tickets::Kind,
     content::{
-        bundle::unpack_bundle,
         slug::valid_slug,
         store::page_url,
     },
@@ -264,16 +263,16 @@ pub(crate) async fn forget_stale_tokens(config: &Config, app: &str) {
     }
 }
 
-/// Makes the app's directory, if its first publish wrote none, so the name
-/// is taken by whatever was published first on either backend. On files a
-/// manifest or a source alone made one, by writing a sidecar inside it; on
-/// Postgres the meta is a row, and without this the next publisher at the
-/// name, in another project, would count as new and inherit that row.
+/// Takes the app's name, if its first publish wrote no file (a manifest,
+/// migrations), so the name is taken by whatever was published first on
+/// either backend: on files its directory, on Postgres a generation
+/// counted. Without this the next publisher at the name, in another
+/// project, would count as new and inherit the meta the first one set.
 async fn hold_the_name(config: &Config, app: &str) {
     if !crate::content::store::app_exists(config, app).await
-        && let Err(e) = fs::create_dir_all(config.data_dir.join(app)).await
+        && let Err(why) = crate::content::files::hold_name(config, app).await
     {
-        tracing::warn!(app, error = %e, "a new app's directory could not be made");
+        tracing::warn!(app, %why, "a new app's name could not be held");
     }
 }
 
@@ -448,13 +447,8 @@ pub(crate) async fn store_for_slug(
         if body.len() > MAX_UPLOAD_BYTES {
             return (StatusCode::PAYLOAD_TOO_LARGE, "source archive too large\n").into_response();
         }
-        let path = config.data_dir.join(format!("{app}.source"));
-        if let Some(parent) = path.parent() {
-            if fs::create_dir_all(parent).await.is_err() {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
-            }
-        }
-        if fs::write(&path, &body).await.is_err() {
+        if let Err(why) = crate::content::files::publish(config, &format!("{app}.source"), body.clone()).await {
+            tracing::warn!(app = %app, %why, "source could not be stored");
             return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
         }
         tracing::info!(app = %app, bytes = body.len(), "source stored");
@@ -508,16 +502,15 @@ pub(crate) async fn store_for_slug(
                 .into_response();
         }
 
-        let dir = config.data_dir.join(&app);
-        if fs::create_dir_all(&dir).await.is_err()
-            || fs::write(dir.join("handler.wasm"), &body).await.is_err()
-        {
+        let size = body.len();
+        if let Err(why) = crate::content::files::publish(config, &crate::content::serve::handler_key(&app), body).await {
+            tracing::warn!(app = %app, %why, "handler could not be stored");
             return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
         }
         runtime.forget(&app);
         // A resident instance runs the code that was replaced.
         config.residents.stop(&app);
-        tracing::info!(app = %app, bytes = body.len(), "handler published");
+        tracing::info!(app = %app, bytes = size, "handler published");
         return (
             StatusCode::OK,
             format!("handler live at {}/api/\n", page_url(config, &app)),
@@ -526,23 +519,13 @@ pub(crate) async fn store_for_slug(
     }
 
     if let UploadKind::Bundle { spa } = kind {
-        let dest = config.data_dir.join(&slug);
-        if fs::create_dir_all(&dest).await.is_err() {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
-        }
-        // Decompression is CPU-bound and blocking; keep it off the runtime.
-        let (unpack_dest, unpack_slug) = (dest.clone(), slug.clone());
-        let result =
-            tokio::task::spawn_blocking(move || unpack_bundle(&body, &unpack_dest, &unpack_slug)).await;
-        let unpacked = match result {
-            Ok(Ok(unpacked)) => unpacked,
-            Ok(Err(message)) => {
+        // Decompression is CPU-bound and blocking; the store keeps it off
+        // the runtime.
+        let unpacked = match crate::content::files::publish_bundle(config, &slug, body).await {
+            Ok(unpacked) => unpacked,
+            Err(message) => {
                 tracing::warn!(slug = %slug, error = %message, "bundle rejected");
                 return (StatusCode::BAD_REQUEST, format!("{message}\n")).into_response();
-            }
-            Err(e) => {
-                tracing::error!(slug = %slug, error = %e, "bundle unpack panicked");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "unpack failed\n").into_response();
             }
         };
 
@@ -558,8 +541,10 @@ pub(crate) async fn store_for_slug(
         // serving prefers <slug>.html, so the bundle would be unreachable and
         // the index would list the slug twice. Republishing a slug replaces
         // what was there, which is what this is.
-        let shadow = config.data_dir.join(format!("{slug}.html"));
-        let replaced_page = fs::remove_file(&shadow).await.is_ok();
+        let replaced_page = crate::content::files::unpublish(config, &format!("{slug}.html")).await.unwrap_or_else(|why| {
+            tracing::warn!(slug = %slug, %why, "the page a bundle replaces could not be removed");
+            false
+        });
 
         let has_index = unpacked.files.iter().any(|f| f == "index.html");
         let mut body = format!(
@@ -610,13 +595,8 @@ pub(crate) async fn store_for_slug(
     };
 
     let extension = if as_icon { "icon" } else { "html" };
-    let path = config.data_dir.join(format!("{slug}.{extension}"));
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).await.is_err() {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
-        }
-    }
-    if fs::write(&path, &bytes).await.is_err() {
+    if let Err(why) = crate::content::files::publish(config, &format!("{slug}.{extension}"), bytes).await {
+        tracing::warn!(slug = %slug, %why, "upload could not be stored");
         return (StatusCode::INTERNAL_SERVER_ERROR, "write failed\n").into_response();
     }
 
@@ -768,8 +748,8 @@ pub(crate) async fn download(
     let app = slug.split('/').next().unwrap_or(&slug).to_string();
 
     if query.source.is_some() {
-        return match fs::read(config.data_dir.join(format!("{app}.source"))).await {
-            Ok(bytes) => (
+        return match crate::content::files::read(config, &format!("{app}.source")).await {
+            Some(bytes) => (
                 [
                     (header::CONTENT_TYPE, "application/gzip".to_string()),
                     (
@@ -780,7 +760,7 @@ pub(crate) async fn download(
                 bytes,
             )
                 .into_response(),
-            Err(_) => (
+            None => (
                 StatusCode::NOT_FOUND,
                 format!(
                     "no source stored for {app}. Whoever published it did not upload one; \
@@ -793,15 +773,12 @@ pub(crate) async fn download(
 
     // Without a flag, hand back the page itself — the same thing a visitor
     // would get, but reachable when the app is gated.
-    match fs::read_to_string(config.data_dir.join(format!("{slug}.html"))).await {
-        Ok(html) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response(),
-        Err(_) => match fs::read_to_string(config.data_dir.join(format!("{slug}/index.html"))).await
-        {
-            Ok(html) => {
-                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
-            }
-            Err(_) => (StatusCode::NOT_FOUND, "nothing published at that slug yet\n")
-                .into_response(),
-        },
+    let page = match crate::content::store::page_path(config, &slug).await {
+        Some(path) => fs::read_to_string(path).await.ok(),
+        None => None,
+    };
+    match page {
+        Some(html) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response(),
+        None => (StatusCode::NOT_FOUND, "nothing published at that slug yet\n").into_response(),
     }
 }

@@ -55,9 +55,7 @@ fn put_bytes(uri: &str, body: Vec<u8>) -> Request<Body> {
 }
 
 fn write_page(config: &Config, slug: &str, html: &str) {
-    let path = config.data_dir.join(format!("{slug}.html"));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, html).unwrap();
+    common::publish(config, &format!("{slug}.html"), html.to_string());
 }
 
 async fn place_app(config: &Config, app: &str, project: &str, gate: &str) {
@@ -187,7 +185,7 @@ async fn world_shaped(postgres: bool, shape: fn(Config) -> Config) -> World {
     };
     let base = shape(Config { base_url: Some("https://site.test".to_string()), ..Config::local(dir.path().to_path_buf(), TOKEN) });
     let config = Arc::new(match &database {
-        Some(database) => Config { stores: database.stores(), ..base },
+        Some(database) => Config { stores: database.stores(), blobs: database.blobs(), ..base },
         None => base,
     });
     blocking(|| {
@@ -260,8 +258,10 @@ async fn a_bundle_cannot_write_the_metas_notes_handler_or_database_the_platform_
 async fn platform_files_not_served(w: World) {
     let config = &w.config;
     place_app(config, "open", "", "public").await;
+    common::publish(config, "open/handler.wasm", &b"\0asm"[..]);
+    // The database is a file on the volume, whichever store keeps the rest.
     let dir = config.data_dir.join("open");
-    std::fs::write(dir.join("handler.wasm"), b"\0asm").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("data.db"), b"SQLite format 3\0secret rows").unwrap();
     std::fs::write(dir.join("data.db-wal"), b"secret wal").unwrap();
     for file in ["handler.wasm", "data.db", "data.db-wal"] {
@@ -415,7 +415,7 @@ fn second_runner(w: &World) -> Arc<Config> {
         ..Config::local(w.config.data_dir.clone(), TOKEN)
     };
     Arc::new(match &w.database {
-        Some(database) => Config { stores: database.stores(), ..base },
+        Some(database) => Config { stores: database.stores(), blobs: database.blobs(), ..base },
         None => base,
     })
 }

@@ -37,7 +37,7 @@ impl Site {
             return Site { _dir: dir, config: Arc::new(local), database: None };
         }
         let database = common::Database::new().await;
-        let config = Arc::new(Config { stores: database.stores(), ..local });
+        let config = Arc::new(Config { stores: database.stores(), blobs: database.blobs(), ..local });
         Site { _dir: dir, config, database: Some(database) }
     }
 

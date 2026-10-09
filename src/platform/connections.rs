@@ -134,13 +134,13 @@ async fn deliver(
             .await
             .map(Some);
     }
-    let Some(wasm) = crate::content::serve::handler_wasm(&state.config, app).await else {
+    let Some(handler) = crate::content::serve::handler_wasm(&state.config, app).await else {
         return Ok(None);
     };
     let (runtime, config, app, user, conn) =
         (state.runtime.clone(), state.config.clone(), app.to_string(), guest_user(visitor), conn.to_string());
     tokio::task::spawn_blocking(move || {
-        runtime.connection_event(config, &app, &wasm, user, &conn, event, guards)
+        runtime.connection_event(config, &app, handler.generation, &handler.wasm, user, &conn, event, guards)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -170,7 +170,7 @@ pub async fn open(
         Some(Visitor { user, session }) => (Some(user), Some(session)),
         None => (None, None),
     };
-    let Some(wasm) = crate::content::serve::handler_wasm(&state.config, &app).await else {
+    let Some(handler) = crate::content::serve::handler_wasm(&state.config, &app).await else {
         return Err(Refusal::NotOffered);
     };
     // The ceilings first: they cost a lock, where asking the handler costs
@@ -182,7 +182,7 @@ pub async fn open(
         .map_err(Refusal::Full)?;
     let takes = {
         let (runtime, app) = (state.runtime.clone(), app.clone());
-        tokio::task::spawn_blocking(move || runtime.takes_connections(&app, &wasm)).await
+        tokio::task::spawn_blocking(move || runtime.takes_connections(&app, handler.generation, &handler.wasm)).await
     };
     match takes {
         Ok(Ok(true)) => {}

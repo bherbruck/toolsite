@@ -67,9 +67,7 @@ fn tiles_of(page: &str) -> &str {
 }
 
 fn write_page(config: &Config, slug: &str, html: &str) {
-    let path = config.data_dir.join(format!("{slug}.html"));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, html).unwrap();
+    common::publish(config, &format!("{slug}.html"), html.to_string());
 }
 
 async fn ticket(config: &Config, slug: &str, ttl: Duration) -> String {
@@ -3978,7 +3976,7 @@ impl Site {
             return Site { _dir: dir, config, database: None };
         }
         let database = common::Database::new().await;
-        let config = Arc::new(Config { stores: database.stores(), ..scoped_config(&config.data_dir) });
+        let config = Arc::new(Config { stores: database.stores(), blobs: database.blobs(), ..scoped_config(&config.data_dir) });
         Site { _dir: dir, config, database: Some(database) }
     }
 

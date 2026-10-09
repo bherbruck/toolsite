@@ -71,8 +71,8 @@ pub struct Entry {
 /// exactly these five values.
 #[derive(Clone)]
 pub struct S3 {
-    bucket: Bucket,
-    credentials: Credentials,
+    pub(crate) bucket: Bucket,
+    pub(crate) credentials: Credentials,
 }
 
 impl S3 {
@@ -231,7 +231,7 @@ fn s3_async_client() -> Result<reqwest::Client, Error> {
 }
 
 /// `Display` on a reqwest error drops the cause; walk to it.
-fn reason(error: &reqwest::Error) -> String {
+pub(crate) fn reason(error: &reqwest::Error) -> String {
     let mut out = error.to_string();
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {

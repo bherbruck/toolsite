@@ -165,24 +165,11 @@ fn derived(app: &str, attempt: u32) -> String {
 
 /// Every top-level name that can be an app: a directory or a loose page.
 fn app_names(config: &Config) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(&config.data_dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let name = if entry.path().is_dir() { name } else { name.strip_suffix(".html")?.to_string() };
-            valid_segment(&name).then_some(name)
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+    crate::content::files::names_blocking(config)
 }
 
 fn app_exists(config: &Config, app: &str) -> bool {
-    config.data_dir.join(app).is_dir() || config.data_dir.join(format!("{app}.html")).is_file()
+    valid_segment(app) && crate::content::files::app_exists_blocking(config, app)
 }
 
 /// The app's label, assigned and stored the first time it is asked for. An

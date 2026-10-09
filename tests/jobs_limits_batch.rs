@@ -56,7 +56,7 @@ async fn site_with(config: impl FnOnce(Config) -> Config) -> Site {
     let local = Config::local(dir.path().to_path_buf(), "test-token");
     let (local, database) = if common::wants_postgres() {
         let database = common::Database::new().await;
-        (Config { stores: database.stores(), ..local }, Some(database))
+        (Config { stores: database.stores(), blobs: database.blobs(), ..local }, Some(database))
     } else {
         (local, None)
     };
@@ -72,8 +72,7 @@ async fn site() -> Site {
 }
 
 fn install(site: &Site, app: &str) {
-    std::fs::create_dir_all(site.config.data_dir.join(app)).unwrap();
-    std::fs::write(site.config.data_dir.join(app).join("handler.wasm"), HANDLER).unwrap();
+    common::publish(&site.config, &format!("{app}/handler.wasm"), HANDLER);
 }
 
 fn request(method: &str, path: &str, query: &str, body: &str) -> toolsite::runtime::wasm::Request {

@@ -8,7 +8,10 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use toolsite::state::{pg, Backend, Stores};
+use toolsite::{
+    runtime::blobs::{Backend as BlobBackend, Blobs, S3},
+    state::{pg, Backend, Stores},
+};
 
 pub const NEEDS: &str = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one";
 /// A key made at random once, for sealing on a test site, when the
@@ -32,9 +35,38 @@ pub fn wants_postgres() -> bool {
     std::env::var("TOOLSITE_TEST_BACKEND").is_ok_and(|backend| backend == "postgres")
 }
 
-/// A database of its own on the test server, every ladder applied.
+/// A bucket of its own on the test MinIO, made now. A Postgres site keeps
+/// its published files and its apps' files there, as a real one must.
+pub async fn bucket() -> S3 {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} unset; scripts/test-postgres.sh sets it"));
+    let name = format!("t-{}", toolsite::content::slug::random_token(12));
+    let s3 = S3::new(
+        &var("TOOLSITE_TEST_S3_ENDPOINT"),
+        &name,
+        "us-east-1",
+        &var("TOOLSITE_TEST_S3_ACCESS_KEY_ID"),
+        &var("TOOLSITE_TEST_S3_SECRET_ACCESS_KEY"),
+        true,
+    )
+    .unwrap();
+    s3.ensure_bucket().await.unwrap();
+    s3
+}
+
+/// The bucket as a site's file settings, with the default ceilings.
+pub fn blobs_in(s3: &S3) -> Blobs {
+    Blobs {
+        backend: BlobBackend::S3(s3.clone()),
+        max_bytes: toolsite::config::DEFAULT_MAX_BLOB_BYTES,
+        max_write_bytes: toolsite::config::DEFAULT_MAX_BLOB_BYTES,
+    }
+}
+
+/// A database of its own on the test server, every ladder applied, and a
+/// bucket of its own beside it.
 pub struct Database {
     pub postgres: Arc<pg::Postgres>,
+    pub bucket: S3,
     name: String,
 }
 
@@ -49,12 +81,17 @@ impl Database {
         url.set_path(&name);
         let postgres = Arc::new(pg::connect(url.as_str(), 8).await.unwrap());
         pg::migrate(&postgres.pool, pg::LADDERS).await.unwrap();
-        Database { postgres, name }
+        Database { postgres, bucket: bucket().await, name }
     }
 
     /// The stores a Postgres site keeps on this database.
     pub fn stores(&self) -> Stores {
         Stores::new(Backend::Postgres(self.postgres.clone()), None, Some(&secret_key())).unwrap()
+    }
+
+    /// Where a Postgres site on this database keeps files: its bucket.
+    pub fn blobs(&self) -> Blobs {
+        blobs_in(&self.bucket)
     }
 
     /// Drops the database. A scenario that fails leaves its database for
@@ -77,4 +114,36 @@ pub fn blocking<T>(call: impl FnOnce() -> T) -> T {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(call),
         _ => call(),
     }
+}
+
+/// Publishes `bytes` at `key` the way an upload does, into whichever store
+/// the site keeps published files in: a fixture written straight to the
+/// volume is invisible to a Postgres site, whose files are in its bucket.
+/// On files it is the plain write the fixtures always made.
+pub fn publish(config: &toolsite::Config, key: &str, bytes: impl Into<axum::body::Bytes>) {
+    let bytes = bytes.into();
+    if !config.stores.is_postgres() {
+        let path = config.data_dir.join(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        return;
+    }
+    let handle = tokio::runtime::Handle::current();
+    blocking(|| handle.block_on(toolsite::content::files::publish(config, key, bytes))).unwrap();
+}
+
+/// Every copy of `name` the trash keeps, oldest entry first, read through
+/// whichever store keeps the site's trash: `.trash/` on files, the bucket
+/// on Postgres.
+pub fn trash_files(config: &toolsite::Config, name: &str) -> Vec<String> {
+    blocking(|| {
+        let files = toolsite::content::files::of(config);
+        files
+            .trash_entries_blocking()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| files.trash_read_blocking(entry, name).unwrap())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect()
+    })
 }

@@ -1,5 +1,5 @@
 //! The catalog: what is published, where, and how. Each page's and app's
-//! `PageMeta`, its notes, its generation, and which slugs exist; the project
+//! `PageMeta`, its notes and its generation; the project
 //! tree and the record of a move under way; every host label issued; and
 //! the site's one-time markers.
 //!
@@ -144,19 +144,18 @@ pub trait Catalog: Send + Sync {
     async fn update_meta(&self, slug: &str, edit: MetaEdit<'_>) -> Result<PageMeta, String>;
     /// `update_meta` for a synchronous caller.
     fn update_meta_blocking(&self, slug: &str, edit: MetaEdit<'_>) -> Result<PageMeta, String>;
-    /// How many times the app's content has been published, as this catalog
-    /// counts. Caches key on it, so a publish makes their old entries
-    /// unreachable rather than needing a message to every runner.
+    /// Which publish of the app's content is current, 0 for none. Caches
+    /// key on it, so a publish makes their old entries unreachable rather
+    /// than needing a message to every runner.
     async fn generation(&self, app: &str) -> Result<u64, String>;
-    /// Counts one more publish and returns the new generation.
+    /// Counts one more publish and returns the new generation: larger than
+    /// any this catalog handed out for the name before, to an app since
+    /// removed included, so a name published again never meets an old
+    /// cache.
     async fn bump_generation(&self, app: &str) -> Result<u64, String>;
     /// What the last agent left for the next one, if anything.
     async fn notes(&self, slug: &str) -> Result<Option<String>, String>;
     async fn set_notes(&self, slug: &str, notes: &str) -> Result<(), String>;
-    /// Every published slug: loose pages, and each app by its root only.
-    async fn slugs(&self) -> Result<Vec<String>, String>;
-    /// Every app, by its top-level name, sorted.
-    async fn apps(&self) -> Result<Vec<String>, String>;
     /// Takes the metas and notes of `slug` and everything under it out of
     /// the catalog, as a removal does, and answers what they were. Nothing
     /// is destroyed: the files backend leaves its sidecars for the trash to
@@ -279,25 +278,23 @@ pub async fn set_notes(config: &Config, slug: &str, notes: &str) -> Result<(), S
     of(config).set_notes(slug, notes).await
 }
 
-/// Every published slug; empty, logged, when the catalog cannot be read.
+/// Every published slug, from the files the site keeps; empty, logged,
+/// when they cannot be listed.
 pub async fn slugs(config: &Config) -> Vec<String> {
-    of(config).slugs().await.unwrap_or_else(|why| {
+    crate::content::files::slugs(config).await.unwrap_or_else(|why| {
         tracing::warn!(%why, "the published slugs could not be listed");
         Vec::new()
     })
 }
 
-/// Every app by its top-level name; empty, logged, when the catalog cannot
-/// be read.
+/// Every app by its top-level name; empty, logged, when the files cannot
+/// be listed.
 pub async fn apps(config: &Config) -> Vec<String> {
-    of(config).apps().await.unwrap_or_else(|why| {
-        tracing::warn!(%why, "the apps could not be listed");
-        Vec::new()
-    })
+    apps_among(slugs(config).await)
 }
 
 /// The top-level names among `slugs`, sorted, each once.
-pub(crate) fn apps_among(slugs: Vec<String>) -> Vec<String> {
+fn apps_among(slugs: Vec<String>) -> Vec<String> {
     let mut apps: Vec<String> = slugs.into_iter().map(|slug| app_of(&slug).to_string()).collect();
     apps.sort();
     apps.dedup();

@@ -608,12 +608,17 @@ fn wit_of(value: serde_json::Value) -> WitValue {
     }
 }
 
+/// A compiled, linked handler and when it was last used.
+type CachedHandler = (AppPre<StoreState>, Instant);
+
 pub struct Runtime {
     engine: Engine,
     modules: Mutex<HashMap<String, (Module, Instant)>>,
     /// Linking a component is the expensive part after compilation, so the
-    /// pre-instantiated form is what gets cached and reused.
-    handlers: Mutex<HashMap<String, (AppPre<StoreState>, Instant)>>,
+    /// pre-instantiated form is what gets cached and reused. Keyed by app
+    /// and generation: a publish on any runner moves the generation on, so
+    /// the next call here compiles what was published, with no message.
+    handlers: Mutex<HashMap<(String, u64), CachedHandler>>,
     linker: Linker<StoreState>,
 }
 
@@ -675,17 +680,17 @@ impl Runtime {
         Ok(component.get_export_index(None, ON_CONNECTION).is_some())
     }
 
-    /// Forgets an app's compiled handler, so the next request picks up what
-    /// was just uploaded. Without this the cache is keyed by app name and a
-    /// redeploy keeps serving the previous component until eviction — code
-    /// that is on disk but not running is a hard thing to debug.
+    /// Forgets an app's compiled handlers, every generation of them. A
+    /// publish here moves the generation on anyway; this frees the memory
+    /// at once, and covers a caller that has no generation to give.
     pub fn forget(&self, app: &str) {
-        self.handlers.lock().unwrap().remove(app);
+        self.handlers.lock().unwrap().retain(|(cached, _), _| cached != app);
     }
 
     /// Compiles and links an app's handler, reusing the result while cached.
-    fn handler(&self, key: &str, wasm: &[u8]) -> anyhow::Result<AppPre<StoreState>> {
-        if let Some((handler, last_used)) = self.handlers.lock().unwrap().get_mut(key) {
+    fn handler(&self, app: &str, generation: u64, wasm: &[u8]) -> anyhow::Result<AppPre<StoreState>> {
+        let key = (app.to_string(), generation);
+        if let Some((handler, last_used)) = self.handlers.lock().unwrap().get_mut(&key) {
             *last_used = Instant::now();
             return Ok(handler.clone());
         }
@@ -703,7 +708,7 @@ impl Runtime {
                 handlers.remove(&coldest);
             }
         }
-        handlers.insert(key.to_string(), (handler.clone(), Instant::now()));
+        handlers.insert(key, (handler.clone(), Instant::now()));
         Ok(handler)
     }
 
@@ -718,7 +723,23 @@ impl Runtime {
         request: Request,
         guards: Guards,
     ) -> anyhow::Result<Response> {
-        let handler = self.handler(app, wasm)?;
+        self.handle_at(site, app, 0, wasm, user, request, guards)
+    }
+
+    /// `handle`, for `wasm` as published at the app's `generation`, which
+    /// is what its compiled form is cached by.
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_at(
+        &self,
+        site: Arc<SiteConfig>,
+        app: &str,
+        generation: u64,
+        wasm: &[u8],
+        user: Option<User>,
+        request: Request,
+        guards: Guards,
+    ) -> anyhow::Result<Response> {
+        let handler = self.handler(app, generation, wasm)?;
         let mut store = self.store(site, app, user, guards);
         let instance = handler.instantiate(&mut store)?;
         Ok(instance.call_handle(&mut store, &request)?)
@@ -726,8 +747,8 @@ impl Runtime {
 
     /// Whether an app's handler exports `on-connection`, that is, was built
     /// for `app-with-connections`.
-    pub fn takes_connections(&self, app: &str, wasm: &[u8]) -> anyhow::Result<bool> {
-        let handler = self.handler(app, wasm)?;
+    pub fn takes_connections(&self, app: &str, generation: u64, wasm: &[u8]) -> anyhow::Result<bool> {
+        let handler = self.handler(app, generation, wasm)?;
         Ok(handler.instance_pre().component().get_export_index(None, ON_CONNECTION).is_some())
     }
 
@@ -740,13 +761,14 @@ impl Runtime {
         &self,
         site: Arc<SiteConfig>,
         app: &str,
+        generation: u64,
         wasm: &[u8],
         user: Option<User>,
         conn: &str,
         event: ConnectionEvent,
         guards: Guards,
     ) -> anyhow::Result<Option<Result<(), String>>> {
-        let handler = self.handler(app, wasm)?;
+        let handler = self.handler(app, generation, wasm)?;
         let Some(export) = handler.instance_pre().component().get_export_index(None, ON_CONNECTION) else {
             return Ok(None);
         };
@@ -855,7 +877,11 @@ impl Runtime {
         memory_bytes: usize,
         guards: Guards,
     ) -> anyhow::Result<Resident> {
-        let handler = self.handler(app, wasm)?;
+        // Compiled afresh, not from the cache: an instance starts rarely,
+        // and lives long enough that it must be the code published now,
+        // whichever generation that is.
+        let component = Component::new(&self.engine, wasm)?;
+        let handler = AppPre::new(self.linker.instantiate_pre(&component)?)?;
         let component = handler.instance_pre().component();
         let Some(on_connection) = component.get_export_index(None, ON_CONNECTION) else {
             anyhow::bail!("the handler does not export on-connection, which an app that runs resident needs");
@@ -1130,9 +1156,10 @@ mod tests {
 
     #[test]
     fn uploading_a_handler_forgets_the_one_that_was_running() {
-        // The cache is keyed by app name, so without this a redeploy leaves
-        // the previous component serving: the new code sits on disk and never
-        // runs, which reads from outside as "uploads land but don't activate".
+        // A caller with no generation to give asks at 0 every time, so
+        // without this a redeploy would leave the previous component
+        // serving it: the new code stored and never run, which reads from
+        // outside as "uploads land but don't activate".
         let runtime = runtime();
         let component = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1141,10 +1168,16 @@ mod tests {
         .unwrap();
 
         let mut store = runtime.store(test_site(), "app", None, Guards::default());
-        let handler = runtime.handler("app", &component).unwrap();
+        let handler = runtime.handler("app", 3, &component).unwrap();
         let instance = handler.instantiate(&mut store).unwrap();
         let _ = instance;
         assert_eq!(runtime.handlers.lock().unwrap().len(), 1);
+        runtime.handler("app", 3, &component).unwrap();
+        assert_eq!(runtime.handlers.lock().unwrap().len(), 1, "one generation was compiled twice");
+        // A publish on another runner moves the generation on: the next
+        // call compiles what was published rather than reusing this.
+        runtime.handler("app", 4, &component).unwrap();
+        assert_eq!(runtime.handlers.lock().unwrap().len(), 2);
 
         runtime.forget("app");
         assert!(

@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     content::{
+        files,
         slug::{valid_asset_path, valid_slug},
         store::{
             icon_path, is_hidden, Icon,
@@ -205,7 +206,7 @@ pub(crate) async fn serve_page(
 
     if is_api {
         return match handler_wasm(config, app).await {
-            Some(wasm) => run_handler(&state, app, &wasm, request, visitor).await,
+            Some(handler) => run_handler(&state, app, handler, request, visitor).await,
             None => (StatusCode::NOT_FOUND, "this app has no handler").into_response(),
         };
     }
@@ -218,12 +219,24 @@ pub(crate) async fn serve_page(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
-    // A file inside a bundle: styles, scripts, images, fonts.
-    let asset = config.data_dir.join(slug);
-    if asset.is_file() {
-        if let Ok(bytes) = fs::read(&asset).await {
-            return ([(header::CONTENT_TYPE, content_type_for(slug))], bytes).into_response();
+    // One generation for the whole request, so its lookups agree.
+    let generation = files::reading(config, app).await;
+
+    // A file inside a bundle: styles, scripts, images, fonts. Only inside
+    // an app: a name at the top is a page or a sidecar, and `/p/x.html`
+    // is not page x, whose own hidden flag and gate were never asked.
+    if !rest.is_empty()
+        && let Some(path) = files::path_at(config, generation, slug).await
+        && let Ok(file) = fs::File::open(&path).await
+    {
+        let length = file.metadata().await.map(|m| m.len()).ok();
+        let mut response = Response::builder().header(header::CONTENT_TYPE, content_type_for(slug));
+        if let Some(length) = length {
+            response = response.header(header::CONTENT_LENGTH, length);
         }
+        return response
+            .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
     // The app's favicon, drawn from its icon, when the bundle ships none.
@@ -238,15 +251,13 @@ pub(crate) async fn serve_page(
             .into_response();
     }
 
-    let direct = config.data_dir.join(format!("{slug}.html"));
-    if let Ok(html) = fs::read_to_string(&direct).await {
+    if let Some(html) = read_page(config, generation, &format!("{slug}.html")).await {
         return Html(crate::content::favicon::add_links(app, html)).into_response();
     }
     // App root without a filename: serve that app's 'index' page. Redirect to
     // the trailing-slash form first so relative links inside the app resolve
     // against the app directory rather than one level above it.
-    let index = config.data_dir.join(format!("{slug}/index.html"));
-    if let Ok(html) = fs::read_to_string(&index).await {
+    if let Some(html) = read_page(config, generation, &format!("{slug}/index.html")).await {
         if !had_trailing_slash {
             return Redirect::permanent(&format!("/p/{slug}/")).into_response();
         }
@@ -255,8 +266,8 @@ pub(crate) async fn serve_page(
 
     // Nothing on disk, but the app ships code: let it answer for its own
     // routes, which is what server-rendered pages need.
-    if let Some(wasm) = handler_wasm(config, app).await {
-        return run_handler(&state, app, &wasm, request, visitor).await;
+    if let Some(handler) = handler_wasm(config, app).await {
+        return run_handler(&state, app, handler, request, visitor).await;
     }
 
     // Client-routed bundle: /p/app/some/route is the app's own concern, so
@@ -268,26 +279,43 @@ pub(crate) async fn serve_page(
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
+async fn read_page(config: &Config, generation: u64, key: &str) -> Option<String> {
+    fs::read_to_string(files::path_at(config, generation, key).await?).await.ok()
+}
+
+/// The key an app's handler is published at.
+pub(crate) fn handler_key(app: &str) -> String {
+    format!("{app}/handler.wasm")
+}
+
 /// Whether the app has a handler, without reading it.
 pub(crate) async fn has_handler(config: &Config, app: &str) -> bool {
-    valid_slug(app) && fs::metadata(config.data_dir.join(app).join("handler.wasm")).await.is_ok_and(|m| m.is_file())
+    valid_slug(app) && !app.contains('/') && files::path(config, &handler_key(app)).await.is_some()
 }
 
 /// `handler_wasm` for a blocking thread.
 pub(crate) fn handler_wasm_blocking(config: &Config, app: &str) -> Option<Vec<u8>> {
-    if !valid_slug(app) {
+    if !valid_slug(app) || app.contains('/') {
         return None;
     }
-    std::fs::read(config.data_dir.join(app).join("handler.wasm")).ok()
+    files::read_blocking(config, &handler_key(app))
 }
 
-pub(crate) async fn handler_wasm(config: &Config, app: &str) -> Option<Vec<u8>> {
-    if !valid_slug(app) {
+/// An app's handler as published, and the generation it was published at,
+/// which its compiled form is cached by.
+pub(crate) struct Handler {
+    pub(crate) generation: u64,
+    pub(crate) wasm: Vec<u8>,
+}
+
+pub(crate) async fn handler_wasm(config: &Config, app: &str) -> Option<Handler> {
+    if !valid_slug(app) || app.contains('/') {
         return None;
     }
-    fs::read(config.data_dir.join(app).join("handler.wasm"))
-        .await
-        .ok()
+    let generation = files::generation(config, app).await;
+    let path = files::path_at(config, generation, &handler_key(app)).await?;
+    let wasm = fs::read(path).await.ok()?;
+    Some(Handler { generation, wasm })
 }
 
 /// Refuses a request the app's gate does not admit.
@@ -445,7 +473,7 @@ pub(crate) async fn admits(
 async fn run_handler(
     state: &AppState,
     app: &str,
-    wasm: &[u8],
+    handler: Handler,
     request: Request<Body>,
     visitor: Option<crate::accounts::users::User>,
 ) -> Response {
@@ -496,7 +524,7 @@ async fn run_handler(
     let runtime = state.runtime.clone();
     let config = state.config.clone();
     let owned_app = app.to_string();
-    let wasm = wasm.to_vec();
+    let Handler { generation, wasm } = handler;
     // The guest's identity import is fed from a session scoped to this app,
     // never from anything the request claimed and never from a session that
     // belongs to a neighbour.
@@ -507,9 +535,10 @@ async fn run_handler(
     // Guest execution is blocking and CPU-bound, and the database import
     // blocks too, so it must not run on an async worker.
     let outcome = tokio::task::spawn_blocking(move || {
-        runtime.handle(
+        runtime.handle_at(
             config,
             &owned_app,
+            generation,
             &wasm,
             user,
             guest_request,
@@ -644,8 +673,9 @@ pub(crate) async fn spa_fallback(config: &Config, slug: &str) -> Option<String> 
         if !crate::content::catalog::meta(config, &app).await.spa {
             continue;
         }
-        let index = config.data_dir.join(format!("{app}/index.html"));
-        if let Ok(html) = fs::read_to_string(&index).await {
+        if let Some(index) = files::path(config, &format!("{app}/index.html")).await
+            && let Ok(html) = fs::read_to_string(&index).await
+        {
             return Some(html);
         }
     }

@@ -8,6 +8,7 @@ pub mod events;
 pub mod limits;
 pub mod connections;
 pub mod migrate;
+pub mod objects;
 pub mod outbound;
 pub mod resident;
 pub mod wasm;

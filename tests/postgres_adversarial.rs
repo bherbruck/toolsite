@@ -24,6 +24,8 @@ use toolsite::{
 };
 use tower::ServiceExt;
 
+mod common;
+
 const NEEDS: &str = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one";
 const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 const TOKEN: &str = "test-token";
@@ -73,15 +75,20 @@ impl Site {
         let mut url = url::Url::parse(&server).unwrap();
         url.set_path(&name);
         let volume = tempfile::tempdir().unwrap();
-        let runner = |url: String, volume: std::path::PathBuf| async move {
-            let postgres = pg::connect(&url, 8).await.unwrap();
-            pg::migrate(&postgres.pool, pg::LADDERS).await.unwrap();
-            let stores = Stores::new(Backend::Postgres(Arc::new(postgres)), None, Some(KEY)).unwrap();
-            Arc::new(Config {
-                base_url: Some(BASE.to_string()),
-                stores,
-                ..Config::local(volume, TOKEN)
-            })
+        let bucket = common::bucket().await;
+        let runner = |url: String, volume: std::path::PathBuf| {
+            let bucket = bucket.clone();
+            async move {
+                let postgres = pg::connect(&url, 8).await.unwrap();
+                pg::migrate(&postgres.pool, pg::LADDERS).await.unwrap();
+                let stores = Stores::new(Backend::Postgres(Arc::new(postgres)), None, Some(KEY)).unwrap();
+                Arc::new(Config {
+                    base_url: Some(BASE.to_string()),
+                    stores,
+                    blobs: common::blobs_in(&bucket),
+                    ..Config::local(volume, TOKEN)
+                })
+            }
         };
         let a = runner(url.to_string(), volume.path().to_path_buf()).await;
         let b = runner(url.to_string(), volume.path().to_path_buf()).await;
@@ -200,10 +207,8 @@ fn query_param(url: &str, name: &str) -> Option<String> {
 
 /// A gated app with a handler, on the shared volume.
 fn app(config: &Config, name: &str) {
-    let dir = config.data_dir.join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("index.html"), format!("<title>{name}</title><h1>{name} home</h1>")).unwrap();
-    std::fs::write(dir.join("handler.wasm"), HANDLER).unwrap();
+    common::publish(config, &format!("{name}/index.html"), format!("<title>{name}</title><h1>{name} home</h1>"));
+    common::publish(config, &format!("{name}/handler.wasm"), HANDLER);
     let mut meta = toolsite::content::catalog::meta_blocking(config, name);
     meta.gate = Some("authenticated".to_string());
     toolsite::content::catalog::update_meta_blocking(config, name, { let meta = meta.clone(); move |stored| { *stored = meta; Ok(()) } }).unwrap();

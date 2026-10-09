@@ -165,7 +165,7 @@ pub async fn fetch_page(config: &Config, slug: &str, manages: bool) -> Option<Fe
             "app": app,
             "access": crate::content::store::effective_gate(config, &app, "/").await.gate,
             "updated": modified,
-            "has_handler": config.data_dir.join(&app).join("handler.wasm").is_file(),
+            "has_handler": crate::content::serve::has_handler(config, &app).await,
             "views": views,
             "open_connections": config.connections.open(&app),
             "limits": config.limits.effective(meta.limits.as_ref()).describe(),

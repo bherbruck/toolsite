@@ -7,9 +7,8 @@
 //! `select ... for update` after making sure there is one to hold, so the
 //! first two changes to a new slug queue like any others.
 //!
-//! Which slugs exist is still read from the volume: pages and bundles stay
-//! files until the `Files` store moves them, and a publish registers its
-//! row there.
+//! A generation comes from `platform.generations`, one sequence for the
+//! site, so no two publishes of any name ever share one.
 //!
 //! The project tree is `platform.projects`, a row per project. A change
 //! takes `LOCK_PROJECTS` for its transaction, reads every row, runs the
@@ -19,7 +18,7 @@
 //! labels are `platform.host_labels`, chosen under `LOCK_LABELS`, with the
 //! label as primary key so no label is ever issued to two apps.
 
-use super::{files, Catalog, FoldersEdit, Held, LabelChoice, MetaEdit, Relocation, Retired};
+use super::{Catalog, FoldersEdit, Held, LabelChoice, MetaEdit, Relocation, Retired};
 use crate::{
     content::store::{current_words, Folder, PageMeta},
     state::pg::{LOCK_LABELS, LOCK_PROJECTS, LOCK_RELOCATION},
@@ -30,8 +29,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 pub struct Postgres {
     pool: Pool,
-    /// Where the published files still are, for listing them.
-    files: files::Files,
+    /// The site's data directory: this process's queue of moves is kept
+    /// by it.
+    data_dir: PathBuf,
 }
 
 fn now() -> i64 {
@@ -99,7 +99,7 @@ impl Drop for MoveHold {
 
 impl Postgres {
     pub fn new(pool: Pool, data_dir: PathBuf) -> Postgres {
-        Postgres { pool, files: files::Files::new(data_dir) }
+        Postgres { pool, data_dir }
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Client, String> {
@@ -281,8 +281,9 @@ impl Catalog for Postgres {
         let client = self.client().await?;
         let row = client
             .query_one(
-                "insert into platform.pages (slug, generation, created_at, updated_at) values ($1, 1, $2, $2)
-                 on conflict (slug) do update set generation = platform.pages.generation + 1, updated_at = $2
+                "insert into platform.pages (slug, generation, created_at, updated_at)
+                 values ($1, nextval('platform.generations'), $2, $2)
+                 on conflict (slug) do update set generation = nextval('platform.generations'), updated_at = $2
                  returning generation",
                 &[&app, &now()],
             )
@@ -311,14 +312,6 @@ impl Catalog for Postgres {
             .await
             .map_err(failed("store notes"))?;
         Ok(())
-    }
-
-    async fn slugs(&self) -> Result<Vec<String>, String> {
-        self.files.slugs().await
-    }
-
-    async fn apps(&self) -> Result<Vec<String>, String> {
-        self.files.apps().await
     }
 
     fn retire_blocking(&self, slug: &str, at: u64) -> Result<Retired, String> {
@@ -378,7 +371,7 @@ impl Catalog for Postgres {
         // would hold a pooled connection while it waited, and enough of them
         // would leave none for the move that holds the lock to do its steps
         // with: a deadlock across the pool.
-        let turn = super::take_turn(self.files.data_dir()).await?;
+        let turn = super::take_turn(&self.data_dir).await?;
         let client = self.client().await?;
         // Held in the struct from here, so an error below closes the
         // connection rather than pooling one inside a transaction.

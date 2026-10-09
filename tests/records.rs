@@ -37,7 +37,7 @@ impl Site {
             return Site { _dir: dir, config: Arc::new(local), database: None };
         }
         let database = common::Database::new().await;
-        let config = Arc::new(Config { stores: database.stores(), ..local });
+        let config = Arc::new(Config { stores: database.stores(), blobs: database.blobs(), ..local });
         Site { _dir: dir, config, database: Some(database) }
     }
 
@@ -50,7 +50,7 @@ impl Site {
     fn second_runner(&self) -> Arc<Config> {
         let local = Config::local(self.config.data_dir.clone(), TOKEN);
         Arc::new(match &self.database {
-            Some(database) => Config { stores: database.stores(), ..local },
+            Some(database) => Config { stores: database.stores(), blobs: database.blobs(), ..local },
             None => local,
         })
     }
@@ -398,13 +398,12 @@ async fn removal_takes_records_and_tokens(site: Site) {
     assert!(toolsite::platform::app_tools::read(&config, "gone").await.is_empty(), "the old tools outlived their app");
     assert_eq!(send(&config, bearer("GET", "/export/gone_x.sqlite", &neighbour, "")).await.0, StatusCode::OK, "the neighbour lost its token");
 
-    let trash = std::fs::read_dir(config.data_dir.join(".trash")).unwrap().next().unwrap().unwrap().path();
     for kept in ["slug.secrets", "slug.tools", "slug.exports", "slug.deploys", "slug.devices"] {
-        assert!(trash.join(kept).is_file(), "{kept} was not kept in the trash");
+        assert_eq!(common::trash_files(&config, kept).len(), 1, "{kept} was not kept in the trash");
     }
-    let kept = std::fs::read_to_string(trash.join("slug.secrets")).unwrap();
+    let kept = common::trash_files(&config, "slug.secrets").remove(0);
     assert!(kept.contains("API_KEY") && !kept.contains("old-secret"));
-    assert!(!std::fs::read_to_string(trash.join("slug.exports")).unwrap().contains(&export[4..]));
+    assert!(!common::trash_files(&config, "slug.exports").remove(0).contains(&export[4..]));
     if site.on_postgres() {
         let removed = site.dump("platform.removed_records").await;
         assert_eq!(removed.len(), 5);

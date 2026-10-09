@@ -361,7 +361,7 @@ pub async fn call(
     if body.len() > MAX_ARGUMENTS {
         return refusal("the arguments are over the 8 MB request limit");
     }
-    let Ok(wasm) = tokio::fs::read(config.data_dir.join(app).join("handler.wasm")).await else {
+    let Some(handler) = crate::content::serve::handler_wasm(config, app).await else {
         return refusal(format!("{app} has no handler to run this tool"));
     };
     let request = crate::runtime::wasm::Request {
@@ -378,7 +378,7 @@ pub async fn call(
     let guards = crate::runtime::limits::of(config, app).await.request;
     let (runtime, config, owned_app) = (runtime.clone(), config.clone(), app.to_string());
     let outcome = tokio::task::spawn_blocking(move || {
-        runtime.handle(config, &owned_app, &wasm, visitor, request, guards)
+        runtime.handle_at(config, &owned_app, handler.generation, &handler.wasm, visitor, request, guards)
     })
     .await;
     let response = match outcome {
