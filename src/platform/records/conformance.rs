@@ -341,13 +341,14 @@ async fn the_postgres_records_conform() {
     assert!(records.fire("farm", "hourly", 1_000_000_002).await.unwrap());
     assert!(records.fire("farm", "nightly", 1_000_000_000).await.unwrap());
     assert!(records.fire("farm2", "hourly", 1_000_000_000).await.unwrap());
-    // Fires a day older than the latest are pruned as it is claimed.
+    // One row per job, holding the latest turn: an older turn is refused.
     assert!(records.fire("farm", "hourly", 1_000_200_000).await.unwrap());
+    assert!(!records.fire("farm", "hourly", 1_000_000_003).await.unwrap(), "an older turn fired after a newer one");
     let kept: i64 = pool
         .get()
         .await
         .unwrap()
-        .query_one("select count(*) from platform.job_fires where app = 'farm' and name = 'hourly'", &[])
+        .query_one("select count(*) from platform.job_turns where app = 'farm' and name = 'hourly'", &[])
         .await
         .unwrap()
         .get(0);

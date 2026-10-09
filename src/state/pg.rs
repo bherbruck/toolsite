@@ -85,6 +85,7 @@ pub const LADDERS: &[Ladder] = &[
             include_str!("../../migrations/postgres/platform/002_projects_labels.sql"),
             include_str!("../../migrations/postgres/platform/003_records_tokens.sql"),
             include_str!("../../migrations/postgres/platform/004_jobs.sql"),
+            include_str!("../../migrations/postgres/platform/005_job_turns.sql"),
         ],
     },
 ];

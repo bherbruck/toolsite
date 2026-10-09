@@ -22,6 +22,47 @@ fn trash_dir(config: &Config) -> PathBuf {
     config.data_dir.join(".trash")
 }
 
+/// Where a removal of `slug` at `at` keeps what it takes. Timestamped so
+/// removing the same slug twice does not overwrite the first removal, which
+/// would be destroying data by another route; two in the same second get a
+/// place each.
+fn destination(config: &Config, slug: &str, at: u64) -> PathBuf {
+    let base = format!("{at}-{}", slug.replace('/', "-"));
+    let mut destination = trash_dir(config).join(&base);
+    let mut n = 2;
+    while destination.exists() {
+        destination = trash_dir(config).join(format!("{base}-{n}"));
+        n += 1;
+    }
+    destination
+}
+
+/// Takes the tokens kept at `app` out of use, into the trash as a removal
+/// would: for the first publish at a name, whose tokens were minted before
+/// there was an app to hold them, by whoever could then. Returns what was
+/// moved, which is nothing at a fresh name.
+pub fn retire_tokens(config: &Config, app: &str, at: u64) -> Result<Vec<String>, String> {
+    if !crate::platform::tokens::valid_app(app) {
+        return Err(format!("invalid app name '{app}'"));
+    }
+    let destination = destination(config, &format!("{app}-tokens"), at);
+    let mut moved = Vec::new();
+    for (extension, text) in crate::platform::tokens::of(config).retire_blocking(app, at)? {
+        std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
+        std::fs::write(destination.join(format!("slug.{extension}")), text).map_err(|e| e.to_string())?;
+        moved.push(format!("{app}.{extension} (records)"));
+    }
+    for kind in crate::platform::tokens::Kind::ALL {
+        let path = config.data_dir.join(format!("{app}.{}", kind.extension()));
+        if path.is_file() {
+            std::fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
+            std::fs::rename(&path, destination.join(format!("slug.{}", kind.extension()))).map_err(|e| e.to_string())?;
+            moved.push(format!("{app}.{}", kind.extension()));
+        }
+    }
+    Ok(moved)
+}
+
 /// Moves a slug's files out of the way. Returns what was moved, so a caller
 /// can say what happened rather than only that it finished.
 pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, String> {
@@ -29,16 +70,7 @@ pub fn remove(config: &Config, slug: &str, at: u64) -> Result<Vec<String>, Strin
         return Err(format!("invalid slug '{slug}'"));
     }
 
-    // Timestamped so removing the same slug twice does not overwrite the
-    // first removal, which would be destroying data by another route.
-    let base = format!("{at}-{}", slug.replace('/', "-"));
-    let mut destination = trash_dir(config).join(&base);
-    // Two removals in the same second get a place each.
-    let mut n = 2;
-    while destination.exists() {
-        destination = trash_dir(config).join(format!("{base}-{n}"));
-        n += 1;
-    }
+    let destination = destination(config, slug, at);
     let mut moved = Vec::new();
 
     // An app's records and tokens go first: a removal that fails after

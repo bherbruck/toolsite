@@ -88,10 +88,10 @@ column platform.github_installations.one boolean not null default true
 column platform.host_labels.app text not null
 column platform.host_labels.issued_at bigint not null
 column platform.host_labels.label text not null
-column platform.job_fires.app text not null
-column platform.job_fires.due_at bigint not null
-column platform.job_fires.fired_at bigint not null
-column platform.job_fires.name text not null
+column platform.job_turns.app text not null
+column platform.job_turns.due_at bigint not null
+column platform.job_turns.fired_at bigint not null
+column platform.job_turns.name text not null
 column platform.jobs.app text not null
 column platform.jobs.job json not null
 column platform.jobs.name text not null
@@ -191,7 +191,7 @@ constraint platform.app_tools app_tools_pkey: PRIMARY KEY (app)
 constraint platform.github_installations github_installations_one_check: CHECK (one)
 constraint platform.github_installations github_installations_pkey: PRIMARY KEY (one)
 constraint platform.host_labels host_labels_pkey: PRIMARY KEY (label)
-constraint platform.job_fires job_fires_pkey: PRIMARY KEY (app, name, due_at)
+constraint platform.job_turns job_turns_pkey: PRIMARY KEY (app, name)
 constraint platform.jobs jobs_pkey: PRIMARY KEY (app, name)
 constraint platform.pages pages_pkey: PRIMARY KEY (slug)
 constraint platform.projects projects_pkey: PRIMARY KEY (path)
@@ -244,7 +244,7 @@ index platform CREATE UNIQUE INDEX app_tokens_pkey ON platform.app_tokens USING 
 index platform CREATE UNIQUE INDEX app_tools_pkey ON platform.app_tools USING btree (app)
 index platform CREATE UNIQUE INDEX github_installations_pkey ON platform.github_installations USING btree (one)
 index platform CREATE UNIQUE INDEX host_labels_pkey ON platform.host_labels USING btree (label)
-index platform CREATE UNIQUE INDEX job_fires_pkey ON platform.job_fires USING btree (app, name, due_at)
+index platform CREATE UNIQUE INDEX job_turns_pkey ON platform.job_turns USING btree (app, name)
 index platform CREATE UNIQUE INDEX jobs_pkey ON platform.jobs USING btree (app, name)
 index platform CREATE UNIQUE INDEX pages_pkey ON platform.pages USING btree (slug)
 index platform CREATE UNIQUE INDEX projects_pkey ON platform.projects USING btree (path)

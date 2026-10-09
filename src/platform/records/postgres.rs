@@ -1,7 +1,7 @@
 //! Per-app records on Postgres, schema `platform`: `app_settings` (a row per
 //! setting, its value sealed by the caller), `app_tools`, `app_migrations`
 //! and `repo_links` (a row per app), `jobs` (a row per job) with
-//! `job_fires` (a row per scheduled turn fired), and `github_installations`
+//! `job_turns` (the latest scheduled turn fired, a row per job), and `github_installations`
 //! (one row).
 //!
 //! Records are `json`, not `jsonb`, as metas are: `json` keeps the text as
@@ -103,6 +103,11 @@ impl Postgres {
         if !jobs.is_empty() {
             out.push(("jobs", super::pretty(&jobs)?));
         }
+        // Claims, not records: nothing to keep.
+        transaction
+            .execute("delete from platform.job_turns where app = $1", &[&app])
+            .await
+            .map_err(failed("take an app's job turns"))?;
         for (kind, text) in &out {
             transaction
                 .execute(
@@ -355,10 +360,16 @@ impl AppRecords for Postgres {
     }
 
     async fn remove_job(&self, app: &str, name: &str) -> Result<bool, String> {
+        // Its claimed turn goes with it, so a job added again at the name
+        // starts its turns afresh.
         Ok(self
             .client()
             .await?
-            .execute("delete from platform.jobs where app = $1 and name = $2", &[&app, &name])
+            .execute(
+                "with turn as (delete from platform.job_turns where app = $1 and name = $2)
+                 delete from platform.jobs where app = $1 and name = $2",
+                &[&app, &name],
+            )
             .await
             .map_err(failed("remove a job"))?
             > 0)
@@ -392,18 +403,17 @@ impl AppRecords for Postgres {
     }
 
     async fn fire(&self, app: &str, name: &str, due_at: u64) -> Result<bool, String> {
-        // A turn only ever conflicts with the same turn seconds apart, so
-        // the job's fires older than a day are pruned on the way.
+        // Claimed only past the latest turn claimed: of two claims of one
+        // turn the second finds it taken, and a turn older than one that
+        // fired (a scheduler whose clock runs behind) is refused too.
         let due_at = due_at as i64;
         let fired = self
             .client()
             .await?
             .execute(
-                "with pruned as (
-                     delete from platform.job_fires where app = $1 and name = $2 and due_at < $3::bigint - 86400
-                 )
-                 insert into platform.job_fires (app, name, due_at, fired_at) values ($1, $2, $3, $4)
-                 on conflict (app, name, due_at) do nothing",
+                "insert into platform.job_turns (app, name, due_at, fired_at) values ($1, $2, $3, $4)
+                 on conflict (app, name) do update set due_at = excluded.due_at, fired_at = excluded.fired_at
+                  where platform.job_turns.due_at < excluded.due_at",
                 &[&app, &name, &due_at, &now()],
             )
             .await

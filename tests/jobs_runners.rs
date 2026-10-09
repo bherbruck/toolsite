@@ -157,7 +157,8 @@ async fn two_schedulers_on_one_database_fire_each_turn_exactly_once_on_postgres(
     }
     assert_eq!(fired_by.0 + fired_by.1, 100, "{fired_by:?}");
     assert_eq!(site.marks("app", "mark"), 100);
-    assert_eq!(site.rows("select count(*) from platform.job_fires where app = 'app' and name = 'mark'").await, 100);
+    // The claim is one row, the latest turn, however many turns fired.
+    assert_eq!(site.rows("select due_at from platform.job_turns where app = 'app' and name = 'mark'").await, (base + 99) as i64);
     let job = &schedule::jobs(&site.b.config, "app").await["mark"];
     assert_eq!(job.last_skipped_at, None, "a turn the other scheduler took was recorded as skipped");
     assert_eq!(job.last_started_at, Some(base + 99));

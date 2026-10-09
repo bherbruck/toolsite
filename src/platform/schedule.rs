@@ -16,13 +16,12 @@
 //! The rules live here; the state is the site's. Job records are
 //! `AppRecords` (`<app>.jobs` on files, `platform.jobs` on Postgres), a
 //! run's slot and a rerun queued behind it are a lease, an app's starts are
-//! a rate window, and a scheduled turn is claimed in `platform.job_fires`
+//! a rate window, and a scheduled turn is claimed in `platform.job_turns`
 //! before it runs. On files all of that is this process's, as it always
 //! was; on Postgres every runner shares it.
 
 use crate::{
     config::Config,
-    content::slug::valid_slug,
     platform::records,
     runtime::wasm::Runtime,
     state::leases::{Ended, Lease, Taken},
@@ -291,8 +290,11 @@ fn keep(config: &Arc<Config>, app: &str, name: &str, lease: &Lease) -> Keeping {
     }))
 }
 
+/// An app is one segment, the top-level directory a handler runs from. A
+/// job named for a path inside one would be counted, capped and rate
+/// limited under a name of its own, out of its app's limits.
 fn valid_app(app: &str) -> bool {
-    valid_slug(app)
+    crate::platform::tokens::valid_app(app)
 }
 
 /// Jobs from their stored text. One that does not parse is passed over and

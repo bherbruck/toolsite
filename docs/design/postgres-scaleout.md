@@ -679,15 +679,18 @@ two instances never run at once. Step 1 hook: `Leases`, `state.runners.address`
 
 **Scheduler.** `Scheduler::spawn` gets a `Leadership` argument: always-leader
 in step 1, a `Leases` lease `scheduler` in step 2. Correctness does not depend
-on the lease alone: a fired turn is recorded in `platform.job_fires (app,
-name, due_at, primary key (app, name, due_at))`, inserted before the run
-starts. A second leader in a split-brain moment gets a conflict and skips.
-Step 1 hook: `job_fires` exists and `tick` inserts before it runs. PR 9:
-every runner runs a scheduler already, since a turn is claimed in
-`job_fires` and a run's slot is a lease; `due_at` is the latest scheduled
-time at or before the tick, so two schedulers that read the job at
-different moments still name the same turn. Fires a day older than the
-one claimed are pruned with it. In step 4,
+on the lease alone: a fired turn is recorded in `platform.job_turns (app,
+name, due_at, primary key (app, name))`, claimed before the run starts by
+an upsert that only moves `due_at` forward. A second leader in a
+split-brain moment finds the turn taken and skips. PR 9: every runner runs
+a scheduler already, since a turn is claimed in `job_turns` and a run's
+slot is a lease; `due_at` is the latest scheduled time at or before the
+tick, so two schedulers that read the job at different moments still name
+the same turn. A turn no later than the one claimed is refused, so a
+runner whose clock runs behind cannot fire an old turn after a newer one,
+and a job keeps one row however often it fires (`job_fires`, a row per
+turn kept for a day, was replaced by platform/005 after an adversarial
+pass). In step 4,
 the leader (control) inserts into `platform.job_queue`, and workers claim
 with `select ... for update skip locked`.
 
@@ -906,7 +909,7 @@ facts from the socket, so file mode and single-runner sites behave as today.
 | Tickets | Replay, guessing, theft from a dump | Ids stored as SHA-256; single-use `take` is one `delete ... returning`; credentials in payloads sealed | Two tasks `take` one ticket at once: exactly one wins. A dump of `state.tickets` contains no plain id and no session token |
 | Sealed values | Key next to the data | Key from the environment only, refused boot without it | A test scans every text column after a full run for the key's base64 and for any plain setting value |
 | Session and MFA races | Two runners accept one TOTP code or one recovery code | Conditional updates (already) | Concurrent `accept` with one code on Postgres: one success |
-| Leases | Two holders after a pause or a lost connection | Epoch fencing; holders stop before expiry when renewal fails; idempotent `job_fires` | A test pauses a holder past its TTL: the second holder takes over, the first's writes with the old epoch are refused; two schedulers on one database fire each turn once |
+| Leases | Two holders after a pause or a lost connection | Epoch fencing; holders stop before expiry when renewal fails; a forward-only claim in `job_turns` | A test pauses a holder past its TTL: the second holder takes over, the first's writes with the old epoch are refused; two schedulers on one database fire each turn once |
 | Bus (`NOTIFY`) | Any role in the database can `NOTIFY` any channel | Apps in a separate database; every payload carries an HMAC; unknown or bad payloads are dropped and logged at `warn` | A forged `NOTIFY` with a valid shape and no HMAC changes nothing |
 | Per-app roles (step 3) | Cross-schema reads, `RESET ROLE`, forged identity, `SET statement_timeout = 0`, `pg_sleep`, large objects, `security definer` functions | Section 6.2 | One adversarial file `tests/pg_app_adversarial.rs`: each escape tried as guest SQL and refused, in the style of `rls_adversarial.rs` |
 | Catalog visibility | App A sees app B's table names in `pg_class` | Accepted for step 3, stated in the README; a database per app is the fix if names are sensitive (question 2) | A test records exactly what is visible, so a change is noticed |
@@ -944,7 +947,7 @@ and the adversarial pass.
 | 6 | `Catalog`, part 1 | `meta`, `update_meta`, `generation`, `notes`, `slugs`, `apps`; replace every `read_meta`/`write_meta` pair; `close_if_hidden` moves to the `AppEvents` sink | Full suite on both backends; a test that two concurrent `update_meta` calls both land | 2.5 days |
 | 7 | `Catalog`, part 2 | Projects, relocation journal, labels, flags | Existing project-move tests (including the step-by-step ones) on both backends; two concurrent moves; two concurrent label assignments never share a label | 1.5 days |
 | 8 | `AppRecords` and `Tokens` | Settings, tools, migrations ladder, repo links, installations; export, deploy and device tokens in one table | Existing tests for each sidecar on both backends; token for A refused on B; device `last_used` resolution | 1.5 days |
-| 9 | Jobs | Job records through `AppRecords`; slots through `Leases`; start rate through `RateWindows`; `job_fires`; scheduler scans the table | `jobs_limits_batch.rs` on both backends; two schedulers on one database fire each turn once | 1.5 days |
+| 9 | Jobs | Job records through `AppRecords`; slots through `Leases`; start rate through `RateWindows`; `job_turns`; scheduler scans the table | `jobs_limits_batch.rs` on both backends; two schedulers on one database fire each turn once | 1.5 days |
 | 10 | `Files` | Local and bucket impls; generation-keyed disk cache; handler cache keyed by `(app, generation)`; trash as records plus moved objects; inline-upload chunks in the bucket | Full suite on both backends with MinIO; traversal fixtures from `bundle.rs` against the bucket impl; deploy on router A is served by router B at once | 3 days |
 | 11 | Migration commands | `migrate-to-postgres`, `--verify-only`, `export-to-files`, `key show`, the marker | Round trip on a fixture `DATA_DIR` built from the examples; interrupted run resumes; symlink skipped; wrong key refused | 1.5 days |
 | 12 | Container trial and docs | Compose profile run end to end in the container; README section; Railway notes | Manual: migrate a copy of a real `DATA_DIR`, sign in, publish, run a job, export | 0.5 day |

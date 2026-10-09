@@ -1217,6 +1217,9 @@ impl PageHost {
 
         let app = slug.split('/').next().unwrap_or(&slug).to_string();
         let is_new = !crate::content::store::app_exists(&self.config, &app).await;
+        if is_new {
+            crate::platform::upload::forget_stale_tokens(&self.config, &app).await;
+        }
         let path = self.config.data_dir.join(format!("{slug}.html"));
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -1371,6 +1374,9 @@ impl PageHost {
 
         let app_dir = self.config.data_dir.join(&app);
         let is_new = !crate::content::store::app_exists(&self.config, &app).await;
+        if is_new {
+            crate::platform::upload::forget_stale_tokens(&self.config, &app).await;
+        }
         fs::create_dir_all(&app_dir)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1783,9 +1789,9 @@ impl PageHost {
         if let Err(refused) = self.allowed(&ctx, &app, needed).await {
             return Ok(refused);
         }
-        if !valid_slug(&app) {
+        if !crate::platform::tokens::valid_app(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+                "app must be one path segment of letters, numbers, '-' or '_'",
             )]));
         }
         let state = crate::AppState {
@@ -1869,9 +1875,9 @@ impl PageHost {
         if let Err(refused) = self.allowed(&ctx, &app, Scope::Editor).await {
             return Ok(refused);
         }
-        if !valid_slug(&app) {
+        if !crate::platform::tokens::valid_app(&app) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "app must be non-empty path segments (letters, numbers, '-' or '_') separated by '/'",
+                "app must be one path segment of letters, numbers, '-' or '_'",
             )]));
         }
 

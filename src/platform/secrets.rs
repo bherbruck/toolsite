@@ -8,8 +8,7 @@
 
 use crate::{
     config::Config,
-    content::slug::valid_slug,
-    platform::records,
+    platform::{records, tokens::valid_app},
     seal::{open, seal},
 };
 use std::collections::BTreeMap;
@@ -18,7 +17,7 @@ use std::collections::BTreeMap;
 /// read. Kept in the records store (`<app>.secrets` on files), beside the
 /// app, and refused by the public route.
 async fn read_sealed(config: &Config, app: &str) -> BTreeMap<String, String> {
-    if !valid_slug(app) {
+    if !valid_app(app) {
         return BTreeMap::new();
     }
     records::of(config).settings(app).await.unwrap_or_else(|why| {
@@ -28,7 +27,7 @@ async fn read_sealed(config: &Config, app: &str) -> BTreeMap<String, String> {
 }
 
 fn read_sealed_blocking(config: &Config, app: &str) -> BTreeMap<String, String> {
-    if !valid_slug(app) {
+    if !valid_app(app) {
         return BTreeMap::new();
     }
     records::of(config).settings_blocking(app).unwrap_or_else(|why| {
@@ -59,7 +58,7 @@ pub fn get_blocking(config: &Config, app: &str, name: &str) -> Option<String> {
 
 /// Setting an existing name replaces it; passing no value removes it.
 pub async fn set(config: &Config, app: &str, name: &str, value: Option<&str>) -> Result<(), String> {
-    if !valid_slug(app) {
+    if !valid_app(app) {
         return Err(format!("invalid app name '{app}'"));
     }
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -174,7 +173,7 @@ const ENTRY_TTL: Duration = Duration::from_secs(60 * 60);
 /// it on without ever handling a secret itself, which is the point: values
 /// that never enter a conversation cannot leak from one.
 pub async fn create_entry(config: &Config, app: &str) -> Result<String, String> {
-    if !valid_slug(app) {
+    if !valid_app(app) {
         return Err("invalid app name".into());
     }
     let token = config.stores.tickets.put(Kind::SettingsLink, ENTRY_TTL, &app).await?;

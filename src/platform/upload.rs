@@ -213,6 +213,7 @@ pub(crate) async fn store_for_publisher(
     let is_new = !crate::content::store::app_exists(config, &app).await;
     if is_new {
         forget_stale_meta(config, &app).await;
+        forget_stale_tokens(config, &app).await;
     }
     let response = store_for_slug(config, runtime, slug, kind, body, meta).await;
     if response.status().is_success() {
@@ -244,6 +245,22 @@ async fn forget_stale_meta(config: &Config, app: &str) {
     .await
     {
         tracing::warn!(app, %why, "a stale meta could not be cleared");
+    }
+}
+
+/// A new app starts with no token on it. One minted at its name before it
+/// existed was minted by whoever could then, which on a first publish by
+/// someone else is not who the app belongs to; like stale access rows, it
+/// goes. To the trash, not away: it may be wanted back. A pipeline that
+/// makes the first publish with its own deploy token never reaches this.
+pub(crate) async fn forget_stale_tokens(config: &Config, app: &str) {
+    let (worker, owned) = (config.clone_for_task(), app.to_string());
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    match tokio::task::spawn_blocking(move || crate::platform::trash::retire_tokens(&worker, &owned, at)).await {
+        Ok(Ok(moved)) if moved.is_empty() => {}
+        Ok(Ok(moved)) => tracing::warn!(app, ?moved, "a new app had tokens waiting at its name; they went to the trash"),
+        Ok(Err(why)) => tracing::warn!(app, %why, "stale tokens could not be retired"),
+        Err(_) => tracing::warn!(app, "stale tokens could not be retired"),
     }
 }
 
