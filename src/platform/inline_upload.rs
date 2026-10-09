@@ -35,6 +35,11 @@ pub const CHUNK_BYTES: usize = 768 * 1024;
 /// As long as an upload ticket lives: enough for a slow client, short
 /// enough that an abandoned spool does not stay.
 pub const INLINE_TTL: Duration = Duration::from_secs(900);
+/// The most pieces one upload may come in: the largest upload in chunks of
+/// 16 KB, far smaller than any client sends. Every index is below it, so
+/// the upload's record and the count a finish names stay small whatever a
+/// caller asks for.
+pub const MAX_CHUNKS: u32 = 4096;
 
 /// One upload in flight: what it is, who began it, and which chunks have
 /// arrived. Only the index-to-size map lives here; the bytes are on disk.
@@ -116,6 +121,9 @@ pub(crate) fn chunk_within(config: &Config, id: &str, index: u32, data: &str, ce
     if bytes.is_empty() {
         return Err("a chunk holds at least one byte".to_string());
     }
+    if index >= MAX_CHUNKS {
+        return Err(format!("an upload comes in at most {MAX_CHUNKS} chunks; index {index} is past them"));
+    }
     let size = bytes.len() as u64;
     let mut over = false;
     let counted = crate::state::wait(config.stores.tickets.update(Kind::InlineUpload, id, |upload: &mut InlineUpload| {
@@ -167,6 +175,9 @@ pub fn finish(config: &Config, id: &str, count: u32) -> Result<(InlineUpload, Ve
         let upload = upload?.ok_or_else(|| UNKNOWN.to_string())?;
         if count == 0 {
             return Err("chunks must be at least 1".to_string());
+        }
+        if count > MAX_CHUNKS {
+            return Err(format!("an upload comes in at most {MAX_CHUNKS} chunks, not {count}; the upload is cancelled, begin again"));
         }
         let missing: Vec<String> = (0..count)
             .filter(|i| !upload.chunks.contains_key(i))
@@ -280,6 +291,23 @@ mod tests {
         assert!(error.contains("ceiling"), "{error}");
         assert!(!spool_dir(&config, &id).exists(), "the spool stayed");
         assert!(chunk(&config, &id, 2, &b64(b"x")).is_err(), "a cancelled upload took another chunk");
+    }
+
+    #[test]
+    fn a_count_or_an_index_past_the_most_chunks_is_refused_without_counting_to_it() {
+        let (_dir, config, runtime) = config();
+        let _entered = runtime.enter();
+        let id = begin(&config, "app".into(), UploadKind::Page, meta(), None, None).unwrap();
+        assert!(chunk(&config, &id, MAX_CHUNKS, &b64(b"x")).unwrap_err().contains("at most"));
+        assert!(chunk(&config, &id, u32::MAX, &b64(b"x")).unwrap_err().contains("at most"));
+        chunk(&config, &id, 0, &b64(b"aa")).unwrap();
+        // Naming every missing index up to this count would take minutes and
+        // gigabytes; it is refused at once instead.
+        let started = std::time::Instant::now();
+        let error = finish(&config, &id, u32::MAX).unwrap_err();
+        assert!(error.contains("at most"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!spool_dir(&config, &id).exists(), "the spool stayed");
     }
 
     #[test]

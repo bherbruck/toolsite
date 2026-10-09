@@ -111,9 +111,9 @@ pub(crate) async fn serve_icon(
     // open, has no icon as far as they can tell. The index asks for icons
     // with the site cookie, so that is who is asking here too.
     let app = slug.split('/').next().unwrap_or(slug);
-    let meta = crate::content::catalog::meta(&config, app).await;
+    // A page hidden inside a group or an app takes its icon down with it.
     let gate = crate::content::store::effective_gate(&config, app, "/").await.gate;
-    if meta.hidden {
+    if is_hidden(&config, slug).await {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     if gate != "public" {

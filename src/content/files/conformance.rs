@@ -247,6 +247,48 @@ async fn writers_take_turns(first: &Arc<dyn Files>, second: &Arc<dyn Files>) {
     next.release().await;
 }
 
+/// Another runner holding the turns of as many apps as this process lets
+/// publish at once leaves this runner free to publish any other: a turn
+/// waiting on another runner's lock holds no place here meanwhile.
+async fn waiting_on_another_runner_holds_no_place(files: &Arc<dyn Files>, pool: &deadpool_postgres::Pool) {
+    let busy: Vec<String> = (0..super::bucket::MAX_TURNS + 2).map(|n| format!("busy-{n}")).collect();
+    let mut elsewhere = Vec::new();
+    for app in &busy {
+        let client = pool.get().await.unwrap();
+        client
+            .execute("select pg_advisory_lock($1::int4, hashtext($2))", &[&crate::state::pg::LOCK_PUBLISH, app])
+            .await
+            .unwrap();
+        elsewhere.push(client);
+    }
+    let waiting: Vec<_> = busy
+        .iter()
+        .map(|app| {
+            let (files, app) = (files.clone(), app.clone());
+            tokio::spawn(async move { files.take_turn(&app).await.unwrap().release().await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let free = tokio::time::timeout(Duration::from_secs(5), files.take_turn("bystander")).await;
+    free.expect("an app waited behind other apps' turns held on another runner").unwrap().release().await;
+    let blocking = files.clone();
+    let free = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || blocking.take_turn_blocking("bystander").map(|turn| turn.release_blocking())),
+    )
+    .await;
+    free.expect("a blocking writer waited behind other apps' turns held on another runner").unwrap().unwrap();
+    for (client, app) in elsewhere.iter().zip(&busy) {
+        client
+            .execute("select pg_advisory_unlock($1::int4, hashtext($2))", &[&crate::state::pg::LOCK_PUBLISH, app])
+            .await
+            .unwrap();
+    }
+    for turn in waiting {
+        tokio::time::timeout(Duration::from_secs(10), turn).await.expect("a turn was never passed on").unwrap();
+    }
+}
+
 async fn run(files: Arc<dyn Files>) {
     a_key_comes_back_as_it_went_in(&*files).await;
     nothing_that_is_not_a_key_is_touched(&files).await;
@@ -272,8 +314,7 @@ fn cache_names_are_digests(data_dir: &Path) {
     walk(&data_dir.join(".tmp").join("content"), &mut names);
     assert!(!names.is_empty(), "nothing was cached");
     for name in names {
-        let stem = name.strip_suffix(".absent").unwrap_or(&name);
-        assert!(stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()), "a cached file named {name}");
+        assert!(name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()), "a cached file named {name}");
     }
 }
 
@@ -293,6 +334,30 @@ async fn a_generation_reads_what_it_read(files: &dyn Files) {
     assert_eq!(files.local("cached/index.html", 0).await.unwrap(), None);
     assert!(!files.exists("cached", 0).await.unwrap());
     assert!(files.exists("cached", 2).await.unwrap());
+}
+
+/// Sets a cached generation's time back past the sweep's grace, as if
+/// nothing had read it for a while.
+fn backdate(dir: &Path) {
+    let then = std::time::SystemTime::now() - Duration::from_secs(600);
+    std::fs::File::open(dir).unwrap().set_modified(then).unwrap();
+}
+
+/// Many publishes leave one generation's cache on the disk, not one per
+/// publish, and an app removed since leaves none once it is asked for.
+async fn the_cache_keeps_no_old_generation(files: &dyn Files, data_dir: &Path) {
+    let app_dir = data_dir.join(".tmp").join("content").join("swept");
+    for generation in 1..=40u64 {
+        files.put("swept/index.html", format!("v{generation}").into()).await.unwrap();
+        assert_eq!(text(files, "swept/index.html", generation).await, Some(format!("v{generation}")));
+        backdate(&app_dir.join(generation.to_string()));
+    }
+    let kept: Vec<_> = std::fs::read_dir(&app_dir).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(kept.len() <= 2, "40 publishes left {} generations cached: {kept:?}", kept.len());
+    // Removed: its generation is 0 from now on, and the next read takes
+    // what this runner kept of it.
+    assert_eq!(files.local("swept/index.html", 0).await.unwrap(), None);
+    assert!(!app_dir.exists(), "a removed app's cache stayed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -346,8 +411,10 @@ async fn the_bucket_files_conform_on_postgres() {
     run(files.clone()).await;
     a_generation_reads_what_it_read(&*files).await;
     cache_names_are_digests(here.path());
+    the_cache_keeps_no_old_generation(&*files, here.path()).await;
     pieces_meet_whoever_reads_them(&files, &other).await;
     writers_take_turns(&files, &other).await;
+    waiting_on_another_runner_holds_no_place(&files, &pool).await;
     assert!(files.by_generation());
 
     // Published files are the bucket's: the volume holds a cache and

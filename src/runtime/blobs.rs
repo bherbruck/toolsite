@@ -1121,6 +1121,15 @@ mod tests {
             "",
             "a\\b",
             "a b",
+            // The platform's own prefix in a bucket the content shares, and
+            // the ways a hand-made key might reach it or another app.
+            ".toolsite/content/x/index.html",
+            ".toolsite/trash/1-x/app/index.html",
+            "%2etoolsite/content/x/index.html",
+            "../other-app/secret",
+            "a/\0b",
+            "\u{ff0e}\u{ff0e}/x",
+            "a/",
         ] {
             let error = put(&config, "app", key, "text/plain", b"x").unwrap_err();
             assert!(matches!(error, Error::InvalidKey(_)), "{key:?} was accepted: {error}");
@@ -1131,6 +1140,9 @@ mod tests {
         }
         assert!(!dir.path().join("victim/pwned").exists());
         assert!(!dir.path().join("etc").exists());
+        for prefix in [".toolsite/", ".toolsite", "../", "%2e/"] {
+            assert!(matches!(list(&config, "app", prefix), Err(Error::InvalidKey(_))), "{prefix:?} was listed");
+        }
     }
 
     #[test]

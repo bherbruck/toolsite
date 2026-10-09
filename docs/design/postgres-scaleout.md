@@ -287,12 +287,20 @@ the local store and the bucket share one key space and one validation
 sequence, `platform.generations`: counted per row, a removed app's row went
 away and the next app at the name started again at 1, which another
 runner's cache may still hold. A publish takes the app's turn (a process
-lock and `pg_advisory_lock(LOCK_PUBLISH, hashtext(app))`), writes, counts
-the generation and lets go, so two deploys land one after the other.
+lock and `pg_try_advisory_lock(LOCK_PUBLISH, hashtext(app))`, tried again
+until it is had, so a turn waiting on another runner holds no connection
+and none of the process's few places), writes, counts the generation and
+lets go, so two deploys land one after the other. A bundle's every key is
+checked before its first file is stored, so one a store would refuse
+(over 900 bytes, a segment over 255) refuses the whole bundle rather than
+leave half of it served.
 Generation 0 reads as nothing published, and on the bucket "the app
 exists" is "its generation is above 0". The cache is
-`DATA_DIR/.tmp/content/<app>/<generation>/<sha256(key)>`, with a marker for
-a key that was absent. A removal moves objects to `.toolsite/trash/<entry>/`
+`DATA_DIR/.tmp/content/<app>/<generation>/<sha256(key)>`. A key that was
+absent is remembered in memory, a bounded number, never as a file: a
+stranger may ask for any number of names. A generation's cache goes once a
+newer one is read and the old one has been idle a minute; a removed app's
+goes at the next read of its name. A removal moves objects to `.toolsite/trash/<entry>/`
 and writes the rows it took there as sidecars; an app's SQLite database,
 still on the volume, goes to that volume's `.trash/<entry>/app`.
 `platform::trash::restore` puts an entry back. Inline-upload pieces are

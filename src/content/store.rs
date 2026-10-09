@@ -423,15 +423,28 @@ pub(crate) fn badge_initials(slug: &str, title: Option<&str>) -> String {
     }
 }
 
-/// True if the page or any app above it has been hidden.
+/// True if the page or any app above it has been hidden. A segment named
+/// like a page's file (`note.html`, in any case) asks for that page too:
+/// `/p/grp/note.html` is page `grp/note` by its file name, and serving it
+/// must not pass by the page's own flag.
 pub(crate) async fn is_hidden(config: &Config, slug: &str) -> bool {
     let mut prefix = String::new();
     for segment in slug.split('/') {
         if !prefix.is_empty() {
             prefix.push('/');
         }
+        let page = segment
+            .len()
+            .checked_sub(".html".len())
+            .filter(|&stem| stem > 0 && segment.is_char_boundary(stem) && segment[stem..].eq_ignore_ascii_case(".html"))
+            .map(|stem| format!("{prefix}{}", &segment[..stem]));
         prefix.push_str(segment);
         if crate::content::catalog::meta(config, &prefix).await.hidden {
+            return true;
+        }
+        if let Some(page) = page
+            && crate::content::catalog::meta(config, &page).await.hidden
+        {
             return true;
         }
     }

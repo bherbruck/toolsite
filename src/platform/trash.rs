@@ -129,8 +129,8 @@ fn take(config: &Config, files: &dyn Files, slug: &str, at: u64, entry: &str, mo
     // so no runner's cache serves what left.
     let app = files::app_of(slug).to_string();
     let turn = files.take_turn_blocking(&app)?;
+    let before = moved.len();
     let outcome = (|| -> Result<(), String> {
-        let before = moved.len();
         if files.trash_move_blocking(entry, slug, "app")? {
             moved.push(format!("{slug}/"));
         }
@@ -155,14 +155,19 @@ fn take(config: &Config, files: &dyn Files, slug: &str, at: u64, entry: &str, mo
                 std::fs::rename(&local, &kept).map_err(|e| e.to_string())?;
                 moved.push(format!("{slug}/ (data on this runner's volume)"));
             }
-            if moved.len() > before {
-                crate::state::wait(crate::content::catalog::of(config).bump_generation(&app))?;
-            }
         }
         Ok(())
     })();
+    // Counted even when a move failed part way: what did move is gone from
+    // the bucket, and no runner's cache may go on serving it.
+    let counted = if files.by_generation() && moved.len() > before {
+        crate::state::wait(crate::content::catalog::of(config).bump_generation(&app)).map(|_| ())
+    } else {
+        Ok(())
+    };
     turn.release_blocking();
     outcome?;
+    counted?;
 
     // The files are gone, so whatever the app holds open goes now, before
     // the catalog step: a removal that fails there must not leave its
@@ -190,9 +195,12 @@ fn take(config: &Config, files: &dyn Files, slug: &str, at: u64, entry: &str, mo
 }
 
 /// Puts a removal back: its published files where they were, its meta and
-/// notes, and on files every sidecar it took. Its permissions, records and
-/// tokens stay in the entry, for a person to put back on purpose. Refused
-/// when anything is published at the slug now.
+/// notes, and on files the sidecars it took other than its tokens. Its
+/// permissions and its tokens stay in the entry on either backend, and its
+/// records on Postgres, for a person to put back on purpose: a token was
+/// taken out of use by the removal, and a restore is not its holder's say.
+/// Refused when anything is published at the slug now, asked in the app's
+/// turn so no publish lands between the answer and the files going back.
 pub fn restore(config: &Config, entry: &str) -> Result<Vec<String>, String> {
     let files = files::of(config);
     let record = files
@@ -204,24 +212,25 @@ pub fn restore(config: &Config, entry: &str) -> Result<Vec<String>, String> {
         .filter(|slug| valid_slug(slug))
         .ok_or_else(|| format!("{entry} does not say what it removed"))?;
     let app = files::app_of(&slug).to_string();
-    let in_use = if slug.contains('/') {
-        files::path_blocking(config, &format!("{slug}.html")).is_some()
-            || files::path_blocking(config, &format!("{slug}/index.html")).is_some()
-    } else {
-        files::app_exists_blocking(config, &slug)
-    };
-    if in_use {
-        return Err(format!("something is published at {slug} now; remove it before putting {entry} back"));
-    }
 
     let mut back = Vec::new();
     let turn = files.take_turn_blocking(&app)?;
     let outcome = (|| -> Result<(), String> {
+        let in_use = if slug.contains('/') {
+            files::path_blocking(config, &format!("{slug}.html")).is_some()
+                || files::path_blocking(config, &format!("{slug}/index.html")).is_some()
+        } else {
+            files::app_exists_blocking(config, &slug)
+        };
+        if in_use {
+            return Err(format!("something is published at {slug} now; remove it before putting {entry} back"));
+        }
         if files.untrash_blocking(entry, "app", &slug)? {
             back.push(format!("{slug}/"));
         }
+        let tokens = crate::platform::tokens::Kind::ALL.map(|kind| kind.extension());
         for extension in SIDECARS {
-            if files.by_generation() && !PUBLISHED.contains(&extension) {
+            if (files.by_generation() && !PUBLISHED.contains(&extension)) || tokens.contains(&extension) {
                 continue;
             }
             if files.untrash_blocking(entry, &format!("slug.{extension}"), &format!("{slug}.{extension}"))? {
@@ -255,12 +264,19 @@ pub fn restore(config: &Config, entry: &str) -> Result<Vec<String>, String> {
                 let notes = String::from_utf8_lossy(&notes).into_owned();
                 crate::state::wait(crate::content::catalog::of(config).set_notes(&slug, &notes))?;
             }
-            crate::state::wait(crate::content::catalog::of(config).bump_generation(&app))?;
         }
         Ok(())
     })();
+    // Counted whenever anything came back, a restore that failed part way
+    // included, so every runner reads what is in the bucket now.
+    let counted = if files.by_generation() && !back.is_empty() {
+        crate::state::wait(crate::content::catalog::of(config).bump_generation(&app)).map(|_| ())
+    } else {
+        Ok(())
+    };
     turn.release_blocking();
     outcome?;
+    counted?;
     if back.is_empty() {
         return Err(format!("{entry} holds nothing to put back"));
     }

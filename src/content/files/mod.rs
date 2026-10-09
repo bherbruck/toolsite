@@ -48,13 +48,18 @@ use bytes::Bytes;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 /// Longer than any key the platform makes: a slug, a bundle path and an
-/// extension.
-const MAX_KEY_LEN: usize = 1024;
+/// extension. Short enough that the key still fits the bucket's 1024 bytes
+/// under `.toolsite/content/`, and moved into the trash under its entry.
+const MAX_KEY_LEN: usize = 900;
+/// A name in a directory, as long as a volume's filesystem takes one.
+const MAX_SEGMENT_LEN: usize = 255;
 
 /// Whether `key` may name a published file. The whole traversal defence for
-/// keys: checked by every store before a key touches a path or an object.
+/// keys: checked by every store before a key touches a path or an object,
+/// and by a bundle for each of its files before any is stored, so no key
+/// passes here that a store would then refuse.
 pub fn valid_key(key: &str) -> bool {
-    key.len() <= MAX_KEY_LEN && valid_asset_path(key)
+    key.len() <= MAX_KEY_LEN && valid_asset_path(key) && key.split('/').all(|segment| segment.len() <= MAX_SEGMENT_LEN)
 }
 
 pub(crate) fn check_key(key: &str) -> Result<(), String> {

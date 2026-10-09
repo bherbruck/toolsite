@@ -52,23 +52,33 @@ pub(crate) fn classify_entry(entry: &tar::Entry<'_, impl std::io::Read>) -> Entr
 
 /// Entry paths as they should land on disk, or an error naming the offender.
 /// Rejects anything that could escape the destination directory.
+/// The ceilings are counted here too, as the entries go by, so a bundle
+/// over one is refused before anything is written, and a bomb is given up
+/// on at the ceiling rather than inflated to its end.
 pub(crate) fn bundle_entry_paths(body: &[u8]) -> Result<Vec<String>, String> {
     let decoder = flate2::read::GzDecoder::new(body);
     let mut archive = tar::Archive::new(decoder);
     let mut paths = Vec::new();
+    let mut total: u64 = 0;
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         match classify_entry(&entry) {
-            EntryVerdict::Take(rel) => paths.push(rel),
+            EntryVerdict::Take(rel) => {
+                total = total.saturating_add(entry.header().size().unwrap_or(0));
+                paths.push(rel);
+            }
             EntryVerdict::Ignore | EntryVerdict::Skip(_) => continue,
             EntryVerdict::Reject(message) => return Err(message),
+        }
+        if paths.len() > MAX_BUNDLE_ENTRIES {
+            return Err(format!("bundle has more than {MAX_BUNDLE_ENTRIES} files"));
+        }
+        if total > MAX_BUNDLE_UNPACKED {
+            return Err(format!("bundle exceeds {} MB unpacked", MAX_BUNDLE_UNPACKED / 1024 / 1024));
         }
     }
     if paths.is_empty() {
         return Err("bundle contains no files".to_string());
-    }
-    if paths.len() > MAX_BUNDLE_ENTRIES {
-        return Err(format!("bundle has more than {MAX_BUNDLE_ENTRIES} files"));
     }
     Ok(paths)
 }
@@ -186,10 +196,21 @@ pub(crate) type Sink<'a> = dyn FnMut(&str, &mut dyn std::io::Read, u64) -> Resul
 
 /// Every entry of a bundle that passes the traversal defence, handed to
 /// `sink` in the archive's order. Every path is checked before the first is
-/// handed over, so an archive with one unsafe path writes nothing at all.
+/// handed over, as the key it will be stored at, so an archive with one
+/// path a store cannot keep writes nothing at all: a refusal half way would
+/// leave the app serving half of the new bundle over the old.
 pub(crate) fn unpack_into(body: &[u8], slug: &str, sink: &mut Sink<'_>) -> Result<Unpacked, String> {
     let paths = bundle_entry_paths(body)?;
     let strip = bundle_strip_prefix(&paths);
+    for path in &paths {
+        let rel = match &strip {
+            Some(prefix) => path.strip_prefix(&format!("{prefix}/")).unwrap_or(path),
+            None => path,
+        };
+        if !rel.is_empty() && !crate::content::files::valid_key(&format!("{slug}/{rel}")) {
+            return Err(format!("unsupported filename in bundle: {rel} (too long to store)"));
+        }
+    }
 
     let decoder = flate2::read::GzDecoder::new(body);
     let mut archive = tar::Archive::new(decoder);
@@ -375,6 +396,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = unpack_bundle(&tarball(&[]), dir.path(), "app").unwrap_err();
         assert!(error.contains("no files"), "got {error:?}");
+    }
+
+    /// A gzipped tar of `index.html` first, then `then`: `(path, size)`
+    /// entries of zeros, made with the `tar` crate since nothing here needs
+    /// forging.
+    fn index_then(then: &[(String, u64)]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(2);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, "index.html", &b"v2"[..]).unwrap();
+            for (path, size) in then {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(*size);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, std::io::Read::take(std::io::repeat(0), *size)).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn a_bundle_over_a_ceiling_hands_the_store_nothing_at_all() {
+        // Over the unpacked ceiling, in one file after the index; over the
+        // count of files; and with a name no store could keep. Each is
+        // refused before the index reaches the store, where a refusal part
+        // way would leave half of the new bundle served over the old.
+        let too_big = index_then(&[("big.bin".to_string(), MAX_BUNDLE_UNPACKED)]);
+        let too_many = index_then(&(0..MAX_BUNDLE_ENTRIES).map(|n| (format!("f{n}.txt"), 1)).collect::<Vec<_>>());
+        let too_long = index_then(&[(format!("{}.js", "x".repeat(300)), 1)]);
+        for (body, said) in [(too_big, "unpacked"), (too_many, "more than"), (too_long, "too long")] {
+            let mut handed = Vec::new();
+            let error = unpack_into(&body, "app", &mut |rel, _, _| {
+                handed.push(rel.to_string());
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(error.contains(said), "{error}");
+            assert!(handed.is_empty(), "the store was handed {handed:?} before the refusal");
+        }
     }
 
     #[test]

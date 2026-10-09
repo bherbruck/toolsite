@@ -12,11 +12,14 @@
 //! path or blob key can start with a dot, so none can reach `.toolsite/`.
 //!
 //! What a runner fetched it keeps under `DATA_DIR/.tmp/content/<app>/
-//! <generation>/`, named by the SHA-256 of the key, with a marker for a key
-//! that was not there. A read at a newer generation never looks at an older
-//! one's files, and one at generation 0, an app with nothing published or
-//! taken away, never looks at all. The names are digests, so nothing a
-//! visitor sends can name a cached file, and `.tmp` is never served.
+//! <generation>/`, named by the SHA-256 of the key. A key that was not
+//! there is remembered in memory, a bounded number of them, never on disk:
+//! a visitor can ask for any number of names that do not exist, and each
+//! would otherwise leave a file behind. A read at a newer generation never
+//! looks at an older one's files, and one at generation 0, an app with
+//! nothing published or taken away, never looks at all. The names are
+//! digests, so nothing a visitor sends can name a cached file, and `.tmp`
+//! is never served.
 
 use super::{
     app_of, check_key, check_trash_name,
@@ -58,12 +61,34 @@ pub struct Bucket {
 /// connection for its lock and needs another to count its generation, so
 /// without a bound enough publishes of different apps at once would hold
 /// every connection and wait for one more.
-const MAX_TURNS: usize = 4;
+pub(super) const MAX_TURNS: usize = 4;
 static TURNS: LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TURNS)));
+/// Between tries at a lock another runner holds: short at first, since most
+/// publishes take moments, then no longer than this.
+const FIRST_PAUSE: Duration = Duration::from_millis(10);
+const LAST_PAUSE: Duration = Duration::from_millis(250);
 
 /// The newest generation each app's cache was swept below, by cache path.
 static SWEPT: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Default::default);
+
+/// Keys found absent, by the path their file would have had in the cache,
+/// which names the generation too. Forgotten all at once when full: a miss
+/// forgotten costs one more request to the bucket, never a wrong answer.
+const MAX_ABSENT: usize = 50_000;
+static ABSENT: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+fn absent(path: &std::path::Path) -> bool {
+    ABSENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(path)
+}
+
+fn remember_absent(path: PathBuf) {
+    let mut known = ABSENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if known.len() >= MAX_ABSENT {
+        known.clear();
+    }
+    known.insert(path);
+}
 
 fn digest(key: &str) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(key.as_bytes()))
@@ -146,29 +171,17 @@ impl Bucket {
             }
             *seen = generation;
         }
-        let Ok(entries) = std::fs::read_dir(app_dir) else { return };
-        for entry in entries.flatten() {
-            let older = entry.file_name().to_str().and_then(|name| name.parse::<u64>().ok()).is_some_and(|g| g < generation);
-            let idle = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|elapsed| elapsed > KEEP_OLD);
-            if older && idle {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
+        Self::sweep_idle(app_dir, generation);
     }
 
     /// Fetches `key` into the cache for `generation`.
     async fn fetch(&self, key: &str, dir: &std::path::Path, name: &str) -> Result<Option<PathBuf>, String> {
         let io = |what: &'static str| move |e: std::io::Error| format!("could not {what} the cache: {e}");
-        tokio::fs::create_dir_all(dir).await.map_err(io("make"))?;
         let Some((object, mut stream)) = self.s3()?.object_get(&format!("{CONTENT}{key}")).await? else {
-            tokio::fs::write(dir.join(format!("{name}.absent")), b"").await.map_err(io("write"))?;
+            remember_absent(dir.join(name));
             return Ok(None);
         };
+        tokio::fs::create_dir_all(dir).await.map_err(io("make"))?;
         // Written aside and renamed, so a reader beside this one sees the
         // whole file or none of it.
         let part = dir.join(format!(".{}.part", crate::content::slug::random_token(12)));
@@ -195,22 +208,59 @@ impl Bucket {
         Ok(Some(dir.join(name)))
     }
 
+    /// Removes what is cached of an app that has nothing published now,
+    /// removed since this runner read it: no newer generation will come to
+    /// sweep it, unless the name is published again.
+    async fn sweep_gone(app_dir: &std::path::Path) {
+        if tokio::fs::metadata(app_dir).await.is_err() {
+            return;
+        }
+        let app_dir = app_dir.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || {
+            Self::sweep_idle(&app_dir, u64::MAX);
+            let _ = std::fs::remove_dir(&app_dir);
+        })
+        .await;
+    }
+
+    /// Removes the caches of generations below `generation` that nothing
+    /// has been added to for a while.
+    fn sweep_idle(app_dir: &std::path::Path, generation: u64) {
+        let Ok(entries) = std::fs::read_dir(app_dir) else { return };
+        for entry in entries.flatten() {
+            let older = entry.file_name().to_str().and_then(|name| name.parse::<u64>().ok()).is_some_and(|g| g < generation);
+            let idle = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|elapsed| elapsed > KEEP_OLD);
+            if older && idle {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     async fn lookup(&self, key: &str, generation: u64) -> Result<Option<PathBuf>, String> {
         check_key(key)?;
+        let app = app_of(key);
+        let named = crate::content::slug::valid_segment(app);
+        let app_dir = self.cache_root().join(app);
         if generation == 0 {
+            if named {
+                Self::sweep_gone(&app_dir).await;
+            }
             return Ok(None);
         }
-        let app = app_of(key);
-        if !crate::content::slug::valid_segment(app) {
+        if !named {
             return Err(format!("{key:?} belongs to no app"));
         }
-        let app_dir = self.cache_root().join(app);
         let dir = app_dir.join(generation.to_string());
         let name = digest(key);
         if tokio::fs::metadata(dir.join(&name)).await.is_ok_and(|m| m.is_file()) {
             return Ok(Some(dir.join(name)));
         }
-        if tokio::fs::metadata(dir.join(format!("{name}.absent"))).await.is_ok() {
+        if absent(&dir.join(&name)) {
             return Ok(None);
         }
         let found = self.fetch(key, &dir, &name).await?;
@@ -244,31 +294,58 @@ impl Bucket {
 
     async fn turn(&self, app: &str) -> Result<Box<dyn Turn>, String> {
         let here = turn_lock(&self.cache_root(), app).lock_owned().await;
-        let place = TURNS.clone().acquire_owned().await.map_err(|e| e.to_string())?;
-        self.turn_everywhere(app, here, place).await
+        let mut pause = FIRST_PAUSE;
+        loop {
+            let place = TURNS.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+            if let Some(client) = self.try_everywhere(app).await? {
+                return Ok(self.held(app, client, here, place));
+            }
+            drop(place);
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(LAST_PAUSE);
+        }
     }
 
-    async fn turn_everywhere(
+    /// The turn, held here and on every runner, or the local one alone on
+    /// a store with no database.
+    fn held(
         &self,
         app: &str,
+        client: Option<deadpool_postgres::Client>,
         here: tokio::sync::OwnedMutexGuard<()>,
         place: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<Box<dyn Turn>, String> {
-        let Some(pool) = &self.pool else { return Ok(Box::new(LocalTurn(here))) };
+    ) -> Box<dyn Turn> {
+        match client {
+            Some(client) => Box::new(BucketTurn { client: Some(client), _here: here, _place: place, app: app.to_string() }),
+            None => Box::new(LocalTurn(here)),
+        }
+    }
+
+    /// One try at the app's lock on every runner: the connection that holds
+    /// it, `Some(None)` on a store with no database, or nothing when another
+    /// runner has it. A try never waits on Postgres, so a turn waiting for
+    /// another runner holds neither a connection nor a place among the
+    /// `TURNS`: one runner's slow publishes cannot leave every other app on
+    /// this one waiting behind them.
+    async fn try_everywhere(&self, app: &str) -> Result<Option<Option<deadpool_postgres::Client>>, String> {
+        let Some(pool) = &self.pool else { return Ok(Some(None)) };
         let client = pool
             .get()
             .await
             .map_err(|e| format!("could not reach Postgres for an app's publish lock: {}", crate::state::pg::chain(&e)))?;
-        // Held in the turn from here, so an error below closes the
-        // connection rather than pooling one that may hold the lock.
-        let turn = BucketTurn { client: Some(client), _here: here, _place: place, app: app.to_string() };
-        turn.client
-            .as_ref()
-            .expect("just set")
-            .execute("select pg_advisory_lock($1::int4, hashtext($2))", &[&LOCK_PUBLISH, &app])
-            .await
-            .map_err(|e| format!("could not take an app's publish lock: {}", crate::state::pg::chain(&e)))?;
-        Ok(Box::new(turn))
+        let taken = client
+            .query_one("select pg_try_advisory_lock($1::int4, hashtext($2))", &[&LOCK_PUBLISH, &app])
+            .await;
+        match taken {
+            Ok(row) if row.get::<_, bool>(0) => Ok(Some(Some(client))),
+            // Not taken: the connection holds nothing and goes back.
+            Ok(_) => Ok(None),
+            Err(e) => {
+                // It may hold the lock or not; closed, it holds nothing.
+                drop(deadpool_postgres::Object::take(client));
+                Err(format!("could not take an app's publish lock: {}", crate::state::pg::chain(&e)))
+            }
+        }
     }
 
     /// Moves every object under `from` (a key, or everything under
@@ -412,13 +489,21 @@ impl Files for Bucket {
 
     fn take_turn_blocking(&self, app: &str) -> Result<Box<dyn Turn>, String> {
         let here = lock_blocking(turn_lock(&self.cache_root(), app));
-        let place = loop {
-            if let Ok(place) = TURNS.clone().try_acquire_owned() {
-                break place;
+        let mut pause = FIRST_PAUSE;
+        loop {
+            let place = loop {
+                if let Ok(place) = TURNS.clone().try_acquire_owned() {
+                    break place;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            if let Some(client) = crate::state::wait(self.try_everywhere(app))? {
+                return Ok(self.held(app, client, here, place));
             }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        crate::state::wait(self.turn_everywhere(app, here, place))
+            drop(place);
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(LAST_PAUSE);
+        }
     }
 
     /// Named at random as well as by time, since two runners may remove
