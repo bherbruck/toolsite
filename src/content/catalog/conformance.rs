@@ -454,6 +454,26 @@ async fn run(catalog: Arc<dyn Catalog>) {
     concurrent_labels_are_never_shared(catalog.clone()).await;
     labels_are_issued_once(catalog.clone()).await;
     markers_round_trip(&*catalog).await;
+    the_catalog_lists_what_it_keeps(&*catalog).await;
+}
+
+/// What the migration commands copy from: every slug with a meta or notes,
+/// and every label with its app.
+async fn the_catalog_lists_what_it_keeps(catalog: &dyn Catalog) {
+    set(catalog, "listed-a", PageMeta { listed: false, ..PageMeta::default() }).await;
+    catalog.set_notes("listed-b/page", "for the next agent").await.unwrap();
+    let pages = catalog.pages().await.unwrap();
+    for slug in ["listed-a", "listed-b/page", "busy"] {
+        assert!(pages.contains(&slug.to_string()), "{slug} is missing from {pages:?}");
+    }
+    let mut sorted = pages.clone();
+    sorted.sort();
+    assert_eq!(pages, sorted);
+    let labels = catalog.labels().await.unwrap();
+    assert!(!labels.is_empty());
+    for (label, app) in &labels {
+        assert_eq!(catalog.label_owner_blocking(label).unwrap().as_ref(), Some(app));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -48,6 +48,7 @@ pub(crate) fn run(store: &dyn AccountStore) {
     a_scope_tree_is_matched_by_its_text_never_as_a_pattern(store);
     two_step_rows_belong_to_one_account(store);
     single_use_writes_let_exactly_one_caller_through(store);
+    every_row_comes_back_and_goes_in_as_it_is(store);
 }
 
 fn people_come_back_as_they_went_in(store: &dyn AccountStore) {
@@ -413,6 +414,101 @@ fn single_use_writes_let_exactly_one_caller_through(store: &dyn AccountStore) {
     assert_eq!(race(CALLERS * 2, || store.try_attempt(&jo.id, NOW, NOW - 900, 3).unwrap()), 3, "counts at once passed the limit");
 }
 
+/// What the migration commands rest on: a table read whole and written back
+/// changes nothing, a row written over its key replaces it, and a table
+/// without a key never doubles a row.
+fn every_row_comes_back_and_goes_in_as_it_is(store: &dyn AccountStore) {
+    use crate::state::rows::Cell;
+    let kit = person(store, "kit@example.com");
+    store.begin_mfa(&kit.id, "sealed-kit", "by-kit").unwrap();
+    store.enable_mfa(&kit.id, NOW).unwrap();
+    store.replace_recovery_codes(&kit.id, &["rc-kit".into()]).unwrap();
+    store.insert_session("s-kit", &kit.id, NOW + 60, Some("shop")).unwrap();
+    store.try_attempt(&kit.id, NOW, NOW - 900, 5).unwrap();
+    let before: Vec<Vec<_>> = super::TABLES.iter().map(|table| sorted(store.rows(table).unwrap())).collect();
+    for (table, rows) in super::TABLES.iter().zip(&before) {
+        assert!(!rows.is_empty() || !["users", "mfa", "recovery_codes", "sessions", "mfa_failures"].contains(&table.name));
+        store.put_rows(table, rows).unwrap();
+    }
+    let after: Vec<Vec<_>> = super::TABLES.iter().map(|table| sorted(store.rows(table).unwrap())).collect();
+    assert_eq!(before, after, "writing every row back changed a table");
+
+    let users = &super::TABLES[0];
+    let mut row = store.rows(users).unwrap().into_iter().find(|row| row[1] == Cell::Text("kit@example.com".into())).unwrap();
+    row[4] = Cell::Bool(true);
+    row[5] = Cell::Int(NOW);
+    store.put_rows(users, &[row]).unwrap();
+    assert_eq!(store.account_by_email("kit@example.com").unwrap(), Some((User { is_admin: true, ..kit.clone() }, Some(NOW))));
+    let wrong = vec![Cell::Text("x".into())];
+    assert!(store.put_rows(users, &[wrong]).is_err(), "a row that does not fit was written");
+}
+
+fn sorted<T: Ord>(mut rows: Vec<T>) -> Vec<T> {
+    rows.sort();
+    rows
+}
+
+/// The tables the migration copies are every table the account database
+/// has, with every column, on both backends.
+#[test]
+fn the_copied_tables_are_the_whole_schema_on_both_backends() {
+    use crate::state::rows::Kind;
+    let dir = tempfile::tempdir().unwrap();
+    drop(super::sqlite::open(&Config::local(dir.path().to_path_buf(), "t")).unwrap());
+    // The file itself, past the authorizer, which refuses the catalog.
+    let conn = rusqlite::Connection::open(dir.path().join(".site/auth.db")).unwrap();
+    let mut tables: Vec<String> = conn
+        .prepare("select name from sqlite_master where type = 'table' and name not like 'sqlite_%'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    tables.sort();
+    let mut described: Vec<String> = super::TABLES.iter().map(|table| table.name.to_string()).collect();
+    described.sort();
+    assert_eq!(tables, described);
+    let schema = include_str!("../../../migrations/postgres/schema.sql");
+    for table in super::TABLES {
+        let columns: Vec<String> = conn
+            .prepare(&format!("select name from pragma_table_info('{}')", table.name))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut listed: Vec<&str> = table.columns.iter().map(|(name, _)| *name).collect();
+        let mut columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        listed.sort();
+        columns.sort();
+        assert_eq!(listed, columns, "{} on SQLite", table.name);
+        let prefix = format!("column accounts.{}.", table.name);
+        let mut on_postgres: Vec<(String, String)> = schema
+            .lines()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .map(|rest| {
+                let (name, kind) = rest.split_once(' ').unwrap();
+                (name.to_string(), kind.split(' ').next().unwrap().to_string())
+            })
+            .collect();
+        on_postgres.sort();
+        let mut expected: Vec<(String, String)> = table
+            .columns
+            .iter()
+            .map(|(name, kind)| {
+                let kind = match kind {
+                    Kind::Text => "text",
+                    Kind::Int => "bigint",
+                    Kind::Bool => "boolean",
+                };
+                (name.to_string(), kind.to_string())
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(on_postgres, expected, "{} on Postgres", table.name);
+    }
+}
+
 #[test]
 fn the_sqlite_store_conforms() {
     let dir = tempfile::tempdir().unwrap();
@@ -472,8 +568,13 @@ fn every_postgres_statement_is_a_literal() {
     for call in [".query(", ".query_opt(", ".query_one(", ".execute(", ".batch_execute("] {
         for (at, _) in source.match_indices(call) {
             let argument = source[at + call.len()..].trim_start();
+            // A whole-table copy's statements are built from `TABLES`,
+            // which is constant, and run prepared.
             assert!(
-                argument.starts_with('"') || argument.starts_with("sql,"),
+                argument.starts_with('"')
+                    || argument.starts_with("sql,")
+                    || argument.starts_with("&table.postgres_")
+                    || argument.starts_with("&statement,"),
                 "a statement that is not a literal: {}",
                 &source[at..(at + 120).min(source.len())]
             );

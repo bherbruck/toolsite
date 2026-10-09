@@ -132,6 +132,14 @@ impl Files for Local {
         tokio::fs::write(&path, &bytes).await.map_err(io("write a file"))
     }
 
+    async fn fetch(&self, key: &str) -> Result<Option<Bytes>, String> {
+        match tokio::fs::read(self.path(key)?).await {
+            Ok(bytes) => Ok(Some(Bytes::from(bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("could not read {key}: {e}")),
+        }
+    }
+
     async fn delete(&self, key: &str) -> Result<bool, String> {
         match tokio::fs::remove_file(self.path(key)?).await {
             Ok(()) => Ok(true),
@@ -243,6 +251,33 @@ impl Files for Local {
     fn trash_entries_blocking(&self) -> Result<Vec<String>, String> {
         let Ok(entries) = std::fs::read_dir(self.trash_root()) else { return Ok(Vec::new()) };
         let mut names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn trash_names_blocking(&self, entry: &str) -> Result<Vec<String>, String> {
+        if !crate::content::slug::valid_segment(entry) {
+            return Err(format!("{entry:?} is not a trash entry"));
+        }
+        let root = self.trash_root().join(entry);
+        let mut names = Vec::new();
+        let mut dirs = vec![String::new()];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(root.join(&dir)) else { continue };
+            for found in entries.flatten() {
+                let Ok(kind) = found.file_type() else { continue };
+                let name = found.file_name().to_string_lossy().into_owned();
+                let rel = if dir.is_empty() { name } else { format!("{dir}/{name}") };
+                if kind.is_symlink() || !super::valid_key(&rel) {
+                    continue;
+                }
+                if kind.is_dir() {
+                    dirs.push(rel);
+                } else if kind.is_file() {
+                    names.push(rel);
+                }
+            }
+        }
         names.sort();
         Ok(names)
     }

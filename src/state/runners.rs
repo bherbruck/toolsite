@@ -63,6 +63,20 @@ impl Runner {
         }
     }
 
+    /// Every runner live by its heartbeat, by id: a command that must run
+    /// with the server stopped asks first.
+    pub async fn live(pool: &Pool) -> Result<Vec<String>, String> {
+        let client = pool.get().await.map_err(|e| format!("could not reach Postgres: {}", super::pg::chain(&e)))?;
+        let rows = client
+            .query(
+                "select id from state.runners where heartbeat_at > $1 order by id",
+                &[&(now() - LIVE_FOR.as_secs() as i64)],
+            )
+            .await
+            .map_err(|e| format!("could not read the runner registry: {}", super::pg::chain(&e)))?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
     /// Other runners live at the last heartbeat, by id.
     pub fn peers(&self) -> Vec<String> {
         self.peers.lock().unwrap_or_else(|e| e.into_inner()).clone()

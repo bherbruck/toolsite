@@ -321,6 +321,38 @@ impl Catalog for Files {
     async fn set_flag(&self, name: &str, value: &str) -> Result<(), String> {
         write_aside(&self.flag_file(name)?, value.as_bytes())
     }
+
+    async fn pages(&self) -> Result<Vec<String>, String> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut dirs = vec![String::new()];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(self.data_dir.join(&dir)) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // .site, .trash, .tmp and an app's .blobs are the platform's;
+                // a link is never followed, to a sidecar or a directory.
+                let Ok(kind) = entry.file_type() else { continue };
+                if name.starts_with('.') || kind.is_symlink() {
+                    continue;
+                }
+                let rel = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                if kind.is_dir() {
+                    dirs.push(rel);
+                    continue;
+                }
+                let Some(stem) = rel.strip_suffix(".meta").or_else(|| rel.strip_suffix(".notes")) else { continue };
+                let slug = stem.strip_suffix("/index").unwrap_or(stem);
+                if crate::content::slug::valid_slug(slug) {
+                    found.insert(slug.to_string());
+                }
+            }
+        }
+        Ok(found.into_iter().collect())
+    }
+
+    async fn labels(&self) -> Result<BTreeMap<String, String>, String> {
+        self.read_labels()
+    }
 }
 
 /// A hold on project moves in this process.

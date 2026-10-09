@@ -125,6 +125,14 @@ pub trait Tokens: Send + Sync {
     /// Takes every token of `app` out, as a removal does, and answers each
     /// kind's as the sidecar it is on files: (extension, contents).
     fn retire_blocking(&self, app: &str, at: u64) -> Result<Vec<(&'static str, String)>, String>;
+
+    /// Every token of a kind on the site with its digest, as (app, token,
+    /// digest): what the migration commands copy. The files backend never
+    /// follows a symbolic link to find one.
+    async fn dump(&self, kind: Kind) -> Result<Vec<(String, Token, String)>, String>;
+    /// Keeps a token copied from another store as it was, replacing the
+    /// app's token of that kind and id if there is one.
+    async fn restore(&self, app: &str, kind: Kind, token: &Token, hash: &str) -> Result<(), String>;
 }
 
 /// The tokens this site's backend keeps. Cheap: a path or a pool handle.

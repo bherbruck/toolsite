@@ -25,7 +25,50 @@
 pub mod postgres;
 pub mod sqlite;
 
-use crate::{accounts::users::User, config::Config, state::Backend};
+use crate::{
+    accounts::users::User,
+    config::Config,
+    state::{
+        rows::{Kind::*, Row, Table},
+        Backend,
+    },
+};
+
+/// Every account table, as both backends keep it, parents before the rows
+/// that point at them: what the migration commands copy, row for row.
+pub const TABLES: &[Table] = &[
+    Table {
+        name: "users",
+        key: &["id"],
+        columns: &[("id", Text), ("email", Text), ("password_hash", Text), ("created_at", Int), ("is_admin", Bool), ("disabled_at", Int)],
+    },
+    Table { name: "identities", key: &["provider", "provider_id"], columns: &[("provider", Text), ("provider_id", Text), ("user_id", Text)] },
+    Table {
+        name: "sessions",
+        key: &["token_hash"],
+        columns: &[("token_hash", Text), ("user_id", Text), ("expires_at", Int), ("scope", Text)],
+    },
+    Table { name: "invites", key: &["token_hash"], columns: &[("token_hash", Text), ("user_id", Text), ("expires_at", Int)] },
+    Table { name: "grants", key: &["user_id", "app"], columns: &[("user_id", Text), ("app", Text), ("role", Text)] },
+    Table {
+        name: "scopes",
+        key: &["user_id", "prefix"],
+        columns: &[("user_id", Text), ("prefix", Text), ("scope", Text), ("granted_by", Text), ("created_at", Int)],
+    },
+    Table { name: "pins", key: &["user_id", "app"], columns: &[("user_id", Text), ("app", Text), ("created_at", Int)] },
+    Table {
+        name: "mfa",
+        key: &["user_id"],
+        columns: &[("user_id", Text), ("secret", Text), ("enabled_at", Int), ("last_step", Int), ("begun_by", Text)],
+    },
+    Table { name: "recovery_codes", key: &["code_hash"], columns: &[("code_hash", Text), ("user_id", Text), ("used_at", Int)] },
+    Table {
+        name: "mfa_pending",
+        key: &["token_hash"],
+        columns: &[("token_hash", Text), ("user_id", Text), ("stage", Text), ("next", Text), ("expires_at", Int), ("failures", Int)],
+    },
+    Table { name: "mfa_failures", key: &[], columns: &[("user_id", Text), ("at", Int)] },
+];
 
 /// One account as the admin list shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -204,6 +247,15 @@ pub trait AccountStore: Send + Sync {
     fn delete_pending(&self, hash: &str) -> Result<(), String>;
     /// Removes every pending sign-in of an account.
     fn delete_pending_for(&self, user_id: &str) -> Result<(), String>;
+
+    // --- the whole store, for the migration commands ---
+
+    /// Every row of one of `TABLES`, in no particular order.
+    fn rows(&self, table: &Table) -> Result<Vec<Row>, String>;
+    /// Writes rows of one of `TABLES` as they are, each replacing the row
+    /// with its key, in one transaction. Nothing is hashed, sealed or
+    /// judged: the rows were the store's own.
+    fn put_rows(&self, table: &Table, rows: &[Row]) -> Result<(), String>;
 }
 
 /// The account store this site's backend keeps accounts in. Cheap: it

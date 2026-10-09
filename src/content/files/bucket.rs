@@ -420,6 +420,11 @@ impl Files for Bucket {
         self.s3()?.object_put(&format!("{CONTENT}{key}"), bytes).await
     }
 
+    async fn fetch(&self, key: &str) -> Result<Option<Bytes>, String> {
+        check_key(key)?;
+        Ok(self.s3()?.object_read(&format!("{CONTENT}{key}")).await?.map(Bytes::from))
+    }
+
     async fn delete(&self, key: &str) -> Result<bool, String> {
         check_key(key)?;
         let s3 = self.s3()?;
@@ -554,6 +559,19 @@ impl Files for Bucket {
             .collect();
         entries.sort();
         Ok(entries)
+    }
+
+    fn trash_names_blocking(&self, entry: &str) -> Result<Vec<String>, String> {
+        let prefix = Self::trash_object(entry, "x")?.trim_end_matches('x').to_string();
+        let listing = crate::state::wait(self.s3()?.object_list(&prefix, false))?;
+        let mut names: Vec<String> = listing
+            .objects
+            .into_iter()
+            .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_string))
+            .filter(|name| super::valid_key(name))
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     /// An entry is its objects; one with none is not there to let go of.

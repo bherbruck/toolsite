@@ -36,6 +36,7 @@ pub mod secrets;
 pub mod shield;
 pub mod tcp;
 pub mod tokens;
+pub mod transfer;
 pub mod trash;
 pub mod udp;
 pub mod upload;

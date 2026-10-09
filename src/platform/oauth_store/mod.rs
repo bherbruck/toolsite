@@ -18,7 +18,13 @@ mod sqlite;
 #[cfg(test)]
 mod conformance;
 
-use crate::{config::Config, state};
+use crate::{
+    config::Config,
+    state::{
+        self,
+        rows::{Kind::*, Row, Table},
+    },
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
@@ -42,6 +48,38 @@ pub(crate) const REFRESH_LIFETIME: Duration = Duration::from_secs(60 * 60 * 24 *
 const IDLE_CLIENT_LIFETIME: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
 const TOKEN_LEN: usize = 48;
+
+/// Every OAuth table, as both backends keep it, clients before the codes
+/// and tokens that point at them: what the migration commands copy.
+pub const TABLES: &[Table] = &[
+    Table { name: "clients", key: &["id"], columns: &[("id", Text), ("name", Text), ("redirect_uris", Text), ("created_at", Int)] },
+    Table {
+        name: "codes",
+        key: &["code_hash"],
+        columns: &[
+            ("code_hash", Text),
+            ("client_id", Text),
+            ("user_id", Text),
+            ("redirect_uri", Text),
+            ("code_challenge", Text),
+            ("expires_at", Int),
+            ("resource", Text),
+        ],
+    },
+    Table {
+        name: "tokens",
+        key: &["token_hash"],
+        columns: &[
+            ("token_hash", Text),
+            ("kind", Text),
+            ("client_id", Text),
+            ("user_id", Text),
+            ("expires_at", Int),
+            ("created_at", Int),
+            ("resource", Text),
+        ],
+    },
+];
 
 fn now() -> u64 {
     SystemTime::now()
@@ -159,6 +197,13 @@ pub trait OAuthStore: Send + Sync {
     /// do: expired tokens and codes, and clients idle past their lifetime
     /// that hold neither.
     async fn sweep(&self);
+
+    /// Every row of one of `TABLES`, as stored, without sweeping: for the
+    /// migration commands.
+    async fn rows(&self, table: &'static Table) -> Result<Vec<Row>, String>;
+    /// Writes rows of one of `TABLES` as they are, each replacing the row
+    /// with its key, in one transaction.
+    async fn put_rows(&self, table: &'static Table, rows: Vec<Row>) -> Result<(), String>;
 }
 
 /// The store for this site's backend. Cheap: the SQLite store opens its file

@@ -245,7 +245,23 @@ async fn run(records: Arc<dyn AppRecords>) {
     documents_round_trip(&*records).await;
     a_failed_edit_changes_nothing(&*records).await;
     concurrent_link_changes_all_land(records.clone()).await;
-    concurrent_settings_all_land(records).await;
+    concurrent_settings_all_land(records.clone()).await;
+    every_app_with_a_record_is_listed(&*records).await;
+}
+
+/// What the migration commands copy from: an app with any one record is
+/// listed, once, in order.
+async fn every_app_with_a_record_is_listed(records: &dyn AppRecords) {
+    records.set_tools("only-tools", Some("[]")).await.unwrap();
+    records.set_migrations_blocking("only-ladder", "[]").unwrap();
+    let apps = records.apps().await.unwrap();
+    for app in ["only-tools", "only-ladder"] {
+        assert_eq!(apps.iter().filter(|listed| *listed == app).count(), 1, "{app} in {apps:?}");
+    }
+    let mut sorted = apps.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(apps, sorted);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

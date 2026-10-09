@@ -3,7 +3,12 @@
 //! the file; each method opens it, so a call holds no lock past its return.
 
 use super::{AccountStore, PendingRow, ScopeRow, UserRow};
-use crate::{accounts::users::User, config::Config, runtime::db};
+use crate::{
+    accounts::users::User,
+    config::Config,
+    runtime::db,
+    state::rows::{Row as Cells, Table},
+};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 
@@ -653,5 +658,24 @@ impl AccountStore for SqliteAccounts {
 
     fn delete_pending_for(&self, user_id: &str) -> Result<(), String> {
         self.open()?.execute("delete from mfa_pending where user_id = ?", [user_id]).map(drop).map_err(err)
+    }
+
+    fn rows(&self, table: &Table) -> Result<Vec<Cells>, String> {
+        let conn = self.open()?;
+        let mut statement = conn.prepare(&table.sqlite_select()).map_err(err)?;
+        let rows = statement.query_map([], |row| table.sqlite_row(row)).map_err(err)?;
+        rows.collect::<Result<_, _>>().map_err(err)
+    }
+
+    fn put_rows(&self, table: &Table, rows: &[Cells]) -> Result<(), String> {
+        let mut conn = self.open()?;
+        let transaction = conn.transaction().map_err(err)?;
+        {
+            let mut statement = transaction.prepare(&table.sqlite_upsert()).map_err(err)?;
+            for row in rows {
+                statement.execute(rusqlite::params_from_iter(table.sqlite_values(row)?)).map_err(err)?;
+            }
+        }
+        transaction.commit().map_err(err)
     }
 }

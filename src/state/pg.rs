@@ -544,11 +544,18 @@ mod tests {
         ];
         // (file, the name passed, how many times). `step` is a ladder step,
         // `include_str!` of a migration; each `sql` is chosen from string
-        // literals a line or two above.
+        // literals a line or two above; `table` is one of the constant table
+        // descriptions the migration commands copy (`state::rows`), whose
+        // statements name only its own columns, and `statement` is one
+        // prepared from it.
         const NAMED: &[(&str, &str, usize)] = &[
             ("state/pg.rs", "step", 1),
             ("accounts/store/postgres.rs", "sql", 1),
+            ("accounts/store/postgres.rs", "table", 2),
+            ("accounts/store/postgres.rs", "statement", 1),
             ("platform/oauth_store/postgres.rs", "sql", 1),
+            ("platform/oauth_store/postgres.rs", "table", 2),
+            ("platform/oauth_store/postgres.rs", "statement", 1),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
@@ -585,7 +592,8 @@ mod tests {
                     if argument.starts_with('"') || argument.starts_with("r\"") || argument.starts_with("r#\"") {
                         continue;
                     }
-                    let ident: String = argument.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    let ident: String =
+                        argument.trim_start_matches('&').chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
                     assert!(
                         !ident.is_empty() && NAMED.iter().any(|(file, allowed, _)| *file == name && *allowed == ident),
                         "{name}: a statement that is not a literal: {}",

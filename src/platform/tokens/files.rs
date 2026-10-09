@@ -180,4 +180,41 @@ impl Tokens for Files {
     fn retire_blocking(&self, _app: &str, _at: u64) -> Result<Vec<(&'static str, String)>, String> {
         Ok(Vec::new())
     }
+
+    async fn dump(&self, kind: Kind) -> Result<Vec<(String, Token, String)>, String> {
+        let Ok(entries) = std::fs::read_dir(&self.data_dir) else { return Ok(Vec::new()) };
+        let suffix = format!(".{}", kind.extension());
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(app) = name.strip_suffix(&suffix) else { continue };
+            if !super::valid_app(app) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            // Unlike a listing, an unreadable list is an error: a copy that
+            // skipped it would lose every token in it.
+            for stored in read(&entry.path())? {
+                out.push((app.to_string(), stored.token(), stored.hash));
+            }
+        }
+        out.sort_by(|a, b| (&a.0, &a.1.id).cmp(&(&b.0, &b.1.id)));
+        Ok(out)
+    }
+
+    async fn restore(&self, app: &str, kind: Kind, token: &Token, hash: &str) -> Result<(), String> {
+        let entry = Stored {
+            id: token.id.clone(),
+            label: token.label.clone(),
+            last_used: token.last_used,
+            created_at: token.created_at,
+            hash: hash.to_string(),
+        };
+        self.change(app, kind, |tokens| match tokens.iter_mut().find(|stored| stored.id == entry.id) {
+            Some(stored) => *stored = entry,
+            None => {
+                tokens.push(entry);
+                tokens.sort_by_key(|stored| stored.created_at);
+            }
+        })
+    }
 }

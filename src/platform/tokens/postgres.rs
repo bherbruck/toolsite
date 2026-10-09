@@ -137,6 +137,44 @@ impl Tokens for Postgres {
         Ok(rows.iter().map(token_of).collect())
     }
 
+    async fn dump(&self, kind: Kind) -> Result<Vec<(String, Token, String)>, String> {
+        let rows = self
+            .client()
+            .await?
+            .query(
+                "select app, id, label, last_used, created_at, hash from platform.app_tokens where kind = $1",
+                &[&kind.name()],
+            )
+            .await
+            .map_err(failed("read every token"))?;
+        let mut out: Vec<(String, Token, String)> = rows.iter().map(|row| (row.get("app"), token_of(row), row.get("hash"))).collect();
+        out.sort_by(|a, b| (&a.0, &a.1.id).cmp(&(&b.0, &b.1.id)));
+        Ok(out)
+    }
+
+    async fn restore(&self, app: &str, kind: Kind, token: &Token, hash: &str) -> Result<(), String> {
+        self.client()
+            .await?
+            .execute(
+                "insert into platform.app_tokens (app, kind, id, label, hash, created_at, last_used)
+                 values ($1, $2, $3, $4, $5, $6, $7)
+                 on conflict (app, kind, id) do update
+                 set label = excluded.label, hash = excluded.hash, created_at = excluded.created_at, last_used = excluded.last_used",
+                &[
+                    &app,
+                    &kind.name(),
+                    &token.id,
+                    &token.label,
+                    &hash,
+                    &(token.created_at as i64),
+                    &token.last_used.map(|at| at as i64),
+                ],
+            )
+            .await
+            .map_err(failed("copy a token"))?;
+        Ok(())
+    }
+
     async fn list_all(&self, kind: Kind) -> Result<Vec<(String, Token)>, String> {
         let rows = self
             .client()

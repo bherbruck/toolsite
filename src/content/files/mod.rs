@@ -122,6 +122,9 @@ pub trait Files: Send + Sync {
     fn local_blocking(&self, key: &str, generation: u64) -> Result<Option<PathBuf>, String>;
     /// Stores `bytes` at `key`, replacing what was there.
     async fn put(&self, key: &str, bytes: Bytes) -> Result<(), String>;
+    /// What is stored at `key` now, read past any cache: for the migration
+    /// commands, which copy and compare every file.
+    async fn fetch(&self, key: &str) -> Result<Option<Bytes>, String>;
     /// Removes what is at `key`; whether anything was.
     async fn delete(&self, key: &str) -> Result<bool, String>;
     /// Unpacks a bundle at `slug`, through `bundle`'s checks, over what is
@@ -157,6 +160,10 @@ pub trait Files: Send + Sync {
     fn untrash_blocking(&self, entry: &str, name: &str, key: &str) -> Result<bool, String>;
     /// Every entry, oldest first.
     fn trash_entries_blocking(&self) -> Result<Vec<String>, String>;
+    /// Every file in an entry, by its name there, sorted. A name no key
+    /// could be (an app's `.blobs`) is left out, and on the volume a
+    /// symbolic link is never followed.
+    fn trash_names_blocking(&self, entry: &str) -> Result<Vec<String>, String>;
     /// Lets go of an entry nothing was put in.
     fn trash_discard_blocking(&self, entry: &str);
 

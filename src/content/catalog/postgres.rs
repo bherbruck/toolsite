@@ -414,4 +414,26 @@ impl Catalog for Postgres {
             .map_err(failed("store a marker"))?;
         Ok(())
     }
+
+    async fn pages(&self) -> Result<Vec<String>, String> {
+        let rows = self
+            .client()
+            .await?
+            .query("select slug from platform.pages", &[])
+            .await
+            .map_err(failed("list the catalog"))?;
+        let mut slugs: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        slugs.sort();
+        Ok(slugs)
+    }
+
+    async fn labels(&self) -> Result<BTreeMap<String, String>, String> {
+        let rows = self
+            .client()
+            .await?
+            .query("select label, app from platform.host_labels", &[])
+            .await
+            .map_err(failed("list the host labels"))?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
 }

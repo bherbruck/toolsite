@@ -110,14 +110,32 @@ pub fn seal(config: &Config, value: &str) -> Result<String, String> {
 
 /// The value back, or nothing if it was not sealed with this key.
 pub fn open(config: &Config, stored: &str) -> Option<String> {
+    open_with(&key(config).ok()?, stored)
+}
+
+/// `open` with a key given rather than the site's: the migration command
+/// checks a key against every sealed value before it is used.
+pub fn open_with(key: &[u8; 32], stored: &str) -> Option<String> {
     let raw = BASE64.decode(stored).ok()?;
     if raw.len() < 24 {
         return None;
     }
     let (nonce, sealed) = raw.split_at(24);
-    let cipher = XChaCha20Poly1305::new(&key(config).ok()?.into());
+    let cipher = XChaCha20Poly1305::new(&(*key).into());
     let plain = cipher.decrypt(XNonce::from_slice(nonce), sealed).ok()?;
     String::from_utf8(plain).ok()
+}
+
+/// The key this site keeps in `.site/secret.key`, when it made one: what
+/// `toolsite key show` prints and the migration compares.
+pub fn file_key(data_dir: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
+    match std::fs::read(data_dir.join(".site").join("secret.key")) {
+        Ok(bytes) => <[u8; 32]>::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| ".site/secret.key is not a 32-byte key".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(".site/secret.key could not be read: {e}")),
+    }
 }
 
 /// A digest of `value` keyed with the site key, for values too short to

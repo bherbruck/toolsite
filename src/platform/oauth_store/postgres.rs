@@ -10,7 +10,10 @@ use super::{
     hash, now, Client, Exchanged, Fits, Grant, Issued, OAuthStore, Redeemed, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME,
     REFRESH_LIFETIME, TOKEN_LEN,
 };
-use crate::content::slug::random_token;
+use crate::{
+    content::slug::random_token,
+    state::rows::{Row, Table},
+};
 use deadpool_postgres::{Pool, Transaction};
 
 #[derive(Clone)]
@@ -359,6 +362,28 @@ impl OAuthStore for PostgresOAuth {
         if let Err(error) = self.sweep_now().await {
             tracing::warn!(%error, "OAuth store: sweep failed");
         }
+    }
+
+    async fn rows(&self, table: &'static Table) -> Result<Vec<Row>, String> {
+        let conn = self.connection().await?;
+        let rows = conn
+            .query(&table.postgres_select("oauth"), &[])
+            .await
+            .map_err(|e| why("could not read the OAuth store", &e))?;
+        Ok(rows.iter().map(|row| table.postgres_row(row)).collect())
+    }
+
+    async fn put_rows(&self, table: &'static Table, rows: Vec<Row>) -> Result<(), String> {
+        let values = rows.iter().map(|row| table.postgres_values(row)).collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.connection().await?;
+        let failed = |e: tokio_postgres::Error| why("could not write the OAuth store", &e);
+        let transaction = conn.transaction().await.map_err(failed)?;
+        let statement = transaction.prepare(&table.postgres_upsert("oauth")).await.map_err(failed)?;
+        for row in &values {
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = row.iter().map(|value| &**value as _).collect();
+            transaction.execute(&statement, &params).await.map_err(failed)?;
+        }
+        transaction.commit().await.map_err(failed)
     }
 }
 

@@ -69,6 +69,7 @@ macro_rules! suite {
             one_refresh_rotated_by_many_at_once_yields_one_new_refresh,
             a_rotation_racing_a_revocation_leaves_nothing_live,
             an_exchange_spends_its_code_and_cannot_outlive_a_revocation,
+            every_row_comes_back_and_goes_in_as_it_is,
         );
     };
     (@each $fixture:ident, #[$attr:meta], $($name:ident),* $(,)?) => {
@@ -113,4 +114,51 @@ async fn the_blocking_calls_and_the_store_see_the_same_rows_in_file_mode() {
         Some(("u1".to_string(), client.id.clone(), None))
     );
     assert!(dir.path().join(".site").join("oauth.db").exists());
+}
+
+/// The tables the migration copies are every table the OAuth store has,
+/// with every column, on both backends.
+#[test]
+fn the_copied_tables_are_the_whole_schema_on_both_backends() {
+    use crate::state::rows::Kind;
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteOAuth::of(&Config::local(dir.path().to_path_buf(), "t"));
+    drop(store.open().unwrap());
+    // The file itself, past the authorizer, which refuses the catalog.
+    let conn = rusqlite::Connection::open(dir.path().join(".site/oauth.db")).unwrap();
+    let names = |sql: &str| -> Vec<String> {
+        let mut names: Vec<String> =
+            conn.prepare(sql).unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+        names.sort();
+        names
+    };
+    let tables = names("select name from sqlite_master where type = 'table' and name not like 'sqlite_%' and name <> '__migrations'");
+    let mut described: Vec<String> = super::TABLES.iter().map(|table| table.name.to_string()).collect();
+    described.sort();
+    assert_eq!(tables, described);
+    let schema = include_str!("../../../migrations/postgres/schema.sql");
+    for table in super::TABLES {
+        let mut listed: Vec<String> = table.columns.iter().map(|(name, _)| name.to_string()).collect();
+        listed.sort();
+        assert_eq!(names(&format!("select name from pragma_table_info('{}')", table.name)), listed, "{} on SQLite", table.name);
+        let prefix = format!("column oauth.{}.", table.name);
+        let mut on_postgres: Vec<String> = schema.lines().filter_map(|line| line.strip_prefix(&prefix)).map(str::to_string).collect();
+        on_postgres.sort();
+        let mut expected: Vec<String> = table
+            .columns
+            .iter()
+            .map(|(name, kind)| {
+                let kind = match kind {
+                    Kind::Text => "text",
+                    Kind::Int => "bigint",
+                    Kind::Bool => "boolean",
+                };
+                format!("{name} {kind}")
+            })
+            .collect();
+        expected.sort();
+        let on_postgres: Vec<String> =
+            on_postgres.iter().map(|line| line.split(' ').take(2).collect::<Vec<_>>().join(" ")).collect();
+        assert_eq!(on_postgres, expected, "{} on Postgres", table.name);
+    }
 }

@@ -30,6 +30,9 @@ async fn text(files: &dyn Files, key: &str, generation: u64) -> Option<String> {
 
 async fn a_key_comes_back_as_it_went_in(files: &dyn Files) {
     files.put("note.html", "<title>Note</title>".into()).await.unwrap();
+    assert_eq!(files.fetch("note.html").await.unwrap().as_deref(), Some(&b"<title>Note</title>"[..]));
+    assert_eq!(files.fetch("never.html").await.unwrap(), None);
+    assert!(files.fetch("../escape.html").await.is_err());
     files.put("shop/assets/app-4f2a.js", "console.log(1)".into()).await.unwrap();
     assert_eq!(text(files, "note.html", 1).await.as_deref(), Some("<title>Note</title>"));
     assert_eq!(text(files, "shop/assets/app-4f2a.js", 1).await.as_deref(), Some("console.log(1)"));
@@ -182,6 +185,12 @@ async fn the_trash_keeps_and_gives_back(files: &Arc<dyn Files>) {
     let entries = blocking(files, move |f| {
         assert_eq!(f.trash_read_blocking(&owned, "app/assets/x.js").unwrap().as_deref(), Some(&b"x"[..]));
         assert_eq!(f.trash_read_blocking(&owned, "slug.meta").unwrap().as_deref(), Some(&br#"{"hidden":true}"#[..]));
+        assert_eq!(
+            f.trash_names_blocking(&owned).unwrap(),
+            ["app/assets/x.js", "app/index.html", "slug.icon", "slug.meta"],
+            "an entry's files are listed by their names in it"
+        );
+        assert!(f.trash_names_blocking("../escape").is_err());
         f.trash_entries_blocking().unwrap()
     })
     .await;

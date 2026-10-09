@@ -424,4 +424,21 @@ impl AppRecords for Postgres {
     fn retire_blocking(&self, app: &str, at: u64) -> Result<Vec<(&'static str, String)>, String> {
         crate::state::wait_in_place(self.retire(app, at))
     }
+
+    async fn apps(&self) -> Result<Vec<String>, String> {
+        let rows = self
+            .client()
+            .await?
+            .query(
+                "select app from platform.app_settings union select app from platform.app_tools
+                 union select app from platform.app_migrations union select app from platform.repo_links
+                 union select app from platform.jobs",
+                &[],
+            )
+            .await
+            .map_err(failed("list the apps with records"))?;
+        let mut apps: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        apps.sort();
+        Ok(apps)
+    }
 }

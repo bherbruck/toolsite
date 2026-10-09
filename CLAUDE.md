@@ -68,6 +68,7 @@ platform/          the site as its owner uses it
   schedule.rs      cron jobs, run through the same handler a request uses
   connections.rs   a live connection's life: connect, events to the handler, re-checks, close
   websocket.rs     the WebSocket transport: upgrades at an app's declared socket paths
+  transfer.rs      migrate-to-postgres and export-to-files: one mapping, both ways, through the stores
 
 content/           what gets published, and how it is served
   slug.rs          naming rules (what may become a path), tokens, escaping

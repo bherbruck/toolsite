@@ -9,7 +9,12 @@ use super::{
     hash, now, Client, Exchanged, Fits, Grant, Issued, OAuthStore, Redeemed, ACCESS_LIFETIME, CODE_LIFETIME, IDLE_CLIENT_LIFETIME,
     REFRESH_LIFETIME, TOKEN_LEN,
 };
-use crate::{config::Config, content::slug::random_token, runtime::db};
+use crate::{
+    config::Config,
+    content::slug::random_token,
+    runtime::db,
+    state::rows::{Row, Table},
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use rusqlite_migration::{Migrations, M};
 use std::{path::PathBuf, sync::LazyLock};
@@ -36,7 +41,7 @@ impl SqliteOAuth {
         }
     }
 
-    fn open(&self) -> Result<Connection, String> {
+    pub(super) fn open(&self) -> Result<Connection, String> {
         let mut conn = db::open_unguarded(&self.path, self.max_db_bytes)?;
         MIGRATIONS.to_latest(&mut conn).map_err(|e| e.to_string())?;
         db::lock_down(&conn)?;
@@ -366,6 +371,35 @@ impl OAuthStore for SqliteOAuth {
     async fn sweep(&self) {
         let this = self.clone();
         blocking(move || SqliteOAuth::sweep(&this)).await;
+    }
+
+    async fn rows(&self, table: &'static Table) -> Result<Vec<Row>, String> {
+        let this = self.clone();
+        blocking(move || {
+            let conn = this.open()?;
+            let mut statement = conn.prepare(&table.sqlite_select()).map_err(|e| e.to_string())?;
+            let rows = statement.query_map([], |row| table.sqlite_row(row)).map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<Row>, _>>().map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|| Err(TASK_FAILED.into()))
+    }
+
+    async fn put_rows(&self, table: &'static Table, rows: Vec<Row>) -> Result<(), String> {
+        let this = self.clone();
+        blocking(move || {
+            let mut conn = this.open()?;
+            let transaction = conn.transaction().map_err(|e| e.to_string())?;
+            {
+                let mut statement = transaction.prepare(&table.sqlite_upsert()).map_err(|e| e.to_string())?;
+                for row in &rows {
+                    statement.execute(rusqlite::params_from_iter(table.sqlite_values(row)?)).map_err(|e| e.to_string())?;
+                }
+            }
+            transaction.commit().map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|| Err(TASK_FAILED.into()))
     }
 }
 

@@ -28,6 +28,36 @@ enum Command {
         #[command(subcommand)]
         command: UserCommand,
     },
+    /// Copies this data directory's platform state to DATABASE_URL and its
+    /// files to the bucket, then compares both sides, with the server
+    /// stopped. Safe to run again: it writes only what still differs.
+    MigrateToPostgres {
+        /// Compare both sides and write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// Copies a Postgres site's state back into a data directory, for
+    /// rolling back, with the server stopped.
+    ExportToFiles {
+        /// Compare both sides and write nothing.
+        #[arg(long)]
+        verify_only: bool,
+        /// Write into this directory rather than the data directory; apps'
+        /// databases are copied there from the data directory.
+        #[arg(long)]
+        to: Option<PathBuf>,
+    },
+    /// The key this site seals values with.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum KeyCommand {
+    /// Prints `.site/secret.key` as base64, for TOOLSITE_SECRET_KEY.
+    Show,
 }
 
 #[derive(clap::Subcommand)]
@@ -101,6 +131,22 @@ async fn main() -> anyhow::Result<()> {
     let bucket = read(&["TOOLSITE_BLOB_S3_ENDPOINT", "ENDPOINT"]).is_some()
         && read(&["TOOLSITE_BLOB_S3_BUCKET", "BUCKET"]).is_some();
     let settings = toolsite::state::Settings::from_env(|name| read(&[name]), bucket).unwrap_or_else(|why| refuse(&why));
+
+    // The commands that move a site between backends run before the boot
+    // guards, which exist to stop a server on a half-moved site.
+    match cli.command {
+        Some(Command::MigrateToPostgres { verify_only }) => {
+            let s3 = bucket_from_env(&read).unwrap_or_else(|why| refuse(&why));
+            return migrate_to_postgres(data_dir, settings, s3, verify_only).await;
+        }
+        Some(Command::ExportToFiles { verify_only, to }) => {
+            let s3 = bucket_from_env(&read).unwrap_or_else(|why| refuse(&why));
+            return export_to_files(data_dir, to, settings, s3, verify_only).await;
+        }
+        Some(Command::Key { command: KeyCommand::Show }) => return show_key(&data_dir, settings.secret_key.as_deref()),
+        _ => {}
+    }
+
     let backend = toolsite::state::open(&settings, &data_dir).await.unwrap_or_else(|why| refuse(&why));
 
     if let Some(Command::User { command }) = cli.command {
@@ -218,29 +264,13 @@ async fn main() -> anyhow::Result<()> {
     // disk. The unprefixed names are what a Railway bucket injects by
     // reference, so pointing at one is five variable references and nothing
     // else.
-    let blobs = match (
-        read(&["TOOLSITE_BLOB_S3_ENDPOINT", "ENDPOINT"]),
-        read(&["TOOLSITE_BLOB_S3_BUCKET", "BUCKET"]),
-    ) {
-        (Some(endpoint), Some(bucket)) => {
-            let access_key_id = read(&["TOOLSITE_BLOB_S3_ACCESS_KEY_ID", "ACCESS_KEY_ID"])
-                .expect("a blob bucket needs TOOLSITE_BLOB_S3_ACCESS_KEY_ID");
-            let secret = read(&["TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY", "SECRET_ACCESS_KEY"])
-                .expect("a blob bucket needs TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY");
-            let region = read(&["TOOLSITE_BLOB_S3_REGION", "REGION"]).unwrap_or_else(|| "auto".into());
-            let path_style = read(&["TOOLSITE_BLOB_S3_PATH_STYLE"]).is_some_and(|v| v != "0");
-            let s3 = toolsite::runtime::blobs::S3::new(
-                &endpoint, &bucket, &region, &access_key_id, &secret, path_style,
-            )
-            .unwrap_or_else(|why| panic!("{why}"));
-            toolsite::runtime::blobs::Blobs {
-                backend: toolsite::runtime::blobs::Backend::S3(s3),
-                max_bytes: max_blob_bytes,
-                max_write_bytes: max_blob_bytes,
-            }
-        }
-        (None, None) => toolsite::runtime::blobs::Blobs::local(max_blob_bytes),
-        _ => panic!("set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET together, or neither"),
+    let blobs = match bucket_from_env(&read).unwrap_or_else(|why| panic!("{why}")) {
+        Some(s3) => toolsite::runtime::blobs::Blobs {
+            backend: toolsite::runtime::blobs::Backend::S3(s3),
+            max_bytes: max_blob_bytes,
+            max_write_bytes: max_blob_bytes,
+        },
+        None => toolsite::runtime::blobs::Blobs::local(max_blob_bytes),
     };
     // A file a handler or job writes in pieces is held to the blob ceiling
     // unless this says otherwise, in bytes: a job's export may need more
@@ -544,6 +574,155 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// The bucket the environment names, if it names one.
+fn bucket_from_env(read: &dyn Fn(&[&str]) -> Option<String>) -> Result<Option<toolsite::runtime::blobs::S3>, String> {
+    match (read(&["TOOLSITE_BLOB_S3_ENDPOINT", "ENDPOINT"]), read(&["TOOLSITE_BLOB_S3_BUCKET", "BUCKET"])) {
+        (Some(endpoint), Some(bucket)) => {
+            let access_key_id = read(&["TOOLSITE_BLOB_S3_ACCESS_KEY_ID", "ACCESS_KEY_ID"])
+                .ok_or("a blob bucket needs TOOLSITE_BLOB_S3_ACCESS_KEY_ID")?;
+            let secret = read(&["TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY", "SECRET_ACCESS_KEY"])
+                .ok_or("a blob bucket needs TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY")?;
+            let region = read(&["TOOLSITE_BLOB_S3_REGION", "REGION"]).unwrap_or_else(|| "auto".into());
+            let path_style = read(&["TOOLSITE_BLOB_S3_PATH_STYLE"]).is_some_and(|v| v != "0");
+            toolsite::runtime::blobs::S3::new(&endpoint, &bucket, &region, &access_key_id, &secret, path_style).map(Some)
+        }
+        (None, None) => Ok(None),
+        _ => Err("set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET together, or neither".into()),
+    }
+}
+
+/// What both transfer commands need: the database, its schema current
+/// unless the run only compares, with no server running on it, and the
+/// bucket, answering.
+async fn transfer_target(
+    settings: &toolsite::state::Settings,
+    s3: Option<toolsite::runtime::blobs::S3>,
+    ladders: bool,
+) -> Result<(Arc<toolsite::state::pg::Postgres>, toolsite::runtime::blobs::S3, String), String> {
+    use toolsite::state::{pg, runners::Runner};
+    let url = settings.database_url.as_deref().ok_or("set DATABASE_URL to the Postgres database the site moves to or from")?;
+    let key = settings
+        .secret_key
+        .clone()
+        .ok_or("set TOOLSITE_SECRET_KEY: on Postgres every sealed value opens with it (`toolsite key show` prints this site's)")?;
+    toolsite::seal::parse_key(&key)?;
+    let s3 = s3.ok_or("set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET: a Postgres site keeps its files in the bucket")?;
+    let postgres = pg::connect(url, settings.pool_size).await?;
+    if ladders {
+        pg::migrate(&postgres.pool, pg::LADDERS).await?;
+    }
+    let live = Runner::live(&postgres.pool)
+        .await
+        .map_err(|why| format!("{why} (has the database been migrated? run without --verify-only first)"))?;
+    if !live.is_empty() {
+        return Err(format!("a toolsite server is running on this database ({}): stop it first", live.join(", ")));
+    }
+    // A probe under .toolsite/tmp/, so a bucket that refuses writes is
+    // found before anything is copied.
+    let probe = format!(".toolsite/tmp/probe-{}", toolsite::content::slug::random_token(12));
+    s3.object_put(&probe, "probe".into()).await.map_err(|why| format!("the bucket refused a write: {why}"))?;
+    s3.object_delete(&probe).await?;
+    Ok((Arc::new(postgres), s3, key))
+}
+
+/// Prints a run's table and notes; an error when anything differs.
+fn finish(report: toolsite::platform::transfer::Report, done: &str) -> anyhow::Result<()> {
+    print!("{}", report.table());
+    for note in &report.notes {
+        println!("note: {note}");
+    }
+    println!("writes: {}", report.written);
+    match report.differences() {
+        0 => {
+            println!("{done}");
+            Ok(())
+        }
+        n => anyhow::bail!("{n} difference(s) between the two sides"),
+    }
+}
+
+async fn migrate_to_postgres(
+    data_dir: PathBuf,
+    settings: toolsite::state::Settings,
+    s3: Option<toolsite::runtime::blobs::S3>,
+    verify_only: bool,
+) -> anyhow::Result<()> {
+    use toolsite::{platform::transfer, state::Backend};
+    let options = transfer::Options { verify_only, ..Default::default() };
+    let key = settings.secret_key.clone().ok_or_else(|| anyhow::anyhow!("set TOOLSITE_SECRET_KEY (`toolsite key show` prints this site's)"))?;
+    let key_bytes = toolsite::seal::parse_key(&key).map_err(anyhow::Error::msg)?;
+    // The files are read and the key checked before anything is written,
+    // the schema included.
+    let source = transfer::side(data_dir.clone(), Backend::Files, None, None).map_err(anyhow::Error::msg)?;
+    let (prepared, source) = {
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || transfer::prepare(&source, &key_bytes, &options).map(|prepared| (prepared, source)))
+            .await?
+            .map_err(anyhow::Error::msg)?
+    };
+    let verify_only = prepared.verify_only();
+    let (postgres, s3, key) = transfer_target(&settings, s3, !verify_only).await.map_err(anyhow::Error::msg)?;
+    let target = transfer::side(data_dir, Backend::Postgres(postgres), Some(s3), Some(&key)).map_err(anyhow::Error::msg)?;
+    let report = tokio::task::spawn_blocking(move || transfer::migrate(prepared, &source, &target, &options))
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    let done = if verify_only {
+        "both sides match"
+    } else {
+        "migrated: start the server with DATABASE_URL set. Sessions and tokens carried over; file mode now refuses this directory"
+    };
+    finish(report, done)
+}
+
+async fn export_to_files(
+    data_dir: PathBuf,
+    to: Option<PathBuf>,
+    settings: toolsite::state::Settings,
+    s3: Option<toolsite::runtime::blobs::S3>,
+    verify_only: bool,
+) -> anyhow::Result<()> {
+    use toolsite::{platform::transfer, state::Backend};
+    let (postgres, s3, key) = transfer_target(&settings, s3, false).await.map_err(anyhow::Error::msg)?;
+    let target_dir = to.unwrap_or_else(|| data_dir.clone());
+    fs::create_dir_all(&target_dir).await?;
+    let source = transfer::side(data_dir, Backend::Postgres(postgres), Some(s3), Some(&key)).map_err(anyhow::Error::msg)?;
+    let target = transfer::side(target_dir, Backend::Files, None, None).map_err(anyhow::Error::msg)?;
+    let options = transfer::Options { verify_only, ..Default::default() };
+    let report = tokio::task::spawn_blocking(move || transfer::export(&source, &target, &options))
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    let done = if verify_only {
+        "both sides match"
+    } else {
+        "exported: start the server without DATABASE_URL, keeping TOOLSITE_SECRET_KEY and the bucket settings"
+    };
+    finish(report, done)
+}
+
+/// Prints the key in `.site/secret.key`, for TOOLSITE_SECRET_KEY. Only on
+/// this machine's terminal: it is never logged.
+fn show_key(data_dir: &std::path::Path, configured: Option<&str>) -> anyhow::Result<()> {
+    use base64::Engine as _;
+    match toolsite::seal::file_key(data_dir).map_err(anyhow::Error::msg)? {
+        Some(key) => {
+            let text = base64::engine::general_purpose::STANDARD.encode(key);
+            println!("{text}");
+            match configured.map(toolsite::seal::parse_key) {
+                Some(Ok(set)) if set != key => {
+                    eprintln!("note: TOOLSITE_SECRET_KEY is set to another key; this site's values were sealed with the one above")
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        None if configured.is_some() => {
+            eprintln!("this site has no .site/secret.key: it seals with TOOLSITE_SECRET_KEY, which is already set");
+            Ok(())
+        }
+        None => anyhow::bail!("this site has no .site/secret.key yet: nothing has been sealed"),
+    }
 }
 
 /// A boot refusal: logged at error, as the guard worded it (never with a

@@ -949,7 +949,7 @@ pub async fn change_lock(
 
 /// The marker that says old grants were adopted: `.site/grants-adopted`, or
 /// its row in `platform.site_flags`.
-const GRANTS_ADOPTED: &str = "grants-adopted";
+pub(crate) const GRANTS_ADOPTED: &str = "grants-adopted";
 
 /// Turns every per-app grant into a View row on that app, once. The grant
 /// itself stays, because it carries the role the app reads.

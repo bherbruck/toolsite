@@ -10,6 +10,7 @@ pub mod events;
 pub mod leases;
 pub mod pg;
 pub mod rate;
+pub mod rows;
 pub mod runners;
 pub mod tickets;
 

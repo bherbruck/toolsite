@@ -390,3 +390,37 @@ pub(super) async fn an_exchange_spends_its_code_and_cannot_outlive_a_revocation<
         }
     }
 }
+
+/// What the migration commands rest on: every table read whole and written
+/// back changes nothing, a row written over its key replaces it, and a
+/// copied token still answers for its holder.
+pub(super) async fn every_row_comes_back_and_goes_in_as_it_is<S: OAuthStore + Backdoor>(store: Arc<S>) {
+    use crate::state::rows::Cell;
+    let client = registered(&*store).await;
+    let issued = store.issue_tokens(&client, "u1", Some("https://site.test/p/shop/mcp")).await.unwrap();
+    code_for(&*store, &client, "u2", None).await;
+    let read = |store: Arc<S>| async move {
+        let mut all = Vec::new();
+        for table in super::TABLES {
+            let mut rows = store.rows(table).await.unwrap();
+            rows.sort();
+            all.push(rows);
+        }
+        all
+    };
+    let before = read(store.clone()).await;
+    assert_eq!(before.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1, 2]);
+    for (table, rows) in super::TABLES.iter().zip(before.clone()) {
+        store.put_rows(table, rows).await.unwrap();
+    }
+    assert_eq!(read(store.clone()).await, before, "writing every row back changed a table");
+    assert_eq!(
+        store.access_token_grant(&issued.access_token).await,
+        Some(("u1".into(), client.clone(), Some("https://site.test/p/shop/mcp".into())))
+    );
+
+    let mut renamed = before[0][0].clone();
+    renamed[1] = Cell::Text("renamed".into());
+    store.put_rows(&super::TABLES[0], vec![renamed]).await.unwrap();
+    assert_eq!(store.client(&client).await.unwrap().name.as_deref(), Some("renamed"));
+}

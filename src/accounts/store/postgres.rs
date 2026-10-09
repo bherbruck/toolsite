@@ -10,7 +10,13 @@
 //! and the second finds the condition already false.
 
 use super::{AccountStore, PendingRow, ScopeRow, UserRow};
-use crate::{accounts::users::User, state};
+use crate::{
+    accounts::users::User,
+    state::{
+        self,
+        rows::{Row as Cells, Table},
+    },
+};
 use deadpool_postgres::{Object, Pool};
 use tokio_postgres::{error::SqlState, Row};
 
@@ -727,6 +733,23 @@ impl AccountStore for PostgresAccounts {
         self.run(async |c| {
             c.execute("delete from accounts.mfa_pending where user_id = $1", &[&user_id]).await?;
             Ok(())
+        })
+    }
+
+    fn rows(&self, table: &Table) -> Result<Vec<Cells>, String> {
+        self.run(async |c| Ok(c.query(&table.postgres_select("accounts"), &[]).await?.iter().map(|row| table.postgres_row(row)).collect()))
+    }
+
+    fn put_rows(&self, table: &Table, rows: &[Cells]) -> Result<(), String> {
+        let values = rows.iter().map(|row| table.postgres_values(row)).collect::<Result<Vec<_>, _>>()?;
+        self.run(async |c| {
+            let transaction = c.transaction().await?;
+            let statement = transaction.prepare(&table.postgres_upsert("accounts")).await?;
+            for row in &values {
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = row.iter().map(|value| &**value as _).collect();
+                transaction.execute(&statement, &params).await?;
+            }
+            transaction.commit().await
         })
     }
 }

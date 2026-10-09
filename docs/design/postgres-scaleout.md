@@ -655,9 +655,59 @@ difference. The verification is the same code as the import's mapping
   marker. The files were only read, never changed.
 - **After running in Postgres mode:** `toolsite export-to-files` writes
   Postgres and bucket state back into the `DATA_DIR` layout, through the same
-  `state::transfer` mapping, and removes the marker.
+  `state::transfer` mapping, and removes the marker. As built it writes into
+  a new directory (`--to`), not over the old one; see 5.6.
 - A round-trip test (files to Postgres to files) compares the two `DATA_DIR`
   trees and must find them equal, apart from `.tmp/`.
+
+### 5.6 As built (PR 11)
+
+`platform/transfer.rs`, not `state/`: the mapping reads every store, and
+`state` may not reach up into them. A side is a `Config` whose backend says
+where it lives; both directions read a `Snapshot` of each side through the
+store traits, write to the target only what differs, read the target again
+and compare. The stores gained what that needs and nothing else: `rows` and
+`put_rows` over a constant description of every account and OAuth table
+(`state::rows`; the two backends keep the same tables, and a test holds the
+description to both schemas), `Catalog::pages` and `labels`,
+`AppRecords::apps`, `Tokens::dump` and `restore`, `Files::fetch` and
+`trash_names_blocking`.
+
+- Commands: `toolsite migrate-to-postgres [--verify-only]`, `toolsite
+  export-to-files [--verify-only] [--to <dir>]`, `toolsite key show`. No
+  `--dry-run`: `--verify-only` is it.
+- Order: the files are read and the key checked before anything is
+  written, the Postgres ladders included. A key that is not
+  `.site/secret.key`, or that does not open every sealed setting and MFA
+  secret, is refused there. Then the ladders, no live runner, a probe write
+  under `.toolsite/tmp/`, the copy, the compare, the marker (JSON: time and
+  counts per category).
+- Sessions, invitations, pending sign-ins and OAuth codes carry over as
+  rows, so nobody signs in again. Tickets do not (in memory on files).
+  `platform.job_turns` is not copied back: files keep no turns. Removed
+  rows (`platform.removed_pages`, `removed_records`) are not copied either
+  way: the trash entry holds the same records as sidecars.
+- A copy never removes anything from the target; what the target holds
+  beyond the source is reported as "extra". A second run writes nothing.
+  On a migrated directory (marker present) `migrate-to-postgres` only
+  compares, since copying again could undo what changed on Postgres since;
+  removing the marker allows it.
+- Trash: a meta or notes that was a file inside a removed app
+  (`app/index.meta`) is kept as `slug.meta`, where a restore on Postgres
+  reads it. An app's database in the trash stays on the volume.
+- Apps' files on the volume go to the bucket on migration. Export leaves
+  them there: file mode reads them with the same `TOOLSITE_BLOB_S3_*`.
+- `export-to-files` writes the marker into the target while it copies (so
+  no server starts on half a site, and a stopped run resumes) and removes
+  it once the compare finds nothing. A directory holding file-mode state
+  (`auth.db` or `oauth.db`) is refused, the one the site was migrated from
+  included: a copy never removes, so an account, grant or token removed on
+  Postgres since would come back. Rollback is into a new directory with
+  `--to`, which is then served. With `--to`, apps'
+  SQLite databases and those in the trash are copied there from the
+  volume, never over a file already there.
+- Symbolic links under `DATA_DIR` are found by one walk that follows none;
+  anything at or under one is left out, with a warning in the report.
 
 ---
 

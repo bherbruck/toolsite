@@ -194,6 +194,13 @@ pub trait Catalog: Send + Sync {
     /// A one-time marker's value, if it was set.
     async fn flag(&self, name: &str) -> Result<Option<String>, String>;
     async fn set_flag(&self, name: &str, value: &str) -> Result<(), String>;
+
+    /// Every slug the catalog keeps anything for, sorted: a meta, notes,
+    /// or on Postgres a generation. For the migration commands, which copy
+    /// each; the files backend never follows a symbolic link to find one.
+    async fn pages(&self) -> Result<Vec<String>, String>;
+    /// Every host label issued, to its app.
+    async fn labels(&self) -> Result<BTreeMap<String, String>, String>;
 }
 
 /// The catalog this site's backend keeps. Cheap: it holds a path or a pool

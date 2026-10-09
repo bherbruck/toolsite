@@ -163,7 +163,24 @@ async fn run(tokens: Arc<dyn Tokens>) {
     revocation_is_final(&*tokens).await;
     use_is_recorded_at_the_kinds_resolution(&*tokens).await;
     a_token_minted_while_others_are_used_is_never_lost(tokens.clone()).await;
-    a_use_never_brings_back_a_token_revoked_beside_it(tokens).await;
+    a_use_never_brings_back_a_token_revoked_beside_it(tokens.clone()).await;
+    a_copied_token_answers_as_it_did(&*tokens).await;
+}
+
+/// What the migration commands rest on: every token comes out with its
+/// digest, and one put back, or put back twice, answers exactly as before.
+async fn a_copied_token_answers_as_it_did(tokens: &dyn Tokens) {
+    let plain = mint(tokens, "copied", Kind::Deploy, "c1", T0).await;
+    let dumped = tokens.dump(Kind::Deploy).await.unwrap();
+    let (app, token, digest) = dumped.iter().find(|(app, token, _)| app == "copied" && token.id == "c1").unwrap().clone();
+    assert_eq!(digest, hash(&plain));
+    assert!(tokens.dump(Kind::Export).await.unwrap().iter().all(|(app, _, _)| app != "copied"), "a dump crossed kinds");
+    tokens.revoke(&app, Kind::Deploy, "c1").await.unwrap();
+    let used = Token { last_used: Some(T0 + 9), ..token };
+    tokens.restore(&app, Kind::Deploy, &used, &digest).await.unwrap();
+    tokens.restore(&app, Kind::Deploy, &used, &digest).await.unwrap();
+    assert_eq!(tokens.list("copied", Kind::Deploy).await.unwrap(), vec![used.clone()]);
+    assert_eq!(tokens.check("copied", Kind::Deploy, &digest, T0 + 10).await.unwrap().map(|t| t.id), Some("c1".into()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

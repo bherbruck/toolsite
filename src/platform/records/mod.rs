@@ -98,7 +98,15 @@ pub trait AppRecords: Send + Sync {
     /// Nothing is destroyed: files leave their sidecars for the trash to
     /// move; Postgres keeps the rows in `platform.removed_records` besides.
     fn retire_blocking(&self, app: &str, at: u64) -> Result<Vec<(&'static str, String)>, String>;
+
+    /// Every app with any record (settings, tools, migrations, a link or a
+    /// job), sorted: what the migration commands copy. The files backend
+    /// never follows a symbolic link to find one.
+    async fn apps(&self) -> Result<Vec<String>, String>;
 }
+
+/// The sidecars a record lives in on files, by extension.
+pub const EXTENSIONS: [&str; 5] = ["secrets", "tools", "migrations", "repo", "jobs"];
 
 /// The records this site's backend keeps. Cheap: a path or a pool handle.
 pub fn of(config: &Config) -> Arc<dyn AppRecords> {

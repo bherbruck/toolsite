@@ -291,4 +291,22 @@ impl AppRecords for Files {
     fn retire_blocking(&self, _app: &str, _at: u64) -> Result<Vec<(&'static str, String)>, String> {
         Ok(Vec::new())
     }
+
+    async fn apps(&self) -> Result<Vec<String>, String> {
+        let Ok(entries) = std::fs::read_dir(&self.data_dir) else { return Ok(Vec::new()) };
+        let mut apps = std::collections::BTreeSet::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some((app, extension)) = name.rsplit_once('.')
+                && super::EXTENSIONS.contains(&extension)
+                && crate::platform::tokens::valid_app(app)
+            {
+                apps.insert(app.to_string());
+            }
+        }
+        Ok(apps.into_iter().collect())
+    }
 }
