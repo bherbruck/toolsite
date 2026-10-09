@@ -396,8 +396,15 @@ async fn a_handoff_begun_on_one_router_finishes_on_another_on_postgres() {
     let b = runner_config(volume.path(), stores(&pg_b));
 
     app(&a, "members");
-    toolsite::accounts::users::sign_up(&a, "reader@example.com", "correct horse battery").unwrap();
-    let (_, site_token) = toolsite::accounts::users::log_in(&a, "reader@example.com", "correct horse battery").unwrap();
+    // Accounts live in Postgres here too, and an account call blocks its
+    // thread, as it does under spawn_blocking in the server.
+    let accounts = a.clone();
+    let (_, site_token) = tokio::task::spawn_blocking(move || {
+        toolsite::accounts::users::sign_up(&accounts, "reader@example.com", "correct horse battery").unwrap();
+        toolsite::accounts::users::log_in(&accounts, "reader@example.com", "correct horse battery").unwrap()
+    })
+    .await
+    .unwrap();
 
     // The main host is runner A: it mints the code.
     let (host, state, landing) = begin_handoff(&a, "members", &site_token).await;
