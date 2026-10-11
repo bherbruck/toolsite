@@ -360,6 +360,30 @@ async fn the_cache_keeps_no_old_generation(files: &dyn Files, data_dir: &Path) {
     assert!(!app_dir.exists(), "a removed app's cache stayed");
 }
 
+#[tokio::test]
+async fn local_discovery_ignores_non_published_volume_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = Local::new(dir.path().to_path_buf());
+    files.put("note.html", "note".into()).await.unwrap();
+    files.put("shop/index.html", "shop".into()).await.unwrap();
+    files.put("group/page.html", "page".into()).await.unwrap();
+    files.put("shop/assets/main.abc.js", "asset".into()).await.unwrap();
+    // These bypass publish validation, as filesystem housekeeping does.
+    for name in ["lost+found", "group/lost+found", ".site"] {
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        std::fs::write(dir.path().join(name).join("index.html"), "not an app").unwrap();
+    }
+    std::fs::write(dir.path().join("bad name.html"), "not a page").unwrap();
+    let mut slugs = slugs_in(&files).await.unwrap();
+    slugs.sort();
+    assert_eq!(slugs, vec!["group/page", "note", "shop"]);
+    assert_eq!(files.list("").await.unwrap(), files.list_blocking("").unwrap());
+    assert!(files.list("").await.unwrap().iter().all(|entry| super::valid_key(&entry.name)));
+    assert_eq!(files.list("shop/assets").await.unwrap(), vec![Entry { name: "main.abc.js".into(), dir: false }]);
+    assert!(files.list("lost+found").await.is_err(), "direct invalid keys must still be refused");
+    assert!(dir.path().join("lost+found/index.html").is_file(), "housekeeping files must stay untouched");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_local_files_conform() {
     let dir = tempfile::tempdir().unwrap();
