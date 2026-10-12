@@ -707,7 +707,41 @@ description to both schemas), `Catalog::pages` and `labels`,
   SQLite databases and those in the trash are copied there from the
   volume, never over a file already there.
 - Symbolic links under `DATA_DIR` are found by one walk that follows none;
-  anything at or under one is left out, with a warning in the report.
+  anything at or under one is left out, with a warning in the report. So
+  is anything that is neither a file nor a directory (a FIFO is never
+  read). Where leaving a path out would loosen the site, the run is refused
+  instead: anything under `.site/` (an account store, the projects, the
+  labels or the grants-adopted marker read as absent would come back as
+  defaults), any `.meta`, an `app` the trash keeps, and any path a
+  published page or app reads its meta through. `.site/auth.db` or
+  `oauth.db` that exists but is not a file is refused, not read as empty.
+- The database records the copy in `platform.site_flags`
+  (`migrated-from-files`): `copying` before the first write, `done` once
+  both sides match. Every runner refuses to start while it says anything
+  but `done`, from any directory, and an export refuses such a database:
+  until then it holds part of a site (an account without its two-step
+  secret, grants without the marker that they were adopted). With `done`,
+  a run only compares whatever the directory says, so a removed marker or
+  a copy of the directory from before cannot undo what changed on Postgres
+  since; deleting the row allows it. A database with no such row that
+  already holds anything of a site is not copied into.
+- Before a run says it finished (the marker, `done`, or the export's
+  marker removed), it reads the source's platform state again and the
+  runner registry: a change to the source, or a heartbeat from any runner,
+  a stalled one the live check let past included, means a server ran
+  beside the copy, and the run fails instead.
+- An export goes only into a directory that holds nothing of a site (no
+  accounts, metas, tokens, published files, trash, links), unless it
+  resumes its own; one resumed after the site revoked something finds the
+  revoked thing as "extra" and never removes its marker. `--to` inside the
+  data directory, or holding it, is refused.
+- With no `.site/secret.key` and nothing sealed, nothing proves the key:
+  it is taken, and the report says it seals what comes next. The key is
+  held to the boot guard's test of randomness, and `key show` never reads
+  `.site/secret.key` through a link.
+- `--verify-only` and `export-to-files` write nothing to the bucket or the
+  schema; only a migration that copies probes the bucket and applies the
+  ladders.
 
 ---
 

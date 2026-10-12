@@ -661,6 +661,7 @@ impl AccountStore for SqliteAccounts {
     }
 
     fn rows(&self, table: &Table) -> Result<Vec<Cells>, String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         let conn = self.open()?;
         let mut statement = conn.prepare(&table.sqlite_select()).map_err(err)?;
         let rows = statement.query_map([], |row| table.sqlite_row(row)).map_err(err)?;
@@ -668,6 +669,7 @@ impl AccountStore for SqliteAccounts {
     }
 
     fn put_rows(&self, table: &Table, rows: &[Cells]) -> Result<(), String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         let mut conn = self.open()?;
         let transaction = conn.transaction().map_err(err)?;
         {

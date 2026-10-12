@@ -737,10 +737,12 @@ impl AccountStore for PostgresAccounts {
     }
 
     fn rows(&self, table: &Table) -> Result<Vec<Cells>, String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         self.run(async |c| Ok(c.query(&table.postgres_select("accounts"), &[]).await?.iter().map(|row| table.postgres_row(row)).collect()))
     }
 
     fn put_rows(&self, table: &Table, rows: &[Cells]) -> Result<(), String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         let values = rows.iter().map(|row| table.postgres_values(row)).collect::<Result<Vec<_>, _>>()?;
         self.run(async |c| {
             let transaction = c.transaction().await?;

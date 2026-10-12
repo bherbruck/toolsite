@@ -365,6 +365,7 @@ impl OAuthStore for PostgresOAuth {
     }
 
     async fn rows(&self, table: &'static Table) -> Result<Vec<Row>, String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         let conn = self.connection().await?;
         let rows = conn
             .query(&table.postgres_select("oauth"), &[])
@@ -374,6 +375,7 @@ impl OAuthStore for PostgresOAuth {
     }
 
     async fn put_rows(&self, table: &'static Table, rows: Vec<Row>) -> Result<(), String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         let values = rows.iter().map(|row| table.postgres_values(row)).collect::<Result<Vec<_>, _>>()?;
         let mut conn = self.connection().await?;
         let failed = |e: tokio_postgres::Error| why("could not write the OAuth store", &e);

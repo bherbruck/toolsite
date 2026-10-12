@@ -25,6 +25,25 @@ use std::{
 /// directory that had nothing to migrate.
 pub const MARKER: &str = "migrated-to-postgres";
 
+/// The row in `platform.site_flags` that `toolsite migrate-to-postgres`
+/// keeps on the database it copies into: `copying` from before its first
+/// write until both sides compare equal, then `done`. A runner refuses to
+/// start while it says anything but `done`, from any directory: until then
+/// the database holds part of a site, an account without its two-step
+/// secret or a grant without the marker that says it was adopted.
+pub const TRANSFER_FLAG: &str = "migrated-from-files";
+
+/// A `TRANSFER_FLAG` value.
+pub fn transfer_flag(done: bool, at: u64) -> String {
+    serde_json::json!({ "state": if done { "done" } else { "copying" }, "at": at }).to_string()
+}
+
+/// Whether a `TRANSFER_FLAG` value says the copy finished. Anything else,
+/// one that cannot be read included, says it did not.
+pub fn transfer_finished(value: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(value).is_ok_and(|value| value["state"] == "done")
+}
+
 /// The backend a site's platform state lives in, chosen once in `main`.
 #[derive(Clone, Default)]
 pub enum Backend {
@@ -158,18 +177,7 @@ pub fn check(settings: &Settings, data_dir: &Path) -> Result<(), String> {
                     to 32 random bytes in base64 (`openssl rand -base64 32`)"
             .into());
     };
-    let bytes = crate::seal::parse_key(key)?;
-    // 32 random bytes take about 30 distinct values; a key typed by hand,
-    // copied from an example or left as zeros takes a handful. On Postgres
-    // this one key opens every sealed value and every ticket on every
-    // runner, so a guessable one is refused rather than used.
-    let distinct = bytes.iter().collect::<std::collections::HashSet<_>>().len();
-    if distinct < 16 {
-        return Err(format!(
-            "TOOLSITE_SECRET_KEY has only {distinct} distinct bytes in 32, so it was not generated at random: \
-             set it to `openssl rand -base64 32`"
-        ));
-    }
+    strong_key(key)?;
     if !settings.bucket {
         return Err("DATABASE_URL is set but no bucket is: on Postgres apps' files must be shared \
                     between runners, so set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET"
@@ -185,6 +193,23 @@ pub fn check(settings: &Settings, data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `TOOLSITE_SECRET_KEY` as bytes, refused when it was plainly not made at
+/// random. 32 random bytes take about 30 distinct values; a key typed by
+/// hand, copied from an example or left as zeros takes a handful. On
+/// Postgres this one key opens every sealed value and every ticket on every
+/// runner, so a guessable one is refused rather than used.
+pub fn strong_key(key: &str) -> Result<[u8; 32], String> {
+    let bytes = crate::seal::parse_key(key)?;
+    let distinct = bytes.iter().collect::<std::collections::HashSet<_>>().len();
+    if distinct < 16 {
+        return Err(format!(
+            "TOOLSITE_SECRET_KEY has only {distinct} distinct bytes in 32, so it was not generated at random: \
+             set it to `openssl rand -base64 32`"
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Chooses the backend: the guards, then for Postgres the pool and every
 /// ladder. Logs what it chose, the database by host, port and name only.
 pub async fn open(settings: &Settings, data_dir: &Path) -> Result<Backend, String> {
@@ -195,6 +220,14 @@ pub async fn open(settings: &Settings, data_dir: &Path) -> Result<Backend, Strin
     };
     let postgres = pg::connect(url, settings.pool_size).await?;
     let applied = pg::migrate(&postgres.pool, pg::LADDERS).await?;
+    if let Some(value) = pg::site_flag(&postgres.pool, TRANSFER_FLAG).await?
+        && !transfer_finished(&value)
+    {
+        return Err(format!(
+            "toolsite migrate-to-postgres has not finished copying into this database (platform.site_flags \
+             {TRANSFER_FLAG}): run it again with the server stopped until both sides match"
+        ));
+    }
     claim(data_dir)?;
     tracing::info!(
         backend = "postgres",

@@ -374,6 +374,7 @@ impl OAuthStore for SqliteOAuth {
     }
 
     async fn rows(&self, table: &'static Table) -> Result<Vec<Row>, String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         let this = self.clone();
         blocking(move || {
             let conn = this.open()?;
@@ -386,6 +387,7 @@ impl OAuthStore for SqliteOAuth {
     }
 
     async fn put_rows(&self, table: &'static Table, rows: Vec<Row>) -> Result<(), String> {
+        let table = crate::state::rows::described(super::TABLES, table)?;
         let this = self.clone();
         blocking(move || {
             let mut conn = this.open()?;

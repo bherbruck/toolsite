@@ -77,6 +77,19 @@ impl Runner {
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
+    /// Every row of the registry, live or not, as (id, last heartbeat): a
+    /// command that must run with the server stopped reads it before and
+    /// after, since a runner whose heartbeat stalled past `LIVE_FOR` is not
+    /// live by the clock and may still be serving.
+    pub async fn registry(pool: &Pool) -> Result<Vec<(String, i64)>, String> {
+        let client = pool.get().await.map_err(|e| format!("could not reach Postgres: {}", super::pg::chain(&e)))?;
+        let rows = client
+            .query("select id, heartbeat_at from state.runners order by id", &[])
+            .await
+            .map_err(|e| format!("could not read the runner registry: {}", super::pg::chain(&e)))?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
     /// Other runners live at the last heartbeat, by id.
     pub fn peers(&self) -> Vec<String> {
         self.peers.lock().unwrap_or_else(|e| e.into_inner()).clone()

@@ -593,13 +593,14 @@ fn bucket_from_env(read: &dyn Fn(&[&str]) -> Option<String>) -> Result<Option<to
     }
 }
 
-/// What both transfer commands need: the database, its schema current
-/// unless the run only compares, with no server running on it, and the
-/// bucket, answering.
+/// What both transfer commands need: the database, with no server running
+/// on it, and the bucket. With `writes` (a migration that copies), the
+/// schema is brought current and the bucket must take a write; a run that
+/// only reads writes to neither.
 async fn transfer_target(
     settings: &toolsite::state::Settings,
     s3: Option<toolsite::runtime::blobs::S3>,
-    ladders: bool,
+    writes: bool,
 ) -> Result<(Arc<toolsite::state::pg::Postgres>, toolsite::runtime::blobs::S3, String), String> {
     use toolsite::state::{pg, runners::Runner};
     let url = settings.database_url.as_deref().ok_or("set DATABASE_URL to the Postgres database the site moves to or from")?;
@@ -607,10 +608,10 @@ async fn transfer_target(
         .secret_key
         .clone()
         .ok_or("set TOOLSITE_SECRET_KEY: on Postgres every sealed value opens with it (`toolsite key show` prints this site's)")?;
-    toolsite::seal::parse_key(&key)?;
+    toolsite::state::strong_key(&key)?;
     let s3 = s3.ok_or("set TOOLSITE_BLOB_S3_ENDPOINT and TOOLSITE_BLOB_S3_BUCKET: a Postgres site keeps its files in the bucket")?;
     let postgres = pg::connect(url, settings.pool_size).await?;
-    if ladders {
+    if writes {
         pg::migrate(&postgres.pool, pg::LADDERS).await?;
     }
     let live = Runner::live(&postgres.pool)
@@ -621,14 +622,18 @@ async fn transfer_target(
     }
     // A probe under .toolsite/tmp/, so a bucket that refuses writes is
     // found before anything is copied.
-    let probe = format!(".toolsite/tmp/probe-{}", toolsite::content::slug::random_token(12));
-    s3.object_put(&probe, "probe".into()).await.map_err(|why| format!("the bucket refused a write: {why}"))?;
-    s3.object_delete(&probe).await?;
+    if writes {
+        let probe = format!(".toolsite/tmp/probe-{}", toolsite::content::slug::random_token(12));
+        s3.object_put(&probe, "probe".into()).await.map_err(|why| format!("the bucket refused a write: {why}"))?;
+        s3.object_delete(&probe).await?;
+    }
     Ok((Arc::new(postgres), s3, key))
 }
 
-/// Prints a run's table and notes; an error when anything differs.
+/// Prints a run's table and notes; an error when anything differs. `done`
+/// is what a copy that finished says.
 fn finish(report: toolsite::platform::transfer::Report, done: &str) -> anyhow::Result<()> {
+    let done = if report.compared_only { "both sides match" } else { done };
     print!("{}", report.table());
     for note in &report.notes {
         println!("note: {note}");
@@ -662,18 +667,15 @@ async fn migrate_to_postgres(
             .await?
             .map_err(anyhow::Error::msg)?
     };
-    let verify_only = prepared.verify_only();
-    let (postgres, s3, key) = transfer_target(&settings, s3, !verify_only).await.map_err(anyhow::Error::msg)?;
+    let (postgres, s3, key) = transfer_target(&settings, s3, !prepared.verify_only()).await.map_err(anyhow::Error::msg)?;
     let target = transfer::side(data_dir, Backend::Postgres(postgres), Some(s3), Some(&key)).map_err(anyhow::Error::msg)?;
     let report = tokio::task::spawn_blocking(move || transfer::migrate(prepared, &source, &target, &options))
         .await?
         .map_err(anyhow::Error::msg)?;
-    let done = if verify_only {
-        "both sides match"
-    } else {
-        "migrated: start the server with DATABASE_URL set. Sessions and tokens carried over; file mode now refuses this directory"
-    };
-    finish(report, done)
+    finish(
+        report,
+        "migrated: start the server with DATABASE_URL set. Sessions and tokens carried over; file mode now refuses this directory",
+    )
 }
 
 async fn export_to_files(
@@ -693,12 +695,7 @@ async fn export_to_files(
     let report = tokio::task::spawn_blocking(move || transfer::export(&source, &target, &options))
         .await?
         .map_err(anyhow::Error::msg)?;
-    let done = if verify_only {
-        "both sides match"
-    } else {
-        "exported: start the server without DATABASE_URL, keeping TOOLSITE_SECRET_KEY and the bucket settings"
-    };
-    finish(report, done)
+    finish(report, "exported: start the server without DATABASE_URL, keeping TOOLSITE_SECRET_KEY and the bucket settings")
 }
 
 /// Prints the key in `.site/secret.key`, for TOOLSITE_SECRET_KEY. Only on

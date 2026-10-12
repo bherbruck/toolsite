@@ -38,6 +38,17 @@ pub struct Table {
     pub columns: &'static [(&'static str, Kind)],
 }
 
+/// The constant description in `tables` that `table` matches by name, key
+/// and columns. A store builds its statements from what this returns, never
+/// from what it was handed, so a description made at run time (a name
+/// taken from a row, say) never reaches SQL.
+pub fn described<'a>(tables: &'a [Table], table: &Table) -> Result<&'a Table, String> {
+    tables
+        .iter()
+        .find(|known| known.name == table.name && known.key == table.key && known.columns == table.columns)
+        .ok_or_else(|| format!("{:?} is not a table this store copies", table.name))
+}
+
 impl Table {
     fn names(&self) -> String {
         self.columns.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ")
@@ -218,6 +229,21 @@ mod tests {
         }
         let count: i64 = conn.query_row("select count(*) from mfa_failures", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// A description with a name or a column the stores do not have is
+    /// refused before any statement is built from it: what reaches SQL is
+    /// only ever the constant.
+    #[test]
+    fn only_a_constant_description_reaches_a_statement() {
+        const TABLES: &[Table] = &[KEYED, LOOSE];
+        assert!(std::ptr::eq(described(TABLES, &KEYED).unwrap(), &TABLES[0]));
+        let hostile = Table { name: "pins; drop table users; --", key: KEYED.key, columns: KEYED.columns };
+        assert!(described(TABLES, &hostile).is_err());
+        let extra = Table { name: "pins", key: KEYED.key, columns: &[("user_id", Kind::Text), ("app", Kind::Text), ("password_hash", Kind::Text)] };
+        assert!(described(TABLES, &extra).is_err());
+        let rekeyed = Table { name: "pins", key: &["app"], columns: KEYED.columns };
+        assert!(described(TABLES, &rekeyed).is_err());
     }
 
     #[test]

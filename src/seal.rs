@@ -127,9 +127,15 @@ pub fn open_with(key: &[u8; 32], stored: &str) -> Option<String> {
 }
 
 /// The key this site keeps in `.site/secret.key`, when it made one: what
-/// `toolsite key show` prints and the migration compares.
+/// `toolsite key show` prints and the migration compares. Never through a
+/// link: what one points at is not this site's key, and printing it would
+/// print whatever it was.
 pub fn file_key(data_dir: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
-    match std::fs::read(data_dir.join(".site").join("secret.key")) {
+    let path = data_dir.join(".site").join("secret.key");
+    if std::fs::symlink_metadata(&path).is_ok_and(|found| !found.is_file()) {
+        return Err(".site/secret.key is a symbolic link or not a plain file: put the key itself there".into());
+    }
+    match std::fs::read(&path) {
         Ok(bytes) => <[u8; 32]>::try_from(bytes.as_slice())
             .map(Some)
             .map_err(|_| ".site/secret.key is not a 32-byte key".to_string()),

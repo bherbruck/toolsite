@@ -89,6 +89,13 @@ impl Database {
         Stores::new(Backend::Postgres(self.postgres.clone()), None, Some(&secret_key())).unwrap()
     }
 
+    /// The URL a runner would be given for this database.
+    pub fn url(&self) -> String {
+        let mut url = url::Url::parse(&std::env::var("TOOLSITE_TEST_DATABASE_URL").expect(NEEDS)).unwrap();
+        url.set_path(&self.name);
+        url.to_string()
+    }
+
     /// Where a Postgres site on this database keeps files: its bucket.
     pub fn blobs(&self) -> Blobs {
         blobs_in(&self.bucket)

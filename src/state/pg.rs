@@ -334,6 +334,17 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// One row of `platform.site_flags`, read before anything else uses the
+/// database: the boot guard asks whether a migration into it finished.
+pub async fn site_flag(pool: &Pool, name: &str) -> Result<Option<String>, String> {
+    let client = pool.get().await.map_err(|e| format!("could not reach Postgres: {}", chain(&e)))?;
+    let row = client
+        .query_opt("select value from platform.site_flags where name = $1", &[&name])
+        .await
+        .map_err(|e| format!("could not read platform.site_flags: {}", chain(&e)))?;
+    Ok(row.map(|row| row.get(0)))
+}
+
 /// Applies every pending step of every ladder, each in its own transaction,
 /// while holding the migration lock: runners booting together queue on it,
 /// and each one after the first finds nothing left to do. Returns the steps
@@ -528,6 +539,58 @@ mod tests {
         assert!(why.to_lowercase().contains("refused"), "{why}");
     }
 
+    const CALLS: &[&str] = &[
+        ".query(", ".query_opt(", ".query_one(", ".query_raw(", ".query_typed(", ".query_typed_raw(",
+        ".execute(", ".execute_raw(", ".batch_execute(", ".simple_query(", ".prepare(",
+        ".prepare_cached(", ".prepare_typed(", ".copy_in(", ".copy_out(",
+    ];
+    // (file, the name passed, how many times). `step` is a ladder step,
+    // `include_str!` of a migration; each `sql` is chosen from string
+    // literals a line or two above; `table` is one of the constant table
+    // descriptions the migration commands copy (`state::rows`), whose
+    // statements name only its own columns, and `statement` is one
+    // prepared from it.
+    const NAMED: &[(&str, &str, usize)] = &[
+        ("state/pg.rs", "step", 1),
+        ("accounts/store/postgres.rs", "sql", 1),
+        ("accounts/store/postgres.rs", "table", 2),
+        ("accounts/store/postgres.rs", "statement", 1),
+        ("platform/oauth_store/postgres.rs", "sql", 1),
+        ("platform/oauth_store/postgres.rs", "table", 2),
+        ("platform/oauth_store/postgres.rs", "statement", 1),
+    ];
+
+    /// The statements a source file sends, checked: each a literal, or a
+    /// name `NAMED` allows that file exactly as often as it says. The count
+    /// of statements, or the first that is neither.
+    fn literal_statements(name: &str, source: &str) -> Result<usize, String> {
+        // Code below a file's own `mod tests` is the file's tests.
+        let source = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let mut named: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut statements = 0;
+        for call in CALLS {
+            for (at, _) in source.match_indices(call) {
+                let argument = source[at + call.len()..].trim_start();
+                statements += 1;
+                if argument.starts_with('"') || argument.starts_with("r\"") || argument.starts_with("r#\"") {
+                    continue;
+                }
+                let ident: String =
+                    argument.trim_start_matches('&').chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if ident.is_empty() || !NAMED.iter().any(|(file, allowed, _)| *file == name && *allowed == ident) {
+                    return Err(format!("{name}: a statement that is not a literal: {}", &source[at..(at + 120).min(source.len())]));
+                }
+                *named.entry(ident).or_default() += 1;
+            }
+        }
+        for (file, allowed, count) in NAMED {
+            if *file == name && named.get(*allowed).copied().unwrap_or(0) != *count {
+                return Err(format!("{name}: calls passing `{allowed}` changed"));
+            }
+        }
+        Ok(statements)
+    }
+
     /// Every statement any Postgres store sends is a literal, so a value can
     /// only ever arrive as a bound parameter. Every source file that reaches
     /// Postgres is found, not listed, so a new store is scanned the day it
@@ -537,26 +600,6 @@ mod tests {
     /// to be looked at and added here.
     #[test]
     fn every_postgres_statement_in_every_store_is_a_literal() {
-        const CALLS: &[&str] = &[
-            ".query(", ".query_opt(", ".query_one(", ".query_raw(", ".query_typed(", ".query_typed_raw(",
-            ".execute(", ".execute_raw(", ".batch_execute(", ".simple_query(", ".prepare(",
-            ".prepare_cached(", ".prepare_typed(", ".copy_in(", ".copy_out(",
-        ];
-        // (file, the name passed, how many times). `step` is a ladder step,
-        // `include_str!` of a migration; each `sql` is chosen from string
-        // literals a line or two above; `table` is one of the constant table
-        // descriptions the migration commands copy (`state::rows`), whose
-        // statements name only its own columns, and `statement` is one
-        // prepared from it.
-        const NAMED: &[(&str, &str, usize)] = &[
-            ("state/pg.rs", "step", 1),
-            ("accounts/store/postgres.rs", "sql", 1),
-            ("accounts/store/postgres.rs", "table", 2),
-            ("accounts/store/postgres.rs", "statement", 1),
-            ("platform/oauth_store/postgres.rs", "sql", 1),
-            ("platform/oauth_store/postgres.rs", "table", 2),
-            ("platform/oauth_store/postgres.rs", "statement", 1),
-        ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         let mut stack = vec![root.clone()];
@@ -582,31 +625,7 @@ mod tests {
             if !(source.contains("deadpool_postgres") || source.contains("tokio_postgres")) {
                 continue;
             }
-            // Code below a file's own `mod tests` is the file's tests.
-            let source = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-            let mut named: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            for call in CALLS {
-                for (at, _) in source.match_indices(call) {
-                    let argument = source[at + call.len()..].trim_start();
-                    statements += 1;
-                    if argument.starts_with('"') || argument.starts_with("r\"") || argument.starts_with("r#\"") {
-                        continue;
-                    }
-                    let ident: String =
-                        argument.trim_start_matches('&').chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                    assert!(
-                        !ident.is_empty() && NAMED.iter().any(|(file, allowed, _)| *file == name && *allowed == ident),
-                        "{name}: a statement that is not a literal: {}",
-                        &source[at..(at + 120).min(source.len())]
-                    );
-                    *named.entry(ident).or_default() += 1;
-                }
-            }
-            for (file, allowed, count) in NAMED {
-                if *file == name {
-                    assert_eq!(named.get(*allowed).copied().unwrap_or(0), *count, "{name}: calls passing `{allowed}` changed");
-                }
-            }
+            statements += literal_statements(&name, &source).unwrap_or_else(|why| panic!("{why}"));
             scanned.push(name);
         }
         scanned.sort();
@@ -614,6 +633,28 @@ mod tests {
             assert!(scanned.iter().any(|f| f == expected), "{expected} was not scanned: {scanned:?}");
         }
         assert!(statements > 80, "the scan found only {statements} statements");
+    }
+
+    /// The scan is only as good as what it catches. A statement built with
+    /// `format!` is caught in any file, the ones allowed a table description
+    /// included; a description's statement is caught in a file not allowed
+    /// one; and one more call passing a description, where some are
+    /// allowed, is caught by the count.
+    #[test]
+    fn the_literal_scan_catches_a_planted_statement() {
+        let formatted = "c.query(&format!(\"select * from {table}\"), &[]).await";
+        for file in ["platform/records/postgres.rs", "accounts/store/postgres.rs", "platform/oauth_store/postgres.rs"] {
+            assert!(literal_statements(file, formatted).is_err(), "{file}: format! passed");
+        }
+        let built = "c.query(&table.postgres_select(\"accounts\"), &[]).await";
+        assert!(literal_statements("platform/records/postgres.rs", built).is_err(), "a description passed where none is allowed");
+        let real = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/accounts/store/postgres.rs")).unwrap();
+        let (before, after) = real.split_once("#[cfg(test)]\nmod tests").map_or((real.as_str(), ""), |(a, b)| (a, b));
+        assert!(literal_statements("accounts/store/postgres.rs", &real).is_ok());
+        let planted = format!("{before}\nfn more(c: &Client, table: &Table) {{ c.query(&table.postgres_select(\"accounts\"), &[]); }}\n#[cfg(test)]\nmod tests{after}");
+        assert!(literal_statements("accounts/store/postgres.rs", &planted).is_err(), "a third table statement passed");
+        let renamed = "c.query(&table_from_request, &[]).await";
+        assert!(literal_statements("accounts/store/postgres.rs", renamed).is_err(), "a name that starts like an allowed one passed");
     }
 
     /// Advisory locks share one key space per database. Every class is a

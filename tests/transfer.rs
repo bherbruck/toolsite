@@ -665,3 +665,214 @@ fn key_show_prints_the_sites_key() {
         .unwrap();
     assert!(!out.status.success() && out.stdout.is_empty(), "a key was printed for a site with none");
 }
+
+// --- revocations, and what may run beside a copy ---------------------------------
+
+/// What the revocations made on the file-mode site answer on another site:
+/// each must still be refused.
+struct Refusals {
+    disabled: String,
+    revoked_deploy: String,
+    revoked_oauth: String,
+    retired: String,
+}
+
+async fn revoke_on_files(built: &Built) -> Refusals {
+    let config = &built.config;
+    users::sign_up(config, "left@example.com", PASSWORD).unwrap();
+    users::set_active(config, "left@example.com", false).unwrap();
+    let (revoked, revoked_deploy) = tokens::create(config, "orders", Kind::Deploy, "old ci", "ci").await.unwrap();
+    tokens::revoke(config, "orders", Kind::Deploy, &revoked.id).await.unwrap();
+    let (_, retired) = tokens::create(config, "not-yet", Kind::Deploy, "early", "someone").await.unwrap();
+    common::blocking(|| toolsite::platform::trash::retire_tokens(config, "not-yet", 1_800_000_100)).unwrap();
+    let viewer = users::user_by_email(config, "viewer@example.com").unwrap();
+    let client = toolsite::platform::oauth_store::register_client(config, Some("Old"), &["https://o.test/cb".into()]).unwrap();
+    let issued = toolsite::platform::oauth_store::issue_tokens(config, &client.id, &viewer.id, None).unwrap();
+    toolsite::platform::oauth_store::revoke_for_user(config, &viewer.id).unwrap();
+    // A recovery code spent before the move.
+    assert!(sign_in(config, "admin@example.com", &built.recovery[1]).await.is_ok());
+    Refusals { disabled: "left@example.com".into(), revoked_deploy, revoked_oauth: issued.access_token, retired }
+}
+
+async fn assert_refused(config: &Arc<Config>, built: &Built, refusals: &Refusals, side: &str) {
+    assert!(common::blocking(|| users::check_password(config, &refusals.disabled, PASSWORD)).is_err(), "{side}: a disabled account signs in");
+    assert!(tokens::check(config, "orders", Kind::Deploy, &refusals.revoked_deploy).await.is_none(), "{side}: a revoked token opens");
+    assert!(tokens::check(config, "not-yet", Kind::Deploy, &refusals.retired).await.is_none(), "{side}: a retired token opens");
+    assert!(
+        common::blocking(|| toolsite::platform::oauth_store::access_token_holder(config, &refusals.revoked_oauth)).is_none(),
+        "{side}: a revoked OAuth token opens"
+    );
+    assert!(sign_in(config, "admin@example.com", &built.recovery[1]).await.is_err(), "{side}: a spent recovery code worked");
+    assert_eq!(get(config, "/p/gone/", None).await.status, StatusCode::NOT_FOUND, "{side}: a removed app came back");
+    assert!(tokens::check(config, "orders", Kind::Export, &built.export_token).await.is_some(), "{side}: a live token was lost");
+}
+
+/// Every revocation made on files is one on Postgres after the move, and
+/// on files again after the way back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn revocations_stay_revoked_both_ways_on_postgres() {
+    let (dir, back) = (SiteDir::new(), tempfile::tempdir().unwrap());
+    let built = build(dir.path()).await;
+    let refusals = revoke_on_files(&built).await;
+    let database = common::Database::new().await;
+    let target = postgres_site(dir.path(), &database);
+    let report = migrate(&built.config, &target, Options::default()).await.unwrap();
+    assert_eq!(differences(&report), Vec::<String>::new(), "{}", report.table());
+    assert_refused(&target, &built, &refusals, "postgres").await;
+    let returned = files_site(back.path());
+    let report = export(&target, &returned, Options::default()).await.unwrap();
+    assert_eq!(differences(&report), Vec::<String>::new(), "{}", report.table());
+    assert_refused(&returned, &built, &refusals, "files again").await;
+    database.drop().await;
+}
+
+/// Once a database was migrated into, a second copy never runs over it,
+/// whatever the directory says: what changed on Postgres since (an account
+/// turned off, a token revoked) stays changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_database_migrated_into_is_never_copied_over_on_postgres() {
+    let dir = SiteDir::new();
+    let built = build(dir.path()).await;
+    let database = common::Database::new().await;
+    let target = postgres_site(dir.path(), &database);
+    migrate(&built.config, &target, Options::default()).await.unwrap();
+    common::blocking(|| users::set_active(&target, "viewer@example.com", false)).unwrap();
+    tokens::revoke_all(&target, "orders", Kind::Export).await.unwrap();
+
+    // The marker gone, or a copy of the directory from before: either way
+    // the directory alone no longer says it moved.
+    std::fs::remove_file(dir.path().join(".site").join(state::MARKER)).unwrap();
+    let again = migrate(&built.config, &target, Options::default()).await.unwrap();
+    assert!(again.compared_only && again.written == 0, "{}", again.table());
+    assert!(again.notes.iter().any(|note| note.contains("migrated into already")), "{:?}", again.notes);
+    assert!(!differences(&again).is_empty(), "the changes on Postgres were not seen");
+    assert!(common::blocking(|| users::check_password(&target, "viewer@example.com", PASSWORD)).is_err(), "the account came back");
+    assert!(tokens::check(&target, "orders", Kind::Export, &built.export_token).await.is_none(), "the token came back");
+    database.drop().await;
+}
+
+/// A database holding a site of its own is not copied into: the two would
+/// be merged, and what that site revoked overwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_database_holding_a_site_is_not_copied_into_on_postgres() {
+    let dir = SiteDir::new();
+    let built = build(dir.path()).await;
+    let database = common::Database::new().await;
+    let target = postgres_site(dir.path(), &database);
+    // Another site's admin, turned off there; the files hold the same email.
+    common::blocking(|| users::sign_up_as(&target, "viewer@example.com", PASSWORD, false)).unwrap();
+    common::blocking(|| users::set_active(&target, "viewer@example.com", false)).unwrap();
+    let before = everything(&database).await;
+    let why = migrate(&built.config, &target, Options::default()).await.expect_err("copied into a site");
+    assert!(why.contains("already holds a site") && why.contains("accounts"), "{why}");
+    assert_eq!(everything(&database).await, before, "a refused run wrote");
+    assert!(!dir.path().join(".site").join(state::MARKER).exists());
+    database.drop().await;
+}
+
+/// From the first write until both sides match, no runner starts on the
+/// database, from any directory, and it is not exported: it holds an
+/// account without its two-step secret, or grants without the marker that
+/// they were adopted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn no_runner_starts_on_a_half_migrated_database_on_postgres() {
+    let (dir, elsewhere, back) = (SiteDir::new(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let built = build(dir.path()).await;
+    let database = common::Database::new().await;
+    let target = postgres_site(dir.path(), &database);
+    let settings = state::Settings { database_url: Some(database.url()), secret_key: Some(common::secret_key()), bucket: true, pool_size: 2 };
+    state::open(&settings, elsewhere.path()).await.map(|_| ()).expect("a fresh database was refused");
+    std::fs::remove_file(elsewhere.path().join(".site").join(state::MARKER)).unwrap();
+
+    let stopped = migrate(&built.config, &target, Options { fail_after: Some(5), ..Options::default() }).await;
+    assert!(stopped.is_err());
+    let why = state::open(&settings, elsewhere.path()).await.map(|_| ()).expect_err("a runner started on half a site");
+    assert!(why.contains("has not finished"), "{why}");
+    assert!(!elsewhere.path().join(".site").join(state::MARKER).exists(), "a refused boot claimed the directory");
+    let returned = Arc::new(transfer::side(back.path().to_path_buf(), Backend::Files, None, None).unwrap());
+    let why = export(&target, &returned, Options::default()).await.expect_err("half a site was exported");
+    assert!(why.contains("has not finished"), "{why}");
+
+    let finished = migrate(&built.config, &target, Options::default()).await.unwrap();
+    assert_eq!(differences(&finished), Vec::<String>::new(), "{}", finished.table());
+    state::open(&settings, elsewhere.path()).await.map(|_| ()).expect("a migrated database was refused");
+    database.drop().await;
+}
+
+/// A runner whose heartbeat stalled past the live window is not live by
+/// the clock, and gets past the check at the start. If it beats again
+/// while the copy runs, the run does not say it finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_runner_beating_during_the_copy_stops_it_finishing_on_postgres() {
+    let dir = SiteDir::new();
+    let built = build(dir.path()).await;
+    let database = common::Database::new().await;
+    let target = postgres_site(dir.path(), &database);
+    let client = database.postgres.pool.get().await.unwrap();
+    client
+        .execute(
+            "insert into state.runners (id, roles, pool, started_at, heartbeat_at) values ('stalled', '{control,worker}', 'default', 1, 1)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(state::runners::Runner::live(&database.postgres.pool).await.unwrap().is_empty(), "the stalled runner counts as live");
+    let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let beat = {
+        let (pool, beating) = (database.postgres.pool.clone(), beating.clone());
+        tokio::spawn(async move {
+            let mut at = 2i64;
+            while beating.load(std::sync::atomic::Ordering::SeqCst) {
+                let client = pool.get().await.unwrap();
+                client.execute("update state.runners set heartbeat_at = $1 where id = 'stalled'", &[&at]).await.unwrap();
+                at += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let why = migrate(&built.config, &target, Options::default()).await.expect_err("finished beside a running server");
+    assert!(why.contains("heartbeat") && why.contains("stalled"), "{why}");
+    assert!(!dir.path().join(".site").join(state::MARKER).exists(), "marked beside a running server");
+    beating.store(false, std::sync::atomic::Ordering::SeqCst);
+    beat.await.unwrap();
+    let finished = migrate(&built.config, &target, Options::default()).await.unwrap();
+    assert_eq!(differences(&finished), Vec::<String>::new(), "{}", finished.table());
+    database.drop().await;
+}
+
+/// A value Postgres will not hold (a NUL in a text column, which SQLite
+/// keeps) stops the copy part way. What was written is never served: the
+/// database stays marked as being copied into until a run finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn a_value_postgres_refuses_leaves_no_half_site_to_serve_on_postgres() {
+    let (dir, elsewhere) = (SiteDir::new(), tempfile::tempdir().unwrap());
+    let built = build(dir.path()).await;
+    let admin = users::user_by_email(&built.config, "admin@example.com").unwrap();
+    let auth = rusqlite::Connection::open(dir.path().join(".site/auth.db")).unwrap();
+    auth.execute(
+        "insert into mfa_pending (token_hash, user_id, stage, next, expires_at, failures) values (?1, ?2, 'code', '/', 9999999999, 0)",
+        rusqlite::params!["nul\u{0}hash", admin.id],
+    )
+    .unwrap();
+    let database = common::Database::new().await;
+    let target = postgres_site(dir.path(), &database);
+    let why = migrate(&built.config, &target, Options::default()).await.expect_err("Postgres took a NUL");
+    assert!(why.to_lowercase().contains("0x00") || why.contains("invalid"), "{why}");
+    let settings = state::Settings { database_url: Some(database.url()), secret_key: Some(common::secret_key()), bucket: true, pool_size: 2 };
+    let refused = state::open(&settings, elsewhere.path()).await.map(|_| ()).expect_err("a runner started on part of a site");
+    assert!(refused.contains("has not finished"), "{refused}");
+    assert!(!dir.path().join(".site").join(state::MARKER).exists());
+
+    auth.execute("delete from mfa_pending where token_hash = ?1", ["nul\u{0}hash"]).unwrap();
+    let finished = migrate(&built.config, &target, Options::default()).await.unwrap();
+    assert_eq!(differences(&finished), Vec::<String>::new(), "{}", finished.table());
+    state::open(&settings, elsewhere.path()).await.map(|_| ()).expect("a migrated database was refused");
+    database.drop().await;
+}
+
