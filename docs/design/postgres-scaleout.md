@@ -1,7 +1,8 @@
 # Postgres scale-out: design note
 
-Status: proposal for step 1, with the seams for steps 2 to 5. Written against
-`main` at `e8bce6d`. Nothing here is built yet.
+Status: step 1 is built (PRs 1 to 11) and tried in the container (PR 12,
+section 9); steps 2 to 5 are proposals. Written against `main` at
+`e8bce6d`; the "As built" notes record where the build departed from it.
 
 The approved plan has four steps:
 
@@ -1091,6 +1092,115 @@ row is one PR, in order.
 | E7 | Draining and container trial | SIGTERM handling on edge and worker; compose file with two edges, two workers, one control; Railway notes | Draining tests; the whole set tried in the container | 1.5 days |
 
 About 12 agent-days.
+
+---
+
+## 9. Trial (PR 12)
+
+Run on 2026-10-12 against `main` at `b36e2a2` plus the export fix below,
+in the image the `Dockerfile` builds (`debian:bookworm-slim`), with
+`postgres:16` and `cgr.dev/chainguard/minio` on one Docker network. Every
+toolsite volume was given a `lost+found` directory at its root, mode 700,
+owned by root, as a Railway (ext4) volume has. The driver was a small
+Python script over plain HTTP: the same requests a browser, an MCP client
+and a CI job send.
+
+### 9.1 Setup
+
+```
+docker network create trial12-net
+for v in trial12-files trial12-a trial12-b trial12-back; do
+  docker volume create $v
+  docker run --rm -v $v:/data --entrypoint sh toolsite-trial12 -c 'mkdir -m 700 /data/lost+found'
+done
+docker run -d --name trial12-pg --network trial12-net -e POSTGRES_USER=toolsite \
+  -e POSTGRES_DB=toolsite -e POSTGRES_PASSWORD=$PGPASS postgres:16
+docker run -d --name trial12-minio --network trial12-net -e MINIO_ROOT_USER=toolsite \
+  -e MINIO_ROOT_PASSWORD=$PGPASS cgr.dev/chainguard/minio:latest server /data
+docker run --rm --network trial12-net -e MC_HOST_local=http://toolsite:$PGPASS@trial12-minio:9000 \
+  cgr.dev/chainguard/minio-client:latest mb --ignore-existing local/toolsite
+
+DBURL="postgres://toolsite:$PGPASS@trial12-pg:5432/toolsite?sslmode=disable"
+S3="-e TOOLSITE_BLOB_S3_ENDPOINT=http://trial12-minio:9000 -e TOOLSITE_BLOB_S3_BUCKET=toolsite
+    -e TOOLSITE_BLOB_S3_ACCESS_KEY_ID=toolsite -e TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY=$PGPASS
+    -e TOOLSITE_BLOB_S3_PATH_STYLE=1"
+```
+
+### 9.2 Results
+
+| Step | What was done | Result | Time |
+|---|---|---|---|
+| a | File-mode site: `docker run ... -v trial12-files:/data -e TOOLSITE_MCP_TOKEN=... -e TOOLSITE_BASE_URL=...` | Pass | ready 0.34 s after `run` |
+| a | `toolsite user add admin@trial.test --admin`, the setup link, forced two-step setup with a TOTP code | Pass: held at `/auth/mfa/setup`, session after the code, ten recovery codes | |
+| a | `static-report` (static), `orders` (handler, migrations, row policies, tools) and `kitchen-sink` (handler, two migrations, the `heartbeat` job): manifest and migrations from `GET /examples/<name>.tar.gz`, handler and web root from `tests/fixtures/examples/` (no npm or wasm toolchain in the trial), source as the served tarball; through `create_upload` and `PUT ?migrations`, `?manifest`, `?handler`, `?bundle`, `?source` | Pass | 0.01 s, 0.07 s, 0.07 s |
+| a | A row in `orders` (`run_sql`), setting `GREETING` on `kitchen-sink`, a file through its handler's upload URL (local blob store), the heartbeat run once, export token on `orders`, deploy token on `static-report`, device token on `kitchen-sink`, project `farm` with `orders` moved into it | Pass; export served 32 KB, `/api/settings` said `greeting_set: true` | |
+| b | `docker stop`; `toolsite key show` on the volume | Pass | |
+| b | `migrate-to-postgres --verify-only` on an empty database | Refused: "relation state.runners does not exist (has the database been migrated? run without --verify-only first)" | 0.33 s |
+| b | `migrate-to-postgres` with a random `TOOLSITE_SECRET_KEY` | Refused before any write: "TOOLSITE_SECRET_KEY is not the key in .site/secret.key ... Nothing was written"; no schema created | |
+| b | `docker run --rm --network trial12-net -v trial12-files:/data -e DATABASE_URL=$DBURL -e TOOLSITE_SECRET_KEY=$KEY $S3 toolsite-trial12 toolsite migrate-to-postgres` | Pass: 29 categories, 0 differences, 37 writes (1 account, 4 sessions, MFA row, 10 recovery codes, 3 pages, project, marker, setting, 2 tool sets, 2 ladders, job, 3 tokens, 15 published files, 1 app file to the bucket). `lost+found` ignored | 0.73 s |
+| b | The same again | Pass: "compared only", 0 writes, both sides match | 0.38 s |
+| b | The file-mode container started again on the migrated volume | Refused: "this data directory moved to Postgres" | |
+| c | Runners A (`:18812`) and B (`:18813`), each on its own empty volume (only `lost+found`), `DATABASE_URL`, the key, the bucket, `TOOLSITE_RUNNER_ADDRESS` | Pass: both in `state.runners`; within one heartbeat each logged at error that another runner is live and app databases are refused | ready 0.35 s, 0.31 s |
+| d | The file-mode session cookie on A and on B | Pass: signed in on both | |
+| d | Password, then a TOTP code on A; the same code on B; a recovery code on B; the same recovery code on A | Pass: A signs in; B refuses the spent step (401); B signs in with the recovery code; A refuses it (401). One replay guard for both runners | |
+| d | Every app on both runners: pages, a hashed asset, `kitchen-sink/status`, the setting through `/api/settings`, the migrated file read back through the handler | Pass on both; the setting opens (same key), the file comes from the bucket | |
+| d | Anything that opens an app's SQLite database on either runner (`orders` tools, `kitchen-sink` file list) | Refused by design with two live runners: the handler gets "another toolsite runner is live on this database ...; app databases are SQLite files on one volume" | |
+| d | Job: `app_jobs` on A adds `tick`, `*/5 * * * * *`, path `/status` (which tolerates a refused database); 70 s watched | Pass: 15 turns, 15 runs, every turn exactly once, 10 on A and 5 on B; one row in `platform.job_turns`. The manifest's `heartbeat` fired at 17:50:00 on one runner and recorded 400 (its insert was refused) | |
+| d | `PUT /deploy/static-report?bundle` with the deploy token on A, then `GET` on B | Pass: B served the new page on its next request | 21 ms after the PUT |
+| d | The same token for `orders` | Refused, 401 | |
+| d | `GET /export/orders.sqlite` with the export token, on A and on B | **Bug**: 500 "could not snapshot the database". Fixed: 503, `Retry-After: 30`, a plain reason (below) | |
+| d | `set_visibility hidden` on B, `GET` on A; then unhidden | Pass: A answered 404, then 200 again | 4 ms after the call |
+| d | Device tokens, projects and settings listed through B's MCP | Pass: as made on files | |
+| d | B stopped (`docker stop`, SIGTERM); export on A, whose volume holds no app databases | B left the registry at once; A was alone 3 s later. Export said 404 "this app has no database yet" and `orders` "has no database yet": nothing created an empty database in the volume's place | |
+| d | A replaced by a runner on the volume the site was migrated from (`trial12-files`, holding `data.db`), alone | Pass: export 200 with the row from step a, `orders` tools and the `kitchen-sink` file list work | |
+| d | B started again beside it | Export 503 on both, as fixed | |
+| e | A stopped; `docker run --rm --network trial12-net -v trial12-files:/data -v trial12-back:/back -e DATABASE_URL=$DBURL -e TOOLSITE_SECRET_KEY=$KEY $S3 toolsite-trial12 toolsite export-to-files --to /back` | Pass: 0 differences, 41 writes (12 sessions, 2 pending sign-ins, 1 wrong-code record, 2 jobs, ...); both `data.db` files copied from `/data`; the `lost+found` in `/back` did not count as "holds a site" | 1.05 s |
+| e | `export-to-files` without `--to` into the migrated directory | Refused: "still holds its file-mode state from then: export into a new directory with --to" | |
+| e | File mode on `trial12-back` with the key and the bucket, no `DATABASE_URL` | Pass | ready 0.27 s |
+| e | All three session cookies (from files, A and B); the recovery code spent on B; a fresh TOTP sign-in; every app; A's deploy; the setting; the file in the bucket; the export token (row from step a); the deploy token; the project, both jobs with their last runs, the device token | Pass: the spent recovery code stays spent (401) | |
+| e | A Postgres runner pointed at `trial12-back` | Refused: "still holds file-mode state (.site/auth.db) and no .site/migrated-to-postgres" | |
+| - | A Postgres runner with no key; with no bucket | Refused at boot, each naming the missing variable | |
+| - | `docker compose --profile postgres up -d` (the repository's `compose.yml` with a local override for the image tag and port), `toolsite user add`, a sign-in, a page published over MCP | Pass: the ladders applied at first boot, the page served from the bucket | 6.4 s to serving, Postgres's health check included |
+
+### 9.3 What the trial found
+
+- **Export answered 500 beside another runner.** `GET /export/<app>.sqlite`
+  went to the snapshot, which `db::app_db` refused, and the endpoint
+  reported every snapshot failure as 500 "could not snapshot the database".
+  A reporting tool reads that as broken. It now checks
+  `Stores::sqlite_refusal` first and answers 503 with `Retry-After: 30` and
+  a reason that names no runner, logging the refusal at `warn`. Test:
+  `an_export_beside_another_live_runner_is_refused_as_unavailable_on_postgres`
+  in `tests/records.rs`.
+- **A killed runner holds the guard for up to 30 s.** `docker rm -f` (SIGKILL)
+  leaves its row fresh, so the next runner on the same database refuses app
+  databases until `LIVE_FOR` passes (12 s here). SIGTERM, which `docker stop`
+  and a Railway redeploy send, leaves at once. Expected; documented in the
+  README.
+- **A runner without the volume does not invent databases.** An app whose
+  `data.db` is not on this runner's volume says "has no database yet"
+  rather than starting an empty one. Uploading migrations there would
+  create one, though, so SQLite apps must be served by the runner that
+  holds the volume.
+- `lost+found` at the root of the source, of each runner's volume and of the
+  export target was ignored everywhere.
+
+### 9.4 What still needs one runner, or the volume
+
+- **App SQLite databases.** They are files on the volume the site was
+  migrated from. While two runners are live, every runner refuses to open
+  any of them, so a volume shared between runners would not help (and
+  Railway mounts a volume on one service with one active deployment). A
+  site whose apps use their databases runs **one** runner, on that volume,
+  until step 3 moves app data to Postgres. Runners with an empty volume
+  serve everything else: sign-in, MCP, admin, pages and bundles (from the
+  bucket), handlers that do not open their database, settings, tokens,
+  apps' files, jobs.
+- **Live connections, resident apps, TCP and UDP ports.** The hub and the
+  resident instances are in one process's memory; a publish reaches only
+  that runner's sockets. Single-runner until step 2's bus and leases.
+- **Scratch.** `DATA_DIR/.tmp/` (export snapshots, the bucket's file cache,
+  upload spools) is per runner and needs no sharing.
 
 ---
 

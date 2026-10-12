@@ -69,7 +69,8 @@ app is the repository's head.
 
 You need a domain pointing at the server and a persistent directory for its
 data, `/data` by default. Everything lives there as plain files; losing it
-loses every app.
+loses every app. A site can keep its own state in Postgres instead; see
+Running on Postgres.
 
 **Railway.** Deploy the repository as a service, attach a Volume at `/data`
 (the Dockerfile has no `VOLUME` line on purpose; Railway's builder rejects
@@ -213,6 +214,174 @@ the protocol version, who, and the status. Never the arguments.
 ```
 INFO toolsite::platform::mcp_log: mcp path=/mcp method=tools/call tool=list_pages client=- protocol=- user_agent="openai-mcp/1.0.0 (ChatGPT)" email=you@example.com status=200
 ```
+
+### Running on Postgres
+
+By default everything is files under `TOOLSITE_DATA_DIR`. With
+`DATABASE_URL` set, the site's own state moves to Postgres and its
+published files to the bucket, so the volume stops being the only copy of
+the site and more than one toolsite process ("runner") can share it.
+
+**When to use it.** When you want platform state in a managed database
+with its own backups, or are preparing for several runners. Not for a
+small site that is happy on one volume: files need nothing else and stay
+the default. Today a site whose apps use their databases still runs one
+runner (below), so the gain is where the state lives, not yet scale.
+
+**What it needs.** All three, or the server refuses to start and says
+which is missing:
+
+```
+DATABASE_URL=postgres://toolsite:<password>@db.internal:5432/toolsite
+TOOLSITE_SECRET_KEY=<32 random bytes, base64: openssl rand -base64 32>
+TOOLSITE_BLOB_S3_ENDPOINT=...   # with _BUCKET, _ACCESS_KEY_ID, _SECRET_ACCESS_KEY, _REGION
+```
+
+The key has to come from the environment, never from the database, so a
+dump of the database does not open the sealed values in it; every runner
+gets the same one. Postgres 16 is what the trial ran on. Connect directly,
+or through PgBouncer in session mode: transaction mode breaks the
+session-level advisory locks that schema migrations and publishes take. `TOOLSITE_DATABASE_POOL` sets
+the connections one runner holds (16).
+
+**What moves, and what does not.**
+
+| Where | In file mode | On Postgres |
+|---|---|---|
+| Accounts, sessions, two-step secrets, grants, scopes, pins | `.site/auth.db` | schema `accounts` |
+| MCP clients' sign-ins | `.site/oauth.db` | schema `oauth` |
+| Projects, labels, metas, notes, settings, jobs, migration ladders, tokens, repository links, app tools | `.site/*.json` and the sidecars | schema `platform` |
+| Upload tickets, provider sign-ins in flight, job slots, rates, the runner registry | memory | schema `state` |
+| Pages, bundles, handlers, icons, sources, the trash | the volume | the bucket, under `.toolsite/` |
+| Apps' files | the volume or the bucket | the bucket |
+| Apps' SQLite databases | the volume | **still the volume** |
+
+Nothing about publishing, URLs, tokens or sign-in changes for anyone using
+the site.
+
+**Moving an existing site.** With the server stopped, on the machine or
+in the container that holds the volume:
+
+1. `toolsite key show` prints the key in `.site/secret.key`. Set it as
+   `TOOLSITE_SECRET_KEY`: sealed settings and two-step secrets were sealed
+   with it, and the migration refuses any other key before writing
+   anything.
+2. Set `DATABASE_URL` and the bucket variables beside it.
+3. `toolsite migrate-to-postgres`. It applies the schema, copies every
+   account and OAuth row as it is (sessions, invitations, pending two-step
+   sign-ins, recovery codes and connector tokens carry over, so nobody
+   signs in again), the projects, metas, settings (still sealed), jobs,
+   tokens and records, and every published file and the trash to the
+   bucket, then compares both sides and prints one table. It writes
+   `.site/migrated-to-postgres`, after which file mode refuses the
+   directory. Upload tickets and sign-ins in flight do not carry over; they
+   live minutes. Run it again and it writes nothing; `--verify-only`
+   compares without writing.
+4. Start the server with the same variables.
+
+On a small site the whole run takes about a second (trial: 37 writes,
+0.7 s). It refuses while another runner is live on the database, and
+fails rather than finishing if the source changed during the copy.
+
+**Rolling back.** Until anything has changed on Postgres, remove
+`DATABASE_URL` and `.site/migrated-to-postgres`: the files were only read.
+After that, everything written on Postgres since (accounts, revocations,
+deploys) would be lost that way, and a revoked token or a disabled account
+would come back, so instead export:
+
+```
+toolsite export-to-files --to /new/data
+```
+
+with the same `DATABASE_URL`, key and bucket variables and
+`TOOLSITE_DATA_DIR` still pointing at the old volume, whose apps' SQLite
+databases are copied across. It refuses to write into the old directory
+(it still holds the file-mode state from before) or into one that holds
+anything of a site. Then serve file mode from `/new/data`, keeping
+`TOOLSITE_SECRET_KEY` and the bucket variables set: apps' files and sealed
+values stay where they are.
+
+**One runner, for now.** Apps' SQLite databases are files on the volume.
+While a second runner is live on the same database, every runner refuses
+to open any app's database (the handler gets an error saying why, an
+export answers 503), since two writers on one SQLite file corrupt it.
+Sharing the volume would not help, and a Railway volume mounts on one
+service with one active deployment anyway. Live connections, resident apps
+and TCP or UDP ports are in one process's memory too. So:
+
+- a site whose apps use their databases, sockets or ports runs **one**
+  runner, on the volume, until per-app Postgres schemas (step 3) and a
+  cross-runner bus with leases (step 2) land;
+- extra runners on an empty volume serve everything else: sign-in, MCP,
+  admin, pages and bundles, handlers that do not open their database,
+  settings, tokens, apps' files, and jobs, each turn fired once across all
+  runners;
+- a runner stopped with SIGTERM leaves the registry at once; one killed
+  outright counts as live for up to 30 s, during which the next runner
+  refuses app databases.
+
+`docker compose --profile postgres up -d` runs this locally with Postgres
+and MinIO beside toolsite; `compose.yml` lists the variables to set.
+`docs/design/postgres-scaleout.md` has the design, the trial and the steps
+still to come.
+
+### Postgres on Railway
+
+1. In the project, **+ New, Database, PostgreSQL**. Add a **Bucket** too if
+   the service has none.
+2. On the toolsite service, set these as references (Railway fills them in
+   and keeps them current):
+
+   ```
+   DATABASE_URL=${{Postgres.DATABASE_URL}}
+   TOOLSITE_BLOB_S3_ENDPOINT=${{Bucket.ENDPOINT}}
+   TOOLSITE_BLOB_S3_BUCKET=${{Bucket.BUCKET}}
+   TOOLSITE_BLOB_S3_ACCESS_KEY_ID=${{Bucket.ACCESS_KEY_ID}}
+   TOOLSITE_BLOB_S3_SECRET_ACCESS_KEY=${{Bucket.SECRET_ACCESS_KEY}}
+   TOOLSITE_BLOB_S3_REGION=${{Bucket.REGION}}
+   ```
+
+   using your services' names in place of `Postgres` and `Bucket`.
+   `DATABASE_URL` is the private address, which needs no TLS settings; use
+   `DATABASE_PUBLIC_URL` only from outside Railway. For a new site, also set
+   `TOOLSITE_SECRET_KEY` to `openssl rand -base64 32` and deploy: that is
+   all.
+3. **Set the health check path to `/healthz`** in the service settings. It
+   answers on any host, in either mode.
+
+Moving a site that already has a volume: the migration must run where the
+volume is mounted, with the server stopped, and Railway offers that in one
+place only. `railway run` runs on your machine with the service's
+variables but without its volume, and a pre-deploy command runs in a
+separate container with no volume mounted. A start command runs in the
+service's own container, after the old deployment has stopped (Railway
+never has two deployments of a service with a volume active at once). So:
+
+1. With the site still on files, read its key:
+   `railway ssh -- toolsite key show`. Set it as `TOOLSITE_SECRET_KEY`.
+2. Add the variables from step 2 above, and in **Settings, Deploy, Custom
+   Start Command** put
+
+   ```
+   /bin/sh -c "toolsite migrate-to-postgres && exec toolsite"
+   ```
+
+   then deploy the staged changes once. The deploy log shows the
+   comparison table, "migrated: ...", and then the server's
+   `platform state backend="postgres"` line. If the migration refuses, the
+   server does not start and nothing was changed on the volume; fix what
+   it names and deploy again.
+3. Clear the custom start command and deploy again. Left in place, every
+   restart would compare again, and once the site has changed on Postgres
+   the comparison differs and the server would not start.
+
+Keep the volume attached: it still holds the apps' SQLite databases, and
+the service still runs one replica.
+
+A Railway volume is ext4 and has a `lost+found` directory at its root.
+toolsite ignores it everywhere it walks the data directory (serving,
+migration, export); a site whose app list goes empty on Railway after an
+upgrade is the first thing to check against this.
 
 ---
 
@@ -1697,7 +1866,9 @@ The answer is a consistent snapshot of the whole file, taken with
 the token once and lists tokens by label afterwards. Each token opens one app
 and nothing else; the publish token is refused there. Revoke from either place
 and the tool gets 401 on its next pull. Tokens live hashed in
-`<app>.exports`, so removing the app takes them with it.
+`<app>.exports`, so removing the app takes them with it. On a Postgres site
+with more than one runner live, the answer is 503 with `Retry-After: 30`
+until one runner is alone (see Running on Postgres).
 
 In the reporting tool: a connection of type `sqlite` with that URL and the token as its
 bearer token. It downloads the file on each sync.
@@ -1859,7 +2030,10 @@ is required to serve HTTP.
 | `TOOLSITE_MAX_MEMORY_MB` | no (default `1024`) | The most memory a request or job may ask for. |
 | `TOOLSITE_JOB_STARTS_PER_MINUTE` | no (default `600`) | Jobs one app may start through `jobs.run` in a minute, queued reruns included. |
 | `TOOLSITE_JOBS_RUNNING_PER_APP` | no (default `4`) | Jobs of one app that may run at once, however they were started. A scheduled turn past it is skipped and recorded; `jobs.run` and Run now are refused. |
-| `TOOLSITE_SECRET_KEY` | no | Base64, 32 bytes. Encrypts app settings and two-step sign-in secrets. Generated beside the data when unset, which is weaker; see Settings. |
+| `TOOLSITE_SECRET_KEY` | with `DATABASE_URL` | Base64, 32 bytes. Encrypts app settings and two-step sign-in secrets. Generated beside the data when unset in file mode, which is weaker; see Settings. Required on Postgres, where admin form tokens are derived from it too. `toolsite key show` prints a file-mode site's key. |
+| `DATABASE_URL` | no | Platform state in Postgres instead of files; needs `TOOLSITE_SECRET_KEY` and a bucket. Never logged. `sslmode` as libpq: `prefer` (default), `require`, `verify-full` (bundled roots, or `sslrootcert=<file>`). See Running on Postgres. |
+| `TOOLSITE_DATABASE_POOL` | no (default `16`) | Postgres connections one runner holds. |
+| `TOOLSITE_RUNNER_ADDRESS` / `TOOLSITE_INTERNAL_PORT` / `TOOLSITE_POOL` | no | Where other runners reach this one (on Railway, its private address), the port (default `8081`) and its worker pool (default `default`). Recorded in the runner registry for routing that comes later; nothing reads them yet. |
 | `PORT` | no (default `8080`) | Port to listen on. Unprefixed because platforms inject it. |
 | `RUST_LOG` | no (default `info`) | Log filter. Unprefixed because the Rust ecosystem owns it. |
 
@@ -1894,6 +2068,7 @@ myapp.notes, .secrets, .jobs, .migrations, .source, .exports
                           sidecars               (never served)
 .site/auth.db             accounts, sessions, two-step sign-in (secrets sealed)
 .site/oauth.db            MCP clients' tokens
+.site/migrated-to-postgres  written by migrate-to-postgres; file mode then refuses the directory
 .trash/                   what remove_page moved aside
 ```
 

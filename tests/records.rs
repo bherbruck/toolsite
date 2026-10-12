@@ -492,3 +492,47 @@ async fn tools_and_the_migration_ladder_are_kept_per_app_on_postgres() {
 async fn removing_an_app_takes_its_records_and_tokens_with_it_on_postgres() {
     removal_takes_records_and_tokens(Site::on(true).await).await;
 }
+
+/// Found by the container trial: with a second runner live, an export
+/// answered 500 "could not snapshot the database", which a reporting tool
+/// reads as a broken export. The refusal is the site's state, so it says
+/// so with 503 and when to come back, and the export works once the other
+/// runner leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs TOOLSITE_TEST_DATABASE_URL; scripts/test-postgres.sh starts one"]
+async fn an_export_beside_another_live_runner_is_refused_as_unavailable_on_postgres() {
+    use toolsite::state::runners::Runner;
+    let site = Site::on(true).await;
+    let database = site.database.as_ref().unwrap();
+    let me = Arc::new(Runner::new(&["control", "worker"], "default", None, 8081));
+    let config = Arc::new(Config {
+        stores: toolsite::state::Stores { runner: Some(me.clone()), ..database.stores() },
+        blobs: database.blobs(),
+        ..Config::local(site.config.data_dir.clone(), TOKEN)
+    });
+    seed(&config, "sales");
+    let (_, token) = mint(&config, "app_exports", "sales", "reporting").await;
+    me.register(&database.postgres.pool).await.unwrap();
+
+    let other = Runner::new(&["control", "worker"], "default", None, 8081);
+    other.register(&database.postgres.pool).await.unwrap();
+    me.beat(&database.postgres.pool).await.unwrap();
+    let response = build_router(config.clone(), Runtime::new().unwrap())
+        .oneshot(bearer("GET", "/export/sales.sqlite", &token, ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("30"));
+    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let said = String::from_utf8_lossy(&body);
+    assert!(said.contains("more than one runner"), "{said}");
+    assert!(!said.contains(&other.id), "the refusal named a runner to a token holder: {said}");
+
+    other.leave(&database.postgres.pool).await;
+    me.beat(&database.postgres.pool).await.unwrap();
+    let (status, body) = send(&config, bearer("GET", "/export/sales.sqlite", &token, "")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.starts_with(b"SQLite format 3"));
+    drop(config);
+    site.finish().await;
+}

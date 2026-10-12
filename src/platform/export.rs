@@ -128,6 +128,19 @@ pub(crate) async fn download(
         return (StatusCode::UNAUTHORIZED, "no export token for this app\n").into_response();
     }
 
+    // Another live runner means the file may not be opened at all. That is
+    // the site's state, not a fault: a reporting tool told 503 and when to
+    // come back retries, where a 500 reads as a broken export.
+    if let Some(why) = config.stores.sqlite_refusal() {
+        tracing::warn!(app = %app, %why, "export refused: another runner is live");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "30")],
+            "app databases are not served while more than one runner is live on this site; try again once one runner serves it\n",
+        )
+            .into_response();
+    }
+
     let copy = {
         let (config, app) = (config.clone(), app.clone());
         tokio::task::spawn_blocking(move || snapshot(&config, &app)).await

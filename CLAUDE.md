@@ -121,9 +121,14 @@ nothing in `state` reaches `Config` or anything above it.
 ## Conventions
 
 - Storage is plain files under `DATA_DIR` by default; with `DATABASE_URL`
-  platform state is moving to Postgres store by store
-  (`docs/design/postgres-scaleout.md`), and file mode must keep behaving
-  exactly as before. A page is
+  platform state is in Postgres and published files in the bucket
+  (`docs/design/postgres-scaleout.md`, README "Running on Postgres"), and
+  file mode must keep behaving exactly as before. Apps' SQLite databases
+  stay on the volume either way, so a second live runner makes every
+  runner refuse them (`Stores::sqlite_refusal`); a surface that opens one
+  says so plainly rather than failing as a fault. Anything that walks
+  `DATA_DIR` skips names it cannot publish (a Railway volume has
+  `lost+found` at its root) rather than failing. A page is
   `<slug>.html`, its icon `<slug>.icon`, its state `<slug>.meta`. An app is a
   directory whose `index.html` serves at the app root; its files live under
   `<app>/.blobs/`, which no slug, bundle path or blob key can name.
@@ -178,7 +183,10 @@ A test that reaches the network is `#[ignore]`d with a reason, so the suite
 stays hermetic and `cargo test -- --ignored` still proves the real path.
 Tests that need Postgres are ignored the same way and carry `postgres` in
 their names; `scripts/test-postgres.sh` starts Postgres and MinIO in Docker
-and runs them, each in a database of its own.
+and runs them, each in a database of its own. A change to the migration
+commands or the boot guards is tried end to end in the container as
+section 9 of the design note records: a volume with `lost+found`, Postgres
+16 and MinIO, two runners, and the export back to files.
 
 **Anything touching the outside world must be tried in the container**, not
 only against `cargo run`. The host has CA certificates, a full toolchain and
