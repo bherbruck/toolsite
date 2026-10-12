@@ -96,8 +96,11 @@ impl Local {
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                // .site, .trash, .tmp and an app's .blobs are the platform's.
-                (!name.starts_with('.')).then(|| Entry { name, dir: entry.path().is_dir() })
+                // A mounted volume can contain non-published entries such as
+                // lost+found. Never return a key the next read would reject;
+                // this also excludes .site, .trash, .tmp and an app's .blobs.
+                let key = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                super::valid_key(&key).then(|| Entry { name, dir: entry.path().is_dir() })
             })
             .collect();
         out.sort();
