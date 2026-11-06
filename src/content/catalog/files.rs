@@ -178,21 +178,31 @@ fn read_site_json<T: serde::de::DeserializeOwned + Default>(path: &Path, what: &
     }
 }
 
-/// Writes `bytes` to a dotted temporary file beside `path` and renames it
-/// into place.
+/// Writes `bytes` to a dotted temporary file beside `path`, flushes them to
+/// the disk and renames the file into place, then flushes the directory.
+/// Without the first flush a rename can reach the disk before the bytes do,
+/// and a restart leaves a sidecar of the right length holding only zeros,
+/// which is how a site lost an app's jobs.
 pub(crate) fn write_aside(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
     let parent = path.parent().ok_or("a sidecar has no directory")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let name = path.file_name().and_then(|n| n.to_str()).ok_or("a sidecar has no name")?;
     let temp = parent.join(format!(".{name}.{}.part", crate::content::slug::random_token(8)));
-    if let Err(e) = std::fs::write(&temp, bytes) {
+    let written = std::fs::File::create(&temp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&temp, path)) {
         let _ = std::fs::remove_file(&temp);
         return Err(e.to_string());
     }
-    std::fs::rename(&temp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        e.to_string()
-    })
+    // The rename is what a restart must find. The sidecar is already whole
+    // either way, so a filesystem that cannot flush a directory is no fault.
+    if let Err(e) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        tracing::debug!(error = %e, "a sidecar's directory was not flushed");
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -361,4 +371,33 @@ struct MoveHold(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
 #[async_trait]
 impl Held for MoveHold {
     async fn release(self: Box<Self>) {}
+}
+
+#[cfg(test)]
+mod write_aside_tests {
+    use super::write_aside;
+
+    #[test]
+    fn a_sidecar_replaced_in_place_holds_the_new_bytes_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep/shop.jobs");
+        write_aside(&path, b"[1]").unwrap();
+        write_aside(&path, b"[1, 2]").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[1, 2]");
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names, ["shop.jobs"], "a temporary file was left behind");
+    }
+
+    #[test]
+    fn a_write_that_cannot_land_keeps_the_old_sidecar_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in the sidecar's place: the rename is what fails.
+        let path = dir.path().join("shop.jobs");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("kept"), b"kept").unwrap();
+        assert!(write_aside(&path, b"[1]").is_err());
+        assert_eq!(std::fs::read(path.join("kept")).unwrap(), b"kept");
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names, ["shop.jobs"], "a temporary file was left behind");
+    }
 }
