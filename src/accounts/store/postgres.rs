@@ -149,6 +149,15 @@ impl AccountStore for PostgresAccounts {
         })
     }
 
+    fn set_admin(&self, email: &str, is_admin: bool) -> Result<Option<String>, String> {
+        self.run(async |c| {
+            let row = c
+                .query_opt("update accounts.users set is_admin = $1 where email = $2 returning id", &[&is_admin, &email])
+                .await?;
+            Ok(row.map(|row| row.get(0)))
+        })
+    }
+
     fn list_users(&self) -> Result<Vec<UserRow>, String> {
         self.run(async |c| {
             let rows = c

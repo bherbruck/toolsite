@@ -1446,7 +1446,7 @@ breaking it.
 |---|---|
 | `/admin/apps` | The apps you manage, with their gate and whether they ship a handler. Each row opens the app's page. Projects and their permissions are run from the app browser. |
 | `/admin/apps/<app>` | Overview (title, database size, outbound hosts, visibility), then tabs: Access (who may open it, route rules, people with access), Exports, Settings, Jobs, Notes. |
-| `/admin/accounts/<email>` | One account: the apps they may open (add with a searchable picker, revoke), whether two-step sign-in is on and a reset for it, a fresh setup link shown once, disable or enable. |
+| `/admin/accounts/<email>` | One account: the apps they may open (add with a searchable picker, revoke), whether two-step sign-in is on and a reset for it, its platform role (Admin or Visitor; never your own, and leaving Admin ends its connected MCP clients while its project and app access stays), a fresh setup link shown once, disable or enable. |
 | `/admin/accounts` | Accounts with role, status and two-step sign-in; disable or re-enable; New account is its own page. |
 | `/admin/exports` | Every export token, by app and label. |
 

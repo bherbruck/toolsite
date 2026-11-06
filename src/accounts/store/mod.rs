@@ -126,6 +126,9 @@ pub trait AccountStore: Send + Sync {
     /// Disables the account at `at`, or enables it with `None`. Answers the
     /// account's id, or `None` when no account has this email.
     fn set_disabled(&self, email: &str, at: Option<i64>) -> Result<Option<String>, String>;
+    /// Makes the account a site admin or takes that away. Answers the
+    /// account's id, or `None` when no account has this email.
+    fn set_admin(&self, email: &str, is_admin: bool) -> Result<Option<String>, String>;
     /// Every account, by email.
     fn list_users(&self) -> Result<Vec<UserRow>, String>;
 

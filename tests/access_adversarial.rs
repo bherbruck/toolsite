@@ -1664,3 +1664,204 @@ async fn a_jobs_status_is_shown_to_its_editors_and_never_to_a_viewer() {
     let (err, text) = tool(&w.config, "/mcp", &boss, "app_jobs", serde_json::json!({"app":"ledger"})).await;
     assert!(!err && leaks(&text), "{text}");
 }
+
+// --- the platform role ---------------------------------------------------------------
+
+fn is_admin(config: &Config, email: &str) -> bool {
+    user(config, email).is_admin
+}
+
+fn role_form(token: &str, email: &str, role: &str) -> String {
+    format!("token={token}&email={}&role={role}", urlencoding::encode(email))
+}
+
+/// A second admin, with a session and a connected client, for `boss` to act on.
+fn another_admin(config: &Config, email: &str) {
+    blocking(|| users::sign_up_as(config, email, PW, true).unwrap());
+}
+
+async fn platform_role_is_for_a_site_admin_alone(w: World) {
+    let config = &w.config;
+    another_admin(config, "ex@x.test");
+    // Manage on a project is not a site admin, and neither is anything less.
+    for email in ["mgr@x.test", "sub@x.test", "ed@x.test", "fin@x.test", "nobody@x.test"] {
+        let (status, ..) = send(
+            config,
+            post_as("/admin/platform-role", &session(config, email), role_form(&form_token(config, email), email, "admin")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{email} reached the role form");
+        assert!(!is_admin(config, email), "{email} made itself an admin");
+        let (status, ..) = send(
+            config,
+            post_as("/admin/platform-role", &session(config, email), role_form(&form_token(config, email), "ex@x.test", "visitor")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{email} reached the role form");
+    }
+    assert!(is_admin(config, "ex@x.test"), "someone without standing demoted an admin");
+
+    // A request carrying no session, and an admin's session with no form
+    // token or with another person's: what a forged page could send.
+    let anonymous = Request::builder()
+        .method("POST")
+        .uri("/admin/platform-role")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(role_form(&form_token(config, "boss@x.test"), "nobody@x.test", "admin")))
+        .unwrap();
+    assert_eq!(send(config, anonymous).await.0, StatusCode::SEE_OTHER);
+    let boss = session(config, "boss@x.test");
+    for token in ["", "wrong", &form_token(config, "nobody@x.test")] {
+        let (status, ..) = send(config, post_as("/admin/platform-role", &boss, role_form(token, "nobody@x.test", "admin"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the form token {token:?} was taken");
+    }
+    assert!(!is_admin(config, "nobody@x.test"), "a forged form made an admin");
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn only_a_site_admin_with_its_own_form_token_can_change_a_platform_role() {
+    platform_role_is_for_a_site_admin_alone(world().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Postgres; scripts/test-postgres.sh runs it"]
+async fn only_a_site_admin_with_its_own_form_token_can_change_a_platform_role_on_postgres() {
+    platform_role_is_for_a_site_admin_alone(world_on(true).await).await;
+}
+
+/// However the address is spelled, it is still your own: the check runs on
+/// the same normal form the store does, so no spelling gets past it and then
+/// lands on the account. U+212A lowercases to `k` and is not ASCII.
+#[tokio::test]
+async fn no_spelling_of_your_own_email_lets_you_change_your_own_role() {
+    let w = world().await;
+    let config = &w.config;
+    another_admin(config, "kit@x.test");
+    let (kit, token) = (session(config, "kit@x.test"), form_token(config, "kit@x.test"));
+    for spelling in ["kit@x.test", "KIT@X.TEST", "  kit@x.test\t", "\u{212A}it@x.test"] {
+        let (status, _, headers) = send(config, post_as("/admin/platform-role", &kit, role_form(&token, spelling, "visitor"))).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{spelling:?}");
+        assert!(headers.iter().any(|(k, _)| k == "set-cookie"), "{spelling:?}: no message");
+        assert!(is_admin(config, "kit@x.test"), "{spelling:?} demoted the admin acting");
+    }
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn a_role_that_is_neither_admin_nor_visitor_changes_nothing() {
+    let w = world().await;
+    let config = &w.config;
+    let (boss, token) = (session(config, "boss@x.test"), form_token(config, "boss@x.test"));
+    for role in ["", "ADMIN", "Admin", "root", "1", "true", "admin%20", "visitor%00"] {
+        let (status, ..) = send(config, post_as("/admin/platform-role", &boss, role_form(&token, "nobody@x.test", role))).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{role:?}");
+        assert!(!is_admin(config, "nobody@x.test"), "the role {role:?} made an admin");
+    }
+    // No role at all is refused before anything is read.
+    let (status, ..) = send(config, post_as("/admin/platform-role", &boss, format!("token={token}&email=nobody@x.test"))).await;
+    assert!(status.is_client_error(), "{status}");
+    assert!(!is_admin(config, "nobody@x.test"));
+    // An account that is not there is not made.
+    send(config, post_as("/admin/platform-role", &boss, role_form(&token, "ghost@x.test", "admin"))).await;
+    assert!(blocking(|| users::list_accounts(config).unwrap()).iter().all(|account| account.email != "ghost@x.test"));
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn the_role_form_cannot_send_you_off_the_site_afterwards() {
+    let w = world().await;
+    let (boss, token) = (session(&w.config, "boss@x.test"), form_token(&w.config, "boss@x.test"));
+    for back in ["https://evil.test/", "//evil.test/"] {
+        let body = format!("{}&back={}", role_form(&token, "nobody@x.test", "visitor"), urlencoding::encode(back));
+        let (status, _, headers) = send(&w.config, post_as("/admin/platform-role", &boss, body)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let location = headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.as_str()).unwrap_or("");
+        assert!(location.starts_with('/') && !location.starts_with("//"), "{back} led to {location}");
+    }
+    w.finish().await;
+}
+
+async fn a_demotion_ends_what_admin_gave(w: World) {
+    let config = &w.config;
+    another_admin(config, "ex@x.test");
+    let ex = user(config, "ex@x.test");
+    blocking(|| users::grant_scope(config, "ex@x.test", "finance", Scope::Editor, None).unwrap());
+    let (kept_session, connected) = (session(config, "ex@x.test"), token_for(config, "ex@x.test"));
+    assert_eq!(send(config, get_as("/admin", &kept_session)).await.0, StatusCode::OK);
+    let (boss, token) = (session(config, "boss@x.test"), form_token(config, "boss@x.test"));
+
+    let (status, ..) = send(config, post_as("/admin/platform-role", &boss, role_form(&token, "ex@x.test", "visitor"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(!is_admin(config, "ex@x.test"));
+
+    // The session they already hold stops being an admin's on its next request.
+    assert_eq!(send(config, get_as("/admin/accounts", &kept_session)).await.0, StatusCode::FORBIDDEN, "a live session kept the admin pages");
+    let (status, ..) = send(
+        config,
+        post_as("/admin/platform-role", &kept_session, role_form(&form_token(config, "ex@x.test"), "ex@x.test", "admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a demoted admin took the role back");
+
+    // The client they connected is gone, and stays gone if they are raised again.
+    let held = connected.clone();
+    assert!(blocking(|| toolsite::platform::oauth_store::access_token_holder(config, &held)).is_none(), "a client outlived the demotion");
+    let (status, ..) = send(config, post_as("/admin/platform-role", &boss, role_form(&token, "ex@x.test", "admin"))).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(blocking(|| toolsite::platform::oauth_store::access_token_holder(config, &connected)).is_none(), "promotion revived a client");
+    send(config, post_as("/admin/platform-role", &boss, role_form(&token, "ex@x.test", "visitor"))).await;
+
+    // What they were given stays, and a client connected from now on holds that and no more.
+    assert!(blocking(|| users::scopes_for(config, &ex.id)).iter().any(|(prefix, scope)| prefix == "finance" && *scope == Scope::Editor), "a demotion took a grant");
+    let fresh = token_for(config, "ex@x.test");
+    let (refused, text) = tool(config, "/mcp", &fresh, "set_user_active", serde_json::json!({"email": "nobody@x.test", "active": false})).await;
+    assert!(refused, "a demoted admin's new client ran a site tool: {text}");
+    assert!(blocking(|| users::check_password(config, "nobody@x.test", PW)).is_ok());
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn a_demotion_ends_a_live_sessions_standing_and_every_client_and_keeps_the_grants() {
+    a_demotion_ends_what_admin_gave(world().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Postgres; scripts/test-postgres.sh runs it"]
+async fn a_demotion_ends_a_live_sessions_standing_and_every_client_and_keeps_the_grants_on_postgres() {
+    a_demotion_ends_what_admin_gave(world_on(true).await).await;
+}
+
+#[tokio::test]
+async fn an_upload_ticket_minted_as_an_admin_dies_with_the_demotion() {
+    let w = world().await;
+    let config = &w.config;
+    another_admin(config, "ex@x.test");
+    let ex = token_for(config, "ex@x.test");
+    let (err, text) = tool(config, "/mcp", &ex, "create_upload", serde_json::json!({"slug":"yard"})).await;
+    assert!(!err, "{text}");
+    let path = upload_path(&text);
+    let (boss, token) = (session(config, "boss@x.test"), form_token(config, "boss@x.test"));
+    send(config, post_as("/admin/platform-role", &boss, role_form(&token, "ex@x.test", "visitor"))).await;
+    let (status, body, _) = send(config, put(&path, "<p>after demotion</p>")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a demoted admin's ticket still wrote: {body}");
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn an_admin_sees_the_role_of_others_and_no_control_over_its_own() {
+    let w = world().await;
+    let config = &w.config;
+    another_admin(config, "ex@x.test");
+    let boss = session(config, "boss@x.test");
+    let selected = |page: &str, value: &str| page.contains(&format!(r#"<option value="{value}" selected>"#));
+
+    let (status, own, _) = send(config, get_as("/admin/accounts/boss%40x.test", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!own.contains("/admin/platform-role") && own.contains("cannot change your own platform role"));
+    let (_, admin, _) = send(config, get_as("/admin/accounts/ex%40x.test", &boss)).await;
+    assert!(admin.contains("/admin/platform-role") && selected(&admin, "admin") && !selected(&admin, "visitor"), "{admin}");
+    let (_, visitor, _) = send(config, get_as("/admin/accounts/nobody%40x.test", &boss)).await;
+    assert!(selected(&visitor, "visitor") && !selected(&visitor, "admin"), "{visitor}");
+    w.finish().await;
+}

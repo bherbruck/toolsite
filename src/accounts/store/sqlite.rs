@@ -153,6 +153,17 @@ impl AccountStore for SqliteAccounts {
         conn.query_row("select id from users where email = ?", [email], |row| row.get(0)).optional().map_err(err)
     }
 
+    fn set_admin(&self, email: &str, is_admin: bool) -> Result<Option<String>, String> {
+        let conn = self.open()?;
+        let changed = conn
+            .execute("update users set is_admin = ? where email = ?", rusqlite::params![is_admin, email])
+            .map_err(err)?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        conn.query_row("select id from users where email = ?", [email], |row| row.get(0)).optional().map_err(err)
+    }
+
     fn list_users(&self) -> Result<Vec<UserRow>, String> {
         let conn = self.open()?;
         let mut statement = conn

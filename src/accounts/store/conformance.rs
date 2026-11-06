@@ -41,6 +41,7 @@ fn race(n: usize, attempt: impl Fn() -> bool + Sync) -> usize {
 pub(crate) fn run(store: &dyn AccountStore) {
     people_come_back_as_they_went_in(store);
     a_disabled_account_answers_nowhere(store);
+    the_admin_flag_moves_both_ways_and_nothing_else_does(store);
     hostile_text_is_data(store);
     sessions_answer_only_for_their_own_scope_and_account(store);
     an_invitation_is_spent_once(store);
@@ -118,6 +119,23 @@ fn a_disabled_account_answers_nowhere(store: &dyn AccountStore) {
     store.set_disabled("bo@example.com", None).unwrap();
     assert_eq!(store.user_by_id(&bo.id).unwrap(), Some(bo.clone()));
     assert_eq!(store.invited("bo-invite", NOW).unwrap(), Some(bo), "a refused take spent the invitation");
+}
+
+fn the_admin_flag_moves_both_ways_and_nothing_else_does(store: &dyn AccountStore) {
+    let flo = person(store, "flo@example.com");
+    store.insert_session("flo-site", &flo.id, NOW + 100, None).unwrap();
+    let raised = User { is_admin: true, ..flo.clone() };
+
+    assert_eq!(store.set_admin("flo@example.com", true).unwrap(), Some(flo.id.clone()));
+    assert_eq!(store.user_by_id(&flo.id).unwrap(), Some(raised.clone()));
+    assert_eq!(store.session_user("flo-site", None, NOW).unwrap(), Some(raised), "a live session kept the old standing");
+
+    assert_eq!(store.set_admin("flo@example.com", false).unwrap(), Some(flo.id.clone()));
+    assert_eq!(store.user_by_id(&flo.id).unwrap(), Some(flo.clone()));
+    assert_eq!(store.session_user("flo-site", None, NOW).unwrap(), Some(flo.clone()), "a live session kept the old standing");
+
+    assert_eq!(store.set_admin("nobody@example.com", true).unwrap(), None);
+    assert_eq!(store.user_by_email("bo@example.com").unwrap().map(|bo| bo.is_admin), Some(false), "another account moved");
 }
 
 fn hostile_text_is_data(store: &dyn AccountStore) {

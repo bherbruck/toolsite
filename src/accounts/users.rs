@@ -1814,6 +1814,20 @@ pub fn set_active(config: &Config, email: &str, active: bool) -> Result<String, 
     Ok(user_id)
 }
 
+/// Makes an account a site admin or takes that away, and answers its id.
+/// Takes effect on the account's next request: a session reads the flag
+/// from the account each time, so nothing here needs ending. Stopping the
+/// account's clients is the platform's to do, as it is for `set_active`.
+pub fn set_admin(config: &Config, email: &str, is_admin: bool) -> Result<String, String> {
+    let email = normalise(email);
+    store::of(config).set_admin(&email, is_admin)?.ok_or_else(|| format!("no account for {email}"))
+}
+
+/// Whether `email`, as a form might spell it, is this account's.
+pub fn is_same_email(email: &str, user: &User) -> bool {
+    normalise(email) == user.email
+}
+
 pub fn list_accounts(config: &Config) -> Result<Vec<Account>, String> {
     Ok(store::of(config)
         .list_users()?

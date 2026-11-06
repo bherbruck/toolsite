@@ -3403,7 +3403,8 @@ async fn an_account_page_shows_grants_and_lets_an_admin_change_them() {
     // Read-only now: what the account holds, each linking to where it is set.
     assert!(page.contains("No access of its own"));
     assert!(!page.contains("<datalist"), "a native datalist is still in use");
-    assert!(!page.contains("<select"), "a select lists every app");
+    assert_eq!(page.matches("<select").count(), 1, "a select lists every app");
+    assert!(page.contains(r#"<select name="role""#), "the one select is the platform role");
     let token = form_token_from(&page);
 
     // Add from the account page, with a role, and come back to it.

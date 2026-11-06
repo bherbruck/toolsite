@@ -207,6 +207,7 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
         .route("/admin/users", post(admin::add_account))
         .route("/admin/access", post(admin::change_access))
         .route("/admin/active", post(admin::change_active))
+        .route("/admin/platform-role", post(admin::change_platform_role))
         .route("/admin/mfa-reset", post(admin::reset_mfa))
         .route("/admin/gate", post(admin::change_gate))
         .route("/admin/rule", post(admin::change_rule))

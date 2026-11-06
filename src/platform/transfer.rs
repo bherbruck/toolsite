@@ -1557,6 +1557,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     struct Revoked {
         disabled_password: bool,
+        former_admin: bool,
         ended_session: bool,
         live_session: bool,
         dropped_grant: Option<String>,
@@ -1599,6 +1600,8 @@ mod tests {
         users::sign_up(config, "gone@example.com", "correct horse battery").unwrap();
         users::log_in(config, "gone@example.com", "correct horse battery").unwrap();
         users::set_active(config, "gone@example.com", false).unwrap();
+        users::sign_up_as(config, "former@example.com", "correct horse battery", true).unwrap();
+        users::set_admin(config, "former@example.com", false).unwrap();
         let (_, ended) = users::log_in(config, "viewer@example.com", "correct horse battery").unwrap();
         users::log_out(config, &ended).unwrap();
         let (_, live) = users::log_in(config, "viewer@example.com", "correct horse battery").unwrap();
@@ -1663,6 +1666,7 @@ mod tests {
             .collect();
         Revoked {
             disabled_password: users::check_password(config, "gone@example.com", "correct horse battery").is_ok(),
+            former_admin: users::user_by_email(config, "former@example.com").unwrap().is_admin,
             ended_session: users::site_session_user(config, &r.ended).is_some(),
             live_session: users::site_session_user(config, &r.live).is_some(),
             dropped_grant: users::role_for(config, &viewer.id, "note"),
@@ -1691,6 +1695,7 @@ mod tests {
     fn assert_still_refused(answers: &Revoked) {
         let expected = Revoked {
             disabled_password: false,
+            former_admin: false,
             ended_session: false,
             live_session: true,
             dropped_grant: None,
@@ -1956,6 +1961,10 @@ mod tests {
             crate::accounts::users::set_active(&site, "viewer@example.com", false).unwrap();
             let why = unchanged(&site, &before).expect_err("a revocation during the copy went unseen");
             assert!(why.contains("accounts.users") && why.contains("server running"), "{why}");
+            let before = read(&site, &Links::scan(&dir), false, true, &mut Vec::new()).unwrap();
+            crate::accounts::users::set_admin(&site, "admin@example.com", false).unwrap();
+            let why = unchanged(&site, &before).expect_err("an admin demoted during the copy went unseen");
+            assert!(why.contains("accounts.users"), "{why}");
             let before = read(&site, &Links::scan(&dir), false, true, &mut Vec::new()).unwrap();
             wait(tokens::revoke_all(&site, "shop", tokens::Kind::Deploy)).unwrap();
             let why = unchanged(&site, &before).expect_err("a revoked token during the copy went unseen");

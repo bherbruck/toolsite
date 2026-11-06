@@ -1739,6 +1739,23 @@ async fn render_account_page(
                         }
                     }
                 }))
+                (ui::panel("Platform role", Some("An admin holds Manage everywhere and can change accounts and access. A visitor holds only what it is given on projects and apps."), html! {
+                    @if is_self {
+                        p."muted" { "You cannot change your own platform role." }
+                    } @else {
+                        form."row" method="post" action="/admin/platform-role"
+                             data-confirm={ "Change the platform role of " (account.email) "?" }
+                             data-confirm-detail="Moving an account to Visitor ends its connected MCP clients and keeps its project and app access. Moving an account to Admin gives it Manage everywhere."
+                             data-confirm-label="Change role" data-confirm-danger="1" {
+                            (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back))
+                            select name="role" aria-label="Platform role" {
+                                option value="admin" selected[account.is_admin] { "Admin" }
+                                option value="visitor" selected[!account.is_admin] { "Visitor" }
+                            }
+                            button."quiet" type="submit" { "Save" }
+                        }
+                    }
+                }))
                 (ui::panel("Two-step sign-in", None, html! {
                     @if account.mfa {
                         p { "Two-step sign-in is on for this account." }
@@ -2174,6 +2191,57 @@ pub async fn change_active(
                 true,
                 if active { format!("Account {email} is enabled.") } else { format!("Account {email} is disabled.") },
             )
+        }
+        Ok(Err(message)) => redirect_flash(&back, false, message),
+        Err(_) => redirect_flash(&back, false, "The account was not changed."),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PlatformRoleChange {
+    token: String,
+    email: String,
+    role: String,
+    back: Option<String>,
+}
+
+/// `POST /admin/platform-role`: makes an account a site admin or a visitor.
+/// Your own role cannot be changed here, so whoever acts stays an admin and
+/// the site always keeps one. Leaving admin ends the account's MCP clients,
+/// so a client connected as an admin does not carry on as anything else, and
+/// does not come back if the account is made an admin again.
+pub async fn change_platform_role(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    Form(form): Form<PlatformRoleChange>,
+) -> Response {
+    let admin = match checked(&config, &headers, &form.token).await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let back = back_or(form.back.as_deref(), "/admin/accounts");
+    let is_admin = match form.role.as_str() {
+        "admin" => true,
+        "visitor" => false,
+        other => {
+            tracing::warn!(by = %admin.email, role = %other, "platform role refused: no such role");
+            return redirect_flash(&back, false, "Choose Admin or Visitor.");
+        }
+    };
+    if users::is_same_email(&form.email, &admin) {
+        tracing::warn!(by = %admin.email, "platform role refused: an admin cannot change their own");
+        return redirect_flash(&back, false, "You cannot change your own platform role.");
+    }
+    let config2 = config.clone();
+    let email = form.email.clone();
+    let outcome = tokio::task::spawn_blocking(move || users::set_admin(&config2, &form.email, is_admin)).await;
+    match outcome {
+        Ok(Ok(user_id)) => {
+            tracing::info!(by = %admin.email, %email, is_admin, "platform role changed");
+            if !is_admin {
+                crate::platform::account::revoke_clients(&config, &user_id, &email, "account is no longer an admin").await;
+            }
+            redirect_flash(&back, true, format!("{email} is now {}.", if is_admin { "an admin" } else { "a visitor" }))
         }
         Ok(Err(message)) => redirect_flash(&back, false, message),
         Err(_) => redirect_flash(&back, false, "The account was not changed."),

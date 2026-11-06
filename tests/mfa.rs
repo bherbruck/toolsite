@@ -649,6 +649,20 @@ async fn policy_admins_forces_setup_for_an_admin_and_not_for_a_regular_user() {
     assert!(reply.cookie("ts_session").is_some(), "a regular user was held for setup under admins");
 }
 
+/// A role changed under a live session is held to the site's policy like
+/// any admin: being made one opens nothing until two-step sign-in is on.
+#[tokio::test]
+async fn an_account_made_an_admin_mid_session_owes_two_step_before_any_admin_page() {
+    let (_dir, config) = site(Policy::Admins);
+    person(&config, "jo@example.com", false);
+    let (reply, _) = password(&config, "jo@example.com", "/").await;
+    let session = reply.cookie("ts_session").expect("a regular user is not held");
+    users::set_admin(&config, "jo@example.com", true).unwrap();
+    let page = get(&config, "/admin/accounts", Some(&format!("ts_session={session}"))).await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    assert!(page.location().starts_with("/account"), "{}", page.location());
+}
+
 #[tokio::test]
 async fn policy_everyone_forces_setup_for_everyone() {
     let (_dir, config) = site(Policy::Everyone);
