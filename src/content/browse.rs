@@ -30,7 +30,7 @@ use crate::{
     ui,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
@@ -288,13 +288,33 @@ pub(crate) async fn visible_projects(config: &Arc<Config>, viewer: Option<&User>
     tree.projects.iter().map(|path| (path.clone(), tree.apps_below(path))).collect()
 }
 
+/// On a site that is not public by default, the browser is for people who
+/// have signed in: a stranger would see only the public apps, or an empty
+/// page that reads as though nothing was published, so they are sent to sign
+/// in and brought back to what they asked for. A public app is still
+/// reachable by its own link. The browser has no background endpoints, so
+/// this is always a redirect, never a bare status.
+async fn sign_in_first(config: &Arc<Config>, headers: &HeaderMap, uri: &axum::http::Uri) -> Option<Response> {
+    if config.default_gate == "public" || users::current_site_user(config, headers).await.is_some() {
+        return None;
+    }
+    let asked = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let next = users::safe_next(Some(asked));
+    tracing::debug!(path = %uri.path(), "app browser sends a signed-out visitor to sign in");
+    Some(Redirect::to(&format!("/auth/login?next={}", urlencoding::encode(&next))).into_response())
+}
+
 /// `GET /`: the top level. `?project=` was the old way to name a level and
 /// is sent on to its path.
 pub(crate) async fn index(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<BrowseQuery>,
 ) -> Response {
+    if let Some(to_sign_in) = sign_in_first(&config, &headers, &uri).await {
+        return to_sign_in;
+    }
     if let Some(project) = query.project.as_deref().map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()) {
         if !users::valid_prefix(project) {
             return (StatusCode::NOT_FOUND, "There is no such project.").into_response();
@@ -316,9 +336,13 @@ pub(crate) async fn index(
 pub(crate) async fn browse(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(path): Path<String>,
     Query(query): Query<BrowseQuery>,
 ) -> Response {
+    if let Some(to_sign_in) = sign_in_first(&config, &headers, &uri).await {
+        return to_sign_in;
+    }
     let project = path.trim_matches('/').to_string();
     if project.is_empty() {
         return Redirect::permanent("/").into_response();

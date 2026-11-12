@@ -3298,15 +3298,122 @@ async fn an_app_that_names_no_access_follows_the_site_default() {
     // Said public: open.
     let (status, ..) = send(&config, get("/p/brochure/")).await;
     assert_eq!(status, StatusCode::OK);
-    // And the index agrees.
-    let (_, index, _) = send(&config, get("/")).await;
+    // And the index agrees, for an account that holds no grant: a stranger
+    // is sent to sign in before it lists anything.
+    account(&config, "stranger@example.com", "correct horse battery");
+    let stranger = sign_in(&config, "stranger@example.com", "correct horse battery");
+    let (_, index, _) = send(&config, get_as("/", &stranger)).await;
     assert!(index.contains("Brochure"));
-    assert!(!index.contains("Internal"), "a closed app was listed to a stranger");
+    assert!(!index.contains("Internal"), "a closed app was listed to an account without a grant");
 
     // The same files on an open-by-default site are open.
     let open = Arc::new(Config::local(dir.path().to_path_buf(), TOKEN));
     let (status, ..) = send(&open, get("/p/internal/")).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The `next` a sign-in redirect carries, decoded.
+fn sign_in_next(headers: &[(String, String)]) -> String {
+    let to = location(headers);
+    let next = to.strip_prefix("/auth/login?next=").unwrap_or_else(|| panic!("not sent to sign in: {to}"));
+    urlencoding::decode(next).unwrap().into_owned()
+}
+
+/// A site with the given default and one project, `tools`, holding a
+/// public app, `inventory`.
+async fn site_defaulting_to(dir: &tempfile::TempDir, gate: &str) -> Arc<Config> {
+    let config = Arc::new(Config {
+        default_gate: gate.to_string(),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    folder(&config, "", "tools").await;
+    open_app_in(&config, "inventory", "tools").await;
+    config
+}
+
+#[tokio::test]
+async fn a_signed_out_visitor_to_the_app_browser_on_a_closed_by_default_site_is_sent_to_sign_in_and_back() {
+    for gate in ["restricted", "granted", "authenticated"] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = site_defaulting_to(&dir, gate).await;
+
+        let (status, body, headers) = send(&config, get("/")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{gate}: the home page was served to a stranger: {body}");
+        assert_eq!(location(&headers), "/auth/login?next=%2F", "{gate}");
+
+        let (status, _, headers) = send(&config, get("/browse/tools?q=inv")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{gate}: a project level was served to a stranger");
+        assert_eq!(sign_in_next(&headers), "/browse/tools?q=inv", "{gate}: the path asked for was lost");
+
+        // Even a project that does not exist reads the same as one that does.
+        let (status, _, headers) = send(&config, get("/browse/nowhere")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{gate}");
+        assert_eq!(sign_in_next(&headers), "/browse/nowhere", "{gate}");
+    }
+}
+
+#[tokio::test]
+async fn a_signed_in_visitor_still_sees_the_app_browser_on_a_closed_by_default_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = site_defaulting_to(&dir, "restricted").await;
+    admin_account(&config, "boss@example.com", "correct horse battery");
+    let boss = sign_in(&config, "boss@example.com", "correct horse battery");
+    let (status, page, _) = send(&config, get_as("/", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("href=\"/browse/tools\""), "the signed-in admin's browser lost its projects");
+    let (status, page, _) = send(&config, get_as("/browse/tools", &boss)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("/p/inventory"), "the project level lost its app");
+}
+
+#[tokio::test]
+async fn a_public_by_default_site_still_shows_the_app_browser_to_a_signed_out_visitor() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = site_defaulting_to(&dir, "public").await;
+    let (status, page, _) = send(&config, get("/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("href=\"/browse/tools\""), "the stranger's browser lost the project");
+    let (status, page, _) = send(&config, get("/browse/tools")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("/p/inventory"), "the project level lost its app");
+}
+
+#[tokio::test]
+async fn a_public_app_stays_reachable_by_its_link_on_a_closed_by_default_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = site_defaulting_to(&dir, "restricted").await;
+    write_page(&config, "brochure/index", "<title>Brochure</title>");
+    std::fs::write(
+        dir.path().join("brochure.meta"),
+        r#"{"listed":true,"hidden":false,"spa":false,"gate":"public","allow_http":[],"rules":[]}"#,
+    )
+    .unwrap();
+    let (status, ..) = send(&config, get("/p/brochure/")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_app_browsers_sign_in_redirect_never_names_another_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = site_defaulting_to(&dir, "restricted").await;
+    for hostile in [
+        "/browse//evil.test",
+        "/browse/%2F%2Fevil.test",
+        "/browse/%5C%5Cevil.test",
+        "/browse/x?next=https://evil.test",
+        "/?project=//evil.test",
+        "/?project=https://evil.test",
+    ] {
+        let (status, _, headers) = send(&config, get(hostile)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{hostile}");
+        let to = location(&headers);
+        assert!(to.starts_with("/auth/login?next="), "{hostile} sent the visitor to {to}");
+        let next = sign_in_next(&headers);
+        assert!(
+            next.starts_with('/') && !next.starts_with("//") && !next.starts_with("/\\"),
+            "{hostile} produced an off-site next: {next}"
+        );
+    }
 }
 
 #[tokio::test]

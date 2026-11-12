@@ -1161,3 +1161,30 @@ async fn the_main_host_runs_no_app_code_by_any_method_or_spelling() {
         }
     }
 }
+
+#[tokio::test]
+async fn the_main_host_sends_a_signed_out_visitor_from_the_app_browser_to_sign_in_on_a_closed_by_default_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config {
+        base_url: Some(BASE.to_string()),
+        apps: Some(AppsDomain::parse("apps.test", Some(BASE), None).unwrap()),
+        default_gate: "restricted".to_string(),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    app(&config, "yard", "restricted");
+
+    let home = get(&config, MAIN, "/", None).await;
+    assert_eq!(home.status, StatusCode::SEE_OTHER, "{}", home.body);
+    assert_eq!(home.location(), "/auth/login?next=%2F");
+    let level = get(&config, MAIN, "/browse/tools", None).await;
+    assert_eq!(level.status, StatusCode::SEE_OTHER, "{}", level.body);
+    assert_eq!(level.location(), "/auth/login?next=%2Fbrowse%2Ftools");
+    // The sign-in page it points at is served on the main host.
+    let login = get(&config, MAIN, "/auth/login?next=%2F", None).await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.body);
+
+    // Signed in on the main host, the browser is there as before.
+    let token = person(&config, "someone@example.com");
+    let home = get(&config, MAIN, "/", Some(&format!("__Host-ts_session={token}"))).await;
+    assert_eq!(home.status, StatusCode::OK, "{}", home.body);
+}
