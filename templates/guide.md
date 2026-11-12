@@ -214,7 +214,10 @@ goes through guest memory:
   empty body. The platform streams the file in its place, with the stored
   content type unless you set one, and keeps your other headers, so
   `content-disposition` and `cache-control` are yours to add. Gate it however
-  the route is gated: answering is the permission.
+  the route is gated: answering is the permission. A `Range` request on a
+  200 gets just those bytes (206), so DuckDB-WASM reads only the parts of a
+  Parquet file it needs; set an `etag` to make `If-Range` work, or
+  `accept-ranges: none` to always send the whole file.
 - **Small things from inside.** `put`, `get`, `stat`, `list(prefix)` and
   `delete`. `get` refuses anything over 16 MB rather than truncating it;
   serve those with the header.

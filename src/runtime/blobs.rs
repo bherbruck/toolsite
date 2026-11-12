@@ -23,7 +23,7 @@ use std::{
     pin::Pin,
     time::Duration,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// The most `get` will copy into a guest's memory. Anything bigger is served
 /// with the response header instead, which never touches the guest at all.
@@ -683,39 +683,138 @@ where
     Ok(size)
 }
 
+/// Part of a blob a client asked for, before anyone knows how big the blob
+/// is: one range of an HTTP `Range: bytes=...` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRange {
+    /// `first-`: from a byte to the end.
+    From(u64),
+    /// `first-last`, inclusive.
+    Span(u64, u64),
+    /// `-length`: the last `length` bytes.
+    Suffix(u64),
+}
+
+impl ByteRange {
+    /// The first and last byte of this range in a blob of `size` bytes, or
+    /// none when not one of its bytes exists. A range running past the end
+    /// stops at it, and a suffix longer than the blob is all of it.
+    pub fn within(self, size: u64) -> Option<(u64, u64)> {
+        let end = size.checked_sub(1)?;
+        match self {
+            ByteRange::From(first) | ByteRange::Span(first, _) if first > end => None,
+            ByteRange::Span(first, last) if last < first => None,
+            ByteRange::From(first) => Some((first, end)),
+            ByteRange::Span(first, last) => Some((first, last.min(end))),
+            ByteRange::Suffix(0) => None,
+            ByteRange::Suffix(length) => Some((size.saturating_sub(length), end)),
+        }
+    }
+
+    /// As a `Range` header value, for a backend that serves ranges itself.
+    fn header(self) -> String {
+        match self {
+            ByteRange::From(first) => format!("bytes={first}-"),
+            ByteRange::Span(first, last) => format!("bytes={first}-{last}"),
+            ByteRange::Suffix(length) => format!("bytes=-{length}"),
+        }
+    }
+}
+
+/// How much of a blob `open_range` is streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slice {
+    /// All of it: no range was asked for, or the backend answered with the
+    /// whole thing, which it may.
+    Whole,
+    /// Bytes `first` to `last`, inclusive.
+    Part { first: u64, last: u64 },
+    /// The range names no byte of the blob; the stream is empty.
+    Unsatisfiable,
+}
+
 /// Opens a blob for streaming out, with what a response needs to know first.
 pub async fn open(config: &Config, app: &str, key: &str) -> Result<(Entry, ByteStream), Error> {
+    let (entry, _, stream) = open_range(config, app, key, None).await?;
+    Ok((entry, stream))
+}
+
+/// `open`, for part of the blob when `range` asks for one. The entry's size
+/// is always the whole blob's, whatever part is streamed; the bytes never
+/// reach past either end of the blob.
+pub async fn open_range(
+    config: &Config,
+    app: &str,
+    key: &str,
+    range: Option<ByteRange>,
+) -> Result<(Entry, Slice, ByteStream), Error> {
     valid_key(key)?;
     match &config.blobs.backend {
         Backend::Local => {
             let (data, _) = local_paths(config, app, key)?;
             // stat blocks, but only for one metadata call and one tiny read.
             let entry = stat(config, app, key)?.ok_or(Error::NotFound)?;
-            let file = tokio::fs::File::open(&data).await.map_err(|e| match e.kind() {
+            let mut file = tokio::fs::File::open(&data).await.map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => Error::NotFound,
                 _ => Error::Failed(format!("open: {e}")),
             })?;
-            let stream = tokio_util::io::ReaderStream::new(file);
-            Ok((entry, Box::pin(stream)))
+            let Some(range) = range else {
+                return Ok((entry, Slice::Whole, Box::pin(tokio_util::io::ReaderStream::new(file))));
+            };
+            let Some((first, last)) = range.within(entry.size) else {
+                return Ok((entry, Slice::Unsatisfiable, Box::pin(futures_util::stream::empty())));
+            };
+            file.seek(std::io::SeekFrom::Start(first))
+                .await
+                .map_err(|e| Error::Failed(format!("seek: {e}")))?;
+            let part = tokio_util::io::ReaderStream::new(file.take(last - first + 1));
+            Ok((entry, Slice::Part { first, last }, Box::pin(part)))
         }
         Backend::S3(s3) => {
             let url = s3
                 .bucket
                 .get_object(Some(&s3.credentials), &s3_key(app, key))
                 .sign(S3_SIGN_TTL);
-            let response = s3_async_client()?
-                .get(url)
+            let mut request = s3_async_client()?.get(url);
+            if let Some(range) = range {
+                request = request.header(reqwest::header::RANGE, range.header());
+            }
+            let response = request
                 .send()
                 .await
                 .map_err(|e| Error::Failed(format!("get: {}", reason(&e))))?;
-            if !response.status().is_success() {
-                return Err(s3_failure("get", response.status()));
+            // The bucket answers a range with 206, or 416 naming the size
+            // when none of it exists; either way the size is the one in
+            // Content-Range, since Content-Length is the part's.
+            let range_of = |response: &reqwest::Response| {
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(content_range)
+            };
+            let status = response.status();
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && range.is_some() {
+                let size = range_of(&response).map(|(_, size)| size).ok_or_else(|| s3_failure("get", status))?;
+                let entry = Entry { size, ..entry_from_headers(key, response.headers()) };
+                return Ok((entry, Slice::Unsatisfiable, Box::pin(futures_util::stream::empty())));
             }
-            let entry = entry_from_headers(key, response.headers());
+            if !status.is_success() {
+                return Err(s3_failure("get", status));
+            }
+            let mut entry = entry_from_headers(key, response.headers());
+            let slice = match (status, range_of(&response)) {
+                (reqwest::StatusCode::PARTIAL_CONTENT, Some((Some((first, last)), size))) => {
+                    entry.size = size;
+                    Slice::Part { first, last }
+                }
+                (reqwest::StatusCode::PARTIAL_CONTENT, _) => return Err(s3_failure("get", status)),
+                _ => Slice::Whole,
+            };
             let stream = response
                 .bytes_stream()
                 .map_err(|e| std::io::Error::other(reason(&e)));
-            Ok((entry, Box::pin(stream)))
+            Ok((entry, slice, Box::pin(stream)))
         }
     }
 }
@@ -1085,6 +1184,18 @@ fn unknown_writer() -> Error {
     Error::Failed("no such writer in this call".into())
 }
 
+/// `bytes 0-99/1234` as the part, if any, and the whole size: what a
+/// Content-Range header says. `bytes */1234` has no part.
+fn content_range(value: &str) -> Option<(Option<(u64, u64)>, u64)> {
+    let (part, size) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let size = size.parse().ok()?;
+    if part == "*" {
+        return Some((None, size));
+    }
+    let (first, last) = part.split_once('-')?;
+    Some((Some((first.parse().ok()?, last.parse().ok()?)), size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1216,49 @@ mod tests {
         let entry = stat(&config, "app", "photos/cat.jpg").unwrap().unwrap();
         assert_eq!(entry.size, 8);
         assert!(stat(&config, "app", "photos/dog.jpg").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_range_is_held_inside_the_blob() {
+        // 0..=9 of a 10-byte blob.
+        assert_eq!(ByteRange::Span(2, 4).within(10), Some((2, 4)));
+        assert_eq!(ByteRange::Span(8, 99).within(10), Some((8, 9)));
+        assert_eq!(ByteRange::From(7).within(10), Some((7, 9)));
+        assert_eq!(ByteRange::Suffix(3).within(10), Some((7, 9)));
+        assert_eq!(ByteRange::Suffix(50).within(10), Some((0, 9)));
+        for nowhere in [ByteRange::From(10), ByteRange::Span(10, 12), ByteRange::Suffix(0)] {
+            assert_eq!(nowhere.within(10), None, "{nowhere:?}");
+        }
+        // An empty blob has no bytes for any range to name.
+        assert_eq!(ByteRange::Suffix(5).within(0), None);
+        assert_eq!(ByteRange::From(0).within(0), None);
+    }
+
+    #[test]
+    fn content_range_is_read_as_a_bucket_writes_it() {
+        assert_eq!(content_range("bytes 0-99/1234"), Some((Some((0, 99)), 1234)));
+        assert_eq!(content_range("bytes */1234"), Some((None, 1234)));
+        assert_eq!(content_range("items 0-1/2"), None);
+        assert_eq!(content_range("bytes 0-99/*"), None);
+    }
+
+    #[tokio::test]
+    async fn a_local_range_streams_exactly_those_bytes() {
+        let (_dir, config) = config();
+        put(&config, "app", "data.bin", "application/octet-stream", b"0123456789").unwrap();
+        let read = |range: Option<ByteRange>| {
+            let config = &config;
+            async move {
+                let (entry, slice, stream) = open_range(config, "app", "data.bin", range).await.unwrap();
+                let bytes: Vec<u8> = stream.map(|chunk| chunk.unwrap().to_vec()).concat().await;
+                (entry.size, slice, bytes)
+            }
+        };
+        assert_eq!(read(None).await, (10, Slice::Whole, b"0123456789".to_vec()));
+        assert_eq!(read(Some(ByteRange::Span(2, 4))).await, (10, Slice::Part { first: 2, last: 4 }, b"234".to_vec()));
+        assert_eq!(read(Some(ByteRange::Suffix(3))).await, (10, Slice::Part { first: 7, last: 9 }, b"789".to_vec()));
+        assert_eq!(read(Some(ByteRange::Span(8, 1_000))).await, (10, Slice::Part { first: 8, last: 9 }, b"89".to_vec()));
+        assert_eq!(read(Some(ByteRange::From(10))).await, (10, Slice::Unsatisfiable, Vec::new()));
     }
 
     #[test]
