@@ -9,7 +9,7 @@ use crate::{
         bearer::Caller,
         knowledge::{self, FetchOutput, SearchOutput},
         inline_upload,
-        upload::{self, upload_url, SourceMeta, UploadKind, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
+        upload::{self, upload_url, SourceMeta, SourceTicket, UploadKind, UploadTicket, MAX_ICON_BYTES, UPLOAD_TTL},
     },
     runtime::db,
 };
@@ -290,6 +290,12 @@ pub(crate) struct ListPagesRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PullAppRequest {
     #[schemars(description = "App namespace to fetch all pages for.")]
+    pub(crate) app: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DownloadSourceRequest {
+    #[schemars(description = "The app whose whole source (handler, front end, docs, everything published with ?source) to download.")]
     pub(crate) app: String,
 }
 
@@ -2329,7 +2335,59 @@ impl PageHost {
     }
 
     #[tool(
-        description = "Fetch the current HTML for every page in an app namespace, keyed by page name, so the app can be edited and pushed back with push_app.",
+        description = "The way to get an app's whole source: its handler, front end, planner or other code, docs and manifest, as published with ?source. Returns a download link that works once, within 15 minutes, and never uploads; fetch it with curl and unpack it. The code never passes through the conversation. Use this, not pull_app, whenever you need more than the served HTML pages.",
+        annotations(title = "Download an app's source", read_only_hint = true, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn download_source(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(DownloadSourceRequest { app }): Parameters<DownloadSourceRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !valid_segment(&app) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "app must be non-empty and contain only letters, numbers, '-' or '_'",
+            )]));
+        }
+        if !crate::content::store::app_exists(&self.config, &app).await {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!("no app named '{app}'"))]));
+        }
+        let caller = match self.allowed(&ctx, &app, Scope::Editor).await {
+            Ok(caller) => caller,
+            Err(refused) => return Ok(refused),
+        };
+        if !crate::content::files::path(&self.config, &format!("{app}.source")).await.is_some() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "no source stored for {app}: whoever published it did not upload one with ?source. \
+                 pull_app gives the served pages; ask the app's owner for the project."
+            ))]));
+        }
+        let minted = crate::platform::upload::issue_source_ticket(
+            &self.config,
+            &SourceTicket { app: app.clone(), user: caller.user.as_ref().map(|user| user.id.clone()) },
+        )
+        .await;
+        let ticket = match minted {
+            Ok(ticket) => ticket,
+            Err(why) => {
+                tracing::error!(%why, "source download link could not be stored");
+                return Ok(CallToolResult::error(vec![ContentBlock::text("could not create a download link; try again")]));
+            }
+        };
+        let link = crate::platform::upload::source_url(&self.config, &ticket);
+        let minutes = crate::platform::upload::SOURCE_TTL.as_secs() / 60;
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Download {app}'s source (works once, within {minutes} min; download only):\n\
+             \n  mkdir -p {app} && curl -fsS '{link}' | tar -xz -C {app}\n\
+             \nAfter changing it, build and publish as usual (create_upload), and publish the \
+             source again so the next session gets your changes:\n\
+             \n  tar -czf - --exclude node_modules --exclude target . | curl -f -T - '<upload-url>?source'\n\
+             \nIf the link is unreachable from your sandbox, ask for this site's domain to be allowed \
+             in your network settings."
+        ))]))
+    }
+
+    #[tool(
+        description = "Fetch the current HTML for every page in an app namespace, keyed by page name, so the app can be edited and pushed back with push_app. Pages only: for the app's code (handler, front-end project, scripts), use download_source.",
         annotations(title = "Read an app", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn pull_app(
@@ -2358,7 +2416,13 @@ impl PageHost {
         }
         let json = serde_json::to_string(&pages)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+        let mut content = vec![ContentBlock::text(json)];
+        if crate::content::files::path(&self.config, &format!("{app}.source")).await.is_some() {
+            content.push(ContentBlock::text(format!(
+                "These are the served pages only. {app} also has its source stored (handler, front end and the rest): call download_source for it."
+            )));
+        }
+        Ok(CallToolResult::success(content))
     }
 }
 

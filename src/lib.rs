@@ -251,6 +251,8 @@ pub fn build_router(config: Arc<Config>, runtime: Arc<Runtime>) -> Router {
             put(upload_root).post(upload_root).get(upload::download),
         )
         .route("/upload/{ticket}/{*sub}", put(upload_sub).post(upload_sub))
+        // One app's source archive, once, for a link download_source minted.
+        .route("/source/{ticket}", get(upload::source_download))
         // A visitor's file, streamed to storage. The ticket caps it, not the
         // body limit below, which exists for things held in memory.
         .route(

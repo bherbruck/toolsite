@@ -470,6 +470,7 @@ which is the mistake that ships a blank page while looking like a success.
 | `upload_begin` / `upload_chunk` / `upload_finish` | Fallback for a sandbox that cannot reach the upload URL: any kind the URL takes, sent inline as base64 chunks of at most 768 KB decoded. Same rules, same reply. |
 | `screenshot(slug, path?, as_user?, width?, full_page?)` | A picture of the page from a real browser on the server, as nobody or as an account (site admins only). Say what you see before you say it works. |
 | `pull_page(slug)` / `pull_app(app)` | Read a page back for editing. With a shell, `curl` the public URL instead. |
+| `download_source(app)` | A link to the app's whole source archive (handler, front end, everything published with `?source`), for an editor of the app. Download only, works once, within 15 minutes, and checks the account's access again when it is opened. |
 | `remove_page(slug, confirm)` | Takes a slug down for good. Files move to `.trash/` on the server rather than being deleted. |
 
 Prefer `set_visibility`; it retracts without removing anything. `remove_page`

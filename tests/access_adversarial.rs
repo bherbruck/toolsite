@@ -1865,3 +1865,129 @@ async fn an_admin_sees_the_role_of_others_and_no_control_over_its_own() {
     assert!(selected(&visitor, "visitor") && !selected(&visitor, "admin"), "{visitor}");
     w.finish().await;
 }
+
+// --- source download links -----------------------------------------------------------
+
+const SOURCE: &[u8] = b"\x1f\x8b pretend this is the yard project";
+
+async fn with_source(config: &Config, app: &str) {
+    toolsite::content::files::publish(config, &format!("{app}.source"), bytes::Bytes::from_static(SOURCE)).await.unwrap();
+}
+
+fn source_link(text: &str) -> String {
+    let start = text.find("/source/").expect("no download link in the reply");
+    text[start..].split(|c: char| c.is_whitespace() || c == '\'' || c == '"').next().unwrap().to_string()
+}
+
+async fn fetch(config: &Arc<Config>, path: &str) -> (StatusCode, Vec<u8>) {
+    let response = build_router(config.clone(), Runtime::new().unwrap()).oneshot(get(path)).await.unwrap();
+    let status = response.status();
+    (status, axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec())
+}
+
+async fn source_links_are_for_editors_once(w: World) {
+    let config = &w.config;
+    with_source(config, "yard").await;
+    with_source(config, "ledger").await;
+
+    // An account that is an editor nowhere never reaches the tool: the
+    // publishing connector refuses it at the door.
+    for email in ["fin@x.test", "nobody@x.test"] {
+        let call = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"download_source","arguments":{"app":"ledger"}}});
+        let (status, json) = mcp_post(config, "/mcp", &token_for(config, email), call).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{email}: {json}");
+    }
+    // An editor elsewhere gets no link to an app outside its project.
+    for (email, app) in [("ed@x.test", "ledger"), ("ed@x.test", "dock"), ("ed@x.test", "rootapp"), ("sub@x.test", "dock")] {
+        let (refused, text) = tool(config, "/mcp", &token_for(config, email), "download_source", serde_json::json!({"app": app})).await;
+        assert!(refused && !text.contains("/source/"), "{email} got a link to {app}: {text}");
+    }
+
+    // An editor gets one; it serves the archive once and is spent.
+    let ed = token_for(config, "ed@x.test");
+    let (refused, text) = tool(config, "/mcp", &ed, "download_source", serde_json::json!({"app": "yard"})).await;
+    assert!(!refused, "{text}");
+    let link = source_link(&text);
+    let (status, body) = fetch(config, &link).await;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, SOURCE));
+    assert_eq!(fetch(config, &link).await.0, StatusCode::NOT_FOUND, "a link worked twice");
+
+    // A download link uploads nothing, here or as an upload ticket.
+    let (_, text) = tool(config, "/mcp", &ed, "download_source", serde_json::json!({"app": "yard"})).await;
+    let link = source_link(&text);
+    let id = link.trim_start_matches("/source/");
+    let put_here = send(config, put(&link, "<p>planted</p>")).await.0;
+    assert!(put_here.is_client_error(), "a download link took a PUT: {put_here}");
+    for path in [format!("/upload/{id}"), format!("/upload/{id}?source")] {
+        assert_eq!(send(config, put(&path, "planted")).await.0, StatusCode::UNAUTHORIZED, "{path} took a download link as an upload ticket");
+    }
+    assert!(!std::fs::read_to_string(config.data_dir.join("yard.html")).unwrap_or_default().contains("planted"));
+    assert_eq!(toolsite::content::files::read(config, "yard.source").await.as_deref(), Some(SOURCE));
+    // An upload ticket is no download link either.
+    let (_, text) = tool(config, "/mcp", &ed, "create_upload", serde_json::json!({"slug": "yard"})).await;
+    let upload = upload_path(&text);
+    let ticket = upload.trim_start_matches("/upload/");
+    assert_eq!(fetch(config, &format!("/source/{ticket}")).await.0, StatusCode::NOT_FOUND, "an upload ticket opened as a download link");
+    // The link the editor still holds keeps working once, then nothing.
+    assert_eq!(fetch(config, &link).await.0, StatusCode::OK);
+    assert_eq!(fetch(config, &format!("/source/{id}x")).await.0, StatusCode::NOT_FOUND);
+    w.finish().await;
+}
+
+#[tokio::test]
+async fn a_source_link_is_for_an_editor_works_once_and_uploads_nothing() {
+    source_links_are_for_editors_once(world().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Postgres; scripts/test-postgres.sh runs it"]
+async fn a_source_link_is_for_an_editor_works_once_and_uploads_nothing_on_postgres() {
+    source_links_are_for_editors_once(world_on(true).await).await;
+}
+
+#[tokio::test]
+async fn a_source_link_dies_with_the_scope_that_minted_it() {
+    let w = world().await;
+    with_source(&w.config, "yard").await;
+    let ed = token_for(&w.config, "ed@x.test");
+    let (_, text) = tool(&w.config, "/mcp", &ed, "download_source", serde_json::json!({"app": "yard"})).await;
+    let link = source_link(&text);
+    let (_, text) = tool(&w.config, "/mcp", &ed, "create_upload", serde_json::json!({"slug": "yard"})).await;
+    let upload = upload_path(&text);
+    blocking(|| users::revoke_scope(&w.config, "ed@x.test", "ops/warehouse").unwrap());
+    let (status, body) = fetch(&w.config, &link).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a revoked editor's link still read: {}", String::from_utf8_lossy(&body));
+    assert!(!body.windows(SOURCE.len()).any(|window| window == SOURCE));
+    // The upload URL is held to the same rule on its read side.
+    let (status, body) = fetch(&w.config, &format!("{upload}?source")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a revoked editor's upload ticket still read the source");
+    assert!(!body.windows(SOURCE.len()).any(|window| window == SOURCE));
+    assert_eq!(fetch(&w.config, &upload).await.0, StatusCode::FORBIDDEN, "a revoked editor's upload ticket still read the page");
+    // Given back, the spent link stays spent.
+    blocking(|| users::grant_scope(&w.config, "ed@x.test", "ops/warehouse", Scope::Editor, None).unwrap());
+    assert_eq!(fetch(&w.config, &link).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_source_link_names_only_an_app_that_exists_and_has_a_source() {
+    let w = world().await;
+    let boss = token_for(&w.config, "boss@x.test");
+    for app in ["yard", "ghost", "../yard", "yard/index", "", ".site"] {
+        let (refused, text) = tool(&w.config, "/mcp", &boss, "download_source", serde_json::json!({"app": app})).await;
+        assert!(refused && !text.contains("/source/"), "{app:?}: {text}");
+    }
+    // pull_app points at download_source only when there is a source to get.
+    let (_, pages) = tool(&w.config, "/mcp", &boss, "pull_app", serde_json::json!({"app": "yard"})).await;
+    assert!(!pages.contains("download_source"));
+    with_source(&w.config, "yard").await;
+    let init = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    mcp_post(&w.config, "/mcp", &boss, init).await;
+    let call = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pull_app","arguments":{"app":"yard"}}});
+    let (_, json) = mcp_post(&w.config, "/mcp", &boss, call).await;
+    assert!(json.to_string().contains("download_source"), "{json}");
+    // A removed app's link is refused even if one was minted before.
+    let (_, text) = tool(&w.config, "/mcp", &boss, "download_source", serde_json::json!({"app": "yard"})).await;
+    let link = source_link(&text);
+    blocking(|| toolsite::platform::trash::remove(&w.config, "yard", 1_800_000_000).unwrap());
+    assert_eq!(fetch(&w.config, &link).await.0, StatusCode::NOT_FOUND, "a removed app's source was served");
+}

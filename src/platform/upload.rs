@@ -729,6 +729,90 @@ pub(crate) fn upload_kind(query: &UploadQuery) -> UploadKind {
     }
 }
 
+/// A download link for one app's source archive: the app and who asked.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceTicket {
+    pub app: String,
+    /// The account that asked, checked again when the link is opened.
+    pub user: Option<String>,
+}
+
+pub(crate) const SOURCE_TTL: Duration = Duration::from_secs(900);
+
+/// Mints a source download link's id. It downloads, never uploads, and
+/// works once.
+pub async fn issue_source_ticket(config: &Config, ticket: &SourceTicket) -> Result<String, String> {
+    config.stores.tickets.put(Kind::SourceDownload, SOURCE_TTL, ticket).await
+}
+
+pub(crate) fn source_url(config: &Config, ticket: &str) -> String {
+    let base = config.base_url.as_deref().unwrap_or(&config.local_base);
+    format!("{base}/source/{ticket}")
+}
+
+/// Whether the account still holds editor at an app that exists: asked when
+/// a ticket is used, not only when it was minted, so a revoked scope or a
+/// demotion in between counts. `None` is the static token, which answers to
+/// no account.
+async fn still_editor(config: &Config, user: Option<&str>, app: &str) -> bool {
+    let Some(user_id) = user else { return true };
+    let folder = crate::content::store::app_folder(config, app).await;
+    let (check, who, which) = (config.clone_for_task(), user_id.to_string(), app.to_string());
+    tokio::task::spawn_blocking(move || {
+        crate::accounts::users::user_by_id(&check, &who).and_then(|user| {
+            let locks = crate::content::store::locked_prefixes_blocking(&check);
+            crate::accounts::users::app_scope(&check, &user, &folder, &which, &locks)
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+    .is_some_and(|held| held >= crate::accounts::users::Scope::Editor)
+}
+
+fn source_archive(app: &str, bytes: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{app}-source.tar.gz\"")),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// `GET /source/<ticket>`: the app's source archive, once. The link is
+/// spent on the first request whatever comes of it, and the account behind
+/// it must still be an editor of the app.
+pub(crate) async fn source_download(State(state): State<AppState>, Path(ticket): Path<String>) -> Response {
+    let config = &state.config;
+    let taken = match config.stores.tickets.take::<SourceTicket>(Kind::SourceDownload, &ticket).await {
+        Ok(taken) => taken,
+        Err(why) => {
+            tracing::error!(%why, "source link could not be spent");
+            None
+        }
+    };
+    let Some(SourceTicket { app, user }) = taken else {
+        tracing::warn!("source download refused: link unknown, expired or already used");
+        return (StatusCode::NOT_FOUND, "this download link is unknown, expired or already used; call download_source again\n")
+            .into_response();
+    };
+    if !crate::content::store::app_exists(config, &app).await {
+        tracing::warn!(app = %app, "source download refused: the app is gone");
+        return (StatusCode::NOT_FOUND, "this app no longer exists\n").into_response();
+    }
+    if !still_editor(config, user.as_deref(), &app).await {
+        tracing::warn!(app = %app, "source download refused: the account no longer has editor access");
+        return (StatusCode::FORBIDDEN, format!("the account behind this link no longer has editor access to {app}\n")).into_response();
+    }
+    match crate::content::files::read(config, &format!("{app}.source")).await {
+        Some(bytes) => source_archive(&app, bytes),
+        None => (StatusCode::NOT_FOUND, format!("no source stored for {app}\n")).into_response(),
+    }
+}
+
 /// The same ticket, read side. An agent that can write an app can fetch what
 /// it needs to change it: the project it was built from, or the page as
 /// served. Scoped to the ticket's own slug, like every write is.
@@ -738,7 +822,7 @@ pub(crate) async fn download(
     Query(query): Query<UploadQuery>,
 ) -> Response {
     let config = &state.config;
-    let Some(slug) = live_ticket(config, &ticket).await.map(|t| t.slug) else {
+    let Some(UploadTicket { slug, user, .. }) = live_ticket(config, &ticket).await else {
         return (
             StatusCode::UNAUTHORIZED,
             "upload ticket unknown or expired; call create_upload again\n",
@@ -746,20 +830,16 @@ pub(crate) async fn download(
             .into_response();
     };
     let app = slug.split('/').next().unwrap_or(&slug).to_string();
+    // Reading is held to the same standing a write is: an editor revoked
+    // since the ticket was minted reads nothing through it either.
+    if crate::content::store::app_exists(config, &app).await && !still_editor(config, user.as_deref(), &app).await {
+        tracing::warn!(app = %app, "upload ticket read refused: the account no longer has editor access");
+        return (StatusCode::FORBIDDEN, format!("the account behind this upload no longer has editor access to {app}\n")).into_response();
+    }
 
     if query.source.is_some() {
         return match crate::content::files::read(config, &format!("{app}.source")).await {
-            Some(bytes) => (
-                [
-                    (header::CONTENT_TYPE, "application/gzip".to_string()),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{app}-source.tar.gz\""),
-                    ),
-                ],
-                bytes,
-            )
-                .into_response(),
+            Some(bytes) => source_archive(&app, bytes),
             None => (
                 StatusCode::NOT_FOUND,
                 format!(

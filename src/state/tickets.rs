@@ -1,7 +1,7 @@
 //! Tickets: short-lived capabilities minted on one request and presented on
 //! another. Upload URLs, settings links, inline uploads in progress, browser
-//! upload URLs, provider sign-ins in flight, preview sign-ins and subdomain
-//! handoff codes are all this one shape, and all live here.
+//! upload URLs, provider sign-ins in flight, preview sign-ins, subdomain
+//! handoff codes and source download links are all this one shape, and all live here.
 //!
 //! What the store holds never opens anything by itself. A ticket's id is
 //! the credential, so only its SHA-256 digest is kept, and the payload is
@@ -55,6 +55,8 @@ pub enum Kind {
     Preview,
     /// A subdomain handoff code: single use.
     Handoff,
+    /// A link that downloads one app's source archive: single use.
+    SourceDownload,
 }
 
 impl Kind {
@@ -67,6 +69,7 @@ impl Kind {
             Kind::Login => "login",
             Kind::Preview => "preview",
             Kind::Handoff => "handoff",
+            Kind::SourceDownload => "source-download",
         }
     }
 }
