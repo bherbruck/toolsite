@@ -304,7 +304,7 @@ pub(crate) struct CreateUserRequest {
     #[schemars(description = "Email address, which is the account's identity across every app on this site.")]
     pub(crate) email: String,
     #[schemars(
-        description = "Optional. Leave it out and the reply carries a one-time link the person opens to choose their own password, which is usually what you want — nobody else ever handles it."
+        description = "Optional. Leave it out and the reply carries a one-time link the person opens to choose their own password, which is usually what you want — nobody else ever handles it. On a site with passwords off, leave it out: the account has no password and the person signs in through the site's provider with this email."
     )]
     pub(crate) password: Option<String>,
     #[schemars(
@@ -1661,9 +1661,14 @@ impl PageHost {
         if let Err(refused) = Self::root_only(&ctx) {
             return Ok(refused);
         }
+        if !self.config.passwords && password.is_some() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(crate::accounts::users::passwords_off(&self.config))]));
+        }
         let config = self.config.clone();
         let outcome =
             tokio::task::spawn_blocking(move || match password {
+                _ if !config.passwords => crate::accounts::users::add_account(&config, &email, admin.unwrap_or(false))
+                    .map(|user| (user, None)),
                 Some(password) => crate::accounts::users::sign_up_as(
                     &config,
                     &email,
@@ -1684,7 +1689,7 @@ impl PageHost {
                 let admin = if user.is_admin { " as an admin" } else { "" };
                 // A new account has no authenticator yet; say when the
                 // site will ask them to set one up at first sign-in.
-                let required = if self.config.mfa.policy.requires(&user) {
+                let required = if self.config.mfa.policy.requires(&user) && (self.config.passwords || self.config.mfa.for_providers) {
                     " (the site requires it, so they set it up at first sign-in)"
                 } else {
                     ""

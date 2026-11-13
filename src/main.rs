@@ -303,6 +303,18 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Passwords off makes the providers the only way in, so off with none
+    // configured is a site nobody can sign in to: refuse to start instead.
+    let passwords = match read(&["TOOLSITE_PASSWORDS"]).as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("on") => true,
+        Some("off") => false,
+        Some(other) => panic!("TOOLSITE_PASSWORDS must be on or off, not {other:?}"),
+    };
+    if !passwords && providers.is_empty() {
+        panic!("TOOLSITE_PASSWORDS=off needs a sign-in provider (TOOLSITE_LOGIN_*), or nobody could sign in");
+    }
+    tracing::info!(passwords = if passwords { "on" } else { "off" }, "password sign-in");
+
     // What an app is until it says otherwise. An internal deployment sets
     // this to granted or authenticated once and never thinks about it again.
     let asked = read(&["TOOLSITE_DEFAULT_ACCESS"]).unwrap_or_else(|| "public".into());
@@ -514,6 +526,7 @@ async fn main() -> anyhow::Result<()> {
         max_db_bytes,
         blobs,
         providers,
+        passwords,
         default_gate,
         github,
         renderer,
@@ -754,6 +767,9 @@ fn run_user_command(
         max_db_bytes: toolsite::config::DEFAULT_MAX_DB_BYTES,
         blobs: toolsite::runtime::blobs::Blobs::local(toolsite::config::DEFAULT_MAX_BLOB_BYTES),
         providers: Vec::new(),
+        // The server's setting, so the shell cannot leave a password or a
+        // setup link waiting for the day passwords come back on.
+        passwords: !std::env::var("TOOLSITE_PASSWORDS").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")),
         default_gate: "public".to_string(),
         github: None,
         renderer: None,
@@ -784,10 +800,26 @@ fn run_user_command(
             admin,
             password: Some(password),
         } => {
+            if !config.passwords {
+                anyhow::bail!("TOOLSITE_PASSWORDS is off: leave out --password, and they sign in through the provider");
+            }
             let user = users::sign_up_as(&config, &email, &password, admin)
                 .map_err(anyhow::Error::msg)?;
             println!(
                 "created {}{}",
+                user.email,
+                if user.is_admin { " as an admin" } else { "" }
+            );
+            Ok(())
+        }
+        UserCommand::Add {
+            email,
+            admin,
+            password: None,
+        } if !config.passwords => {
+            let user = users::add_account(&config, &email, admin).map_err(anyhow::Error::msg)?;
+            println!(
+                "created {}{}; they sign in through the provider with this email",
                 user.email,
                 if user.is_admin { " as an admin" } else { "" }
             );

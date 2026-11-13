@@ -2957,6 +2957,11 @@ mod fake_idp {
 /// A deployment with one OIDC provider pointing at the fake, which issues
 /// tokens for `allow_domain` if given.
 async fn server_with_provider(allow_domain: Option<&str>) -> (TempDir, Arc<Config>, fake_idp::Shared) {
+    server_with_provider_and(allow_domain, true).await
+}
+
+/// The same, with password sign-in on or off.
+async fn server_with_provider_and(allow_domain: Option<&str>, passwords: bool) -> (TempDir, Arc<Config>, fake_idp::Shared) {
     use toolsite::accounts::providers::{IssuerRule, Kind, Provider};
     let (fake, base) = fake_idp::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -2973,6 +2978,7 @@ async fn server_with_provider(allow_domain: Option<&str>) -> (TempDir, Arc<Confi
             client_secret: "shh".into(),
             allow_domain: allow_domain.map(str::to_string),
         }],
+        passwords,
         ..Config::local(dir.path().to_path_buf(), TOKEN)
     });
     (dir, config, fake)
@@ -7432,4 +7438,156 @@ async fn toolsites_own_scripts_reach_their_json_only_with_the_form_token() {
     request.headers_mut().insert("x-toolsite-form", "guess".parse().unwrap());
     let (status, ..) = send(&config, request).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// --- a site with passwords off ---------------------------------------------
+
+/// Signs in through the fake provider as `email` and returns the session.
+async fn provider_session(config: &Arc<Config>, fake: &fake_idp::Shared, email: &str) -> String {
+    {
+        let mut fake = fake.lock().unwrap();
+        fake.email = email.into();
+        fake.sub = format!("sub-{email}");
+    }
+    let (status, _, headers) = sign_in_through(config, "/").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    session_cookie(&headers).expect("the provider sign-in gave no session")
+}
+
+#[tokio::test]
+async fn with_passwords_off_the_sign_in_page_is_only_the_provider_buttons() {
+    let (_dir, config, _) = server_with_provider_and(None, false).await;
+    let (status, page, _) = send(&config, get("/auth/login?next=/admin")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Sign in with Fake IdP"), "{page}");
+    assert!(page.contains("/auth/login/fake?next=%2Fadmin"), "next is not carried: {page}");
+    assert!(!page.contains(r#"type="password""#), "a password field on a site without passwords: {page}");
+    assert!(!page.contains("setup link"), "{page}");
+}
+
+#[tokio::test]
+async fn with_passwords_off_the_right_password_still_opens_nothing() {
+    let (_dir, config, _) = server_with_provider_and(None, false).await;
+    // An account that had a password before the site turned them off.
+    blocking(|| toolsite::accounts::users::sign_up_as(&config, "boss@example.com", "correct horse battery", true)).unwrap();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("email=boss%40example.com&password=correct+horse+battery&next=%2Fadmin"))
+        .unwrap();
+    let (status, _, headers) = send(&config, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(session_cookie(&headers).is_none(), "a session from a password on a site without passwords");
+    assert!(!headers.iter().any(|(k, v)| k == "set-cookie" && v.contains("ts_pending")), "{headers:?}");
+    assert!(blocking(|| toolsite::accounts::users::check_password(&config, "boss@example.com", "correct horse battery")).is_err());
+    assert!(blocking(|| toolsite::accounts::users::log_in(&config, "boss@example.com", "correct horse battery")).is_err());
+}
+
+#[tokio::test]
+async fn with_passwords_off_a_setup_link_sets_nothing_and_signs_in_no_one() {
+    let (_dir, config, _) = server_with_provider_and(None, false).await;
+    // A link minted while passwords were on, or by the command line.
+    let (user, link) = blocking(|| toolsite::accounts::users::invite(&config, "late@example.com", true)).unwrap();
+
+    let (status, page, _) = send(&config, get(&format!("/auth/setup?token={link}"))).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(!page.contains(r#"type="password""#), "{page}");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/auth/setup")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(format!("token={link}&password=correct+horse+battery")))
+        .unwrap();
+    let (status, _, headers) = send(&config, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(session_cookie(&headers).is_none(), "a setup link signed someone in");
+    assert!(!blocking(|| toolsite::accounts::users::has_password(&config, &user.id)), "the link set a password");
+    assert!(blocking(|| toolsite::accounts::users::reinvite(&config, "late@example.com")).is_err());
+}
+
+#[tokio::test]
+async fn with_passwords_off_a_password_cannot_be_changed_either() {
+    let (_dir, config, fake) = server_with_provider_and(None, false).await;
+    blocking(|| toolsite::accounts::users::sign_up_as(&config, "alice@example.com", "correct horse battery", false)).unwrap();
+    let session = provider_session(&config, &fake, "alice@example.com").await;
+
+    let (status, page, _) = send(&config, get_as("/account", &session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("/account/password"), "a change-password form on a site without passwords");
+    let token = form_token_from(&page);
+
+    // Setting a new one would be a password that works again the day the
+    // site turns them back on, chosen by whoever holds this session.
+    send(
+        &config,
+        post_form("/account/password", &session, format!("token={token}&current=correct+horse+battery&new=chosen+by+a+thief&confirm=chosen+by+a+thief")),
+    )
+    .await;
+    let mut on = Config::local(config.data_dir.clone(), TOKEN);
+    on.passwords = true;
+    assert!(blocking(|| toolsite::accounts::users::check_password(&on, "alice@example.com", "chosen by a thief")).is_err());
+    assert!(blocking(|| toolsite::accounts::users::check_password(&on, "alice@example.com", "correct horse battery")).is_ok());
+}
+
+#[tokio::test]
+async fn with_passwords_off_an_admin_makes_an_account_the_provider_signs_in_to() {
+    let (_dir, config, fake) = server_with_provider_and(None, false).await;
+    blocking(|| toolsite::accounts::users::sign_up_as(&config, "boss@example.com", "correct horse battery", true)).unwrap();
+    let boss = provider_session(&config, &fake, "boss@example.com").await;
+
+    let (_, page, _) = send(&config, get_as("/admin/accounts/new", &boss)).await;
+    assert!(!page.contains(r#"type="password""#), "{page}");
+    assert!(page.contains("Fake IdP"), "the page does not say how they sign in: {page}");
+    let token = form_token_from(&page);
+
+    // Even a form that asks for a password gets an account without one.
+    let (status, body, headers) = send(
+        &config,
+        post_form("/admin/users", &boss, format!("token={token}&email=max%40example.com&mode=password&password=correct+horse+battery")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(location(&headers), "/admin/accounts/max@example.com");
+    assert!(!body.contains("/auth/setup"), "a setup link was handed out");
+
+    let max = blocking(|| toolsite::accounts::users::user_by_email(&config, "max@example.com")).expect("no account");
+    assert!(!max.is_admin);
+    assert!(!blocking(|| toolsite::accounts::users::has_password(&config, &max.id)));
+    let (_, account_page, _) = send(&config, get_as("/admin/accounts/max@example.com", &boss)).await;
+    assert!(!account_page.contains("/admin/reinvite"), "a setup-link button on a site without passwords");
+
+    // And the provider lands them on it.
+    let session = provider_session(&config, &fake, "max@example.com").await;
+    let (_, me, _) = send(&config, get_as("/auth/me", &session)).await;
+    assert!(me.contains("max@example.com"), "{me}");
+}
+
+#[tokio::test]
+async fn with_passwords_off_an_old_password_does_not_hold_an_admin_at_two_step_setup() {
+    use toolsite::accounts::mfa::{Clock, Policy, Settings};
+    use toolsite::accounts::providers::{IssuerRule, Kind, Provider};
+    let (fake, base) = fake_idp::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    // Admins must have two-step sign-in, providers bring their own.
+    let config = Arc::new(Config {
+        base_url: Some("http://localhost:8080".to_string()),
+        providers: vec![Provider {
+            slug: "fake".into(),
+            name: "Fake IdP".into(),
+            kind: Kind::Oidc { issuer: base.clone(), issuer_claim: IssuerRule::Exactly(base.clone()) },
+            client_id: "toolsite-test".into(),
+            client_secret: "shh".into(),
+            allow_domain: None,
+        }],
+        passwords: false,
+        mfa: Settings { policy: Policy::Admins, for_providers: false, clock: Clock::default() },
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    blocking(|| toolsite::accounts::users::sign_up_as(&config, "boss@example.com", "correct horse battery", true)).unwrap();
+    let boss = provider_session(&config, &fake, "boss@example.com").await;
+    let (status, ..) = send(&config, get_as("/admin", &boss)).await;
+    assert_eq!(status, StatusCode::OK, "the admin was held at setup over a password the site does not accept");
 }

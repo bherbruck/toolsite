@@ -206,7 +206,7 @@ pub fn from_env(vars: impl IntoIterator<Item = (String, String)>) -> Result<Vec<
                 let tenant = need("TENANT")?;
                 (
                     oidc(&format!("https://login.microsoftonline.com/{tenant}/v2.0")),
-                    "Microsoft Entra",
+                    "Microsoft",
                 )
             }
             _ => {
@@ -791,6 +791,7 @@ mod tests {
         .unwrap();
         let entra = providers.iter().find(|p| p.slug == "entra").unwrap();
         assert_eq!(entra.kind, oidc("https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0"));
+        assert_eq!(entra.name, "Microsoft", "the button says Microsoft, not a product name nobody knows");
         let microsoft = providers.iter().find(|p| p.slug == "microsoft").unwrap();
         let Kind::Oidc { issuer_claim, .. } = &microsoft.kind else { panic!() };
         assert!(issuer_claim.matches("https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0"));

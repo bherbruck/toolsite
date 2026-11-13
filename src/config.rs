@@ -21,6 +21,11 @@ pub struct Config {
     pub blobs: Blobs,
     /// Ways to sign in besides a password, from the environment.
     pub providers: Vec<Provider>,
+    /// Whether a password signs anyone in. Off (`TOOLSITE_PASSWORDS=off`)
+    /// leaves the providers as the only way in: the sign-in form, setup
+    /// links and password changes all refuse, and the site will not start
+    /// with it off and no provider configured.
+    pub passwords: bool,
     /// The gate an app has until it says otherwise. "public" for a site on
     /// the open internet; "granted" or "authenticated" for an internal one.
     pub default_gate: String,
@@ -92,6 +97,7 @@ impl Config {
             blobs: self.blobs.clone_settings(),
             default_gate: self.default_gate.clone(),
             providers: Vec::new(),
+            passwords: self.passwords,
             github: None,
             renderer: self.renderer.clone(),
             preview_base: self.preview_base.clone(),
@@ -118,6 +124,7 @@ impl Config {
             max_db_bytes: DEFAULT_MAX_DB_BYTES,
             blobs: Blobs::local(DEFAULT_MAX_BLOB_BYTES),
             providers: Vec::new(),
+            passwords: true,
             default_gate: "public".to_string(),
             github: None,
             renderer: None,

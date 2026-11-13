@@ -1779,9 +1779,11 @@ async fn render_account_page(
                 }))
                 (ui::panel("Account", None, html! {
                     div."actions" {
-                        form method="post" action="/admin/reinvite" {
-                            (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back))
-                            button."quiet" type="submit" { "Create setup link" }
+                        @if config.passwords {
+                            form method="post" action="/admin/reinvite" {
+                                (hidden("token", &token)) (hidden("email", &account.email)) (hidden("back", &back))
+                                button."quiet" type="submit" { "Create setup link" }
+                            }
                         }
                         @if is_self {
                             span."muted small" { "You cannot disable your own account." }
@@ -1879,6 +1881,39 @@ pub async fn new_account_page(State(config): State<Arc<Config>>, headers: Header
         Err(response) => return response,
     };
     let token = form_token(&config, &admin);
+    if !config.passwords {
+        let how = format!("This site does not use passwords. The person signs in with {} using this email.", users::provider_names(&config));
+        return admin_page(
+            &headers,
+            &admin,
+            Page {
+                active: "accounts",
+                title: "New account",
+                crumbs: vec![("Accounts", "/admin/accounts")],
+                subtitle: None,
+                actions: None,
+                script: None,
+                body: ui::panel("New account", Some(how.as_str()), html! {
+                    form method="post" action="/admin/users" {
+                        (hidden("token", &token)) (hidden("back", "/admin/accounts"))
+                        div."field" {
+                            label for="email" { "Email" }
+                            input id="email" name="email" type="email" required autofocus;
+                        }
+                        label."choice" {
+                            input type="checkbox" name="admin" value="1";
+                            strong { "Admin" }
+                            span { "An admin can open this page, manage all apps, and connect an MCP client that publishes." }
+                        }
+                        div."actions end" {
+                            a."btn quiet" href="/admin/accounts" { "Cancel" }
+                            button type="submit" { "Create account" }
+                        }
+                    }
+                }),
+            },
+        );
+    }
     admin_page(
         &headers,
         &admin,
@@ -2067,6 +2102,25 @@ pub async fn add_account(
         None if password.is_some() => "password".to_string(),
         None => "invite".to_string(),
     };
+
+    // No password and no setup link: the person signs in through a
+    // provider with this email and lands on the account.
+    if !config.passwords {
+        let (config2, for_account) = (config.clone(), email.clone());
+        let outcome = tokio::task::spawn_blocking(move || users::add_account(&config2, &for_account, is_admin)).await;
+        return match outcome {
+            Ok(Ok(_)) => {
+                tracing::info!(admin = %admin.email, account = %email, "account created for provider sign-in");
+                redirect_flash(
+                    &format!("/admin/accounts/{email}"),
+                    true,
+                    format!("Account {email} is created. They sign in with {}.", users::provider_names(&config)),
+                )
+            }
+            Ok(Err(message)) => redirect_flash("/admin/accounts/new", false, message),
+            Err(_) => redirect_flash(&back, false, "The account was not created."),
+        };
+    }
 
     if mode == "password" || mode == "generate" {
         let generated = mode == "generate";

@@ -407,7 +407,9 @@ pub fn begin_setup(config: &Config, user_id: &str, by: &str) -> Result<String, S
 /// not use an admin's powers until it has.
 pub fn owes_setup(config: &Config, user: &User) -> bool {
     config.mfa.policy.requires(user)
-        && (config.mfa.for_providers || users::has_password(config, &user.id))
+        // A password the site no longer accepts is not a door the policy
+        // has to cover.
+        && (config.mfa.for_providers || (config.passwords && users::has_password(config, &user.id)))
         && !is_enabled(config, &user.id)
 }
 

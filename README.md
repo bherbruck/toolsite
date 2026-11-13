@@ -1430,6 +1430,22 @@ under that domain gets an account made on first sign-in, never an admin one.
 Anyone else is told to ask an admin. A disabled account is refused however
 it arrives.
 
+The ENTRA and MICROSOFT presets both say "Sign in with Microsoft".
+
+**Providers only.** `TOOLSITE_PASSWORDS=off` turns passwords off: the sign-in
+page is just the provider buttons, a correct password opens nothing, setup
+links set nothing and no new ones are made, and a password cannot be changed.
+An admin's new account has no password; the person signs in through the
+provider with that email and lands on it. Old password hashes stay in the
+database, unused, so turning passwords back on restores them. The site will not
+start with passwords off and no provider configured. Turn it off only after a
+provider sign-in has worked, and flip it back in the environment if the
+provider breaks. Sessions and connected MCP clients that signed in with a
+password before the switch keep working until they expire or are signed out;
+disable and re-enable an account to end its ones at once. The `toolsite user`
+command reads the same variable, so with it off `user add` makes an account
+without a password or a setup link.
+
 Under the hood: authorization code with PKCE, a single-use state that lasts
 ten minutes, and a nonce checked against the id token, which is verified
 against the provider's published keys (asymmetric algorithms only). An email
@@ -1993,6 +2009,7 @@ is required to serve HTTP.
 | `TOOLSITE_MCP_TOKEN` | if clients don't sign in | Static token an MCP client sends to `/mcp`. |
 | `TOOLSITE_DATA_DIR` | no (default `/data`) | Where everything is stored. |
 | `TOOLSITE_LOGIN_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET` | no | A sign-in provider. Presets `GOOGLE`, `GITHUB`, `MICROSOFT`, `ENTRA` (needs `_TENANT`); any other slug needs `_ISSUER`. Optional `_NAME` and `_ALLOW_DOMAIN`. See Accounts. |
+| `TOOLSITE_PASSWORDS` | no (default `on`) | `off` makes the sign-in providers the only way in: no password sign-in, setup links or password changes. Needs at least one `TOOLSITE_LOGIN_*` provider. See Signing in with a provider. |
 | `TOOLSITE_REQUIRE_MFA` | no (default `admins`) | Who must have two-step sign-in: `admins` (site admins), `everyone`, or `off`. Someone covered without it sets it up after the password, before any session. See Two-step sign-in. |
 | `TOOLSITE_MFA_FOR_PROVIDERS` | no (default off) | `1`: a sign-in through a provider also asks for toolsite's two-step code. Off, the provider's own second step counts. |
 | `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `restricted` (`granted`, the old name, still works). Set `restricted` for an internal site. |

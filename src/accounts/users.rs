@@ -159,6 +159,23 @@ pub fn password_matches(config: &Config, user_id: &str, password: &str) -> bool 
     stored.is_some_and(|stored| verify_password(&stored, password))
 }
 
+/// What every password door says on a site that signs in only through its
+/// providers, naming them the way the sign-in buttons do.
+pub fn passwords_off(config: &Config) -> String {
+    format!("This site does not use passwords. Sign in with {}.", provider_names(config))
+}
+
+/// The providers' button names, joined for a sentence: "Microsoft", or
+/// "Google or Microsoft".
+pub fn provider_names(config: &Config) -> String {
+    let names: Vec<&str> = config.providers.iter().map(|p| p.name.as_str()).collect();
+    match names.as_slice() {
+        [] => "a provider".to_string(),
+        [only] => only.to_string(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
 pub fn sign_up(config: &Config, email: &str, password: &str) -> Result<User, String> {
     sign_up_as(config, email, password, false)
 }
@@ -198,6 +215,9 @@ pub fn sign_up_as(
 /// the email is unknown or the password is wrong, so this cannot be used to
 /// enumerate accounts.
 pub fn check_password(config: &Config, email: &str, password: &str) -> Result<User, String> {
+    if !config.passwords {
+        return Err(passwords_off(config));
+    }
     let email = normalise(email);
     let found = store::of(config).credentials(&email).ok().flatten();
 
@@ -383,6 +403,9 @@ pub fn change_password(
     new: &str,
     current_session: &str,
 ) -> Result<(), String> {
+    if !config.passwords {
+        return Err(passwords_off(config));
+    }
     if new.chars().count() < 8 {
         return Err("Enter a new password of at least 8 characters.".into());
     }
@@ -1357,6 +1380,9 @@ pub async fn login_form(
 ) -> Response {
     let next = safe_next(params.next.as_deref());
     let encoded_next = urlencoding::encode(&next);
+    if !config.passwords {
+        return provider_buttons_page(&config, &encoded_next, StatusCode::OK);
+    }
     let markup = crate::ui::form_page(
         "Sign in",
         maud::html! {
@@ -1391,6 +1417,40 @@ pub async fn login_form(
     Html(markup.into_string()).into_response()
 }
 
+/// The sign-in page of a site with passwords off: the provider buttons and
+/// nothing to type a password into.
+fn provider_buttons_page(config: &Config, encoded_next: &str, status: StatusCode) -> Response {
+    let markup = crate::ui::form_page(
+        "Sign in",
+        maud::html! {
+            div."column" {
+                h1 { "Sign in" }
+                @for provider in &config.providers {
+                    a."btn" href={ "/auth/login/" (provider.slug) "?next=" (encoded_next) } {
+                        "Sign in with " (provider.name)
+                    }
+                }
+            }
+        },
+    );
+    (status, Html(markup.into_string())).into_response()
+}
+
+/// Where a setup link lands on a site with passwords off: there is nothing
+/// to set, so it points at the provider buttons.
+pub fn signed_in_elsewhere(config: &Config, status: StatusCode) -> Response {
+    let markup = crate::ui::form_page(
+        "Sign in",
+        maud::html! {
+            div."column" {
+                h1 { "No password needed" }
+                p { (passwords_off(config)) }
+                a."btn" href="/auth/login" { "Go to sign in" }
+            }
+        },
+    );
+    (status, Html(markup.into_string())).into_response()
+}
 
 #[derive(serde::Deserialize)]
 pub struct Credentials {
@@ -1404,6 +1464,10 @@ pub async fn login_submit(
     Form(credentials): Form<Credentials>,
 ) -> Response {
     let next = safe_next(credentials.next.as_deref());
+    if !config.passwords {
+        tracing::warn!("password sign-in refused: passwords are off on this site");
+        return provider_buttons_page(&config, &urlencoding::encode(&next), StatusCode::FORBIDDEN);
+    }
     let worker = config.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         check_password(&worker, &credentials.email, &credentials.password)
@@ -1921,6 +1985,15 @@ const INVITE_LIFETIME: Duration = Duration::from_secs(60 * 60 * 48);
 /// setting its password. The password never passes through whoever is doing
 /// the inviting — not their shell history, not their clipboard.
 pub fn invite(config: &Config, email: &str, is_admin: bool) -> Result<(User, String), String> {
+    let user = add_account(config, email, is_admin)?;
+    let token = new_invite(&*store::of(config), &user.id)?;
+    Ok((user, token))
+}
+
+/// An account with no password and no setup link: on a site with passwords
+/// off, the person signs in through a provider with this email and lands
+/// on it. An admin may make it one, unlike an account a provider creates.
+pub fn add_account(config: &Config, email: &str, is_admin: bool) -> Result<User, String> {
     let email = normalise(email);
     if !email.contains('@') || email.len() < 3 {
         return Err("Enter a valid email address.".into());
@@ -1935,14 +2008,15 @@ pub fn invite(config: &Config, email: &str, is_admin: bool) -> Result<(User, Str
     if !accounts.insert_user(&user, None, now() as i64)? {
         return Err("An account with this email exists.".into());
     }
-
-    let token = new_invite(&*accounts, &user.id)?;
-    Ok((user, token))
+    Ok(user)
 }
 
 /// Issues a fresh invitation for an existing account, replacing any
 /// outstanding one so an old link stops working.
 pub fn reinvite(config: &Config, email: &str) -> Result<String, String> {
+    if !config.passwords {
+        return Err(passwords_off(config));
+    }
     let accounts = store::of(config);
     let id = account_id(&*accounts, &normalise(email))?;
     new_invite(&*accounts, &id)
@@ -1968,6 +2042,9 @@ pub fn invited_account(config: &Config, token: &str) -> Option<User> {
 /// every session and pending sign-in of the account ends: whatever the old
 /// password opened closes with it.
 pub fn accept_invite(config: &Config, token: &str, password: &str) -> Result<User, String> {
+    if !config.passwords {
+        return Err(passwords_off(config));
+    }
     invited_account(config, token).ok_or("This link is not valid.")?;
     if password.chars().count() < 8 {
         return Err("Enter a password of at least 8 characters.".into());
@@ -2003,6 +2080,9 @@ pub async fn setup_form(
     State(config): State<Arc<Config>>,
     Query(params): Query<InviteToken>,
 ) -> Response {
+    if !config.passwords {
+        return signed_in_elsewhere(&config, StatusCode::GONE);
+    }
     let token = params.token.clone();
     let config2 = config.clone();
     let account =

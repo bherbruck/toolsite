@@ -60,6 +60,9 @@ pub async fn page(State(config): State<Arc<Config>>, headers: HeaderMap) -> Resp
         .await
         .unwrap_or_default()
     };
+    // A password the site no longer accepts is not a sign-in method: no
+    // change form, and no asking for it before two-step setup.
+    let has_password = has_password && config.passwords;
     let required = config.mfa.policy.requires(&user);
     let token = form_token(&config, &user);
     let flash = take_flash(&headers);
@@ -456,7 +459,8 @@ pub async fn mfa_confirm(State(config): State<Arc<Config>>, headers: HeaderMap, 
     };
     let (worker, who) = (config.clone(), user.clone());
     let outcome = tokio::task::spawn_blocking(move || {
-        if users::has_password(&worker, &who.id)
+        if worker.passwords
+            && users::has_password(&worker, &who.id)
             && !users::password_matches(&worker, &who.id, form.password.as_deref().unwrap_or_default())
         {
             tracing::warn!(email = %who.email, "two-step setup refused: the password is not correct");
