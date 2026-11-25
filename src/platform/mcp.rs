@@ -172,7 +172,7 @@ pub(crate) struct RepoRequest {
     #[schemars(description = "The app. For import, the slug the repository will be served at; it need not exist yet.")]
     pub(crate) app: String,
     #[schemars(
-        description = "'status' says where the app's source is mirrored, the last push, which commit the live app came from, whether the repository is ahead of it, and the newest commits. 'discover' lists repositories tagged toolsite that no app is linked to yet, each with the import call to make (the app argument is ignored; pass any name). 'create' makes a new repository from the app's stored source (publish it with ?source first). 'import' links a repository you already have and pulls its branch into the app's source archive. 'pull' pulls the branch again. 'disconnect' forgets the link; the repository stays. 'installations' lists the accounts the GitHub App is installed on."
+        description = "'status' says where the app's source is mirrored, the last push, which commit the live app came from, whether the repository is ahead of it, and the newest commits. 'discover' lists repositories tagged toolsite that no app is linked to yet, each with the import call to make (the app argument is ignored; pass any name). 'create' makes a new repository from the app's stored source (publish it with ?source first). 'import' links a repository you already have and pulls its branch into the app's source archive. 'pull' pulls the branch again. 'disconnect' forgets the link (the repository stays) and opts the app out: on a site that gives every app a repository, it is never given one again unless you 'create' it. Use it only for an app that must stay out of GitHub. 'installations' lists the accounts the GitHub App is installed on."
     )]
     pub(crate) action: String,
     #[schemars(description = "For create: the repository name, default the app's slug. For import: owner/name of the existing repository.")]
@@ -786,11 +786,9 @@ impl PageHost {
             "sync" | "pull" => github::pull(config, &app)
                 .await
                 .map(|p| format!("pulled commit {} into the source archive of {app} ({} bytes)", &p.sha[..p.sha.len().min(7)], p.bytes)),
-            "disconnect" => {
-                github::disconnect(config, &app)
-                    .await
-                    .map(|link| format!("{app} is no longer mirrored at {}; the repository is untouched", link.full_name()))
-            }
+            // Also the way an app with no repository yet opts out of the one
+            // a site that mirrors every app would make it.
+            "disconnect" => github::opt_out(config, &app).await,
             other => Err(format!("action must be status, installations, discover, create, import, pull or disconnect, not '{other}'")),
         };
         Ok(match outcome {

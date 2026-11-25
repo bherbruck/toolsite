@@ -1425,3 +1425,105 @@ async fn an_app_with_no_repository_is_told_to_get_one_only_where_the_site_has_gi
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!body.contains("GitHub") && !body.contains("app_repo"), "a site without GitHub is told about it: {body}");
 }
+
+/// A site that keeps every app in GitHub, on the acme organisation.
+fn mirroring_server(api: &str, account: Option<&str>) -> (TempDir, Arc<Config>) {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new("12345", KEY_PEM, Some("toolsite-app".into()), Some("hook-secret".into()), Some(api.into()))
+        .unwrap()
+        .mirroring(true, account.map(str::to_string));
+    let config = Arc::new(Config {
+        base_url: Some(SITE.to_string()),
+        github: Some(app),
+        ..Config::local(dir.path().to_path_buf(), TOKEN)
+    });
+    (dir, config)
+}
+
+#[tokio::test]
+async fn on_a_site_that_mirrors_every_app_the_first_source_makes_a_private_repository() {
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = mirroring_server(&api, Some("acme"));
+    let ticket = upload_ticket(&config, "pantry").await;
+
+    // Published without source: told it is not in GitHub, nothing made.
+    let (_, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?bundle"), tgz(&[("./index.html", b"<p>hi</p>")]))).await;
+    assert!(body.contains("NOT IN GITHUB YET") && body.contains("?source"), "{body}");
+    assert!(fake.lock().unwrap().repos.is_empty());
+
+    let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source"), tgz(&[("./src/App.tsx", b"v1")]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("made the private repository") && body.contains("acme/toolsite-pantry"), "{body}");
+    {
+        let fake = fake.lock().unwrap();
+        let repo = fake.repo("acme/toolsite-pantry");
+        assert!(repo.private, "an automatic repository must be private");
+        assert!(repo.files.contains_key("src/App.tsx"));
+    }
+    let link = toolsite::platform::github::link(&config, "pantry").await.expect("not linked");
+    assert_eq!(link.full_name(), "acme/toolsite-pantry");
+
+    // From then on a source upload is a commit, not another repository.
+    let (_, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source&message=v2"), tgz(&[("./src/App.tsx", b"v2")]))).await;
+    assert!(body.contains("pushed to acme/toolsite-pantry@main"), "{body}");
+    assert_eq!(fake.lock().unwrap().repos.len(), 1);
+}
+
+#[tokio::test]
+async fn an_app_that_opts_out_is_never_given_a_repository_or_nagged() {
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = mirroring_server(&api, Some("acme"));
+    let said = toolsite::platform::github::opt_out(&config, "secret-app").await.unwrap();
+    assert!(said.contains("opted out"), "{said}");
+
+    let ticket = upload_ticket(&config, "secret-app").await;
+    let (_, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?bundle"), tgz(&[("./index.html", b"<p>hi</p>")]))).await;
+    assert!(!body.contains("GitHub") && !body.contains("app_repo"), "an opted-out app is still nagged: {body}");
+    let (_, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source"), tgz(&[("./a.txt", b"x")]))).await;
+    assert!(!body.contains("repository"), "{body}");
+    let (made, _) = toolsite::platform::github::mirror_every_app(&config).await;
+    assert!(made.is_empty());
+    assert!(fake.lock().unwrap().repos.is_empty(), "a repository was made for an app that opted out");
+    assert!(toolsite::platform::github::upload_preamble(&config, "secret-app", "u").await.is_empty());
+
+    // Asked for by name, it still gets one.
+    let link = toolsite::platform::github::create(&config, "secret-app", 1, None, true).await.unwrap();
+    assert_eq!(link.full_name(), "acme/toolsite-secret-app");
+}
+
+#[tokio::test]
+async fn existing_apps_with_source_are_mirrored_once_and_a_taken_name_gets_a_number() {
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = mirroring_server(&api, Some("acme"));
+    fake.lock().unwrap().add_repo("acme", "toolsite-shop", true);
+    for app in ["shop", "dash", "notes"] {
+        publish_app(&config, app);
+    }
+    store_source(&config, "shop");
+    store_source(&config, "dash");
+
+    let (made, left) = toolsite::platform::github::mirror_every_app(&config).await;
+    let mut made: Vec<_> = made.into_iter().map(|(app, repo)| format!("{app}={repo}")).collect();
+    made.sort();
+    assert_eq!(made, ["dash=acme/toolsite-dash", "shop=acme/toolsite-shop-2"]);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].0, "notes");
+    assert!(left[0].1.contains("no source"), "{left:?}");
+
+    // Again: nothing new.
+    let (made, _) = toolsite::platform::github::mirror_every_app(&config).await;
+    assert!(made.is_empty(), "{made:?}");
+    assert_eq!(fake.lock().unwrap().repos.len(), 3);
+}
+
+#[tokio::test]
+async fn an_app_on_several_accounts_with_none_named_is_told_why_and_nothing_is_made() {
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = mirroring_server(&api, None);
+    publish_app(&config, "shop");
+    store_source(&config, "shop");
+    let (made, left) = toolsite::platform::github::mirror_every_app(&config).await;
+    assert!(made.is_empty());
+    assert!(left[0].1.contains("TOOLSITE_GITHUB_MIRROR_ACCOUNT"), "{left:?}");
+    assert!(fake.lock().unwrap().repos.is_empty());
+}

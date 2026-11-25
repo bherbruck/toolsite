@@ -340,7 +340,16 @@ async fn main() -> anyhow::Result<()> {
                 read(&["TOOLSITE_GITHUB_WEBHOOK_SECRET"]),
                 read(&["TOOLSITE_GITHUB_API"]),
             )
-            .unwrap_or_else(|why| panic!("{why}")),
+            .unwrap_or_else(|why| panic!("{why}"))
+            // Every app in a repository of its own unless the site says off.
+            .mirroring(
+                match read(&["TOOLSITE_GITHUB_MIRROR"]).as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+                    None | Some("") | Some("on") => true,
+                    Some("off") => false,
+                    Some(other) => panic!("TOOLSITE_GITHUB_MIRROR must be on or off, not {other:?}"),
+                },
+                read(&["TOOLSITE_GITHUB_MIRROR_ACCOUNT"]),
+            ),
         ),
         (None, None) => None,
         _ => panic!("set TOOLSITE_GITHUB_APP_ID and TOOLSITE_GITHUB_APP_PRIVATE_KEY together, or neither"),
@@ -349,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
         if base_url.is_none() {
             panic!("TOOLSITE_BASE_URL is required with TOOLSITE_GITHUB_*: the README toolsite writes into a repository names the site");
         }
-        tracing::info!(app_id = %app.app_id, webhook = app.install_url().is_some(), "github app configured");
+        tracing::info!(app_id = %app.app_id, webhook = app.install_url().is_some(), mirror = app.mirror, mirror_account = app.mirror_account.as_deref().unwrap_or("<the one installation>"), "github app configured");
     }
 
     // Subdomain mode: every app on a host of its own. Its scheme and port
@@ -560,6 +569,20 @@ async fn main() -> anyhow::Result<()> {
         runtime: runtime.clone(),
     })
     .spawn();
+
+    // Apps made before the site kept every app in GitHub get their
+    // repositories now, in the background, once the site is up.
+    if toolsite::platform::github::mirrors_every_app(&config) {
+        let config = config.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let (made, left) = toolsite::platform::github::mirror_every_app(&config).await;
+            for (app, repo) in &made {
+                tracing::info!(%app, %repo, "repository made for an existing app");
+            }
+            tracing::info!(made = made.len(), left = left.len(), "every app with source is mirrored");
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");

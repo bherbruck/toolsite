@@ -1361,6 +1361,18 @@ account with Administration permission; an organisation works the same way.
 If GitHub refuses to create one, import an empty repository you made by hand
 instead.
 
+**Every app gets a repository.** With a GitHub App configured, an app's
+first source upload makes it a private `toolsite-<app>` repository (a number
+is added when the name is taken), and every source upload after that is a
+commit. When the site starts, every existing app that has source and no
+repository gets one the same way. An app with no source yet gets its
+repository from its first `?source`, and until then each publish replies
+`NOT IN GITHUB YET`. To keep one app out, `app_repo(app, "disconnect")`: it
+is never given a repository again unless someone asks with `create`.
+`TOOLSITE_GITHUB_MIRROR=off` turns this off for the whole site. When the App
+is on more than one account, `TOOLSITE_GITHUB_MIRROR_ACCOUNT` names the one
+repositories go to; without it nothing is made and the log says why.
+
 ## Accounts
 
 Visitors are separate from publishing: a token, or an admin signing a client
@@ -2018,6 +2030,8 @@ is required to serve HTTP.
 | `TOOLSITE_GITHUB_APP_ID` / `TOOLSITE_GITHUB_APP_PRIVATE_KEY` | no | A GitHub App, so an app's source can live in a repository. The key is the PEM, raw or base64. Both or neither. See GitHub. |
 | `TOOLSITE_GITHUB_APP_SLUG` | no | The App's URL name, for the install link on `/admin/github`. |
 | `TOOLSITE_GITHUB_WEBHOOK_SECRET` | no | Signs the pushes GitHub sends to `/github/webhook`. Without it the webhook is closed. |
+| `TOOLSITE_GITHUB_MIRROR` | no (default `on`) | `off` stops giving every app a private repository of its own. See the GitHub section. |
+| `TOOLSITE_GITHUB_MIRROR_ACCOUNT` | no | The GitHub login automatic repositories go to, when the App is installed on more than one account. |
 | `TOOLSITE_GITHUB_API` | no | The API base, `https://api.github.com` unless you run GitHub Enterprise. |
 | `TOOLSITE_BROWSER_URL` | no | A browser sidecar for `screenshot`: the `ws://` or `http://` address of its DevTools endpoint, e.g. `ws://browser.railway.internal:3000`. Wins over `TOOLSITE_BROWSER`. |
 | `TOOLSITE_BROWSER` | no | Path to a Chromium or chrome-headless-shell binary in this container. An image built with `WITH_BROWSER=1` sets it. When unset, the usual names on `PATH` are tried; when none is found, screenshots are off and say so. |

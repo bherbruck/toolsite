@@ -707,9 +707,10 @@ where you run, as always.
 a commit.** A page, bundle or handler upload never reaches the repository;
 only `?source` does. So on a linked app, end every publish with
 `tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . | curl -f -T - '<upload-url>?source&message=<what changed>'`
-(`toolsite deploy` does it for you), and give an app with no repository one
-with `app_repo(app, "create")` once it works. Upload replies say
-`NOT IN GITHUB YET` until the source arrives.
+(`toolsite deploy` does it for you). An app with no repository gets a private
+one from its first `?source`, without a call. Upload replies say
+`NOT IN GITHUB YET` until the source arrives. Only an app that must stay out
+of GitHub opts out, with `app_repo(app, "disconnect")`.
 
 - `app_repo(app, "create")` makes a repository out of the source you
   published with `?source`, named `toolsite-<app>` unless you say otherwise,

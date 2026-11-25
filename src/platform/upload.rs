@@ -217,6 +217,7 @@ pub(crate) async fn store_for_publisher(
     // What the app serves or runs changed, and only its source reaches
     // the repository: the reply says so, every time.
     let changes_the_app = !matches!(kind, UploadKind::Source | UploadKind::Blob(_));
+    let is_source = matches!(kind, UploadKind::Source);
     let response = store_for_slug(config, runtime, slug, kind, body, meta).await;
     if response.status().is_success() {
         if is_new {
@@ -226,6 +227,26 @@ pub(crate) async fn store_for_publisher(
         stamp_new_app(config, &app, user.as_deref(), project.as_deref()).await;
         if changes_the_app && let Some(note) = crate::platform::github::after_publish(config, &app).await {
             return with_note(response, &note).await;
+        }
+        // The first source of an app on a site that keeps every app in
+        // GitHub becomes its repository.
+        if is_source {
+            match crate::platform::github::auto_mirror(config, &app).await {
+                Some(Ok(link)) => {
+                    let note = format!(
+                        "made the private repository {} ({}) for {app}, holding this source. Every source \
+                         upload from now on is a commit; say what changed with &message=...\n",
+                        link.url(),
+                        link.branch
+                    );
+                    return with_note(response, &note).await;
+                }
+                Some(Err(why)) => {
+                    tracing::warn!(app = %app, %why, "source stored but no repository made");
+                    return with_note(response, &format!("no repository made for {app}: {why}\n")).await;
+                }
+                None => {}
+            }
         }
     }
     response

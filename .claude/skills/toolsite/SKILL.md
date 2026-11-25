@@ -610,8 +610,11 @@ a commit.** This is not optional:
    it, and the Repo tab marks the app "not mirrored". `toolsite deploy` sends
    the source for you; with curl or the MCP tools it is your last step:
    `tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . | curl -f -T - '<upload-url>?source&message=<what changed>'`
-2. **An app with no repository: make one** once it works: upload the source,
-   then `app_repo(app, "create")`. Replies on such a site say so.
+2. **An app with no repository gets one from its first `?source`**, private,
+   named `toolsite-<app>`; you do not need to call anything. Existing apps
+   with source were given theirs when the site started. Only when an app
+   must stay out of GitHub, opt it out with `app_repo(app, "disconnect")`,
+   and say why in its notes.
 3. **One commit per change you would describe**, with a `message` saying what
    changed and why, not "update".
 

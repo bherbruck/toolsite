@@ -76,6 +76,13 @@ pub struct App {
     /// `https://api.github.com`, or a stand-in under test.
     pub api: String,
     tokens: Mutex<HashMap<u64, (String, Instant)>>,
+    /// Whether every app gets a private repository of its own without
+    /// being asked: `TOOLSITE_GITHUB_MIRROR`, on unless `off`. An app opts
+    /// out with `app_repo(app, "disconnect")`.
+    pub mirror: bool,
+    /// Which installation those repositories go to when the App is on more
+    /// than one account: `TOOLSITE_GITHUB_MIRROR_ACCOUNT`, a login.
+    pub mirror_account: Option<String>,
 }
 
 impl App {
@@ -108,7 +115,16 @@ impl App {
                 .filter(|a| !a.is_empty())
                 .unwrap_or_else(|| "https://api.github.com".to_string()),
             tokens: Mutex::new(HashMap::new()),
+            mirror: false,
+            mirror_account: None,
         })
+    }
+
+    /// Turns on a repository for every app, on `account` when given.
+    pub fn mirroring(mut self, on: bool, account: Option<String>) -> Self {
+        self.mirror = on;
+        self.mirror_account = account.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+        self
     }
 
     pub fn install_url(&self) -> Option<String> {
@@ -1228,6 +1244,123 @@ pub async fn push_source(
     }
 }
 
+// --- a repository for every app --------------------------------------------
+
+/// Whether this site gives every app a repository without being asked.
+pub fn mirrors_every_app(config: &Config) -> bool {
+    config.github.as_ref().is_some_and(|app| app.mirror)
+}
+
+/// Whether the app ever had a link, live or not. A disconnected one is the
+/// app's answer to automatic mirroring, and it is never asked again.
+async fn opted_out(config: &Config, app_name: &str) -> bool {
+    matches!(crate::platform::records::of(config).repo_link(app_name).await, Ok(Some(_)))
+        && link(config, app_name).await.is_none()
+}
+
+/// Records that an app with no repository wants none, so automatic
+/// mirroring leaves it alone. A live link is disconnected instead.
+pub async fn opt_out(config: &Config, app_name: &str) -> Result<String, String> {
+    if !valid_app(app_name) {
+        return Err(format!("invalid app name '{app_name}'"));
+    }
+    if link(config, app_name).await.is_some() {
+        let link = disconnect(config, app_name).await?;
+        return Ok(format!("{app_name} is no longer mirrored at {}; the repository is untouched, and no new one will be made", link.full_name()));
+    }
+    write_link(config, app_name, &RepoLink {
+        owner: String::new(),
+        repo: String::new(),
+        branch: String::new(),
+        directory: String::new(),
+        installation_id: 0,
+        token_id: String::new(),
+        connected_at: now(),
+        last_push: None,
+        deployed: None,
+        disconnected_at: Some(now()),
+        unmirrored_since: None,
+    })
+    .await?;
+    tracing::info!(app = %app_name, "app opted out of a repository");
+    Ok(format!("{app_name} opted out: no repository will be made for it. app_repo(\"{app_name}\", \"create\") still makes one when you want it"))
+}
+
+/// The installation automatic repositories go to: the one the App is on,
+/// or the account the site names.
+async fn mirror_installation(config: &Config) -> Result<u64, String> {
+    let wanted = config.github.as_ref().and_then(|app| app.mirror_account.clone());
+    let mut list = installations(config).await;
+    if list.is_empty() {
+        list = refresh_installations(config).await?;
+    }
+    if let Some(account) = wanted {
+        return list
+            .iter()
+            .find(|i| i.account.eq_ignore_ascii_case(&account))
+            .map(|i| i.id)
+            .ok_or_else(|| format!("the GitHub App is not installed on {account} (TOOLSITE_GITHUB_MIRROR_ACCOUNT)"));
+    }
+    match list.as_slice() {
+        [one] => Ok(one.id),
+        [] => Err("the GitHub App is not installed anywhere yet; install it from /admin/github".into()),
+        _ => Err("the GitHub App is on several accounts; set TOOLSITE_GITHUB_MIRROR_ACCOUNT to the one apps go to".into()),
+    }
+}
+
+/// Makes the app its private repository, when the site mirrors every app,
+/// the app has source and has never had or refused one. `None` when there
+/// is nothing to do. A name already taken on the account gets a number.
+pub async fn auto_mirror(config: &Config, app_name: &str) -> Option<Result<RepoLink, String>> {
+    if !mirrors_every_app(config) || !valid_app(app_name) {
+        return None;
+    }
+    if matches!(crate::platform::records::of(config).repo_link(app_name).await, Ok(Some(_))) {
+        return None;
+    }
+    crate::content::files::read(config, &format!("{app_name}.source")).await?;
+    let installation = match mirror_installation(config).await {
+        Ok(id) => id,
+        Err(why) => return Some(Err(why)),
+    };
+    let mut last = String::new();
+    for attempt in 1..=3 {
+        let name = if attempt == 1 { format!("toolsite-{app_name}") } else { format!("toolsite-{app_name}-{attempt}") };
+        match create(config, app_name, installation, Some(&name), true).await {
+            Ok(link) => return Some(Ok(link)),
+            // Taken: GitHub answers 422 and names the field.
+            Err(why) if why.contains("(422") => last = why,
+            Err(why) => return Some(Err(why)),
+        }
+    }
+    Some(Err(last))
+}
+
+/// A repository for every app that has source and no link yet, as the site
+/// starts: what turns automatic mirroring on for apps made before it.
+/// Answers what was made and what was left, and why.
+pub async fn mirror_every_app(config: &Config) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let (mut made, mut left) = (Vec::new(), Vec::new());
+    if !mirrors_every_app(config) {
+        return (made, left);
+    }
+    for app_name in crate::content::catalog::apps(config).await {
+        if !valid_app(&app_name) {
+            continue;
+        }
+        match auto_mirror(config, &app_name).await {
+            Some(Ok(link)) => made.push((app_name, link.full_name())),
+            Some(Err(why)) => {
+                tracing::warn!(app = %app_name, %why, "no repository made for the app");
+                left.push((app_name, why));
+            }
+            None if link(config, &app_name).await.is_some() || opted_out(config, &app_name).await => {}
+            None => left.push((app_name, "no source uploaded yet; the first ?source upload makes its repository".into())),
+        }
+    }
+    (made, left)
+}
+
 /// What a publish that changed the app tells its publisher about the
 /// mirror. A linked app is marked behind until its source is pushed, and
 /// the reply says how to push it; an app with no repository on a site that
@@ -1256,6 +1389,15 @@ pub async fn after_publish(config: &Config, app_name: &str) -> Option<String> {
                 branch = link.branch,
             ))
         }
+        None if opted_out(config, app_name).await => None,
+        None if mirrors_every_app(config) => Some(format!(
+            "\nNOT IN GITHUB YET: this site keeps every app in GitHub, and {app_name} has no repository \
+             because no source has arrived. Upload the project with ?source and toolsite makes its \
+             private repository; every source upload after that is a commit:\n\
+             \n  tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . \
+             | curl -f -T - '<upload-url>?source&message=<what changed, url-encoded>'\n\
+             \nOnly if this app must stay out of GitHub: app_repo(\"{app_name}\", \"disconnect\").\n"
+        )),
         None => Some(format!(
             "\nThis site keeps apps in GitHub and {app_name} has no repository yet. Mirror it so \
              its history is kept and the next session can start from it: upload the source \
@@ -1281,6 +1423,16 @@ pub async fn upload_preamble(config: &Config, app_name: &str, upload: &str) -> S
              \n`toolsite deploy` sends it for you.\n\n",
             repo = link.full_name(),
             branch = link.branch,
+        ),
+        None if opted_out(config, app_name).await => String::new(),
+        None if mirrors_every_app(config) => format!(
+            "THIS SITE KEEPS EVERY APP IN GITHUB. {app_name} gets a private repository from its first \
+             source upload, and every source upload after that is a commit, so every publish MUST \
+             end with:\n\
+             \n  tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . \
+             | curl -f -T - '{upload}?source&message=<what changed, url-encoded>'\n\
+             \n`toolsite deploy` sends it for you. Only if this app must stay out of GitHub: \
+             app_repo(\"{app_name}\", \"disconnect\").\n\n"
         ),
         None => format!(
             "This site keeps apps in GitHub. Once it works, upload the source (see the end of \
@@ -1352,6 +1504,12 @@ fn short(sha: &str) -> &str {
 /// The link, the drift and the newest commits, for a tool call.
 pub async fn status_text(config: &Config, app_name: &str) -> String {
     let Some(link) = link(config, app_name).await else {
+        if opted_out(config, app_name).await {
+            return format!("{app_name} is not mirrored: it opted out or was disconnected. app_repo(\"{app_name}\", \"create\") makes a repository");
+        }
+        if mirrors_every_app(config) {
+            return format!("{app_name} has no repository yet. This site keeps every app in GitHub: the next ?source upload makes its private repository");
+        }
         return format!("{app_name} is not connected to a repository");
     };
     let mut text = format!("{app_name} is mirrored at {} ({})", link.url(), link.branch);
