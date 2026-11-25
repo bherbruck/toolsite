@@ -1235,7 +1235,8 @@ impl PageHost {
         self.stamp_new_app(&app, &caller, folder.as_deref()).await;
 
         let url = page_url(&self.config, &slug);
-        Ok(CallToolResult::success(vec![ContentBlock::text(url)]))
+        let note = crate::platform::github::after_publish(&self.config, &app).await.unwrap_or_default();
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{url}{note}"))]))
     }
 
     #[tool(
@@ -1398,9 +1399,8 @@ impl PageHost {
         }
         urls.sort();
         self.stamp_new_app(&app, &caller, folder.as_deref()).await;
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            urls.join("\n"),
-        )]))
+        let note = crate::platform::github::after_publish(&self.config, &app).await.unwrap_or_default();
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{}{note}", urls.join("\n")))]))
     }
 
     #[tool(
@@ -1439,8 +1439,12 @@ impl PageHost {
 
         let upload = upload_url(&self.config, &ticket);
         let minutes = UPLOAD_TTL.as_secs() / 60;
+        // First, because an agent that reads only the top of this still
+        // has to learn that the repository gets nothing without the source.
+        let app_name = slug.split('/').next().unwrap_or(&slug).to_string();
+        let mirror = crate::platform::github::upload_preamble(&self.config, &app_name, &upload).await;
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Upload with (expires in {minutes} min, reusable until then):\n\
+            "{mirror}Upload with (expires in {minutes} min, reusable until then):\n\
              \n  curl -fT <file.html> {upload}\n\
              \nMulti-page app — append the page name, one PUT per page:\n\
              \n  curl -fT index.html {upload}/index\n  curl -fT about.html {upload}/about\n\

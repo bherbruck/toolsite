@@ -1371,3 +1371,57 @@ async fn a_source_archive_sent_in_chunks_pushes_with_its_message_like_the_put() 
     let (_, message) = &repo.history[0];
     assert_eq!(message, "Fix the phone field\n\nPublished from toolsite");
 }
+
+#[tokio::test]
+async fn a_publish_the_repository_does_not_have_says_so_until_the_source_commits_it() {
+    let (fake, api) = fake_github::start().await;
+    let (_dir, config) = github_server(&api);
+    publish_app(&config, "shop");
+    store_source(&config, "shop");
+    let session = admin(&config);
+    install(&config, &session).await;
+    let (_, page, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    let token = form_token_from(&page);
+    send(&config, post_form("/admin/repo", &session, format!("token={token}&action=create&app=shop&installation=1&repo=shop&back=/admin/apps/shop/repo"))).await;
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1);
+    assert!(toolsite::platform::github::link(&config, "shop").await.unwrap().unmirrored_since.is_none());
+
+    // A built bundle alone: live, and the reply says the repository lacks it.
+    let ticket = upload_ticket(&config, "shop").await;
+    let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?bundle"), tgz(&[("./index.html", b"<p>v2</p>")]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("NOT IN GITHUB YET") && body.contains("acme/shop") && body.contains("?source"), "{body}");
+    assert_eq!(fake.lock().unwrap().repo("acme/shop").commits_made, 1, "a bundle is not source and is never committed");
+    let link = toolsite::platform::github::link(&config, "shop").await.unwrap();
+    assert!(link.unmirrored_since.is_some(), "the mirror is not marked behind");
+    let (_, repo_tab, _) = send(&config, get_as("/admin/apps/shop/repo", &session)).await;
+    assert!(repo_tab.contains("not mirrored"), "the Repo tab does not say so");
+
+    // The upload instructions an agent gets lead with the rule.
+    let ticket_text = toolsite::platform::github::upload_preamble(&config, "shop", "http://x/upload/t").await;
+    assert!(ticket_text.starts_with("THIS APP IS MIRRORED TO GITHUB (acme/shop"), "{ticket_text}");
+
+    // The source commits it and clears the mark.
+    let ticket = upload_ticket(&config, "shop").await;
+    let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?source&message=v2"), tgz(&[("./src/App.tsx", b"v2")]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("pushed to acme/shop@main"), "{body}");
+    assert!(!body.contains("NOT IN GITHUB YET"), "{body}");
+    assert!(toolsite::platform::github::link(&config, "shop").await.unwrap().unmirrored_since.is_none());
+}
+
+#[tokio::test]
+async fn an_app_with_no_repository_is_told_to_get_one_only_where_the_site_has_github() {
+    let (_fake, api) = fake_github::start().await;
+    let (_dir, config) = github_server(&api);
+    let ticket = upload_ticket(&config, "fresh").await;
+    let (status, body, _) = send(&config, put_plain(&format!("/upload/{ticket}?bundle"), tgz(&[("./index.html", b"<p>hi</p>")]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(r#"app_repo("fresh", "create")"#), "{body}");
+
+    let (_dir, plain) = plain_server();
+    let ticket = upload_ticket(&plain, "fresh").await;
+    let (status, body, _) = send(&plain, put_plain(&format!("/upload/{ticket}?bundle"), tgz(&[("./index.html", b"<p>hi</p>")]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("GitHub") && !body.contains("app_repo"), "a site without GitHub is told about it: {body}");
+}

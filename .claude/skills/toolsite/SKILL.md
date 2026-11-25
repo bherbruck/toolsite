@@ -20,7 +20,7 @@ Decide by what the thing does, not by what is quickest to start:
 | One static page: a document, a chart, a readout | Write the HTML, then `curl -fT page.html <upload-url>` |
 | A front-end project you already have | `toolsite deploy --slug <slug> --spa`; it installs and builds |
 | Needs server-side data or logic | Add `--handler`, see [Server-side handlers](#server-side-handlers) |
-| Something that should keep deploying from a repository | Publish once, then `app_repo(app, "create")`, see [A repository](#a-repository) |
+| Any app on a site with a GitHub App | Mirror it: publish, upload `?source`, `app_repo(app, "create")`; after that every publish ends with `?source`. See [A repository](#a-repository) |
 | No shell available (claude.ai web) | Fall back to the `push_page` / `push_app` MCP tools |
 | A shell that cannot reach the host (ChatGPT's sandbox) | Build there, then send the file with `upload_begin` / `upload_chunk` / `upload_finish` in base64 chunks |
 
@@ -600,6 +600,20 @@ An app's source can live in a GitHub repository, with its history. The
 repository is a mirror: toolsite pushes when you publish the source and pulls
 when someone pushes. Nothing is built or run in GitHub; you build and publish
 from where you run, as always.
+
+**When the site has a GitHub App, every app is mirrored, and every change is
+a commit.** This is not optional:
+
+1. **A linked app: end every publish with the source.** A page, bundle or
+   handler upload never reaches the repository; only `?source` does, and it
+   is the commit. The upload reply says `NOT IN GITHUB YET` until you send
+   it, and the Repo tab marks the app "not mirrored". `toolsite deploy` sends
+   the source for you; with curl or the MCP tools it is your last step:
+   `tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . | curl -f -T - '<upload-url>?source&message=<what changed>'`
+2. **An app with no repository: make one** once it works: upload the source,
+   then `app_repo(app, "create")`. Replies on such a site say so.
+3. **One commit per change you would describe**, with a `message` saying what
+   changed and why, not "update".
 
 - `app_repo(app, "create")` makes a repository out of the source you
   published with `?source`, named `toolsite-<app>` unless `repo` says

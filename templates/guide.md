@@ -703,6 +703,14 @@ repository is a mirror: toolsite pushes when the source is published and
 pulls when someone pushes. Nothing is built there; you build and publish from
 where you run, as always.
 
+**When the site has a GitHub App, every app is mirrored, and every change is
+a commit.** A page, bundle or handler upload never reaches the repository;
+only `?source` does. So on a linked app, end every publish with
+`tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . | curl -f -T - '<upload-url>?source&message=<what changed>'`
+(`toolsite deploy` does it for you), and give an app with no repository one
+with `app_repo(app, "create")` once it works. Upload replies say
+`NOT IN GITHUB YET` until the source arrives.
+
 - `app_repo(app, "create")` makes a repository out of the source you
   published with `?source`, named `toolsite-<app>` unless you say otherwise,
   tagged with the `toolsite` topic.

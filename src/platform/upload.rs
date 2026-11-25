@@ -214,6 +214,9 @@ pub(crate) async fn store_for_publisher(
         forget_stale_meta(config, &app).await;
         forget_stale_tokens(config, &app).await;
     }
+    // What the app serves or runs changed, and only its source reaches
+    // the repository: the reply says so, every time.
+    let changes_the_app = !matches!(kind, UploadKind::Source | UploadKind::Blob(_));
     let response = store_for_slug(config, runtime, slug, kind, body, meta).await;
     if response.status().is_success() {
         if is_new {
@@ -221,8 +224,26 @@ pub(crate) async fn store_for_publisher(
             hold_the_name(config, &app).await;
         }
         stamp_new_app(config, &app, user.as_deref(), project.as_deref()).await;
+        if changes_the_app && let Some(note) = crate::platform::github::after_publish(config, &app).await {
+            return with_note(response, &note).await;
+        }
     }
     response
+}
+
+/// The reply with a line added to its text body.
+async fn with_note(response: Response, note: &str) -> Response {
+    let (parts, body) = response.into_parts();
+    match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => {
+            let mut text = bytes.to_vec();
+            text.extend_from_slice(note.as_bytes());
+            let mut parts = parts;
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            Response::from_parts(parts, axum::body::Body::from(text))
+        }
+        Err(_) => (StatusCode::OK, note.to_string()).into_response(),
+    }
 }
 
 /// A new app starts from the default meta. One left at its name with no

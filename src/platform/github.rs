@@ -346,6 +346,11 @@ pub struct RepoLink {
     /// record, and the history of where an app came from is worth having.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<u64>,
+    /// When the app was first changed by a publish the repository does not
+    /// have (a page, bundle or handler with no source after it). Cleared
+    /// by the next source push, so it says the mirror is behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmirrored_since: Option<u64>,
 }
 
 impl RepoLink {
@@ -1015,6 +1020,7 @@ pub async fn create(
         last_push: Some(Push { at: now(), sha: sha.clone() }),
         deployed: Some(Deployed { sha, at: now() }),
         disconnected_at: None,
+        unmirrored_since: None,
     };
     write_link(config, app_name, &link).await?;
     tracing::info!(app = %app_name, repo = %link.full_name(), "repository created");
@@ -1075,6 +1081,7 @@ pub async fn import(
         last_push: None,
         deployed: None,
         disconnected_at: None,
+        unmirrored_since: None,
     };
     let pulled = pull_into(config, app_name, &repo, &link).await?;
     link.last_push = Some(Push { at: now(), sha: pulled.sha });
@@ -1207,12 +1214,79 @@ pub async fn push_source(
             update_link(config, app_name, |link| {
                 link.last_push = Some(Push { at: now(), sha: pushed.clone() });
                 link.deployed = Some(Deployed { sha: pushed, at: now() });
+                link.unmirrored_since = None;
             })
             .await?;
             tracing::info!(app = %app_name, repo = %link.full_name(), %sha, "source pushed");
             Ok(SourcePush::Pushed(sha))
         }
-        None => Ok(SourcePush::Unchanged),
+        // The branch already holds this source: the mirror is caught up.
+        None => {
+            update_link(config, app_name, |link| link.unmirrored_since = None).await?;
+            Ok(SourcePush::Unchanged)
+        }
+    }
+}
+
+/// What a publish that changed the app tells its publisher about the
+/// mirror. A linked app is marked behind until its source is pushed, and
+/// the reply says how to push it; an app with no repository on a site that
+/// has a GitHub App is told to make one. Nothing for a site without one.
+pub async fn after_publish(config: &Config, app_name: &str) -> Option<String> {
+    if !configured(config) || !valid_app(app_name) {
+        return None;
+    }
+    match link(config, app_name).await {
+        Some(link) => {
+            let marked = update_link(config, app_name, |link| {
+                link.unmirrored_since.get_or_insert_with(now);
+            })
+            .await;
+            if let Err(why) = marked {
+                tracing::warn!(app = %app_name, %why, "could not mark the mirror behind");
+            }
+            Some(format!(
+                "\nNOT IN GITHUB YET: {app_name} is mirrored to {repo} ({branch}) and this update is not \
+                 there. Every change ends with the source, which commits it (same upload URL, or \
+                 upload_begin with kind source):\n\
+                 \n  tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . \
+                 | curl -f -T - '<upload-url>?source&message=<what changed, url-encoded>'\n\
+                 \n`toolsite deploy` does this for you.\n",
+                repo = link.full_name(),
+                branch = link.branch,
+            ))
+        }
+        None => Some(format!(
+            "\nThis site keeps apps in GitHub and {app_name} has no repository yet. Mirror it so \
+             its history is kept and the next session can start from it: upload the source \
+             with ?source, then call app_repo(\"{app_name}\", \"create\").\n"
+        )),
+    }
+}
+
+/// What the upload instructions lead with on a site with a GitHub App: a
+/// linked app's rule that every publish ends with the source, or an
+/// unlinked app's prompt to get a repository. Empty on a site without one.
+pub async fn upload_preamble(config: &Config, app_name: &str, upload: &str) -> String {
+    if !configured(config) {
+        return String::new();
+    }
+    match link(config, app_name).await {
+        Some(link) => format!(
+            "THIS APP IS MIRRORED TO GITHUB ({repo}, {branch}). Every publish MUST end with the \
+             source upload: it is the commit, and without it the repository never sees the \
+             change. Last step, every time:\n\
+             \n  tar -czf - --exclude node_modules --exclude target --exclude .git --exclude dist . \
+             | curl -f -T - '{upload}?source&message=<what changed, url-encoded>'\n\
+             \n`toolsite deploy` sends it for you.\n\n",
+            repo = link.full_name(),
+            branch = link.branch,
+        ),
+        None => format!(
+            "This site keeps apps in GitHub. Once it works, upload the source (see the end of \
+             this message) and call app_repo(\"{app_name}\", \"create\"), so the app has a \
+             history and a later session can start from it.\n\n"
+        ),
     }
 }
 
@@ -1291,6 +1365,13 @@ pub async fn status_text(config: &Config, app_name: &str) -> String {
     match &link.deployed {
         Some(d) => text.push_str(&format!("; live app from {}", short(&d.sha))),
         None => text.push_str("; no publish has named a commit"),
+    }
+    if let Some(since) = link.unmirrored_since {
+        text.push_str(&format!(
+            "; BEHIND: the live app has changes the repository does not have, since {} h ago. \
+             Upload the source with ?source to commit them",
+            now().saturating_sub(since) / 3600
+        ));
     }
     match inspect(config, &link).await {
         Ok((drift, commits)) => {
@@ -1724,8 +1805,14 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
                         dt { "Head" } dd { code { (short(&drift.head)) } }
                     }
                 }
+                @if let Some(since) = link.unmirrored_since {
+                    p."small" style="margin-top:.75rem" {
+                        span."badge warn" { "not mirrored" }
+                        " The live app has changed since " (ago(since)) " and the repository does not have it. The next source upload commits it."
+                    }
+                }
                 @match &inspected {
-                    Some(Ok((drift, _))) => {
+                    Some(Ok((drift, _))) if link.unmirrored_since.is_none() || !drift.live_is_head() => {
                         @if drift.live_is_head() {
                             p."small" style="margin-top:.75rem" { span."badge ok" { "current" } " " (drift.sentence()) }
                         } @else if drift.deployed.is_some() {
@@ -1735,7 +1822,7 @@ pub(crate) async fn render_repo_tab(config: &Config, app: &str, token: &str, bac
                         }
                     }
                     Some(Err(why)) => p."muted small" style="margin-top:.75rem" { "GitHub did not answer: " (why) },
-                    None => {}
+                    _ => {}
                 }
                 div."actions" style="margin-top:1rem" {
                     form method="post" action="/admin/repo"
@@ -2103,7 +2190,7 @@ mod tests {
         let (entry, token) = deploy::create(&config, "shop", "github:o/r").await.unwrap();
         write_link(&config, "shop", &RepoLink {
             owner: "o".into(), repo: "r".into(), branch: "main".into(), directory: String::new(),
-            installation_id: 1, token_id: entry.id, connected_at: now(), last_push: None, deployed: None, disconnected_at: None,
+            installation_id: 1, token_id: entry.id, connected_at: now(), last_push: None, deployed: None, disconnected_at: None, unmirrored_since: None,
         }).await.unwrap();
         assert_eq!(linked_apps(&config).await.len(), 1);
         assert_eq!(link_for_repo(&config, "O/R").await.map(|(app, _)| app), Some("shop".to_string()));
